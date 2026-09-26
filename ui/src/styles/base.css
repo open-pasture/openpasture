@@ -1,0 +1,84 @@
+/* Base, after openpasture-web/assets/landing.css. */
+*,*::before,*::after{box-sizing:border-box}
+html,body,#root{margin:0;height:100%}
+body{font-family:var(--sans);font-size:14px;line-height:1.5;background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;overflow:hidden}
+svg,img{display:block}
+a{color:inherit;text-decoration:none}
+p,ul,figure,h1,h2,h3{margin:0}
+ul{padding:0;list-style:none}
+h1,h2,h3{font-weight:500}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer;background:none;border:0;padding:0}
+button:disabled{cursor:default}
+code,kbd,pre,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+::selection{background:var(--grass);color:var(--ink)}
+:focus-visible{outline:2px solid var(--grass);outline-offset:2px}
+.dim{color:var(--fg3)}
+.ok{color:var(--live)}
+.err{color:var(--red)}
+
+/* the mark */
+.mark{width:18px;height:18px;display:grid;grid-template-columns:repeat(5,1fr);gap:1px;flex:none}
+.mark i{background:var(--fg);display:block}.mark i.o{background:transparent}.mark i.b{background:var(--blaze)}
+svg.px{fill:currentColor;flex:none}
+
+/* buttons: .btn.or is primary */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:600;font-size:14.5px;padding:9px 16px;border:1px solid transparent;border-radius:10px;line-height:20px;white-space:nowrap}
+.btn.sm{font-size:13px;padding:5px 12px;font-weight:500}
+.btn.primary{background:var(--grass);color:var(--ink);font-weight:600;box-shadow:inset 0 -5px 12px rgba(40,90,10,.3),0 1px 2px rgba(159,215,96,.25)}
+.btn.quiet{background:transparent;color:var(--fg);border-color:var(--line2)}
+.btn.plain{color:var(--fg2);padding-left:8px;padding-right:8px}
+.btn:disabled{opacity:.45}
+.btn.danger{color:var(--red)}
+.go{width:42px;height:40px;border-radius:10px;background:var(--grass);color:var(--ink);display:grid;place-items:center;flex:none}
+.go:disabled{opacity:.35}
+
+/* segmented, as the website's .seg */
+.seg{display:inline-flex;gap:2px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:3px}
+.seg button{border-radius:7px;padding:.3rem .8rem;color:var(--fg2);font-size:13px}
+.seg button[aria-checked=true]{background:var(--panel2);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line2)}
+
+/* inputs */
+.input{background:var(--bg2);border:1px solid var(--line2);border-radius:10px;padding:9px 12px;font-size:14px;line-height:20px;width:100%;min-width:0;transition:border-color .15s}
+.input.sm{padding:5px 12px;font-size:13px}
+.input.mono{font-family:var(--mono);font-size:13px}
+.input.big{font-size:22px;line-height:32px;padding:10px 16px;letter-spacing:-.01em}
+.input::placeholder{color:var(--fg3)}
+.input:focus-visible{border-color:var(--fg2);outline:none}
+select.input{appearance:none;width:auto;padding-right:1.6rem;background-image:linear-gradient(45deg,transparent 50%,var(--fg3) 50%),linear-gradient(135deg,var(--fg3) 50%,transparent 50%);background-position:calc(100% - 12px) 55%,calc(100% - 8px) 55%;background-size:4px 4px;background-repeat:no-repeat}
+
+/* key-value rows */
+.kv li{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}
+.kv span{color:var(--fg3);font-family:var(--mono);font-size:12px}
+.kv b{font-family:var(--mono);font-weight:400;color:var(--fg);white-space:pre}
+.kv b.ok{color:var(--live)}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+.tbl th{text-align:left;font-weight:400;color:var(--fg3);font-size:11px;line-height:16px;padding:8px 16px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--bg)}
+.tbl td{padding:8px 16px;line-height:20px;border-bottom:1px solid var(--line);color:var(--fg2);white-space:nowrap}
+.tbl td:first-child{color:var(--fg)}
+.tbl td.ok{color:var(--live)}
+
+/* menu */
+.menuwrap{position:relative}
+.menutrigger{display:inline-flex;align-items:center}
+.menu{position:absolute;top:calc(100% + 6px);z-index:30;min-width:180px;background:var(--bg2);border:1px solid var(--line2);border-radius:10px;padding:4px;box-shadow:0 20px 60px rgba(0,0,0,.55);animation:fade .12s both}
+.menu.right{right:0}.menu.left{left:0}
+.menu button{display:block;width:100%;text-align:left;padding:6px 12px;border-radius:7px;color:var(--fg2);font-size:13px}
+.menu button[aria-current]{color:var(--fg)}
+.menu button:hover,.menu button:focus-visible{background:var(--panel);color:var(--fg);outline:none}
+
+@media (hover:hover){
+  .btn.primary:hover,.go:hover:not(:disabled){background:var(--grass2)}
+  .btn.quiet:hover:not(:disabled){border-color:var(--fg3)}
+  .btn.plain:hover:not(:disabled),.seg button:hover{color:var(--fg)}
+}
+@media (prefers-reduced-motion:no-preference){
+  .btn,.seg button,.topbar nav a{transition:color .15s,border-color .15s,background .15s}
+  .mark i{animation:px-in .5s both}
+  .mark i:nth-child(n+6){animation-delay:.08s}.mark i:nth-child(n+11){animation-delay:.16s}.mark i:nth-child(n+16){animation-delay:.24s}.mark i:nth-child(n+21){animation-delay:.32s}
+}
+@keyframes px-in{from{opacity:0}to{opacity:1}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}

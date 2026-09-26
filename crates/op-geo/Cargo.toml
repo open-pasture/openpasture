@@ -1,0 +1,18 @@
+[package]
+name = "op-geo"
+description = "Geometry for openpasture and OpenCollar: rings, projection, signed distance, geofence and cue logic"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+geo.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

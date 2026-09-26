@@ -1,0 +1,28 @@
+[package]
+name = "openpasture-desktop"
+description = "openpasture desktop app: a Tauri 2 window around the embedded server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "openpasture_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+op-core.workspace = true
+op-server.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+
+[lints]
+workspace = true

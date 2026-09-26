@@ -1,0 +1,36 @@
+[package]
+name = "op-engine"
+description = "Decision cycle, grazing signals, autonomy, land reports, knowledge, MCP tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-geo.workspace = true
+op-ingest.workspace = true
+op-brain.workspace = true
+op-analytics.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+sha2.workspace = true
+rmcp.workspace = true
+tantivy.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+
+[lints]
+workspace = true

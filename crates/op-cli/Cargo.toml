@@ -1,0 +1,23 @@
+[package]
+name = "op-cli"
+description = "The openpasture command line: serve, token, version"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openpasture"
+path = "src/main.rs"
+
+[dependencies]
+op-core.workspace = true
+op-server.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

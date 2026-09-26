@@ -1,0 +1,20 @@
+[package]
+name = "op-protocol"
+description = "OpenCollar device protocol: boundary commands, acks, position reports, validation and signing"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+
+[dependencies]
+op-geo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true

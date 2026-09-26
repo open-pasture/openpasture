@@ -1,0 +1,28 @@
+[package]
+name = "collar-sim"
+description = "Emulated OpenCollar devices for testing an openpasture server before hardware reports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "collar-sim"
+path = "src/main.rs"
+
+[dependencies]
+op-protocol.workspace = true
+op-geo.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+
+[lints]
+workspace = true

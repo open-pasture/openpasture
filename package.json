@@ -1,0 +1,11 @@
+{
+  "name": "openpasture",
+  "private": true,
+  "scripts": {
+    "ui:build": "cd ui && bun install && bun run build",
+    "desktop:dev": "bun run ui:build && cd apps/desktop && bunx @tauri-apps/cli@^2 dev",
+    "desktop:build": "bun run ui:build && cd apps/desktop && bunx @tauri-apps/cli@^2 build --bundles app --target aarch64-apple-darwin",
+    "desktop:icon": "cd apps/desktop && bun install && bun run icon",
+    "desktop:release": "bun run ui:build && cd apps/desktop && bunx @tauri-apps/cli@^2 build --bundles app,dmg --target universal-apple-darwin"
+  }
+}

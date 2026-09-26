@@ -1,0 +1,20 @@
+target/
+node_modules/
+ui/dist/
+.DS_Store
+*.db
+*.db-*
+
+# Builder notes, kept out of the public repo
+docs/internal/
+docs/NOTES.md
+docs/BRIEF.md
+
+# Local data and secrets
+.env
+.env.*
+*.p12
+*.p8
+*.key
+secrets.json
+out/

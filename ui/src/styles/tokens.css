@@ -1,0 +1,14 @@
+/* Identical to openpasture-web/assets/landing.css :root. Change them there first. */
+@font-face{font-family:'DM Sans';font-style:normal;font-weight:100 1000;font-display:swap;src:url('/fonts/dm-sans-latin-wght.woff2') format('woff2')}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400;font-display:swap;src:url('/fonts/jetbrains-mono-latin-400.woff2') format('woff2')}
+
+:root{
+  --bg:#0B0C09;--bg2:#111310;--panel:#181B14;--panel2:#20241B;--line:#22261C;--line2:#333A2A;
+  --fg:#F3F2EA;--fg2:#B7B8A6;--fg3:#838674;--ink:#0C1606;
+  --grass:#9FD760;--grass2:#B3E27C;--moss:#142110;--moss2:#1D3016;--leaf:#4F8A2A;
+  --blaze:#FF6A2B;--blaze2:#FF7F4D;--live:#9FD760;--red:#E5484D;
+  --sans:'DM Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  /* the site's "down" colour, used for warning collars */
+  --warn:#F0936C;
+}

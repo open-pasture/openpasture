@@ -1,0 +1,10 @@
+.git
+target
+**/node_modules
+ui/dist
+docs/internal
+docs/NOTES.md
+docs/BRIEF.md
+.DS_Store
+*.db
+*.db-*

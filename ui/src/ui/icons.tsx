@@ -1,0 +1,42 @@
+// Pixel icons, drawn from openpasture-web/partials/px-*.html.
+// Each row is a string: "#" is a pixel in currentColor, "o" is the one accent pixel, "." is empty.
+import type { CSSProperties, ReactNode } from "react";
+
+const GRIDS = {
+  arrow: ["...##....","....##...","########.","########.","....##...","...##....","........."],
+  book: ["###.###.","#..#..#.","#..#..#.","#..#..#.","#..#..#.","###.###.","...#....","........"],
+  chat: ["######..","#....#..","#.oo.#..","#....#..","####.#..","...##...","........","........"],
+  check: ["......#.",".....#..","#...#...",".#.#....","..#.....","........"],
+  chev: ["#....",".#...","..#..",".#...","#....","....."],
+  collar: ["..###...",".#...#..","#.....#.","#.....#.",".#...#..","..#o#...","..###...","........"],
+  cursor: ["#.......","##......","#o#.....","#oo#....","#ooo#...","#####...","...##...","........"],
+  grass: ["...o....",".#.#.#..",".#.#.#..","##.#.##.","#.###.#.","#######.","........","........"],
+  none: ["#.....#.",".#...#..","..#.#...","...o....","..#.#...",".#...#..","#.....#.","........"],
+  nosig: ["o.....#.",".o...##.","..o.###.","...o###.","..####..",".####o..","#####.o.","........"],
+  pin: ["..###...",".##o##..",".#####..","..###...","...#....","...#....","........","........"],
+  sat: ["###.###.","###.###.","..#o#...","###.###.","###.###.","...#....","..###...","........"],
+  spark: ["...#....","...#....",".#.o.#..","###o###.",".#.o.#..","...#....","...#....","........"],
+  sun: ["...#....",".#...#..","..ooo...","#.ooo.#.","..ooo...",".#...#..","...#....","........"],
+  term: ["#######.","#.....#.","#.#...#.","#..#..#.","#.#.oo#.","#.....#.","#######.","........"],
+} as const;
+
+export type IconName = keyof typeof GRIDS;
+
+export function Icon({ name, size = 12, accent, style, className }: {
+  name: IconName; size?: number; accent?: string; style?: CSSProperties; className?: string;
+}) {
+  const rows = GRIDS[name];
+  const w = rows[0].length, h = rows.length;
+  const cells: ReactNode[] = [];
+  rows.forEach((row, y) => {
+    for (let x = 0; x < row.length; x++) {
+      const c = row[x];
+      if (c === ".") continue;
+      cells.push(<rect key={x + "," + y} x={x} y={y} width={1} height={1} fill={c === "o" ? accent ?? "var(--blaze)" : undefined} />);
+    }
+  });
+  return (
+    <svg className={"px" + (className ? " " + className : "")} viewBox={`-.5 -.5 ${w} ${h}`} width={size} height={(size * h) / w}
+      aria-hidden="true" shapeRendering="crispEdges" style={style}>{cells}</svg>
+  );
+}

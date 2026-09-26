@@ -1,0 +1,34 @@
+[package]
+name = "op-server"
+description = "openpasture axum server: merges every crate's router, /api/live WebSocket, static UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-ingest.workspace = true
+op-analytics.workspace = true
+op-brain.workspace = true
+op-engine.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+
+[lints]
+workspace = true

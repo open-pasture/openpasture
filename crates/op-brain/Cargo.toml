@@ -1,0 +1,28 @@
+[package]
+name = "op-brain"
+description = "Brain trait and backends: codex, claude, anthropic, openai, compatible, hosted, heuristic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-geo.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+tempfile.workspace = true
+sqlx.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

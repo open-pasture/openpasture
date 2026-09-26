@@ -1,0 +1,26 @@
+{
+  "name": "openpasture-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "maplibre-gl": "^6.11.2",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "terra-draw": "^1.35.0",
+    "terra-draw-maplibre-gl-adapter": "^1.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}

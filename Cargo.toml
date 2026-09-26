@@ -1,0 +1,93 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/op-protocol",
+    "crates/op-geo",
+    "crates/op-core",
+    "crates/op-ingest",
+    "crates/op-analytics",
+    "crates/op-brain",
+    "crates/op-engine",
+    "crates/op-server",
+    "crates/op-cli",
+    "tools/collar-sim",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/open-pasture/openpasture"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Workspace crates
+op-protocol = { path = "crates/op-protocol" }
+op-geo = { path = "crates/op-geo" }
+op-core = { path = "crates/op-core" }
+op-ingest = { path = "crates/op-ingest" }
+op-analytics = { path = "crates/op-analytics" }
+op-brain = { path = "crates/op-brain" }
+op-engine = { path = "crates/op-engine" }
+op-server = { path = "crates/op-server" }
+
+# Runtime and web
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+
+# Data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+ulid = "1"
+geo = "0.29"
+datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions", "nested_expressions"] }
+# Same major as datafusion's; only adds compression codecs for Parquet files.
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap"] }
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+
+# Errors, logging, CLI, paths
+anyhow = "1"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+# Killing a CLI brain's whole process group
+libc = "0.2"
+
+# Engine: MCP server, knowledge search, farm time zones
+rmcp = { version = "3.1", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+tantivy = "0.26"
+chrono-tz = "0.10"
+tzf-rs = { version = "2.1", default-features = false, features = ["bundled"] }
+
+# Tests
+tempfile = "3"
+tokio-tungstenite = "0.26"
+
+[workspace.lints.rust]
+# Debug binaries that link datafusion are big enough that macOS ld notes the
+# size of their __eh_frame section. The note is harmless.
+linker_messages = "allow"
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3
+
+[profile.release]
+strip = true
