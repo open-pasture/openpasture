@@ -49,6 +49,7 @@ pub mod live;
 // @C
 // @F
 // @S
+pub mod schedule;
 // @A3
 // @H
 // @L

@@ -127,7 +127,9 @@ pub fn parse_output(v: &Value) -> anyhow::Result<DecisionOutput> {
 fn parse_action(v: &Value) -> anyhow::Result<Action> {
     let s = v.as_str().unwrap_or_default().trim().to_ascii_uppercase().replace([' ', '-'], "_");
     Ok(match s.as_str() {
-        "STAY" | "HOLD" | "REMAIN" => Action::Stay,
+        "STAY" | "REMAIN" => Action::Stay,
+        // @S
+        "HOLD" => Action::Hold,
         "MOVE" => Action::Move,
         "NEEDS_INFO" | "NEED_INFO" | "NEEDSINFO" | "NEEDS_MORE_INFO" | "INFO" => Action::NeedsInfo,
         _ => bail!("unknown action {v}"),

@@ -246,6 +246,7 @@ pub fn rollup_title(kind: &str, n: usize, paddock: Option<&str>) -> String {
         "drop_off" => format!("{n} not moving"),
         "gps_degraded" => format!("{n} GPS weak"),
         // @S
+        "schedule_not_stored" => format!("{n} missing the next strip"),
         // @H
         other => format!("{n} {}", other.replace('_', " ")),
     }
@@ -313,6 +314,18 @@ pub fn alert_text(a: &Alert, place: Option<&str>, t: &TextCtx) -> String {
         "boundary_not_applied" => {
             p.push(name(label(a)));
             p.push(fix(format!(" on an old boundary {age}{ack}")));
+        }
+        // @S: the approval prompt for a call about a strip schedule.
+        "decision_waiting" if schedule_prompt(a).is_some() => {
+            let (strip, of, opens) = schedule_prompt(a).unwrap_or_default();
+            let code = s(a, "code").unwrap_or("");
+            let when = opens.map(|o| day_clock(o, t)).unwrap_or_default();
+            p.push(name(herd(a)));
+            if s(a, "action") == Some("HOLD") {
+                p.push(fix(format!(": hold today's strip? Strip {strip} of {of} is due {when}. Reply Y or N. Code {code}")));
+            } else {
+                p.push(fix(format!(": strip {strip} of {of} opens {when}. Reply Y to keep, N to hold. Code {code}")));
+            }
         }
         "decision_waiting" => {
             let code = s(a, "code").unwrap_or("");
@@ -394,6 +407,23 @@ pub fn alert_text(a: &Alert, place: Option<&str>, t: &TextCtx) -> String {
             }
         }
         // @S
+        "schedule_not_stored" => {
+            let strip = n(a, "strip").map_or(String::new(), |k| format!(" {}", k as i64));
+            let when = s(a, "opens_at").and_then(|x| op_core::time::from_db(x).ok()).map(|o| format!(" (opens {})", day_clock(o, t))).unwrap_or_default();
+            p.push(name(herd(a)));
+            let missing = n(a, "missing").unwrap_or(1.0) as i64;
+            let labels: Vec<&str> = a.data.get("labels").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if missing == 1
+                && let Some(l) = labels.first()
+            {
+                p.push(fix(": "));
+                p.push(name(l));
+                p.push(fix(format!(" missing strip{strip}{when}. Check coverage")));
+            } else {
+                let total = n(a, "total").map_or(String::new(), |t| format!(" of {}", t as i64));
+                p.push(fix(format!(": {missing}{total} collars missing strip{strip}{when}. Check coverage")));
+            }
+        }
         // @H
         _ => p.push(name(&a.title)),
     }
@@ -402,6 +432,22 @@ pub fn alert_text(a: &Alert, place: Option<&str>, t: &TextCtx) -> String {
 
 fn age_of(since: DateTime<Utc>, now: DateTime<Utc>) -> String {
     age(since, now)
+}
+
+// @S
+/// `(strip, of, opens_at)` of the schedule a decision was about.
+fn schedule_prompt(a: &Alert) -> Option<(u64, u64, Option<DateTime<Utc>>)> {
+    let sc = a.data.get("schedule").filter(|v| v.is_object())?;
+    let strip = sc.get("strip").and_then(Value::as_u64)?;
+    let of = sc.get("of").and_then(Value::as_u64)?;
+    let opens = sc.get("opens_at").and_then(Value::as_str).and_then(|t| op_core::time::from_db(t).ok());
+    Some((strip, of, opens))
+}
+
+/// "07:00" today in farm time, "Wed 07:00" another day.
+fn day_clock(at: DateTime<Utc>, t: &TextCtx) -> String {
+    let local = at.with_timezone(&t.tz);
+    if local.date_naive() == t.now.with_timezone(&t.tz).date_naive() { local.format("%H:%M").to_string() } else { local.format("%a %H:%M").to_string() }
 }
 
 /// "3 outside P3: 214 031 118", fitted: labels that don't fit become "+2".
@@ -469,6 +515,7 @@ pub fn group_text(alerts: &[Alert], place: Option<&str>, t: &TextCtx) -> String 
                 "gps_degraded" => "GPS weak".into(),
                 "decision_waiting" | "move_stalled" | "stragglers" | "herd_silent" => return alert_text(a, place, t),
                 // @S
+                "schedule_not_stored" => return alert_text(a, place, t),
                 // @H
                 other => other.replace('_', " "),
             };

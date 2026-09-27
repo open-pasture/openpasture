@@ -56,10 +56,14 @@ impl Report for Nrcs528 {
             Column::new("aud", "AUD").dp(1),
             Column::new("rest", "Rest period").dp(1),
         ]);
+        // @S: planned vs actual days, residual height at exit.
+        let extra = crate::schedule_cols::load(ctx, &events, farm.now).await?;
+        let shown = crate::schedule_cols::shown(&extra);
+        columns.extend(crate::schedule_cols::columns(&f, shown));
 
         let mut rows = Vec::new();
         let (mut days, mut aud) = (0.0, 0.0);
-        for e in &events {
+        for (i, e) in events.iter().enumerate() {
             let pid = &e.stay.paddock_id;
             let mut row = vec![json!(farm.paddock_name(pid))];
             for (key, _, on) in fsa {
@@ -78,6 +82,7 @@ impl Report for Nrcs528 {
                 n(e.au_days(), 1),
                 e.rest_days.map_or(Value::Null, |r| n(r, 1)),
             ]);
+            row.extend(crate::schedule_cols::cells(&f, &extra[i], shown));
             days += e.cut.days;
             aud += e.au_days();
             rows.push(row);
@@ -85,8 +90,9 @@ impl Report for Nrcs528 {
         let totals = (!rows.is_empty()).then(|| {
             let mut t = vec![json!("Total")];
             t.resize(columns.len(), Value::Null);
-            t[columns.len() - 3] = n(days, 1);
-            t[columns.len() - 2] = n(aud, 1);
+            let at = |key: &str| columns.iter().position(|c| c.key == key).expect("column");
+            t[at("days")] = n(days, 1);
+            t[at("aud")] = n(aud, 1);
             t
         });
         doc.sections.push(ReportSection { title: "Grazing record".into(), columns, rows, totals });
@@ -94,6 +100,7 @@ impl Report for Nrcs528 {
         doc.notes = common_notes(&farm, &events, p);
         doc.notes.push("Number is the head count on the date in; AUD are animal-unit days.".into());
         doc.notes.push("Rest period: days since any herd last left the field before the date in.".into());
+        doc.notes.extend(crate::schedule_cols::notes(shown));
         doc.signatures = vec!["Operator".into(), "NRCS planner".into()];
         Ok(doc)
     }

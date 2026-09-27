@@ -70,7 +70,9 @@ pub struct Track {
 #[derive(Debug, Clone)]
 pub struct Situation {
     pub active: Option<Polygon>,
-    /// A staged boundary is waiting to take effect.
+    /// A staged step of this move is waiting to take effect (a farmer's
+    /// target sent for later). Staged boundaries of anything else (a strip
+    /// schedule) don't hold the sweep up; the schedule restages above it.
     pub pending: bool,
     pub paddock: Option<Polygon>,
     /// Fresh positions per collar.
@@ -257,7 +259,8 @@ async fn sweeping_row(db: &sqlx::SqlitePool, herd_id: &str) -> anyhow::Result<Op
 }
 
 /// Everything [`advance`] reads, gathered before any write lock is taken.
-async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Result<Situation> {
+/// `decision_id` is the move's: only its own staged step holds it up.
+async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>, decision_id: Option<&str>) -> anyhow::Result<Situation> {
     let split = db::herd_boundaries(ctx.db(), herd_id, at).await?;
     let paddock = match ctx.store().get_herd(herd_id).await?.and_then(|h| h.paddock_id) {
         Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),
@@ -275,7 +278,9 @@ async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
         })
         .collect();
     let limits = crate::shape::herd_limits(ctx, herd_id).await?;
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending: !split.staged.is_empty(), paddock, positions, limits })
+    // @S: the freeze covers the move's own staged step only.
+    let pending = split.staged.iter().any(|b| decision_id.is_some_and(|d| b.decision_id == d));
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, limits })
 }
 
 /// A sweep step on its way to the collars, like every herd boundary.
@@ -334,7 +339,7 @@ pub(crate) async fn begin(
     let _guard = herd_lock(herd_id).await;
     let at = now();
     let effective_at = effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
-    let sit = situation(ctx, herd_id, at).await?;
+    let sit = situation(ctx, herd_id, at, None).await?;
     let mut out = advance(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, &sit, at);
     if let Next::Send { polygon, last: false, .. } = &mut out.next {
         *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?;
@@ -479,7 +484,7 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
             .await?;
         return Ok(None);
     }
-    let sit = situation(ctx, herd_id, at).await?;
+    let sit = situation(ctx, herd_id, at, Some(&row.m.decision_id)).await?;
     if sit.pending {
         return Ok(None);
     }

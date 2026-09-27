@@ -50,7 +50,7 @@ impl Rule for DecisionWaiting {
         let decisions = rows.iter().map(op_core::store::decision_from_row).collect::<anyhow::Result<Vec<_>>>()?;
         let waiting: Vec<Decision> = decisions
             .into_iter()
-            .filter(|d| matches!(d.action, Some(DecisionAction::Move | DecisionAction::Stay)))
+            .filter(|d| matches!(d.action, Some(DecisionAction::Move | DecisionAction::Stay | DecisionAction::Hold)))
             .filter(|d| d.apply_at.is_some() || now - d.created_at >= after)
             .collect();
         if waiting.is_empty() {
@@ -69,6 +69,10 @@ impl Rule for DecisionWaiting {
             let mut data = json!({ "herd": herd.name, "code": code, "action": d.action.map(|a| a.as_db()) });
             if let Some(t) = d.apply_at {
                 data["apply_at"] = json!(to_db(&t));
+            }
+            // @S: a call about a strip schedule names its next strip (the text is Keep or Hold).
+            if let Some(n) = d.inputs.get("schedule").and_then(|s| s.get("next")).filter(|n| n.is_object()) {
+                data["schedule"] = json!({ "strip": n["strip"], "of": n["of"], "opens_at": n["opens_at"] });
             }
             let mut targets = vec![("decision".to_owned(), d.id.clone())];
             let (title, at) = if d.action == Some(DecisionAction::Move) {
@@ -207,11 +211,14 @@ impl Rule for MoveStalled {
         let mut out = Vec::new();
         for m in stalled {
             let Some(herd) = ctx.store().get_herd(&m.herd_id).await? else { continue };
-            let staged: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM boundaries WHERE herd_id = ? AND collar_id IS NULL AND effective_at > ?)")
-                .bind(&m.herd_id)
-                .bind(ts(&now))
-                .fetch_one(ctx.db())
-                .await?;
+            // @S: only the move's own staged step holds it up (a schedule's don't).
+            let staged: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM boundaries WHERE herd_id = ? AND collar_id IS NULL AND effective_at > ? AND decision_id = ?)")
+                    .bind(&m.herd_id)
+                    .bind(ts(&now))
+                    .bind(&m.decision_id)
+                    .fetch_one(ctx.db())
+                    .await?;
             let to = move_to(ctx, &paddocks, &m).await?;
             let since = m.last_step_at.unwrap_or(m.started_at);
             let mut data = json!({ "herd": herd.name, "since": ts(&since), "staged": staged });

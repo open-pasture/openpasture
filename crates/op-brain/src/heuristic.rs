@@ -39,6 +39,7 @@ fn action_word(a: Action) -> &'static str {
         Action::Stay => "STAY",
         Action::Move => "MOVE",
         Action::NeedsInfo => "NEEDS_INFO",
+        Action::Hold => "HOLD",
     }
 }
 
@@ -60,6 +61,10 @@ impl<'a> Pad<'a> {
 
 /// A decision from the context JSON (shape in docs/API.md, Decision context).
 pub fn decide(ctx: &Value) -> DecisionOutput {
+    // @S
+    if let Some(out) = on_schedule(ctx) {
+        return out;
+    }
     let paddocks: Vec<Pad> = ctx.get("paddocks").and_then(Value::as_array).map(|a| a.iter().filter_map(Pad::from).collect()).unwrap_or_default();
     let current_id = str_at(ctx, &["current_paddock_id"]).or_else(|| str_at(ctx, &["herd", "paddock_id"]));
     let current = current_id.and_then(|id| paddocks.iter().find(|p| p.id == id));
@@ -157,6 +162,54 @@ pub fn decide(ctx: &Value) -> DecisionOutput {
         need,
         model: None,
     }
+}
+
+/// With an active strip schedule the call is about the schedule: HOLD when
+/// field notes say today's strip still has plenty, or it holds at least two
+/// cadences of grazing; otherwise STAY (the next strip opens on time).
+fn on_schedule(ctx: &Value) -> Option<DecisionOutput> {
+    let s = ctx.get("schedule").filter(|s| s.get("status").and_then(Value::as_str) == Some("active"))?;
+    let next = s.get("next").filter(|n| n.is_object())?;
+    let (strip, of) = (next.get("strip").and_then(Value::as_u64)?, next.get("of").and_then(Value::as_u64)?);
+    let opens = str_at(next, &["opens"]).unwrap_or("on time");
+    let every = s.get("cadence").and_then(|c| c.get("every_days")).and_then(Value::as_f64).unwrap_or(1.0);
+    let days = s.get("today").and_then(|t| t.get("days")).and_then(Value::as_f64);
+    let current_id = str_at(ctx, &["current_paddock_id"]).or_else(|| str_at(ctx, &["herd", "paddock_id"]));
+    let notes = ctx
+        .get("observations")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|o| is_field_source(str_at(o, &["source"]).unwrap_or("")))
+                .filter(|o| str_at(o, &["paddock_id"]).is_none_or(|p| Some(p) == current_id))
+                .map(|o| obs_text(o).to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let plenty = STAY_SIGNALS.iter().any(|w| notes.contains(w));
+    let short = MOVE_SIGNALS.iter().any(|w| notes.contains(w));
+    let today = s.get("strip").and_then(Value::as_u64).map_or_else(|| "Today's strip".to_owned(), |k| format!("Strip {k}"));
+    let mut reasoning = Vec::new();
+    let action = if !short && (plenty || days.is_some_and(|d| d >= 2.0 * every)) {
+        if plenty {
+            reasoning.push(format!("Field notes say {} still has plenty of grass.", today.to_lowercase()));
+        }
+        if let Some(d) = days {
+            reasoning.push(format!("{today} holds about {d:.1} days of grazing for the herd."));
+        }
+        reasoning.push(format!("Holding keeps the herd on it; strip {strip} of {of} opens one cadence later."));
+        Action::Hold
+    } else {
+        if short {
+            reasoning.push(format!("Field notes say {} is grazed down.", today.to_lowercase()));
+        } else if let Some(d) = days {
+            reasoning.push(format!("{today} holds about {d:.1} days of grazing, so it is time to move on."));
+        }
+        reasoning.push(format!("The schedule opens strip {strip} of {of} at {opens}."));
+        Action::Stay
+    };
+    Some(DecisionOutput { action, to_paddock_id: None, geometry: None, reasoning: reasoning.join(" "), confidence: MEDIUM, need: None, model: None })
 }
 
 /// The candidate with the most rest (no rest record sorts as fully rested),

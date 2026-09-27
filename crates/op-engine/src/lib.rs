@@ -35,6 +35,7 @@ pub mod layouts;
 pub mod strips;
 // @F
 // @S
+pub mod schedules;
 // @A3
 // @H
 // @L
@@ -74,6 +75,7 @@ pub fn router() -> axum::Router<Ctx> {
         layouts::router(),
         // @F
         // @S
+        schedules::router(),
         // @A3
         // @H
         // @L
@@ -112,6 +114,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @C
     // @F
     // @S
+    schedules::register_brief(&ctx);
     // @A3
     // @H
     // @L
