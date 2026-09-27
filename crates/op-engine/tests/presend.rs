@@ -344,6 +344,50 @@ async fn short_rest_is_found_for_ground_the_herd_isnt_on() {
 }
 
 #[tokio::test]
+async fn fixes_across_the_fence_are_not_grazing() {
+    let t = T::new().await;
+    let rested = Utc::now() - Duration::days(40);
+    t.ok("PATCH", &format!("/api/paddocks/{}", t.p2), json!({ "grazed_until": ts(rested) })).await;
+    let keys = t.collars(10, true).await;
+    // Yesterday 10:00 to 15:55 UTC, a fix every 5 minutes: 72 a collar, the
+    // herd in P1. Two cows lie along the P1/P2 fence and 3 of their fixes each
+    // land 5 m into P2: 6 of 720, under 1 % of the herd's day.
+    let day = (Utc::now() - Duration::days(1)).date_naive().and_hms_opt(10, 0, 0).unwrap().and_utc();
+    for (i, k) in keys.iter().enumerate() {
+        let fixes: Vec<Value> = (0..72)
+            .map(|j| {
+                let p = if i < 2 && j % 24 == 23 { at(5.0, 200.0) } else { at(-200.0, 200.0) };
+                json!({ "at": ts(day + Duration::minutes(5 * j)), "point": p, "accuracy_m": 2.0, "sats": 9 })
+            })
+            .collect();
+        t.report(k, json!({ "fixes": fixes })).await;
+    }
+    let c = t.check(json!({ "geometry": p2() })).await;
+    assert_eq!(c["facts"]["rest_days"], 40.0, "{}", c["facts"]);
+    assert!(!codes(&c).contains(&"rested_short"), "{:?}", codes(&c));
+    let p2_signals = || async {
+        let s = t.ok("GET", &format!("/api/signals?herd_id={}", t.herd), json!(null)).await;
+        s["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).cloned().unwrap()
+    };
+    assert_eq!(p2_signals().await["rest_days"], 40.0);
+
+    // Half the herd walks into P2 for the next hour (16:00 to 16:55): 60 of
+    // 780 fixes, 7.7 % of the day. That is grazing, last at 16:55.
+    for k in &keys[..5] {
+        let fixes: Vec<Value> =
+            (0..12).map(|j| json!({ "at": ts(day + Duration::minutes(360 + 5 * j)), "point": at(200.0, 200.0), "accuracy_m": 2.0, "sats": 9 })).collect();
+        t.report(k, json!({ "fixes": fixes })).await;
+    }
+    let last = day + Duration::minutes(415);
+    let want = (Utc::now() - last).num_milliseconds() as f64 / 86_400_000.0;
+    let c = t.check(json!({ "geometry": p2() })).await;
+    let got = c["facts"]["rest_days"].as_f64().unwrap();
+    assert!((got - want).abs() <= 0.11, "{got} vs {want}");
+    assert!(codes(&c).contains(&"rested_short"));
+    assert_eq!(p2_signals().await["last_grazed"], json!(time::to_db(&last)));
+}
+
+#[tokio::test]
 async fn weak_gps_inside_the_shape_is_found_from_the_coverage_days() {
     let t = T::new().await;
     let keys = t.collars(3, true).await;

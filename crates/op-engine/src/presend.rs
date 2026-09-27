@@ -209,10 +209,11 @@ fn finding(code: &str, severity: Severity, text: String, geometry: Option<Value>
 
 /// Days since the paddock was last grazed, from the record: 0 while a herd is
 /// in it, else the latest of its `grazed_until`, an applied move out of it,
-/// the newest collar fix in it (X1's per-paddock `fix_paddock_last`) and the
-/// last day collars grazed it (rolled-up and imported history). Any herd
-/// counts. A few small reads, never a walk of the fixes, so it answers while
-/// the farmer draws.
+/// and the last day collars grazed it ([`signals::collar_grazed`]: a real
+/// share of a herd's tracked day there, from hot fixes, rolled-up days and
+/// imported history, so fixes across a fence from the herd next door don't
+/// count). Any herd counts. A few small reads, never a walk of the fixes, so
+/// it answers while the farmer draws.
 pub async fn rest_days(ctx: &Ctx, p: &Paddock, now: DateTime<Utc>) -> anyhow::Result<Option<f64>> {
     let herds = ctx.store().list_herds().await?;
     if herds.iter().any(|h| h.paddock_id.as_deref() == Some(p.id.as_str())) {
@@ -220,12 +221,10 @@ pub async fn rest_days(ctx: &Ctx, p: &Paddock, now: DateTime<Utc>) -> anyhow::Re
     }
     let history = db::list(ctx, None, 100).await?;
     let mut last = signals::last_grazed(ctx, None, std::slice::from_ref(p), None, &history, now).await?.remove(&p.id).flatten();
-    for sql in ["SELECT MAX(last_t) FROM fix_paddock_last WHERE paddock_id = ?", "SELECT MAX(last_t) FROM paddock_days WHERE paddock_id = ? AND fixes > 0"] {
-        let t: Option<i64> = sqlx::query(sql).bind(&p.id).fetch_one(ctx.db()).await?.try_get(0)?;
-        // A collar clock running ahead counts as now.
-        if let Some(at) = t.map(|t| time::from_unix_ms(t).min(now)) {
-            last = last.max(Some(at));
-        }
+    let since = now - Duration::days(signals::REST_LOOKBACK_DAYS);
+    // A collar clock running ahead counts as now.
+    for at in signals::collar_grazed(ctx, signals::Grazer::Paddock(&p.id), since, None).await?.into_values() {
+        last = last.max(Some(at.min(now)));
     }
     Ok(last.map(|at| calc::round((now - at).num_milliseconds().max(0) as f64 / 86_400_000.0, 1)))
 }

@@ -1036,8 +1036,11 @@ Height       { id /* hgt_… */, paddock_id, at, height_cm, residual_cm?, by: Ac
 ```
 
 A field is absent when nothing is known. Rest days count from when any herd last grazed the
-paddock (applied moves, collar fixes, rolled-up and imported history, `grazed_until`; a paddock
-with a herd in it now is 0). NDVI, drought and flood come from the newest cached land report:
+paddock (applied moves, collar days, rolled-up and imported history, `grazed_until`; a paddock
+with a herd in it now is 0). Collars graze a paddock on a UTC day when at least 1/24 of the
+herd's tracked day is in it (fixes for hot days, dwell for rolled-up and imported ones), the
+pasture history's rule; fixes across a fence from a herd next door, or one animal that wandered,
+don't count. NDVI, drought and flood come from the newest cached land report:
 they need the land provider key (open data has only weather), so without it they are absent.
 
 A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
@@ -1045,8 +1048,8 @@ behind, at most `height_cm`; `at` defaults to now and can't be in the future). `
 it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
 signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
 count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay on
-the farm record that ended after it, a later `grazed_until`, or collar fixes there): the grass it
-measured has been eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd
+the farm record that ended after it, a later `grazed_until`, or a collar grazing day there, as for
+rest days): the grass it measured has been eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd
 is in now, `height_cm` is the grass ahead of it.
 
 Changes to existing shapes (all additive):
@@ -1286,8 +1289,8 @@ Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage 
 holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
 or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
 = 60 % of it at 11.8 kg DM per animal unit a day (as strip days); `rest_days` since that paddock was last grazed
-(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it, the
-newest collar fix in it and the days collars spent in it, any herd); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
+(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it and the
+last collar grazing day there, any herd, by the rest-days rule); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
 
 Findings, most severe first:
 
@@ -1638,7 +1641,9 @@ the data dir opens, in `paddocks` and in the geometry history reports use. Rows 
 right are left alone.
 
 **Rest days at 250 collars.** "Last grazed" for signals, the decision context and
-`GET /api/layers/paddocks` reads the newest fix per herd and paddock from `fix_paddock_last`
-(kept by a trigger as fixes land), not the herd's hot fixes; the herd's position over the last
+`GET /api/layers/paddocks` reads per-day summaries kept by triggers: `fix_paddock_days` (hot
+fixes per herd, UTC day and paddock) and `paddock_day_dwell` (rolled-up and imported dwell per
+herd, date, paddock), a few rows per paddock and day, not the herd's hot fixes or the collar days
+(`fix_paddock_last` is gone); the herd's position over the last
 day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
 holds more. No response shape changes.

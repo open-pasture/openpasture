@@ -214,17 +214,36 @@ async fn a_height_taken_before_the_paddock_was_grazed_stops_counting() {
     t.ok("POST", &format!("/api/paddocks/{p2}/heights"), Some(json!({ "height_cm": 20.0, "residual_cm": 8.89, "at": time::to_db(&ago(3)) }))).await;
     assert_eq!(forage(&t.paddock_signals(&herd, &p2).await), (json!("measured"), json!(3.5), json!(168.0)));
 
-    // Collars in P2 since then (a day ago): grazed again, the residual is old.
-    sqlx::query("INSERT INTO fix_paddock_last (herd_id, paddock_id, last_t) VALUES (?, ?, ?)")
-        .bind(&herd)
-        .bind(&p2)
-        .bind(time::unix_ms(&ago(1)))
-        .execute(t.ctx.db())
-        .await
-        .unwrap();
+    // Yesterday from 12:00 UTC, the herd's collars in P1 (40 fixes): one
+    // lands across the fence in P2. That isn't grazing P2, the residual stands.
+    let noon = (time::now() - Duration::days(1)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc();
+    let fix = |i: i64, paddock: String| {
+        let (ctx, herd) = (t.ctx.clone(), herd.clone());
+        async move {
+            let at = noon + Duration::minutes(i);
+            sqlx::query(
+                "INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, sats, state, paddock_id) VALUES ('col_a', ?, ?, ?, -93.62, 42.03, 3.0, 9, 'inside', ?)",
+            )
+            .bind(&herd)
+            .bind(time::to_db(&at))
+            .bind(time::unix_ms(&at))
+            .bind(paddock)
+            .execute(ctx.db())
+            .await
+            .unwrap();
+        }
+    };
+    for i in 0..40 {
+        fix(i, if i == 20 { p2.clone() } else { p1.clone() }).await;
+    }
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("measured"));
+    // The herd in P2 for the afternoon (20 more fixes, a third of its day): grazed again, the residual is old.
+    for i in 40..60 {
+        fix(i, p2.clone()).await;
+    }
     assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("imagery"));
     // So is a grazed_until after it.
-    sqlx::query("DELETE FROM fix_paddock_last").execute(t.ctx.db()).await.unwrap();
+    sqlx::query("DELETE FROM fix_paddock_days").execute(t.ctx.db()).await.unwrap();
     assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("measured"));
     t.ok("PATCH", &format!("/api/paddocks/{p2}"), Some(json!({ "grazed_until": time::to_db(&ago(2)) }))).await;
     assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("imagery"));
