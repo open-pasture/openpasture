@@ -7,6 +7,7 @@ import { C, createMap, fc, fitPolys, onLoad, setData } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
 import { Animals } from "../map/animals";
 import { Button, Icon, Menu, Segmented } from "../ui";
+import { useUnits, type Fmt } from "../units";
 
 type RangeKey = "24h" | "7d" | "30d";
 const SPAN: Record<RangeKey, number> = { "24h": 86400e3, "7d": 7 * 86400e3, "30d": 30 * 86400e3 };
@@ -58,14 +59,15 @@ function download(table: string, format: "csv" | "geojson" | "parquet", from: st
 
 // ---- health ----------------------------------------------------------------
 
-type Metric = { key: "fix_rate" | "acc_p50" | "battery"; label: string; fmt: (v: number) => string; unit?: [number, number] };
+type Metric = { key: "fix_rate" | "acc_p50" | "battery"; label: string; fmt: (v: number, u: Fmt) => string; unit?: [number, number] };
 const METRICS: Metric[] = [
   { key: "fix_rate", label: "fix rate", fmt: (v) => `${Math.round(v * 100)}%`, unit: [0, 1] },
-  { key: "acc_p50", label: "accuracy", fmt: (v) => `${v.toFixed(1)} m` },
+  { key: "acc_p50", label: "accuracy", fmt: (v, u) => u.len(v) },
   { key: "battery", label: "battery", fmt: (v) => `${Math.round(v * 100)}%`, unit: [0, 1] },
 ];
 
 function Health({ herdId, from, to }: { herdId?: string; from: string; to: string }) {
+  const u = useUnits();
   const [series, setSeries] = useState<HealthSeries[] | null>([]);
   useEffect(() => {
     if (herdId) void api.health({ herd_id: herdId, from, to }).then(setSeries).catch(() => setSeries(null));
@@ -99,7 +101,7 @@ function Health({ herdId, from, to }: { herdId?: string; from: string; to: strin
     <div className="charts">
       {mean.map(({ m, pts }) => (
         <figure key={m.key}>
-          <figcaption><span>{m.label}</span><b>{pts.length ? m.fmt(pts[pts.length - 1].v) : "–"}</b></figcaption>
+          <figcaption><span>{m.label}</span><b>{pts.length ? m.fmt(pts[pts.length - 1].v, u) : "–"}</b></figcaption>
           <Line pts={pts} span={span} unit={m.unit} />
         </figure>
       ))}
@@ -242,6 +244,7 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
 // ---- pasture ---------------------------------------------------------------
 
 function Pasture({ herdId }: { herdId?: string }) {
+  const u = useUnits();
   const herdPad = useStore((s) => s.state?.herds.find((h) => h.id === s.herdId)?.paddock_id);
   const [rows, setRows] = useState<PastureRow[] | null>([]);
   useEffect(() => {
@@ -260,14 +263,14 @@ function Pasture({ herdId }: { herdId?: string }) {
   return (
     <div className="pasture">
       <table className="tbl">
-        <thead><tr><th>paddock</th><th>rest</th><th>grazed</th><th>AU·d/ha</th>{ndvi && <th>ndvi</th>}</tr></thead>
+        <thead><tr><th>paddock</th><th>rest</th><th>grazed</th><th>AU·d/{u.unitLabel("area")}</th>{ndvi && <th>ndvi</th>}</tr></thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.paddock_id}>
               <td>{r.name}</td>
               <td className={r.paddock_id === herdPad ? "ok" : undefined}>{rest(r)}</td>
               <td>{r.grazing_days ? `${r.grazing_days} d` : "–"}</td>
-              <td>{r.pressure ? r.pressure.toFixed(r.pressure < 10 ? 1 : 0) : "–"}</td>
+              <td>{r.pressure ? auDays(u.toDisplay(r.pressure, "density")) : "–"}</td>
               {ndvi && <td>{r.ndvi === null ? "–" : r.ndvi.toFixed(2)}</td>}
             </tr>
           ))}
@@ -276,6 +279,9 @@ function Pasture({ herdId }: { herdId?: string }) {
     </div>
   );
 }
+
+// AU-days per area, converted like a density: one decimal under 10.
+const auDays = (v: number) => v.toFixed(v < 10 ? 1 : 0);
 
 // ---- sql -------------------------------------------------------------------
 

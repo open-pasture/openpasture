@@ -4,6 +4,7 @@ import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabel, outOf, store, useStore } from "../store";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
+import { useUnits } from "../units";
 import { age, clock, useNow } from "../util";
 
 // Clicking Timer again steps through these.
@@ -22,6 +23,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const animals = useStore((s) => s.animals);
   useStore((s) => s.collars.length);
   const now = useNow(1000);
+  const u = useUnits();
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState("");
   const [err, setErr] = useState<string>();
@@ -97,7 +99,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
           <>
             <p className="call sweep">
               <span>{moveTo ? `Moving to ${moveTo}` : "Moving"}</span>
-              {move.remaining_m >= 1 && <span className="rem mono" title="To the target">{Math.round(move.remaining_m)} m</span>}
+              {move.remaining_m >= 1 && <span className="rem mono" title="To the target">{u.len(move.remaining_m)}</span>}
             </p>
             <div className="acts">
               {behind.length > 0 && (
@@ -177,7 +179,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
               <button type="button" className="behind" onClick={() => onFocusCollar(e.collar_id)}>
                 {collars.find((c) => c.id === e.collar_id)?.label ?? "Collar"} out
               </button>
-              {e.remaining_m >= 1 && <span className="rem mono" title="To the herd's boundary">{Math.round(e.remaining_m)} m</span>}
+              {e.remaining_m >= 1 && <span className="rem mono" title="To the herd's boundary">{u.len(e.remaining_m)}</span>}
               <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>
             </div>
           ))}
