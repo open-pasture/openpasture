@@ -35,7 +35,7 @@ pub const SHOW_ENDED: Duration = Duration::minutes(10);
 const MOVED_UP_M: f64 = 1.0;
 
 /// The smallest advance worth a new version.
-fn stride(warn_m: f64) -> f64 {
+pub(crate) fn stride(warn_m: f64) -> f64 {
     (0.3 * warn_m).max(2.0)
 }
 
@@ -252,9 +252,12 @@ async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
         Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),
         None => None,
     };
+    // Animals out on their own boundary are walked back by their escape.
+    let escaped = crate::escapes::escaped_collars(ctx.db(), herd_id).await?;
     let positions = db::list_collars(ctx.db(), Some(herd_id))
         .await?
         .into_iter()
+        .filter(|c| !escaped.contains(&c.id))
         .filter_map(|c| {
             let f = c.last_fix?;
             (at - f.at <= FRESH_FIX).then_some((c.id, f.point))
@@ -344,7 +347,7 @@ pub(crate) async fn begin(
     let replaced = rows.iter().map(|r| move_from_row(r).map(|r| r.m)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut boundary = None;
     if let Next::Send { polygon, last, remaining_m } = &out.next {
-        let nb = NewBoundary { herd_id, geometry: polygon, warn_m, hysteresis_m, effective_at, decision_id, created_at: at };
+        let nb = NewBoundary { herd_id, geometry: polygon, warn_m, hysteresis_m, effective_at, decision_id, created_at: at, collar_id: None, copy_of: None };
         let b = insert_boundary(&mut tx, &nb).await?;
         sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&b.id).bind(decision_id).execute(&mut *tx).await?;
         m.step = 1;
@@ -476,6 +479,8 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
             effective_at: None,
             decision_id: &m.decision_id,
             created_at: at,
+            collar_id: None,
+            copy_of: None,
         };
         let b = insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?;
         sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&b.id).bind(&m.decision_id).execute(&mut *tx).await?;

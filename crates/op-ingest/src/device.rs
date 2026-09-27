@@ -14,7 +14,7 @@ use op_geo::{Geofence, GeofenceConfig};
 use op_protocol::{Ack, AckStatus, PositionReport, ReportResponse};
 use serde::Deserialize;
 
-use crate::{boundary, db};
+use crate::{boundary, db, escapes};
 
 pub fn router() -> Router<Ctx> {
     Router::new().route("/collar/v1/report", post(report)).route("/collar/v1/boundary", get(get_boundary)).route("/collar/v1/ack", post(ack))
@@ -71,6 +71,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
     // Every read happens before the write lock is taken, so a report holding
     // the lock never waits on the pool for another connection.
     let split = db::herd_boundaries(ctx.db(), &herd_id, received).await?;
+    let held = escapes::collar_boundaries(ctx.db(), &collar, received).await?;
     let paddocks = ctx.store().list_paddocks().await?;
     let health = rep.health.clone().unwrap_or_default();
 
@@ -209,7 +210,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
         ctx.publish(e);
     }
     ctx.publish(Event::Collar { collar });
-    let latest_version = split.staged.last().or(split.active.as_ref()).map(|b| b.version);
+    let latest_version = held.staged.last().or(held.active.as_ref()).map(|b| b.version);
     Ok(Json(ReportResponse { latest_version }))
 }
 
@@ -219,10 +220,11 @@ struct Have {
 }
 
 /// 204 when the collar is current. Otherwise the boundary in effect if it is
-/// newer than `have`, else the next staged one.
+/// newer than `have`, else the next staged one. A collar out on an escape
+/// gets its own boundary instead of the herd's.
 async fn get_boundary(State(ctx): State<Ctx>, Device(collar): Device, Query(q): Query<Have>) -> ApiResult<Response> {
     let have = q.have.unwrap_or(0);
-    let split = db::herd_boundaries(ctx.db(), &collar.herd_id, now()).await?;
+    let split = escapes::collar_boundaries(ctx.db(), &collar, now()).await?;
     let next = split.active.filter(|a| a.version > have).or_else(|| split.staged.into_iter().find(|b| b.version > have));
     match next {
         Some(b) => Ok(Json(boundary::command_for(&ctx, &b)?).into_response()),
@@ -235,8 +237,10 @@ async fn ack(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(a): Api
     if a.reason.as_ref().is_some_and(|r| r.len() > 1000) {
         return Err(ApiError::bad_request("reason is too long."));
     }
-    let b =
-        db::boundary_by_id(ctx.db(), &a.command_id).await?.filter(|b| b.herd_id == collar.herd_id).ok_or_else(|| ApiError::not_found("Unknown command_id."))?;
+    let b = db::boundary_by_id(ctx.db(), &a.command_id)
+        .await?
+        .filter(|b| b.herd_id == collar.herd_id && b.collar_id.as_ref().is_none_or(|c| *c == collar.id))
+        .ok_or_else(|| ApiError::not_found("Unknown command_id."))?;
     if b.version != a.version {
         return Err(ApiError::bad_request(format!("Command {} is version {}, not {}.", b.id, b.version, a.version)));
     }

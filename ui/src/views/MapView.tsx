@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
 import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
-import { behindOf, store, useStore } from "../store";
+import { behindOf, outOf, store, useStore } from "../store";
 import { createMap, fitPolys, onLoad } from "../map/base";
-import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
+import { addFarmLayers, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
 import { inside } from "../geo";
 import { Animals } from "../map/animals";
@@ -138,7 +138,15 @@ export function MapView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map, bstat, mode.k, herdId, sweeping, move?.id]);
 
-  const stragglers = behindOf(move, collars);
+  const out = outOf(bstat);
+  const penKey = out.map((e) => `${e.id}:${e.version}`).join();
+  useEffect(() => {
+    if (map) setEscapes(map, out.flatMap((e) => (e.geometry ? [e.geometry] : [])));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, penKey]);
+
+  // Left behind by a move, or out on their own boundary: marked the same.
+  const stragglers = [...new Set([...behindOf(move, collars), ...out.map((e) => e.collar_id)])];
   const stragglerKey = stragglers.join();
   useEffect(() => {
     if (map) animals.current?.stragglers(stragglers);

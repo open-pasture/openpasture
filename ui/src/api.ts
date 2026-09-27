@@ -51,6 +51,8 @@ export interface Position { collar_id: string; animal_id?: string; fix: Fix; sta
 export interface Boundary {
   id: string; herd_id: string; version: number; geometry: Polygon; warn_m: number; hysteresis_m: number;
   effective_at?: string; decision_id: string; created_at: string;
+  // Set on one collar's own boundary during an escape.
+  collar_id?: string;
 }
 export type AckStatus = "received" | "applied" | "rejected";
 export interface Ack { collar_id: string; version: number; status: AckStatus; reason?: string; at: string }
@@ -63,10 +65,19 @@ export interface Move {
   // Unit east/north axis of the sweep, when the server sends it (absent for a gather).
   direction?: [number, number];
 }
+// An animal that stayed outside its herd's boundary. Its collar holds a boundary of its own,
+// the herd's joined to a pen around it, which closes in behind it until it is back.
+export type EscapeStatus = "returning" | "back" | "stopped";
+export interface Escape {
+  id: string; herd_id: string; collar_id: string; status: EscapeStatus; geometry?: Polygon; version?: number;
+  step: number; remaining_m: number; started_at: string; updated_at: string; ended_at?: string;
+}
 export interface BoundaryStatus {
   active?: Boundary; pending?: Boundary; proposed?: { decision_id: string; geometry: Polygon }; acks: Ack[];
   // The running move, or the last one for 10 min after it ends.
   move?: Move;
+  // Open escapes, and those ended in the last 10 min.
+  escapes?: Escape[];
 }
 export interface NewCollar { collar: Collar; key: string; endpoint: string; public_key: string }
 
@@ -122,6 +133,7 @@ export type LiveEvent =
   | { type: "boundary"; herd_id: string; boundary: Boundary }
   | { type: "decision"; decision: Decision }
   | { type: "move"; move: Move }
+  | { type: "escape"; escape: Escape }
   | { type: "decision_log"; decision_id: string; line: string }
   // The server dropped events for this socket; refetch everything.
   | { type: "resync" };
@@ -229,6 +241,7 @@ export const api = {
   sendBoundary: (herd_id: string, b: { geometry: Polygon; warn_m?: number; hysteresis_m?: number; effective_at?: string }) =>
     post<Move>(`/api/herds/${herd_id}/boundary`, b),
   stopMove: (herd_id: string) => post<Move>(`/api/herds/${herd_id}/move/stop`),
+  stopEscape: (collar_id: string) => post<Escape>(`/api/collars/${collar_id}/escape/stop`),
   positions: (herd_id?: string) => get<Position[]>("/api/positions", { herd_id }),
 
   // decisions and brains

@@ -8,11 +8,13 @@ import { C, fc, setData } from "./base";
 // markers so they can use JetBrains Mono without a glyph server.
 
 export function addFarmLayers(map: MLMap) {
-  for (const id of ["paddocks", "swept", "active", "target", "back", "chevrons", "pending", "proposed", "draft"]) setData(map, id, fc([]));
+  for (const id of ["paddocks", "swept", "escapes", "active", "target", "back", "chevrons", "pending", "proposed", "draft"]) setData(map, id, fc([]));
   map.addLayer({ id: "paddocks-fill", type: "fill", source: "paddocks", paint: { "fill-color": C.fg, "fill-opacity": ["case", ["boolean", ["feature-state", "hover"], false], 0.05, 0] } });
   map.addLayer({ id: "paddocks-line", type: "line", source: "paddocks", paint: { "line-color": C.fg, "line-opacity": 0.32, "line-width": 1 } });
   // A move: the ground behind the back line fades back into the imagery.
   map.addLayer({ id: "swept-fill", type: "fill", source: "swept", paint: { "fill-color": C.bg, "fill-opacity": 0, "fill-opacity-transition": { duration: 700, delay: 0 } } });
+  // An escaped animal's own boundary, under the active line, so only the pen around it shows.
+  map.addLayer({ id: "escape-line", type: "line", source: "escapes", paint: { "line-color": C.warn, "line-width": 1.5 } });
   map.addLayer({ id: "active-fill", type: "fill", source: "active", paint: { "fill-color": C.grass, "fill-opacity": 0.07 } });
   map.addLayer({ id: "active-line", type: "line", source: "active", paint: { "line-color": C.grass, "line-width": 1.5 } });
   // A running move's target: thin, dashed, no fill. The active line sweeps toward it.
@@ -39,6 +41,10 @@ export function setPaddocks(map: MLMap, paddocks: Paddock[]) {
 
 export function setBoundary(map: MLMap, which: "active" | "target" | "swept" | "pending" | "proposed", g?: Polygon) {
   setData(map, which, fc(g ? [poly(g)] : []));
+}
+
+export function setEscapes(map: MLMap, gs: Polygon[]) {
+  setData(map, "escapes", fc(gs.map((g) => poly(g))));
 }
 
 export class Labels {

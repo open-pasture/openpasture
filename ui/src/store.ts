@@ -2,7 +2,7 @@
 // kept fresh by /api/live.
 
 import { useSyncExternalStore } from "react";
-import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type LiveEvent, type Move } from "./api";
+import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type Move } from "./api";
 
 export interface Store {
   ready: boolean;
@@ -64,6 +64,11 @@ export function behindOf(move: Move | undefined, collars: Collar[] = s.collars):
     const c = collars.find((x) => x.id === id);
     return c && (move.status === "sweeping" || c.state !== "inside");
   });
+}
+
+// Escapes still bringing an animal back.
+export function outOf(b: BoundaryStatus | undefined): Escape[] {
+  return (b?.escapes ?? []).filter((e) => e.status === "returning");
 }
 
 export function useStore<T>(sel: (s: Store) => T): T {
@@ -142,6 +147,8 @@ function onEvent(e: LiveEvent) {
         const acks = b.acks.filter((a) => a.collar_id !== e.collar_id);
         acks.push({ collar_id: e.collar_id, version: e.version, status: e.status, reason: e.reason, at: new Date().toISOString() });
         set({ boundary: { ...s.boundary, [e.herd_id]: { ...b, acks } } });
+        // A collar on or back from its own boundary: the server says which herd version that counts as.
+        if (b.escapes?.some((x) => x.collar_id === e.collar_id)) refreshBoundarySoon(e.herd_id);
       }
       break;
     }
@@ -162,6 +169,13 @@ function onEvent(e: LiveEvent) {
       const b = s.boundary[m.herd_id];
       if (b) set({ boundary: { ...s.boundary, [m.herd_id]: { ...b, move: m } } });
       else refreshBoundarySoon(m.herd_id);
+      break;
+    }
+    case "escape": {
+      const x = e.escape;
+      const b = s.boundary[x.herd_id];
+      if (b) set({ boundary: { ...s.boundary, [x.herd_id]: { ...b, escapes: [...(b.escapes ?? []).filter((y) => y.id !== x.id), x] } } });
+      else refreshBoundarySoon(x.herd_id);
       break;
     }
     case "decision_log":

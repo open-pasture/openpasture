@@ -46,7 +46,7 @@ pub async fn delete_collar(db: &SqlitePool, id: &str) -> anyhow::Result<bool> {
 // Boundaries
 
 pub async fn boundaries_for_herd(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<Boundary>> {
-    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? ORDER BY version").bind(herd_id).fetch_all(db).await?;
+    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version").bind(herd_id).fetch_all(db).await?;
     rows.iter().map(boundary_from_row).collect()
 }
 
@@ -85,14 +85,16 @@ pub async fn herd_boundaries(db: &SqlitePool, herd_id: &str, now: DateTime<Utc>)
 }
 
 /// Latest ack per collar still in the herd: highest version first, then the
-/// most recent status for that version.
+/// most recent status for that version. A collar handed back to the herd's
+/// boundary after an escape holds a copy of it; its ack shows the herd
+/// version it copies.
 pub async fn latest_acks(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<BoundaryAck>> {
     let rows = sqlx::query(
-        "SELECT collar_id, version, status, reason, at FROM (
+        "SELECT a.collar_id, COALESCE(b.copy_of, a.version) AS version, a.status, a.reason, a.at FROM (
              SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.collar_id ORDER BY a.version DESC, a.id DESC) AS rn
              FROM acks a JOIN collars c ON c.id = a.collar_id
              WHERE c.herd_id = ? AND a.herd_id = ?
-         ) WHERE rn = 1 ORDER BY collar_id",
+         ) a LEFT JOIN boundaries b ON b.id = a.command_id WHERE a.rn = 1 ORDER BY a.collar_id",
     )
     .bind(herd_id)
     .bind(herd_id)

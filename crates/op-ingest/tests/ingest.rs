@@ -804,3 +804,97 @@ async fn sweeping_moves_resume_after_a_restart() {
     assert_eq!(step.step, 2);
     ctx.shutdown();
 }
+
+// Escapes
+
+#[tokio::test]
+async fn an_escaped_animal_gets_its_own_boundary_and_is_handed_back() {
+    let app = App::new().await;
+    let (herd, collars) = app.sweep_herd(2).await;
+    let (a, a_key) = &collars[0];
+    let (_, b_key) = &collars[1];
+    let (s, _) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let herd_v = app.active(&herd).await["active"]["version"].as_u64().unwrap() as u32;
+    let now = chrono::Utc::now();
+
+    // Out for 30 s: the collar's own cue is still the thing to wait on.
+    app.fix(a_key, m_at(150.0, 230.0), now - chrono::Duration::seconds(30)).await;
+    op_ingest::escapes::scan(&app.ctx, now).await.unwrap();
+    assert!(app.active(&herd).await.get("escapes").is_none());
+
+    // Out for 90 s: its own boundary.
+    app.fix(a_key, m_at(150.0, 231.0), now).await;
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(60)).await.unwrap();
+    let st = app.active(&herd).await;
+    let esc = &st["escapes"][0];
+    assert_eq!((esc["collar_id"].as_str(), esc["status"].as_str()), (Some(a.as_str()), Some("returning")));
+    assert_eq!(st["active"]["version"].as_u64(), Some(herd_v as u64), "the herd's boundary is unchanged");
+
+    // The escaped collar is served its pen; the rest of the herd is not.
+    let (s, cmd) = app.req("GET", &format!("/collar/v1/boundary?have={herd_v}"), Some(a_key), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(cmd["version"], esc["version"]);
+    let pen_v = cmd["version"].as_u64().unwrap() as u32;
+    assert!(pen_v > herd_v);
+    assert!(poly(&esc["geometry"]).contains(m_at(150.0, 231.0)));
+    assert!(poly(&esc["geometry"]).contains(m_at(1.0, 1.0)));
+    let (s, _) = app.req("GET", &format!("/collar/v1/boundary?have={herd_v}"), Some(b_key), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    // Reports point it at its pen, not the herd's boundary.
+    let body = json!({"fixes": [{"at": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true), "point": m_at(150.0, 231.0), "accuracy_m": 2.0, "sats": 9}]});
+    let (_, r) = app.req("POST", "/collar/v1/report", Some(a_key), Some(body)).await;
+    assert_eq!(r["latest_version"].as_u64(), Some(pen_v as u64));
+    let ack = |cmd: &Value| json!({"command_id": cmd["command_id"], "version": cmd["version"], "status": "applied", "at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)});
+    let (s, _) = app.req("POST", "/collar/v1/ack", Some(a_key), Some(ack(&cmd))).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    // Another collar can't ack it.
+    let (s, _) = app.req("POST", "/collar/v1/ack", Some(b_key), Some(ack(&cmd))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Back inside: a copy of the herd's boundary, which counts as holding it.
+    app.fix(a_key, m_at(150.0, 150.0), now + chrono::Duration::seconds(90)).await;
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(95)).await.unwrap();
+    let st = app.active(&herd).await;
+    assert_eq!(st["escapes"][0]["status"].as_str(), Some("back"));
+    let (s, copy) = app.req("GET", &format!("/collar/v1/boundary?have={pen_v}"), Some(a_key), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(copy["version"].as_u64().unwrap() > pen_v as u64);
+    let herd_cmd = app.req("GET", "/collar/v1/boundary?have=0", Some(b_key), None).await.1;
+    assert_eq!(herd_cmd["version"].as_u64(), Some(herd_v as u64));
+    assert_eq!(copy["boundary"], herd_cmd["boundary"]);
+    app.req("POST", "/collar/v1/ack", Some(a_key), Some(ack(&copy))).await;
+    let st = op_ingest::boundary_status(&app.ctx, &herd).await.unwrap();
+    assert_eq!(st.acks.iter().find(|x| x.collar_id == *a).unwrap().version, herd_v);
+    let (s, _) = app.req("GET", &format!("/collar/v1/boundary?have={}", copy["version"]), Some(a_key), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_farmer_can_let_an_escaped_animal_go() {
+    let app = App::new().await;
+    let (herd, collars) = app.sweep_herd(1).await;
+    let (a, a_key) = &collars[0];
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    let now = chrono::Utc::now();
+    app.fix(a_key, m_at(150.0, 230.0), now - chrono::Duration::seconds(90)).await;
+    app.fix(a_key, m_at(150.0, 231.0), now).await;
+    op_ingest::escapes::scan(&app.ctx, now).await.unwrap();
+
+    let (s, e) = app.call("POST", &format!("/api/collars/{a}/escape/stop"), None).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    assert_eq!(e["status"].as_str(), Some("stopped"));
+    let (s, _) = app.call("POST", &format!("/api/collars/{a}/escape/stop"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // Still out, but not given another until it has been back in.
+    app.fix(a_key, m_at(150.0, 232.0), now + chrono::Duration::seconds(5)).await;
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(10)).await.unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM escapes").fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(n, 1);
+    // In, then out again for a minute: a new escape.
+    app.fix(a_key, m_at(150.0, 150.0), now + chrono::Duration::seconds(20)).await;
+    app.fix(a_key, m_at(150.0, 230.0), now + chrono::Duration::seconds(30)).await;
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(100)).await.unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM escapes WHERE status = 'returning'").fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(n, 1);
+}
