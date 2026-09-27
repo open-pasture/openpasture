@@ -62,6 +62,7 @@ async fn test(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<
         context,
         instructions: TEST_INSTRUCTIONS.into(),
         mcp_url: String::new(),
+        tools: vec![],
         log: tx,
     };
     let result = tokio::time::timeout(TEST_TIMEOUT, brain.decide(req)).await;
@@ -149,8 +150,14 @@ mod tests {
         let brain = crate::resolve(&b).await.unwrap();
         assert_eq!(brain.id(), BrainId::Hosted);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req =
-            DecisionRequest { herd_id: "herd_test".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx.clone() };
+        let req = DecisionRequest {
+            herd_id: "herd_test".into(),
+            context: fixture::context(),
+            instructions: String::new(),
+            mcp_url: String::new(),
+            tools: vec![],
+            log: tx.clone(),
+        };
         let out = brain.decide(req).await.unwrap();
         assert_eq!(out.action, Action::Move);
         assert_eq!(out.to_paddock_id.as_deref(), Some("pad_creek"));
@@ -177,7 +184,14 @@ mod tests {
         let id = created["id"].as_str().unwrap();
         assert_eq!(http.delete(format!("{a_url}/api/brains/hosted/keys/{id}")).send().await.unwrap().status(), 204);
         assert_eq!(http.delete(format!("{a_url}/api/brains/hosted/keys/{id}")).send().await.unwrap().status(), 404);
-        let req = DecisionRequest { herd_id: "herd_test".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req = DecisionRequest {
+            herd_id: "herd_test".into(),
+            context: fixture::context(),
+            instructions: String::new(),
+            mcp_url: String::new(),
+            tools: vec![],
+            log: tx,
+        };
         let err = brain.decide(req).await.unwrap_err();
         assert!(err.to_string().contains("key not accepted"), "{err:#}");
 
@@ -185,7 +199,8 @@ mod tests {
         b.secrets().set("hosted_url", "http://127.0.0.1:9").unwrap();
         let brain = crate::resolve(&b).await.unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req =
+            DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), tools: vec![], log: tx };
         assert!(brain.decide(req).await.unwrap_err().to_string().contains("can't connect"));
     }
 
@@ -243,6 +258,7 @@ mod real {
             instructions: "Quick test farm. Decide from the context alone.".into(),
             // Nothing listens here: the run must still work without MCP.
             mcp_url: "http://127.0.0.1:9/mcp".into(),
+            tools: crate::claude::MCP_TOOLS.iter().map(|t| t.to_string()).collect(),
             log: tx,
         };
         let t = Instant::now();

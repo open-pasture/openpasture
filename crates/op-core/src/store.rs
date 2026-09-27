@@ -93,7 +93,7 @@ impl Store {
     }
 
     pub async fn insert_paddock(&self, p: &Paddock) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO paddocks (id, name, geometry, area_ha, status, notes, grazed_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO paddocks (id, name, geometry, area_ha, status, notes, grazed_until, created_at, props) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&p.id)
             .bind(&p.name)
             .bind(serde_json::to_string(&p.geometry)?)
@@ -102,19 +102,21 @@ impl Store {
             .bind(&p.notes)
             .bind(p.grazed_until.as_ref().map(to_db))
             .bind(to_db(&p.created_at))
+            .bind(serde_json::to_string(&p.props)?)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
     pub async fn update_paddock(&self, p: &Paddock) -> anyhow::Result<()> {
-        sqlx::query("UPDATE paddocks SET name = ?, geometry = ?, area_ha = ?, status = ?, notes = ?, grazed_until = ? WHERE id = ?")
+        sqlx::query("UPDATE paddocks SET name = ?, geometry = ?, area_ha = ?, status = ?, notes = ?, grazed_until = ?, props = ? WHERE id = ?")
             .bind(&p.name)
             .bind(serde_json::to_string(&p.geometry)?)
             .bind(p.area_ha)
             .bind(p.status.as_db())
             .bind(&p.notes)
             .bind(p.grazed_until.as_ref().map(to_db))
+            .bind(serde_json::to_string(&p.props)?)
             .bind(&p.id)
             .execute(&self.pool)
             .await?;
@@ -190,15 +192,25 @@ impl Store {
     /// Also points the collar (if any) at the animal.
     pub async fn insert_animal(&self, a: &Animal) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO animals (id, tag, name, herd_id, collar_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(&a.id)
-            .bind(&a.tag)
-            .bind(&a.name)
-            .bind(&a.herd_id)
-            .bind(&a.collar_id)
-            .bind(to_db(&crate::time::now()))
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO animals (id, tag, name, herd_id, collar_id, created_at, eid, breed, sex, born, notes, removed_at, removed_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&a.id)
+        .bind(&a.tag)
+        .bind(&a.name)
+        .bind(&a.herd_id)
+        .bind(&a.collar_id)
+        .bind(to_db(&crate::time::now()))
+        .bind(&a.eid)
+        .bind(&a.breed)
+        .bind(a.sex.map(|s| s.as_db()))
+        .bind(a.born.map(|d| d.format("%Y-%m-%d").to_string()))
+        .bind(&a.notes)
+        .bind(a.removed_at.as_ref().map(to_db))
+        .bind(a.removed_reason.map(|r| r.as_db()))
+        .execute(&mut *tx)
+        .await?;
         link_collar(&mut tx, &a.id, a.collar_id.as_deref()).await?;
         tx.commit().await?;
         Ok(())
@@ -207,13 +219,23 @@ impl Store {
     /// Also keeps `collars.animal_id` in step with `collar_id`.
     pub async fn update_animal(&self, a: &Animal) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE animals SET tag = ?, name = ?, herd_id = ?, collar_id = ? WHERE id = ?")
-            .bind(&a.tag)
-            .bind(&a.name)
-            .bind(&a.herd_id)
-            .bind(&a.collar_id)
-            .bind(&a.id)
-            .execute(&mut *tx)
+        sqlx::query(
+            "UPDATE animals SET tag = ?, name = ?, herd_id = ?, collar_id = ?, eid = ?, breed = ?, sex = ?, born = ?, notes = ?, removed_at = ?, removed_reason = ?
+             WHERE id = ?",
+        )
+        .bind(&a.tag)
+        .bind(&a.name)
+        .bind(&a.herd_id)
+        .bind(&a.collar_id)
+        .bind(&a.eid)
+        .bind(&a.breed)
+        .bind(a.sex.map(|s| s.as_db()))
+        .bind(a.born.map(|d| d.format("%Y-%m-%d").to_string()))
+        .bind(&a.notes)
+        .bind(a.removed_at.as_ref().map(to_db))
+        .bind(a.removed_reason.map(|r| r.as_db()))
+        .bind(&a.id)
+        .execute(&mut *tx)
             .await?;
         link_collar(&mut tx, &a.id, a.collar_id.as_deref()).await?;
         tx.commit().await?;
@@ -359,6 +381,10 @@ pub fn paddock_from_row(r: &SqliteRow) -> anyhow::Result<Paddock> {
         notes: r.try_get("notes")?,
         grazed_until: opt_from_db(r.try_get("grazed_until")?)?,
         created_at: from_db(&r.try_get::<String, _>("created_at")?)?,
+        props: match serde_json::from_str::<Value>(&r.try_get::<String, _>("props")?)? {
+            Value::Object(m) => m,
+            _ => Default::default(),
+        },
     })
 }
 
@@ -376,12 +402,28 @@ pub fn herd_from_row(r: &SqliteRow) -> anyhow::Result<Herd> {
 }
 
 pub fn animal_from_row(r: &SqliteRow) -> anyhow::Result<Animal> {
-    Ok(Animal { id: r.try_get("id")?, tag: r.try_get("tag")?, name: r.try_get("name")?, herd_id: r.try_get("herd_id")?, collar_id: r.try_get("collar_id")? })
+    let born: Option<String> = r.try_get("born")?;
+    Ok(Animal {
+        id: r.try_get("id")?,
+        tag: r.try_get("tag")?,
+        name: r.try_get("name")?,
+        herd_id: r.try_get("herd_id")?,
+        collar_id: r.try_get("collar_id")?,
+        eid: r.try_get("eid")?,
+        breed: r.try_get("breed")?,
+        sex: r.try_get::<Option<String>, _>("sex")?.map(|s| Sex::from_db(&s)).transpose()?,
+        born: born.map(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d")).transpose()?,
+        notes: r.try_get("notes")?,
+        removed_at: opt_from_db(r.try_get("removed_at")?)?,
+        removed_reason: r.try_get::<Option<String>, _>("removed_reason")?.map(|s| RemovedReason::from_db(&s)).transpose()?,
+    })
 }
 
-/// A `collars` row. `last_fix` is Fix JSON.
+/// A `collars` row. `last_fix` is Fix JSON, `caps` a JSON array. The
+/// `limits` column stays off the struct (op-ingest reads it).
 pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
     let last_fix: Option<String> = r.try_get("last_fix")?;
+    let caps: Option<String> = r.try_get("caps")?;
     Ok(Collar {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
@@ -392,6 +434,11 @@ pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
         boundary_version: r.try_get::<Option<i64>, _>("boundary_version")?.map(|v| v as u32),
         state: FenceState::parse(&r.try_get::<String, _>("state")?),
         last_fix: last_fix.map(|s| serde_json::from_str(&s)).transpose()?,
+        fw: r.try_get("fw")?,
+        caps: caps.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default(),
+        outside_since: opt_from_db(r.try_get("outside_since")?)?,
+        parked_at: opt_from_db(r.try_get("parked_at")?)?,
+        parked_reason: r.try_get::<Option<String>, _>("parked_reason")?.map(|s| ParkReason::from_db(&s)).transpose()?,
     })
 }
 

@@ -3,8 +3,31 @@
 //! desktop app both call [`serve`].
 
 mod auth;
-mod live;
+pub mod live;
 mod ui;
+// @HUB
+// @HUB-UI
+// @E-lib
+// @E-srv
+// @J
+// @A-engine
+// @A-notify
+// @D
+// @K-animals
+// @K-files
+// @I
+// @B
+// @G
+// @P
+// @Q
+// @C
+// @F
+// @S
+// @A3
+// @H
+// @L
+// @M
+// @Z
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -124,10 +147,39 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     let info = ServerInfo { data_dir: data_dir.clone(), bind: bind.clone(), port: addr.port(), lan_url: lan_url.clone() };
     let app = build_app(ctx.clone(), info, opts.cors.unwrap_or(cfg!(debug_assertions)));
 
+    // Tools list in registration order: the engine's farm tools first.
+    op_engine::register_tools(&ctx);
+    op_core::register_tools(&ctx);
     op_ingest::start(ctx.clone()).await.context("starting op-ingest")?;
     op_analytics::start(ctx.clone()).await.context("starting op-analytics")?;
     op_brain::start(ctx.clone()).await.context("starting op-brain")?;
     op_engine::start(ctx.clone()).await.context("starting op-engine")?;
+    // @HUB
+    op_alerts::start(ctx.clone()).await.context("starting op-alerts")?;
+    op_import::start(ctx.clone()).await.context("starting op-import")?;
+    op_reports::start(ctx.clone()).await.context("starting op-reports")?;
+    // @HUB-UI
+    // @E-lib
+    // @E-srv
+    // @J
+    // @A-engine
+    // @A-notify
+    // @D
+    // @K-animals
+    // @K-files
+    // @I
+    // @B
+    // @G
+    // @P
+    // @Q
+    // @C
+    // @F
+    // @S
+    // @A3
+    // @H
+    // @L
+    // @M
+    // @Z
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
@@ -148,12 +200,43 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
 /// `auth`). `dev` also lets the Vite dev server (localhost:5173) in.
 pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
     let info = Arc::new(info);
-    let mut app = Router::new()
-        .merge(op_core::router())
-        .merge(op_ingest::router())
-        .merge(op_analytics::router())
-        .merge(op_brain::router())
-        .merge(op_engine::router())
+    let mut routes = Router::new();
+    for part in [
+        op_core::router(),
+        op_ingest::router(),
+        op_analytics::router(),
+        op_brain::router(),
+        op_engine::router(),
+        // @HUB
+        op_alerts::router(),
+        op_import::router(),
+        op_reports::router(),
+        // @HUB-UI
+        // @E-lib
+        // @E-srv
+        // @J
+        // @A-engine
+        // @A-notify
+        // @D
+        // @K-animals
+        // @K-files
+        // @I
+        // @B
+        // @G
+        // @P
+        // @Q
+        // @C
+        // @F
+        // @S
+        // @A3
+        // @H
+        // @L
+        // @M
+        // @Z
+    ] {
+        routes = routes.merge(part);
+    }
+    let mut app = routes
         .route("/api/server", get(move |state| server_info(state, info.clone())))
         .route("/api/live", get(live::handler))
         .fallback(ui::handler)

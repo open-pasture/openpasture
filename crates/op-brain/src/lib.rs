@@ -34,6 +34,9 @@ pub struct DecisionRequest {
     pub instructions: String,
     /// The local MCP URL with read tools for the brain.
     pub mcp_url: String,
+    /// The tools that URL lists (the registry's brain tools), named in the
+    /// prompt. Empty with no `mcp_url`.
+    pub tools: Vec<String>,
     /// Progress, one line at a time.
     pub log: tokio::sync::mpsc::UnboundedSender<String>,
 }
@@ -41,6 +44,11 @@ pub struct DecisionRequest {
 impl DecisionRequest {
     pub(crate) fn say(&self, line: impl Into<String>) {
         let _ = self.log.send(line.into());
+    }
+
+    /// The tools the prompt names: none without an MCP URL.
+    pub fn prompt_tools(&self) -> &[String] {
+        if self.mcp_url.is_empty() { &[] } else { &self.tools }
     }
 }
 

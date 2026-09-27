@@ -651,13 +651,14 @@ pub async fn pasture(State(ctx): State<Ctx>, Query(p): Query<Params>) -> ApiResu
 }
 
 /// Per paddock: grazing days, AU-days/ha and last grazed, from daily dwell.
-/// Rolled days come from `analytics_paddock_days`, the rest from SQLite.
+/// Rolled and imported days come from the `paddock_days` view
+/// (`analytics_paddock_days` plus `imported_paddock_days`), the rest from SQLite.
 /// Pressure follows the agent kit: a herd's AU times its share of the day
 /// in the paddock, summed over days.
 pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -> anyhow::Result<Vec<PaddockPasture>> {
     // (day, herd, paddock) -> (dwell_ms, last_t)
     let mut days: HashMap<(i64, String, String), (f64, i64)> = HashMap::new();
-    let mut sql = "SELECT date, herd_id, paddock_id, SUM(dwell_s) AS dwell, MAX(last_t) AS last_t FROM analytics_paddock_days".to_owned();
+    let mut sql = "SELECT date, herd_id, paddock_id, SUM(dwell_s) AS dwell, MAX(last_t) AS last_t FROM paddock_days".to_owned();
     if herd.is_some() {
         sql.push_str(" WHERE herd_id = ?");
     }

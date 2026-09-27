@@ -47,6 +47,7 @@ impl App {
                 notes: None,
                 grazed_until: None,
                 created_at: now,
+                props: Default::default(),
             })
             .await
             .unwrap();
@@ -71,7 +72,16 @@ impl App {
                 .execute(ctx.db())
                 .await
                 .unwrap();
-            s.insert_animal(&Animal { id: a.into(), tag: a.to_uppercase(), name: None, herd_id: "herd_1".into(), collar_id: Some(c.into()) }).await.unwrap();
+            s.insert_animal(&Animal {
+                id: a.into(),
+                tag: a.to_uppercase(),
+                name: None,
+                herd_id: "herd_1".into(),
+                collar_id: Some(c.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         }
         let router = op_analytics::router().with_state(ctx.clone());
         Self { _dir: dir, ctx, router }

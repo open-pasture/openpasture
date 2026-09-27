@@ -1,7 +1,7 @@
 //! Domain types. Serde shapes match the TypeScript in `docs/API.md` exactly:
 //! snake_case fields, lowercase enums, optional fields omitted when absent.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,7 +25,23 @@ pub trait DbEnum: Sized + Serialize + serde::de::DeserializeOwned {
 macro_rules! db_enum {
     ($($t:ty),*) => { $(impl DbEnum for $t {})* };
 }
-db_enum!(PaddockStatus, Species, Autonomy, FenceState, AckStatus, BrainId, DecisionSource, DecisionStatus, DecisionAction, Units, MoveStatus, EscapeStatus);
+db_enum!(
+    PaddockStatus,
+    Species,
+    Autonomy,
+    FenceState,
+    AckStatus,
+    BrainId,
+    DecisionSource,
+    DecisionStatus,
+    DecisionAction,
+    Units,
+    MoveStatus,
+    EscapeStatus,
+    ParkReason,
+    Sex,
+    RemovedReason
+);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Farm {
@@ -58,6 +74,9 @@ pub struct Paddock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grazed_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Extra facts, e.g. FSA numbers under `fsa_farm`, `fsa_tract`, `fsa_field`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub props: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -93,7 +112,7 @@ pub struct Herd {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Animal {
     pub id: String,
     pub tag: String,
@@ -102,6 +121,49 @@ pub struct Animal {
     pub herd_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collar_id: Option<String>,
+    /// 15-digit electronic ID (ISO 11784).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sex: Option<Sex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub born: Option<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Sold, died, culled or moved off: kept for the record, off the map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_reason: Option<RemovedReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sex {
+    Female,
+    Male,
+    Castrated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovedReason {
+    Sold,
+    Died,
+    Culled,
+    MovedOff,
+}
+
+/// Why a collar is off duty. A parked collar raises no alerts, is not drawn
+/// and is not counted; its reports only update battery and health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParkReason {
+    Charging,
+    Shelf,
+    Repair,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,7 +178,7 @@ pub struct Fix {
     pub ttf_s: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Collar {
     pub id: String,
     pub name: String,
@@ -133,6 +195,19 @@ pub struct Collar {
     pub state: FenceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fix: Option<Fix>,
+    /// Firmware version the collar reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fw: Option<String>,
+    /// Protocol capabilities the collar reports (`holes`, `slots`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
+    /// Since when its fixes have been outside the boundary; cleared once back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_since: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_reason: Option<ParkReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -194,6 +269,26 @@ pub struct BoundaryStatus {
     /// last 10 minutes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub escapes: Vec<Escape>,
+    /// Every alive staged boundary, in version order (`pending` is the last).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub staged: Vec<Boundary>,
+    /// Per version held on collars: how many applied, stored, rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<SlotCount>,
+}
+
+/// How far one boundary version has reached the herd's collars. `collars`
+/// counts herd collars not on an escape and not parked; the UI line
+/// "Wed 07:00 248/250 stored" is `applied + stored` of `collars`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlotCount {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_at: Option<DateTime<Utc>>,
+    pub applied: u32,
+    pub stored: u32,
+    pub rejected: u32,
+    pub collars: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

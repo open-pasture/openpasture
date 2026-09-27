@@ -8,10 +8,13 @@ use op_protocol::{SigningKey, VerifyingKey};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 
+use crate::brief::BriefRegistry;
 use crate::domain::Settings;
 use crate::event::Event;
+use crate::identity::Identity;
 use crate::secrets::Secrets;
 use crate::store::Store;
+use crate::tools::{RegistryRunner, ToolRegistry, ToolRunner};
 use crate::{keys, patch, settings};
 
 /// Everything a crate needs, cheap to clone. Handlers get it as
@@ -28,10 +31,15 @@ struct Inner {
     urls: RwLock<(String, Option<String>)>,
     signing_key: SigningKey,
     shutdown: watch::Sender<bool>,
-    /// Short-lived tokens that only open `/mcp?scope=brain`, one per brain run.
-    brain_tokens: Mutex<HashMap<String, Instant>>,
+    /// Short-lived tokens that only open `/mcp?scope=brain`, one per brain
+    /// run: expiry and the tools the token may list and call.
+    brain_tokens: Mutex<HashMap<String, (Instant, Vec<String>)>>,
     /// Pokes op-engine's scheduler to apply due decisions now.
     scheduler_wake: tokio::sync::Notify,
+    /// Every crate's tools (MCP, brains, text questions).
+    tools: ToolRegistry,
+    /// Lines other crates add to the morning brief.
+    brief_lines: BriefRegistry,
 }
 
 /// Room for bursts of collar reports before a slow `/api/live` client lags.
@@ -85,6 +93,8 @@ impl Ctx {
             shutdown,
             brain_tokens: Mutex::new(HashMap::new()),
             scheduler_wake: tokio::sync::Notify::new(),
+            tools: ToolRegistry::default(),
+            brief_lines: BriefRegistry::default(),
         }));
         let s = ctx.settings().await?;
         ctx.set_local_url(format!("http://127.0.0.1:{}", s.server.port));
@@ -211,20 +221,38 @@ impl Ctx {
         Ok(next)
     }
 
-    /// A token for one brain run: it opens `/mcp?scope=brain` only, lives in
-    /// memory, and expires after `ttl` or when the guard is dropped.
-    pub fn mint_brain_token(&self, ttl: Duration) -> BrainToken {
+    /// A token for one brain run: it opens `/mcp?scope=brain` only, lists
+    /// and calls only `tools` (read tools among them), lives in memory, and
+    /// expires after `ttl` or when the guard is dropped.
+    pub fn mint_brain_token(&self, ttl: Duration, tools: Vec<String>) -> BrainToken {
         let token = format!("opb_{}", settings::new_token());
         let mut map = self.0.brain_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        map.retain(|_, exp| *exp > now);
-        map.insert(token.clone(), now + ttl);
+        map.retain(|_, (exp, _)| *exp > now);
+        map.insert(token.clone(), (now + ttl, tools));
         BrainToken { ctx: self.clone(), token }
     }
 
-    pub fn check_brain_token(&self, token: &str) -> bool {
+    /// The tools a live brain token allows; `None` for an unknown or expired token.
+    pub fn check_brain_token(&self, token: &str) -> Option<Vec<String>> {
         let map = self.0.brain_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(token).is_some_and(|exp| *exp > Instant::now())
+        map.get(token).filter(|(exp, _)| *exp > Instant::now()).map(|(_, tools)| tools.clone())
+    }
+
+    /// The tool registry.
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.0.tools
+    }
+
+    /// Read tools only, minus `exclude`, called as `identity`: what a text
+    /// question or `Brain::ask` may use.
+    pub fn tool_runner(&self, identity: Identity, exclude: &[&str]) -> Arc<dyn ToolRunner> {
+        Arc::new(RegistryRunner::new(self, identity, exclude))
+    }
+
+    /// Lines other crates add to the morning brief.
+    pub fn brief_lines(&self) -> &BriefRegistry {
+        &self.0.brief_lines
     }
 
     /// Ask the decision scheduler to apply due decisions now instead of at its

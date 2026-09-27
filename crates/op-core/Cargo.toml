@@ -23,6 +23,9 @@ rand.workspace = true
 dirs.workspace = true
 sha2.workspace = true
 tzf-rs.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+geo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

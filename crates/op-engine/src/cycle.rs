@@ -47,18 +47,21 @@ async fn activity(ctx: &Ctx, kind: &str, source: &str, title: String, d: &Decisi
     }
 }
 
-/// The URL a brain's MCP client uses: read tools only. On a loopback URL the
-/// request is local and needs no token. Otherwise the URL carries a token
-/// minted for this run only (`/mcp?scope=brain` and nothing else, gone when
-/// the returned guard drops); the CLI brains take it out of the URL and hand
-/// it to the CLI through the environment or a 0600 file, never argv.
+/// The URL a brain's MCP client uses: the brain tools only
+/// (`ctx.tools().brain_tools()`). On a loopback URL the request is local and
+/// needs no token. Otherwise the URL carries a token minted for this run only
+/// (`/mcp?scope=brain` and nothing else, listing and calling only the brain
+/// tools, gone when the returned guard drops); the CLI brains take it out of
+/// the URL and hand it to the CLI through the environment or a 0600 file,
+/// never argv.
 pub fn brain_mcp_url(ctx: &Ctx) -> (String, Option<op_core::BrainToken>) {
+    crate::tools::register_tools(ctx);
     let base = ctx.local_url();
     let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|p| base.starts_with(p));
     if loopback {
         return (format!("{base}/mcp?scope=brain"), None);
     }
-    let token = ctx.mint_brain_token(BRAIN_TIMEOUT + Duration::from_secs(60));
+    let token = ctx.mint_brain_token(BRAIN_TIMEOUT + Duration::from_secs(60), ctx.tools().brain_tools());
     (format!("{base}/mcp?scope=brain&token={}", token.as_str()), Some(token))
 }
 
@@ -151,8 +154,14 @@ async fn run(ctx: &Ctx, mut d: Decision, herd: Herd) -> anyhow::Result<()> {
     });
     // The token (if any) lives until this run ends.
     let (mcp_url, _mcp_token) = brain_mcp_url(ctx);
-    let req =
-        op_brain::DecisionRequest { herd_id: herd.id.clone(), context: a.context.clone(), instructions: skills::daily_grazing_decision(ctx), mcp_url, log: tx };
+    let req = op_brain::DecisionRequest {
+        herd_id: herd.id.clone(),
+        context: a.context.clone(),
+        instructions: skills::daily_grazing_decision(ctx),
+        mcp_url,
+        tools: ctx.tools().brain_tools(),
+        log: tx,
+    };
     let out = tokio::time::timeout(BRAIN_TIMEOUT, brain.decide(req)).await;
     let _ = fwd.await;
     let out = match out {
