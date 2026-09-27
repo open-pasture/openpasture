@@ -705,3 +705,32 @@ async fn get_report_tool_answers_through_the_registry() {
     let err = app.ctx.tools().call(&app.ctx, "get_report", json!({"id": "nope"}), None, Identity::brain(), &scope).await.unwrap_err();
     assert_eq!(err.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn an_applied_move_on_the_record_writes_history() {
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Cows", 250, Some(&f.p1)).await;
+    // The engine's apply path: the herd goes to the decision's paddock, the old one rests.
+    let d: op_core::Decision = serde_json::from_value(json!({
+        "id": "dec_1", "herd_id": h, "source": "heuristic", "status": "applied", "action": "MOVE",
+        "to_paddock_id": f.p2, "inputs": {"from_paddock_id": f.p1}, "created_at": "2026-09-01T12:00:00.000Z"
+    }))
+    .unwrap();
+    op_engine::cycle::move_herd(&app.ctx, &d).await.unwrap();
+    let rows: Vec<(i64, Option<String>, String)> =
+        sqlx::query_as("SELECT count, paddock_id, source FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&h).fetch_all(app.ctx.db()).await.unwrap();
+    assert_eq!(rows, [(250, Some(f.p1.clone()), "created".into()), (250, Some(f.p2.clone()), "changed".into())]);
+    // Marking P1 resting and P2 grazing changes status only: no new paddock history.
+    let shapes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paddock_geometry_history").fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(shapes, 3);
+
+    // The herd came an hour ago (the two rows can share a millisecond otherwise).
+    let hour_ago = op_core::time::to_db(&(op_core::time::now() - chrono::Duration::hours(1)));
+    sqlx::query("UPDATE herd_history SET at = ? WHERE source = 'created'").bind(hour_ago).execute(app.ctx.db()).await.unwrap();
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::America::Chicago).date_naive();
+    let doc = app.report("paddock_record", &format!("from={}&to={today}", today - chrono::Duration::days(1))).await;
+    assert_eq!(column(&doc["sections"][0], "paddock"), [json!("P1"), json!("P2")]);
+    assert_eq!(column(&doc["sections"][0], "days")[0], json!(0.0));
+    assert_eq!(column(&doc["sections"][0], "head"), [json!(250), json!(250)]);
+}
