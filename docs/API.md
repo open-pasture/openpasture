@@ -852,8 +852,9 @@ them together, oldest out first). A row filling more than 256 columns is 400 `Ro
 256 columns.`; cells past a row's end read as empty. A commit creates animals whose tag
 isn't in the herd and updates those whose tag is; an empty cell leaves the field as it is, so
 committing the same file twice changes nothing. Sex reads F/female/cow/heifer, M/male/bull,
-steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (month first on a farm in a US time
-zone, day first elsewhere), `4/1/22`, `01.04.2022` (always day first). A `collar` column names a
+steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (one way for the whole file: the way its
+dates that read only one way show, like `13/4/2022`, else month first on a farm in a US time zone and
+day first elsewhere), `4/1/22`, `01.04.2022` (always day first). A `collar` column names a
 collar of the herd by name or id and puts it on the animal (a parked collar goes back on duty). A
 row with any error is skipped and listed; the rest go in, in one transaction.
 

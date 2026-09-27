@@ -294,6 +294,16 @@ async fn european_files_read_day_first_and_keep_quoted_notes() {
     let p = app.preview(fixture("tag_iso_utf16.txt")).await;
     assert_eq!(app.commit(&p).await["created"], 2);
     assert_eq!(app.animal("7").await.eid.as_deref(), Some("982000323456789"));
+
+    // A day-first file on this US farm: 13/04 says so, and 05/04 is April 5 too.
+    let p = app.preview(b"Tag,DOB\n501,13/04/2021\n502,05/04/2021\n".to_vec()).await;
+    assert_eq!(app.commit(&p).await["created"], 2);
+    let d = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    assert_eq!((app.animal("501").await.born, app.animal("502").await.born), (d(2021, 4, 13), d(2021, 4, 5)));
+    // A month-first one: 05/04 is May 4.
+    let p = app.preview(b"Tag,DOB\n601,04/13/2021\n602,05/04/2021\n".to_vec()).await;
+    assert_eq!(app.commit(&p).await["created"], 2);
+    assert_eq!(app.animal("602").await.born, d(2021, 5, 4));
 }
 
 #[tokio::test]

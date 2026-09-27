@@ -99,6 +99,35 @@ pub fn parse_born(s: &str, month_first: bool) -> Result<NaiveDate, String> {
     NaiveDate::from_ymd_opt(y, m, d).ok_or_else(bad)
 }
 
+/// Whether one file's slash birth dates are month first: what its dates that
+/// read only one way show (13/4/2022 is day first, 4/13/2022 month first;
+/// the more common when they disagree), else `default` (the farm's zone).
+/// Read once per file, so 5/4/2022 means the same day on every row.
+pub fn month_first_in<'a>(dates: impl IntoIterator<Item = &'a str>, default: bool) -> bool {
+    let (mut day, mut month) = (0usize, 0usize);
+    for t in dates {
+        let t = t.trim();
+        if t.contains('.') {
+            continue;
+        }
+        let parts: Vec<&str> = t.split(['/', '-']).map(str::trim).collect();
+        if parts.len() != 3 || parts[0].len() == 4 {
+            continue;
+        }
+        let (Ok(a), Ok(b)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else { continue };
+        if a > 12 && b <= 12 {
+            day += 1;
+        } else if b > 12 && a <= 12 {
+            month += 1;
+        }
+    }
+    match day.cmp(&month) {
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => default,
+    }
+}
+
 fn tidy_text(v: &mut Option<String>, max: usize, what: &str) -> ApiResult<()> {
     if let Some(s) = v.take() {
         let s = s.trim();
@@ -370,6 +399,15 @@ mod tests {
         assert!(parse_born("2021", true).is_err());
         assert!(parse_born("2/30/2022", true).is_err());
         assert!(parse_born("spring", true).is_err());
+    }
+
+    #[test]
+    fn a_file_reads_its_birth_dates_one_way() {
+        assert!(!month_first_in(["13/4/2022", "5/4/2022"], true), "13/4 says day first");
+        assert!(month_first_in(["4/13/2022", "5/4/2022"], false), "4/13 says month first");
+        assert!(month_first_in(["5/4/2022", "2022-04-13", "01.04.2022"], true), "nothing to go on: the zone's");
+        assert!(!month_first_in(["5/4/2022"], false));
+        assert!(!month_first_in(["13/4/2022", "14/4/2022", "4/15/2022"], true), "the more common");
     }
 
     #[test]

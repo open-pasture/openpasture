@@ -243,6 +243,11 @@ async fn plan(conn: &mut SqliteConnection, t: &Table, m: &Mapping, herd_id: Opti
     if !idx.contains_key("tag") {
         return Err(ApiError::bad_request("Choose the column with the tags."));
     }
+    // One way for the whole file's birth dates, from the file itself.
+    let month_first = match idx.get("born") {
+        Some(&i) => rules::month_first_in(t.rows.iter().map(|r| table::cell(r, i)), month_first),
+        None => month_first,
+    };
 
     let herd_animals: Vec<Animal> = match herd_id {
         Some(h) => sqlx::query("SELECT * FROM animals WHERE herd_id = ?")
