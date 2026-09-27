@@ -74,7 +74,8 @@ impl Report for Nrcs528 {
             row.extend([
                 e.area_ha.map_or(Value::Null, |a| n(f.convert("area", a), 1)),
                 json!(farm.local_date(e.cut.start).to_string()),
-                if e.cut.open { Value::Null } else { json!(farm.local_date(e.cut.end).to_string()) },
+                // A stay still running after the report's last day is out on that day, not the next.
+                if e.cut.open { Value::Null } else { json!(e.cut.last_day(&farm).to_string()) },
                 json!(history::species_label(&farm.species(&e.stay.herd_id))),
                 json!(e.cut.head),
                 n(e.au(), 1),

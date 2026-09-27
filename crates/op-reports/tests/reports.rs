@@ -394,8 +394,10 @@ async fn nrcs_528_has_fsa_numbers_header_and_signatures() {
     assert_eq!(column(rec, "field"), [json!("P1"), json!("P2"), json!("P3"), json!("P1"), json!("P2")]);
     assert_eq!(column(rec, "fsa_tract"), [json!("1234"), json!("1234"), json!("1235"), json!("1234"), json!("1234")]);
     assert_eq!(column(rec, "fsa_field"), [json!("7"), json!("8"), json!("2"), json!("7"), json!("8")]);
-    assert_eq!(column(rec, "date_in")[1], json!("2025-09-06"));
-    assert_eq!(column(rec, "date_out")[1], json!("2025-09-11"));
+    assert_eq!(column(rec, "date_in"), [json!("2025-09-01"), json!("2025-09-06"), json!("2025-09-11"), json!("2025-09-15"), json!("2025-09-21")]);
+    // The herd is still in P2 after the record's dates: out on Sep 30, the last day it covers.
+    assert_eq!(column(rec, "date_out"), [json!("2025-09-06"), json!("2025-09-11"), json!("2025-09-15"), json!("2025-09-21"), json!("2025-09-30")]);
+    assert_eq!(column(rec, "days"), [json!(5.0), json!(5.0), json!(4.0), json!(6.0), json!(9.7)]);
     assert_eq!(column(rec, "kind")[0], json!("Cattle"));
     assert_eq!(column(rec, "number"), [json!(100), json!(100), json!(90), json!(90), json!(90)]);
     assert_eq!(column(rec, "aud"), [json!(500.0), json!(470.0), json!(360.0), json!(540.0), json!(873.8)]);

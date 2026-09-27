@@ -60,6 +60,9 @@ pub struct Cut {
     pub open: bool,
     /// The window cut the stay short at either end (not counting `open`).
     pub cut: bool,
+    /// The stay went on past the window: `end` is the window's end (the
+    /// midnight after the report's last day), not a day the herd left.
+    pub cut_end: bool,
     /// Head on the first day of the cut.
     pub head: u32,
     pub days: f64,
@@ -289,6 +292,14 @@ pub fn days(d: Duration) -> f64 {
     d.num_milliseconds().max(0) as f64 / 86_400_000.0
 }
 
+impl Cut {
+    /// The farm day the cut ends on: the day the herd left, or for a stay
+    /// that went on past the window, the window's last day.
+    pub fn last_day(&self, farm: &Farm) -> NaiveDate {
+        if self.cut_end { farm.local_date(self.end - Duration::milliseconds(1)) } else { farm.local_date(self.end) }
+    }
+}
+
 impl Stay {
     /// The part of the stay inside `[w0, w1)`; `now` tells an open stay.
     pub fn cut(&self, w0: DateTime<Utc>, w1: DateTime<Utc>, now: DateTime<Utc>) -> Option<Cut> {
@@ -309,11 +320,13 @@ impl Stay {
             }
         }
         let open = self.end.is_none() && w1 >= now;
+        let cut_end = stop < end && !open;
         Some(Cut {
             start,
             end: stop,
             open,
-            cut: start > self.start || (stop < end && !open),
+            cut: start > self.start || cut_end,
+            cut_end,
             head: head.unwrap_or(0),
             days: days(stop - start),
             head_days,
