@@ -179,6 +179,13 @@ cued back without opening the paddock for the rest of the herd to follow it out.
   boundary joined to a pen around the animal: the sweep planner's step for that one animal with
   the herd's boundary as the target. The animal sits in the pen's warning band at the back, so
   it is cued toward the herd; the pen reaches no further out than the animal.
+- A pen keeps out the exclusions in effect that its own ground would take in (cut or made holes,
+  as on any herd boundary). When that leaves the animal, or most of the herd's boundary, out of
+  it (a creek between them), no pen goes. Nor does one for an animal off the herd's own ground
+  (its paddock, or ground it was fenced to in the last day) and more than 100 m outside its
+  boundary: it went far, or its collar was moved to a herd across the farm. Such an animal stays
+  outside, uncued, and the farmer sees it (the `outside` alert); a later pen is tried as its
+  fixes come in.
 - The pen closes in behind the animal like a sweep step: at most every 30 s, and only once the
   animal is `max(2 m, 0.3 × warn_m)` further along. It never gives up on its own; an animal that
   doesn't move stays held where it is.

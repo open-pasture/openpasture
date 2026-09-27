@@ -11,8 +11,13 @@
 //! herd's boundary with a new version, since it never goes back to an older
 //! one.
 //!
-//! Pens keep the herd boundary's holes. A collar out on an escape reports
-//! and polls fast (its config gets a fast window). When the escape ends, the
+//! Pens keep the herd boundary's holes, and keep out the exclusions in
+//! effect that their own ground would take in (cut or made holes, as on any
+//! herd boundary). When that leaves the animal or the herd's ground out of
+//! the pen (a creek between them), or the animal is out of reach
+//! ([`REACH_M`]), no pen goes: the animal stays outside, uncued, for the
+//! farmer. A collar out on an escape reports and polls fast (its config gets
+//! a fast window). When the escape ends, the
 //! herd boundaries staged at that moment are copied for that collar alone
 //! (`collar_id` + `copy_of`), so the rest of the herd downloads nothing.
 //!
@@ -42,6 +47,15 @@ use op_geo::CollarLimits;
 /// (its outside tone stops after 10 s), and the animal gets a boundary of
 /// its own.
 pub const ESCAPE_AFTER: Duration = Duration::seconds(60);
+/// Farthest from the herd's boundary an animal is walked back on a boundary
+/// of its own when it isn't on the herd's own ground (its paddock, or ground
+/// the herd was fenced to in the last day: left behind by a back fence or a
+/// sweep). Beyond that (it went far, or its collar was moved to a herd
+/// across the farm) a pen would reach over ground nobody drew for it: it
+/// gets none, and the farmer sees it outside (the `outside` alert).
+pub const REACH_M: f64 = 100.0;
+/// How far back the herd's own ground goes, for [`REACH_M`].
+const OWN_GROUND: Duration = Duration::hours(24);
 /// `BoundaryStatus.escapes` keeps showing an ended escape this long.
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
 
@@ -272,9 +286,17 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         return Ok(None);
     }
     let Some(active) = db::herd_boundaries(ctx.db(), &collar.herd_id, at).await?.active else { return Ok(None) };
+    if !in_reach(ctx, &collar.herd_id, &active, point, at).await? {
+        tracing::debug!(collar = %collar_id, "escape: out of reach, no pen");
+        return Ok(None);
+    }
     let limits = crate::shape::herd_limits(ctx, &collar.herd_id).await?;
     let state = EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: None, pen: &Pen::default(), limits };
     let (Next::Send { polygon, remaining_m }, pen) = advance(&state, point, at) else { return Ok(None) };
+    let Some(polygon) = fenced(ctx, &active, &polygon, point, &limits, at).await? else {
+        tracing::info!(collar = %collar_id, "escape: an exclusion lies between the animal and the herd, no pen");
+        return Ok(None);
+    };
 
     let mut e = Escape {
         id: id::new_id(id::ESCAPE),
@@ -314,6 +336,56 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
     // It reports and polls fast while it is walked back.
     config::refresh_quietly(ctx, config::Scope::Collar(collar_id)).await;
     Ok(Some(e))
+}
+
+/// Whether an animal at `point` outside `herd`'s boundary is in reach of a
+/// pen: on the herd's own ground (its paddock, or a herd boundary of the
+/// last day, back to the one in effect a day ago), or within [`REACH_M`] of
+/// the boundary.
+async fn in_reach(ctx: &Ctx, herd_id: &str, herd: &Boundary, point: LonLat, at: DateTime<Utc>) -> anyhow::Result<bool> {
+    let proj = op_geo::Projection::new(point);
+    let outside_by = -planner::signed_distance([0.0, 0.0], &proj.forward_ring(&herd.geometry.outer_ring()));
+    if outside_by <= REACH_M {
+        return Ok(true);
+    }
+    let paddock = match ctx.store().get_herd(herd_id).await?.and_then(|h| h.paddock_id) {
+        Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),
+        None => None,
+    };
+    if paddock.is_some_and(|p| p.contains(point)) {
+        return Ok(true);
+    }
+    let rows = sqlx::query("SELECT geometry, created_at FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version DESC LIMIT 500")
+        .bind(herd_id)
+        .fetch_all(ctx.db())
+        .await?;
+    for r in &rows {
+        let g: Polygon = serde_json::from_str(&r.try_get::<String, _>("geometry")?)?;
+        if Polygon::from_ring(g.outer_ring()).contains(point) {
+            return Ok(true);
+        }
+        if from_db(&r.try_get::<String, _>("created_at")?)? < at - OWN_GROUND {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+/// A pen as it goes to the collar: the exclusions in effect that it takes
+/// in are kept out of it, as on any herd boundary. `None` when that leaves
+/// the animal out of it, or most of the herd's ground (an exclusion between
+/// them): there is no pen to walk it back on.
+async fn fenced(ctx: &Ctx, herd: &Boundary, pen: &Polygon, animal: LonLat, limits: &CollarLimits, at: DateTime<Utc>) -> anyhow::Result<Option<Polygon>> {
+    let gap = op_geo::shape::min_gap_m(herd.warn_m) + op_geo::shape::SERVER_SLACK_M;
+    let ex = crate::prepare::exclude(ctx, pen, limits, herd.warn_m, gap, at).await?;
+    if ex.placed.iter().all(|p| p.placement == op_geo::exclude::Placement::Drop) {
+        return Ok(Some(pen.clone()));
+    }
+    let shaped = ex.fitted;
+    let ok = shaped.contains(animal)
+        && crate::prepare::share_inside(&herd.geometry, &shaped) >= 0.5
+        && op_geo::shape::check(&shaped, limits, herd.warn_m, herd.hysteresis_m, op_geo::shape::SERVER_SLACK_M).is_ok();
+    Ok(ok.then_some(shaped))
 }
 
 /// A boundary for one collar under the decision its herd is on: a pen, or
@@ -374,6 +446,8 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
         }
         (Next::Back, _) => end(ctx, row, Some(&collar), EscapeStatus::Back, at).await,
         (Next::Send { polygon, remaining_m }, pen) => {
+            // The pen it has stays while the next one can't keep the exclusions out.
+            let Some(polygon) = fenced(ctx, &active, &polygon, point, &limits, at).await? else { return Ok(()) };
             let mut e = row.e.clone();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
             let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;

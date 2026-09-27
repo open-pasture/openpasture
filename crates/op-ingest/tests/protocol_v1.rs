@@ -900,3 +900,69 @@ async fn a_collar_that_lost_its_boundary_in_effect_gets_it_again_above_the_stage
     fw.sync(&app, now).await;
     assert_eq!(fw.store.have(), top);
 }
+
+/// An animal of `herd` out at `(x, y)` for a minute: the escape scan's pen, if any.
+async fn out_a_minute(app: &App, herd: &str, (id, key): &(String, String), x: f64, y: f64) -> Option<BoundaryCommand> {
+    let t = Utc::now();
+    app.report(key, json!({"fixes": [fix_at(m_at(x, y), t)]})).await;
+    op_ingest::escapes::scan(&app.ctx, t + Duration::seconds(61)).await.unwrap();
+    let pen = app.download(key, "have=1&free=15").await;
+    let open = app.status(herd).await["escapes"].as_array().map_or(0, |e| e.iter().filter(|e| e["collar_id"] == json!(id)).count());
+    assert_eq!(open, usize::from(pen.is_some()), "an escape is open exactly when a pen went");
+    pen
+}
+
+async fn exclusion(app: &App, name: &str, ring: Vec<[f64; 2]>) {
+    let (s, v) =
+        app.call("POST", "/api/features", Some(json!({"kind": "exclusion", "name": name, "geometry": {"type": "Polygon", "coordinates": [ring]}}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+}
+
+#[tokio::test]
+async fn a_pen_keeps_out_an_exclusion_and_none_goes_across_one() {
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let c = app.v0(&herd).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    // A creek right across the way back, north of the paddock.
+    exclusion(&app, "Creek", rect(0.0, 215.0, 300.0, 235.0)).await;
+    assert!(out_a_minute(&app, &herd, &c, 150.0, 262.0).await.is_none(), "no pen across the creek");
+
+    // A wet patch beside the way back instead: the pen keeps it out.
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let c = app.v0(&herd).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    exclusion(&app, "Wet patch", rect(160.0, 205.0, 190.0, 225.0)).await;
+    let pen = out_a_minute(&app, &herd, &c, 150.0, 230.0).await.expect("a pen");
+    let pen = pen.polygon();
+    assert!(pen.contains(m_at(150.0, 230.0)) && pen.contains(m_at(150.0, 100.0)));
+    assert!(!pen.contains(m_at(175.0, 215.0)), "the wet patch is kept out");
+}
+
+#[tokio::test]
+async fn an_animal_far_outside_its_herds_paddock_gets_no_pen() {
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let c = app.v0(&herd).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    // 30 m out: walked back.
+    assert!(out_a_minute(&app, &herd, &c, 150.0, 230.0).await.is_some());
+    // A collar moved to this herd from a paddock 400 m away isn't walked across the farm.
+    let far = app.v0(&herd).await;
+    assert!(out_a_minute(&app, &herd, &far, 150.0, 600.0).await.is_none());
+    // In the herd's paddock, any distance from its boundary is in reach (left behind by a back fence).
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let c = app.v0(&herd).await;
+    app.send(&herd, polygon(rect(250.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    let pen = out_a_minute(&app, &herd, &c, 20.0, 100.0).await.expect("a pen in the paddock");
+    assert!(pen.polygon().contains(m_at(20.0, 100.0)));
+    // So is ground the herd had today, out of its paddock (left behind by a sweep to the next one).
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let c = app.v0(&herd).await;
+    app.send(&herd, polygon(rect(-400.0, 0.0, 0.0, 200.0), vec![]), json!({})).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    assert!(out_a_minute(&app, &herd, &c, -300.0, 100.0).await.is_some(), "on the herd's ground of this morning");
+}
