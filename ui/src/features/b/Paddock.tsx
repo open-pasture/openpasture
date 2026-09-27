@@ -32,8 +32,10 @@ export function PaddockFacts({ paddock, herdId }: Props) {
   const f = sp?.forage;
 
   const lines: [string, ReactNode][] = [];
-  if (row?.grazing) lines.push(["rest", "grazing now"]);
-  else if (row?.rest_days !== undefined) lines.push(["rest", rest(row.rest_days)]);
+  // A herd in it now: the status line above says so, unless the record still reads otherwise.
+  if (row?.grazing) {
+    if (paddock.status !== "grazing") lines.push(["rest", "grazing now"]);
+  } else if (row?.rest_days !== undefined) lines.push(["rest", rest(row.rest_days)]);
   if (f?.reason) lines.push(["forage", f.reason]);
   else if (f && f.height_inches !== null && f.available_kg_dm_per_ha !== null) {
     // Standing forage above the residual, over the whole paddock.
