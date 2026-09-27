@@ -21,15 +21,26 @@
 //! brain token is [`Identity::brain`] with its tool allowlist as a
 //! [`ToolScope`], and everything outside `/api` and `/mcp` is anonymous
 //! (those endpoints authenticate themselves).
+//!
+//! A person's own token (`opu_…`, from a sign-in link) is that person, with
+//! their role; a revoked or unknown one is 401 even from this machine. The app
+//! token and local requests act as the owner person when the owner added
+//! themselves to People. Every identity then passes [`crate::policy`]: a role
+//! too low for the request is 403. Accepting a sign-in link needs no token and
+//! is limited to a few tries a minute per peer.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use op_core::people::{self, SessionToken};
 use op_core::tools::ToolScope;
 use op_core::{ApiError, Ctx, Identity, Via};
+
+use crate::policy;
 
 /// Origins of the Vite dev server, allowed when dev CORS is on.
 pub const DEV_ORIGINS: [&str; 2] = ["http://localhost:5173", "http://127.0.0.1:5173"];
@@ -42,6 +53,14 @@ pub struct AuthState {
     pub ctx: Ctx,
     /// Also accept the Vite dev origins.
     pub dev: bool,
+    /// Requests that need no sign-in (accepting a sign-in link), per peer.
+    pub open: Arc<policy::RateLimit>,
+}
+
+impl AuthState {
+    pub fn new(ctx: Ctx, dev: bool) -> Self {
+        Self { ctx, dev, open: Arc::default() }
+    }
 }
 
 fn protected(path: &str) -> bool {
@@ -112,6 +131,14 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
         req.extensions_mut().insert(Identity::anonymous());
         return next.run(req).await;
     }
+    if policy::is_open(req.method(), path) {
+        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+        if !st.open.allow(policy::peer_key(peer, req.headers())) {
+            return ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many tries. Wait a minute and try again.").into_response();
+        }
+        req.extensions_mut().insert(Identity::anonymous());
+        return next.run(req).await;
+    }
     let brain_scope = (path == "/mcp" || path.starts_with("/mcp/")) && req.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "scope=brain"));
 
     if let Some(given) = given_token(&req) {
@@ -120,15 +147,24 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
             Err(e) => return ApiError::from(e).into_response(),
         };
         if eq(given.as_bytes(), app_token.as_bytes()) {
-            req.extensions_mut().insert(Identity::owner(Via::AppToken));
-            return next.run(req).await;
+            let identity = people::with_owner_person(&st.ctx, Identity::owner(Via::AppToken)).await;
+            return admit(req, next, identity).await;
         }
         if brain_scope && let Some(tools) = st.ctx.check_brain_token(&given) {
-            req.extensions_mut().insert(Identity::brain());
             req.extensions_mut().insert(ToolScope::Only(tools));
-            return next.run(req).await;
+            return admit(req, next, Identity::brain()).await;
         }
-        // A stale token from the browser falls through to the local check.
+        if given.starts_with(people::TOKEN_PREFIX) {
+            return match people::session_for_token(&st.ctx, &given).await {
+                Ok(Some(session)) => {
+                    req.extensions_mut().insert(SessionToken(session.token_id));
+                    admit(req, next, session.identity).await
+                }
+                Ok(None) => ApiError::unauthorized("This sign-in no longer works. Ask the owner for a new link.").into_response(),
+                Err(e) => ApiError::from(e).into_response(),
+            };
+        }
+        // A stale app token from the browser falls through to the local check.
     }
 
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
@@ -140,7 +176,16 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
     if (upgrade || unsafe_method) && !origin_ok(req.headers(), st.dev) {
         return ApiError::new(StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
     }
-    req.extensions_mut().insert(Identity::owner(Via::Local));
+    let identity = people::with_owner_person(&st.ctx, Identity::owner(Via::Local)).await;
+    admit(req, next, identity).await
+}
+
+/// Let the identity in if its role may make this request (403 otherwise).
+async fn admit(mut req: Request, next: Next, identity: Identity) -> Response {
+    if let Err(e) = policy::check(&identity, req.method(), req.uri().path()) {
+        return e.into_response();
+    }
+    req.extensions_mut().insert(identity);
     next.run(req).await
 }
 

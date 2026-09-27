@@ -3,9 +3,9 @@
 //! registry. Order here is the order `tools/list` shows.
 //!
 //! `propose_boundary` is for outside agents: it records a decision with
-//! source `brain` (an agent, not the farmer), `inputs.via = "mcp"` and the
-//! client's name as `model`; the herd's autonomy then applies exactly as for
-//! the built-in brain.
+//! source `brain` (an agent, not the farmer), `inputs.via = "mcp"`, the
+//! caller as `inputs.by` (an `Actor`) and the client's name as `model`; the
+//! herd's autonomy then applies exactly as for the built-in brain.
 
 use op_core::tools::{ToolCall, ToolSpec};
 use op_core::{ApiError, Ctx, Decision, DecisionAction, DecisionSource, DecisionStatus, Herd, Polygon, Role, id, time};
@@ -112,7 +112,7 @@ pub fn specs() -> Vec<ToolSpec> {
             read: false,
             brain: false,
             min_role: Role::Manager,
-            run: ToolSpec::run_fn(|c: ToolCall| async move { propose(&c.ctx, &c.args, c.client).await }),
+            run: ToolSpec::run_fn(|c: ToolCall| async move { propose(&c.ctx, &c.args, c.client, c.identity.actor()).await }),
         },
         // @HUB
         // @HUB-UI
@@ -223,7 +223,8 @@ async fn run(name: &'static str, c: ToolCall) -> Result<Value, ApiError> {
     })
 }
 
-async fn propose(ctx: &Ctx, a: &Value, client: Option<String>) -> Result<Value, ApiError> {
+/// `by`: the MCP caller, kept as `inputs.by`.
+async fn propose(ctx: &Ctx, a: &Value, client: Option<String>, by: op_core::Actor) -> Result<Value, ApiError> {
     let herd = herd_arg(ctx, a).await?;
     let reasoning = need_str(a, "reasoning")?.to_owned();
     let to_paddock_id = arg_str(a, "to_paddock_id").map(str::to_owned);
@@ -257,7 +258,7 @@ async fn propose(ctx: &Ctx, a: &Value, client: Option<String>) -> Result<Value, 
         reasoning: Some(reasoning),
         confidence: a.get("confidence").and_then(Value::as_f64).map(|c| c.clamp(0.0, 1.0)),
         need: None,
-        inputs: json!({ "via": "mcp", "from_paddock_id": current, "position_source": source }),
+        inputs: json!({ "via": "mcp", "by": by, "from_paddock_id": current, "position_source": source }),
         apply_at: None,
         boundary_id: None,
         error: None,

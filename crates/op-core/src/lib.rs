@@ -32,6 +32,7 @@ pub mod users;
 // @E-lib
 // @E-srv
 // @J
+pub mod people;
 // @A-engine
 // @A-notify
 // @D
@@ -71,6 +72,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @E-lib
         // @E-srv
         // @J
+        people::router(),
         // @A-engine
         // @A-notify
         // @D

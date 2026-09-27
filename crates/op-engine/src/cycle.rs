@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::DateTime;
 use chrono::Utc;
 use op_core::{
-    ActivityEvent, ApiError, ApiResult, Autonomy, BrainId, Ctx, DbEnum, Decision, DecisionAction, DecisionSource, DecisionStatus, Event, Herd, Paddock,
+    ActivityEvent, Actor, ApiError, ApiResult, Autonomy, BrainId, Ctx, DbEnum, Decision, DecisionAction, DecisionSource, DecisionStatus, Event, Herd, Paddock,
     Polygon, id, time,
 };
 use serde_json::{Value, json};
@@ -29,8 +29,13 @@ fn short(e: &anyhow::Error) -> String {
     if s.chars().count() > 300 { format!("{}…", s.chars().take(300).collect::<String>()) } else { s }
 }
 
-async fn activity(ctx: &Ctx, kind: &str, source: &str, title: String, d: &Decision) {
+/// `by`: who answered, for the events a farmer's answer causes (`payload.by` is their name).
+async fn activity(ctx: &Ctx, kind: &str, source: &str, title: String, d: &Decision, by: Option<&Actor>) {
     let now = time::now();
+    let mut payload = json!({ "decision_id": d.id, "status": d.status, "action": d.action, "to_paddock_id": d.to_paddock_id });
+    if let Some(name) = by.and_then(op_core::people::actor_label) {
+        payload["by"] = json!(name);
+    }
     let e = ActivityEvent {
         id: id::new_id(id::EVENT),
         kind: kind.into(),
@@ -39,7 +44,7 @@ async fn activity(ctx: &Ctx, kind: &str, source: &str, title: String, d: &Decisi
         recorded_at: now,
         title,
         body: d.reasoning.clone(),
-        payload: json!({ "decision_id": d.id, "status": d.status, "action": d.action, "to_paddock_id": d.to_paddock_id }),
+        payload,
         targets: vec![("herd".into(), d.herd_id.clone()), ("decision".into(), d.id.clone())],
     };
     if let Err(e) = ctx.store().record_event(&e).await {
@@ -259,10 +264,10 @@ pub async fn record(ctx: &Ctx, mut d: Decision, herd: &Herd) -> anyhow::Result<D
     }
     db::update(ctx, &d).await?;
     supersede(ctx, &d.herd_id, &d.id).await?;
-    activity(ctx, "decision.proposed", d.source.as_db().as_str(), format!("Decision: {}", d.action.map(|a| a.as_db()).unwrap_or_default()), &d).await;
+    activity(ctx, "decision.proposed", d.source.as_db().as_str(), format!("Decision: {}", d.action.map(|a| a.as_db()).unwrap_or_default()), &d, None).await;
 
     if d.action == Some(DecisionAction::Move) && herd.autonomy == Autonomy::Auto {
-        return apply_claimed(ctx, &d.id, None).await;
+        return apply_claimed(ctx, &d.id, None, None).await;
     }
     Ok(d)
 }
@@ -291,21 +296,26 @@ async fn claim(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>) -> 
     Ok(n.rows_affected() == 1)
 }
 
-/// Claim a proposed decision and send its boundary.
-async fn apply_claimed(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>) -> anyhow::Result<Decision> {
+/// Claim a proposed decision and send its boundary. `by` answered it (none for the timer).
+async fn apply_claimed(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>, by: Option<&Actor>) -> anyhow::Result<Decision> {
     if !claim(ctx, id, farmer).await? {
         let d = db::get(ctx, id).await?.ok_or_else(|| anyhow::anyhow!("decision {id} vanished"))?;
         anyhow::bail!(ApiError::conflict(format!("This decision is {} now.", d.status.as_db())).message);
     }
     let d = db::get(ctx, id).await?.ok_or_else(|| anyhow::anyhow!("decision {id} vanished"))?;
     ctx.publish(Event::Decision { decision: d.clone() });
-    apply(ctx, d).await
+    apply_by(ctx, d, by).await
 }
 
 /// Start a move toward the decision's boundary (the target) and mark the
 /// decision applied. The move's steps go out under this decision. Failures
 /// leave it failed with a short error.
-pub async fn apply(ctx: &Ctx, mut d: Decision) -> anyhow::Result<Decision> {
+pub async fn apply(ctx: &Ctx, d: Decision) -> anyhow::Result<Decision> {
+    apply_by(ctx, d, None).await
+}
+
+/// [`apply`], for a farmer's answer: `payload.by` on the activity names them.
+async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Result<Decision> {
     let Some(geometry) = d.geometry.clone() else {
         d.status = DecisionStatus::Failed;
         d.error = Some("There is no boundary to send.".into());
@@ -330,7 +340,7 @@ pub async fn apply(ctx: &Ctx, mut d: Decision) -> anyhow::Result<Decision> {
                 (Some(b), _) => format!("Move started, step v{} sent", b.version),
                 (None, _) => "Move started".into(),
             };
-            activity(ctx, "decision.applied", "system", title, &d).await;
+            activity(ctx, "decision.applied", "system", title, &d, by).await;
         }
         Err(e) => {
             d.status = DecisionStatus::Failed;
@@ -357,8 +367,9 @@ pub enum Response {
 
 /// `POST /api/decisions/{id}/respond`. Approve sends a MOVE; modify records the
 /// farmer's boundary (the brain's stays in `inputs.proposed_geometry`) and
-/// sends it; reject stops it. A farmer's note becomes a farm lesson.
-pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Polygon>, note: Option<String>) -> ApiResult<Decision> {
+/// sends it; reject stops it. A farmer's note becomes a farm lesson. `actor`
+/// answered: stored as `inputs.farmer_response.by`, named in the activity.
+pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Polygon>, note: Option<String>, actor: Actor) -> ApiResult<Decision> {
     let d = db::get(ctx, id).await?.ok_or_else(|| ApiError::not_found("No such decision."))?;
     if d.status != DecisionStatus::Proposed {
         return Err(ApiError::conflict(format!("This decision is {}; there is nothing to answer.", d.status.as_db())));
@@ -370,19 +381,20 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
     if let Some(n) = &note {
         resp["note"] = json!(n);
     }
+    resp["by"] = json!(actor);
 
     let out = match action {
         Response::Reject => {
             let d = answer(ctx, id, DecisionStatus::Rejected, &resp, at).await?;
-            activity(ctx, "decision.rejected", "farmer", "Decision rejected".into(), &d).await;
+            activity(ctx, "decision.rejected", "farmer", "Decision rejected".into(), &d, Some(&actor)).await;
             d
         }
         Response::Approve if d.action != Some(DecisionAction::Move) => {
             let d = answer(ctx, id, DecisionStatus::Approved, &resp, at).await?;
-            activity(ctx, "decision.approved", "farmer", "Decision approved".into(), &d).await;
+            activity(ctx, "decision.approved", "farmer", "Decision approved".into(), &d, Some(&actor)).await;
             d
         }
-        Response::Approve => apply_claimed(ctx, id, Some((&resp, at))).await.map_err(|e| ApiError::conflict(short(&e)))?,
+        Response::Approve => apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?,
         Response::Modify => {
             let g = check_geometry(&geometry.ok_or_else(|| ApiError::bad_request("A change needs the farmer's boundary (geometry)."))?)?;
             resp["geometry"] = json!(g);
@@ -407,7 +419,7 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
             if n.rows_affected() != 1 {
                 return Err(ApiError::conflict("This decision changed while you were answering."));
             }
-            apply_claimed(ctx, id, Some((&resp, at))).await.map_err(|e| ApiError::conflict(short(&e)))?
+            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?
         }
     };
 
@@ -455,7 +467,7 @@ pub async fn apply_due(ctx: &Ctx) -> anyhow::Result<()> {
     let now = time::now();
     for d in db::with_status(ctx, DecisionStatus::Proposed).await? {
         if d.action == Some(DecisionAction::Move) && d.apply_at.is_some_and(|t| t <= now) {
-            match apply_claimed(ctx, &d.id, None).await {
+            match apply_claimed(ctx, &d.id, None, None).await {
                 Ok(d) => tracing::info!(decision = %d.id, status = %d.status.as_db(), "timer decision applied"),
                 Err(e) => tracing::debug!("timer apply skipped: {e:#}"),
             }
