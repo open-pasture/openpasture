@@ -1,0 +1,9 @@
+/* Pre-send check: sentences under the tools bar (warn, critical in red; each flies to its cause),
+   the mono facts line, and the sweep's minutes on the map. */
+.fcheck{display:grid;gap:2px}
+.fsent{font-size:13px;line-height:20px;text-align:left;padding:4px 8px;margin:0 -8px;border-radius:7px;color:var(--warn);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fsent[data-sev=critical]{color:var(--red)}
+.fsent:hover,.fsent:focus-visible{background:var(--bg2);outline:none}
+.ffacts{font-size:12px;color:var(--fg);white-space:pre;margin:4px 0 0}
+.fcheck-err{font-size:12px;white-space:normal;margin:0}
+.plabel.fsweep{opacity:.6}

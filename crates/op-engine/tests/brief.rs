@@ -482,6 +482,8 @@ async fn a_question_reads_the_brief_through_the_real_tools() {
     let offered: Vec<&str> = seen[0]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     let mut expected: Vec<&str> = op_engine::mcp::READ_TOOLS.iter().copied().filter(|n| *n != "run_sql").collect();
     expected.push("get_morning_brief");
+    // @F: the pre-send check is a read tool too.
+    expected.push("check_boundary");
     // @S: the schedule is a read tool too; schedule_strips (a write) is never offered.
     expected.push("get_schedule");
     assert_eq!(offered, expected, "the read tools, never run_sql or propose_boundary");

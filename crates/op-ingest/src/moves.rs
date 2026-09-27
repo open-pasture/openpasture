@@ -260,7 +260,7 @@ async fn sweeping_row(db: &sqlx::SqlitePool, herd_id: &str) -> anyhow::Result<Op
 
 /// Everything [`advance`] reads, gathered before any write lock is taken.
 /// `decision_id` is the move's: only its own staged step holds it up.
-async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>, decision_id: Option<&str>) -> anyhow::Result<Situation> {
+pub(crate) async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>, decision_id: Option<&str>) -> anyhow::Result<Situation> {
     let split = db::herd_boundaries(ctx.db(), herd_id, at).await?;
     let paddock = match ctx.store().get_herd(herd_id).await?.and_then(|h| h.paddock_id) {
         Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),

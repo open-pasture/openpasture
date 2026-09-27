@@ -1228,6 +1228,80 @@ deletes its layouts.
 stay with the original.
 
 <!-- @F -->
+
+## Pre-send check (op-engine, op-ingest)
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/herds/:id/check` | `CheckRequest` (hand) | `CheckResult`; 400 when the shape can't be sent, 404 for an unknown herd |
+
+```ts
+CheckRequest { geometry: Polygon, warn_m?, effective_at?, sweep?: boolean }
+CheckResult  { sent: Polygon, legacy?: Polygon, facts: CheckFacts, findings: Finding[], sweep?: SweepPreview }
+CheckFacts   { area_ha, head, m2_per_head, grazing_days?, forage_kg_dm?, forage_source?: "ndvi" | "measured",
+               rest_days?, sweep_minutes?, vertices, holes }
+SweepPreview { back_lines: LonLat[][], minutes }
+Finding      { code, severity: "info" | "warning" | "critical", text, geometry?, targets?: [kind, id][] }
+```
+
+What a boundary would do, without sending it. Nothing is stored, and the check never blocks a send.
+
+**Every herd boundary is shaped by the exclusions in effect when it takes effect** (its
+`effective_at` when that is ahead, else now): farm-wide ones and those of the paddocks it touches.
+An exclusion inside becomes a hole (grown to 110 m² when smaller), one across the edge is cut out,
+one closer to the edge than the collars' gap is joined to it by a notch, close ones merge into one
+hole, one covering the whole shape is left alone. This happens on every path (a farmer's draw, an
+applied decision, each sweep step, a staged boundary, a reissue), so an exclusion that starts later
+takes effect on the first send at or after it starts, and one that has ended no longer shapes
+sends. An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
+doesn't change. Hazards, roads, neighbour lines, water and the farm boundary are only checked.
+
+`sent` is what sending the same shape now stores, byte for byte (holes and cuts from exclusions,
+fitted to the herd's collars); a sweep toward it ends on exactly this shape. `legacy` is the single
+ring (at most 64 corners, no holes) that firmware 0.1 collars enforce, when the herd has one.
+
+Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage from the paddock
+holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
+or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
+= 60 % of it at 11.8 kg DM per animal unit a day; `rest_days` since that paddock was last grazed
+(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it, the
+newest collar fix in it and the days collars spent in it, any herd); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
+
+Findings, most severe first:
+
+| Code | Severity | When | `geometry` |
+| --- | --- | --- | --- |
+| `crosses_road` | critical | a road runs through it | the road inside |
+| `crosses_neighbour_line` | warning | a neighbour line runs through it | the line inside |
+| `crosses_farm_boundary` | warning | it goes past the farm boundary | the part outside |
+| `overlaps_hazard` | warning | it takes in a hazard (a point's `radius_m`, or an area) | the overlap |
+| `overlaps_exclusion` | info, warning | it overlapped an exclusion: kept out (info), or the exclusion covers all of it (warning) | the overlap |
+| `no_water` | warning | the farm has water mapped and none is inside | |
+| `water_inside` | info | one per water point or area inside | the water |
+| `forage_short` | warning | grass for under half a day | |
+| `area_per_head_low` | warning | under 25 m²/hd for cattle, 4 for sheep and goats | |
+| `rested_short` | warning | its paddock rested under 21 days and the herd isn't on it | |
+| `weak_coverage` | warning | 3+ 10 m cells inside with median accuracy ≥ 5 m or under 90 % of fixes, last 7 days | the cells, clipped |
+| `collars_offline` | warning | herd collars (not parked) with no report for 20 min | their last fixes |
+| `collars_no_holes` | warning | it has holes and some collars can't hold them | |
+| `animals_in_new_holes` | warning | animals inside a hole the active boundary doesn't have | their positions |
+| `animals_outside` | warning (info when a previewed sweep walks them in) | animals outside it | their positions |
+| `slots_full` | warning | staged, and some collars have no free slot or slot bytes for it yet | |
+| `simplified` | info | fitting to the collars changed the shape | |
+
+Targets name what a finding is about: `["collar", id]`, `["feature", id]`, `["paddock", id]`.
+
+**Sweep preview** (`sweep: true`): the move driver's own planner and step rule, run forward from
+the herd's fresh positions (escaped and parked collars left out): each step at least 30 s after
+the last, and every animal inside a step's warning band walking 1 m clear of it. `back_lines` are
+where the back of the sweep will be, first to last, about every 10 m; `minutes` is the steps times
+this herd's own seconds per step over its last finished sweeps (five at most, of five steps or
+more), else 30 s plus half the fast poll and report intervals (40 s at the defaults). No preview
+when the herd is already inside, has no fresh positions, or the sweep can't finish.
+
+MCP `check_boundary` (read) `{ herd_id?, geometry, warn_m?, effective_at?, sweep? }` returns the
+same `CheckResult`.
+
 <!-- @S -->
 
 ## Strip schedules (op-ingest, op-engine)

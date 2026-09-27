@@ -34,6 +34,7 @@ pub mod brief;
 pub mod layouts;
 pub mod strips;
 // @F
+pub mod presend;
 // @S
 pub mod schedules;
 // @A3
@@ -74,6 +75,7 @@ pub fn router() -> axum::Router<Ctx> {
         strips::router(),
         layouts::router(),
         // @F
+        presend::router(),
         // @S
         schedules::router(),
         // @A3
