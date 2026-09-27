@@ -25,7 +25,7 @@ pub trait DbEnum: Sized + Serialize + serde::de::DeserializeOwned {
 macro_rules! db_enum {
     ($($t:ty),*) => { $(impl DbEnum for $t {})* };
 }
-db_enum!(PaddockStatus, Species, Autonomy, FenceState, AckStatus, BrainId, DecisionSource, DecisionStatus, DecisionAction, Units, MoveStatus);
+db_enum!(PaddockStatus, Species, Autonomy, FenceState, AckStatus, BrainId, DecisionSource, DecisionStatus, DecisionAction, Units, MoveStatus, EscapeStatus);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Farm {
@@ -156,6 +156,9 @@ pub struct Boundary {
     pub effective_at: Option<DateTime<Utc>>,
     pub decision_id: String,
     pub created_at: DateTime<Utc>,
+    /// Set when the boundary is one collar's own (an escape), not the herd's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collar_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -187,6 +190,10 @@ pub struct BoundaryStatus {
     /// The running move, or the last one for 10 minutes after it ends.
     #[serde(default, rename = "move", skip_serializing_if = "Option::is_none")]
     pub r#move: Option<Move>,
+    /// Animals out on their own boundary, and those back or let go in the
+    /// last 10 minutes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escapes: Vec<Escape>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -213,6 +220,38 @@ pub struct Move {
     pub stragglers: Vec<String>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EscapeStatus {
+    Returning,
+    Back,
+    Stopped,
+}
+
+/// An animal that stayed outside its herd's boundary (API.md "Escapes"). Its
+/// collar holds a boundary of its own, the herd's joined to a pen around it,
+/// which closes in behind it until it is back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Escape {
+    pub id: String,
+    pub herd_id: String,
+    pub collar_id: String,
+    pub status: EscapeStatus,
+    /// The collar's own boundary now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Polygon>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Boundaries sent to the collar so far.
+    pub step: u32,
+    /// From the pen's back line to the herd's boundary, metres.
+    pub remaining_m: f64,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

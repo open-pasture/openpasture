@@ -9,6 +9,7 @@ pub const BOUNDARY: &str = "bnd";
 pub const DECISION: &str = "dec";
 pub const EVENT: &str = "evt";
 pub const MOVE: &str = "mov";
+pub const ESCAPE: &str = "esc";
 
 pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", ulid::Ulid::new())

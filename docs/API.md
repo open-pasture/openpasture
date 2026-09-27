@@ -79,10 +79,10 @@ Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
 Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
-           decision_id, created_at }
+           decision_id, created_at, collar_id? /* one collar's own, see Escapes */ }
 BoundaryStatus { active?: Boundary, pending?: Boundary, proposed?: { decision_id, geometry },
            acks: { collar_id, version, status: "received"|"applied"|"rejected", reason?, at }[],
-           move?: Move }
+           move?: Move, escapes?: Escape[] }
 ```
 
 Boundary versions come from one sequence shared by every herd (herd A may hold v1, v3, v4 and
@@ -146,6 +146,48 @@ Event { type: "move", move: Move }   // on start, each step, each new straggler,
 
 Decisions: approving (or auto/timer applying) a MOVE starts a move with the decision's geometry as
 the target, through the same path.
+
+### Escapes: one animal's own boundary
+
+An animal that stays outside its herd's active boundary gets a boundary of its own, so it can be
+cued back without opening the paddock for the rest of the herd to follow it out.
+
+- A collar whose state has been `outside` for 60 s (its own outside tone stops after 10 s) with a
+  fix from the last 10 minutes starts an **escape**. Its collar is sent the herd's active
+  boundary joined to a pen around the animal: the sweep planner's step for that one animal with
+  the herd's boundary as the target. The animal sits in the pen's warning band at the back, so
+  it is cued toward the herd; the pen reaches no further out than the animal.
+- The pen closes in behind the animal like a sweep step: at most every 30 s, and only once the
+  animal is `max(2 m, 0.3 × warn_m)` further along. It never gives up on its own; an animal that
+  doesn't move stays held where it is.
+- When the herd's boundary changes (a sweep step, a new target), the pen is rebuilt against it at
+  once. An animal that gets out of its pen too gets a new pen where it is.
+- It is **back** when the planner would send the target itself (inside the herd's boundary by
+  `warn_m + 2` m, or past its near edge and 1.5 m in). Its collar then gets a copy of the herd's
+  boundary with a new version (a collar never goes back to an older version); the copy carries
+  the herd version it copies, and its ack is reported with that version in
+  `BoundaryStatus.acks`. Herd boundaries staged at that moment are stored again above the copy.
+- The farmer can **let it go**: the collar gets the herd's boundary, which leaves the animal
+  outside and so uncued. It isn't given another escape until it has had a fix inside.
+- The rest of the herd never sees a pen. A move's sweep leaves escaped animals out of its
+  positions. Pens are boundary versions like any other, under the decision the herd is on, with
+  `collar_id` set; `active`/`pending` only ever show the herd's.
+
+A collar out on an escape is served only its own boundary on `/collar/v1/boundary`, and
+`latest_version` in its report replies is its own. Its fixes keep their state against the herd's
+boundary: `outside` means outside where the herd should be.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/collars/:id/escape/stop` | | `Escape` (409 when none is open) |
+
+```ts
+Escape { id, herd_id, collar_id, status: "returning"|"back"|"stopped",
+         geometry?: Polygon /* the collar's own boundary now */, version?, step: number,
+         remaining_m: number /* pen's back line to the herd's boundary */, started_at, updated_at, ended_at? }
+BoundaryStatus.escapes?: Escape[]   // open ones, and those ended in the last 10 min
+Event { type: "escape", escape: Escape }   // on start, each step, back, stopped
+```
 
 ### Collar rule: only cue a crossing
 
@@ -316,6 +358,7 @@ Event =
   | { type: "boundary", herd_id, boundary: Boundary }
   | { type: "decision", decision: Decision }
   | { type: "move", move: Move }     // a move started, stepped, dropped a straggler, finished or stopped
+  | { type: "escape", escape: Escape } // an escape started, stepped, ended or was stopped
   | { type: "decision_log", decision_id, line }   // brain progress, one line at a time
   | { type: "resync" }   // this socket fell behind and missed events: refetch state
 ```

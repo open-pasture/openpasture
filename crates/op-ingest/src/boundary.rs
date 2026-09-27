@@ -64,7 +64,7 @@ async fn send(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: SendOpts, decis
     // Wire times are whole seconds; a time already past means now.
     let effective_at = opts.effective_at.map(wire_time::trunc_secs).filter(|t| *t > created_at);
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let b = NewBoundary { herd_id, geometry: &geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at };
+    let b = NewBoundary { herd_id, geometry: &geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at, collar_id: None, copy_of: None };
     let boundary = insert_boundary(&mut tx, &b).await?;
     sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&boundary.id).bind(decision_id).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -80,6 +80,10 @@ pub(crate) struct NewBoundary<'a> {
     pub effective_at: Option<DateTime<Utc>>,
     pub decision_id: &'a str,
     pub created_at: DateTime<Utc>,
+    /// One collar's own boundary (an escape) instead of the herd's.
+    pub collar_id: Option<&'a str>,
+    /// The herd version whose shape a collar's own boundary carries.
+    pub copy_of: Option<u32>,
 }
 
 /// Insert with the next version. Versions come from one sequence across all
@@ -88,8 +92,8 @@ pub(crate) struct NewBoundary<'a> {
 pub(crate) async fn insert_boundary(tx: &mut sqlx::SqliteConnection, b: &NewBoundary<'_>) -> ApiResult<Boundary> {
     let id = id::new_id(id::BOUNDARY);
     let (version,): (i64,) = sqlx::query_as(
-        "INSERT INTO boundaries (id, herd_id, version, geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at)
-         SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ? FROM boundaries
+        "INSERT INTO boundaries (id, herd_id, version, geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at, collar_id, copy_of)
+         SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM boundaries
          RETURNING version",
     )
     .bind(&id)
@@ -100,6 +104,8 @@ pub(crate) async fn insert_boundary(tx: &mut sqlx::SqliteConnection, b: &NewBoun
     .bind(b.effective_at.as_ref().map(to_db))
     .bind(b.decision_id)
     .bind(to_db(&b.created_at))
+    .bind(b.collar_id)
+    .bind(b.copy_of.map(i64::from))
     .fetch_one(&mut *tx)
     .await?;
     Ok(Boundary {
@@ -112,6 +118,7 @@ pub(crate) async fn insert_boundary(tx: &mut sqlx::SqliteConnection, b: &NewBoun
         effective_at: b.effective_at,
         decision_id: b.decision_id.to_owned(),
         created_at: b.created_at,
+        collar_id: b.collar_id.map(str::to_owned),
     })
 }
 
@@ -143,7 +150,7 @@ pub(crate) async fn announce(ctx: &Ctx, boundary: &Boundary) {
 /// new versions. Returns what was re-issued.
 pub(crate) async fn reissue_for_moved_collar(ctx: &Ctx, herd_id: &str, held: u32) -> anyhow::Result<Vec<Boundary>> {
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? ORDER BY version").bind(herd_id).fetch_all(&mut *tx).await?;
+    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version").bind(herd_id).fetch_all(&mut *tx).await?;
     let all = rows.iter().map(op_core::store::boundary_from_row).collect::<anyhow::Result<Vec<_>>>()?;
     let split = db::split_boundaries(all, now());
     let current: Vec<Boundary> = split.active.into_iter().chain(split.staged).collect();
@@ -161,6 +168,8 @@ pub(crate) async fn reissue_for_moved_collar(ctx: &Ctx, herd_id: &str, held: u32
             effective_at: b.effective_at.filter(|t| *t > created_at),
             decision_id: &b.decision_id,
             created_at,
+            collar_id: None,
+            copy_of: None,
         };
         out.push(insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?);
     }
@@ -227,6 +236,7 @@ pub async fn boundary_status(ctx: &Ctx, herd_id: &str) -> anyhow::Result<Boundar
         proposed,
         acks: db::latest_acks(ctx.db(), herd_id).await?,
         r#move: crate::moves::current_move(ctx.db(), herd_id, now()).await?,
+        escapes: crate::escapes::current_escapes(ctx.db(), herd_id, now()).await?,
     })
 }
 
@@ -294,7 +304,7 @@ pub fn spawn_activation_watcher(ctx: Ctx) {
                 _ = tick.tick() => {}
             }
             let t = now();
-            let rows = sqlx::query("SELECT * FROM boundaries WHERE effective_at > ? AND effective_at <= ? ORDER BY version")
+            let rows = sqlx::query("SELECT * FROM boundaries WHERE effective_at > ? AND effective_at <= ? AND collar_id IS NULL ORDER BY version")
                 .bind(to_db(&last))
                 .bind(to_db(&t))
                 .fetch_all(ctx.db())

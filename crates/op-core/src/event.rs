@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{AckStatus, Boundary, Collar, Decision, FenceState, Fix, Move};
+use crate::domain::{AckStatus, Boundary, Collar, Decision, Escape, FenceState, Fix, Move};
 
 /// Live events, streamed as JSON on `/api/live`. Publish with
 /// [`crate::Ctx::publish`].
@@ -44,6 +44,10 @@ pub enum Event {
     Move {
         #[serde(rename = "move")]
         r#move: Move,
+    },
+    /// An escape started, stepped, ended or was stopped.
+    Escape {
+        escape: Escape,
     },
     /// Brain progress, one line at a time.
     DecisionLog {

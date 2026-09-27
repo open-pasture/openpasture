@@ -59,6 +59,12 @@
 .dec .behind:hover,.dec .behind:focus-visible{background:var(--bg2);outline:none}
 .dec .acts .stop{margin-left:auto}
 .dec .behind.end{margin:0 -8px 0 auto}
+/* animals out on their own boundary: who, metres to go, Let go */
+.esc{padding-top:8px;padding-bottom:8px;border-bottom:1px solid var(--line);flex:none;animation:fade .3s both}
+.esc .behind{font-size:13px;line-height:20px;padding:6px 8px;margin-left:-8px;border-radius:7px;color:var(--warn);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.esc .behind:hover,.esc .behind:focus-visible{background:var(--bg2);outline:none}
+.esc .rem{font-size:13px;color:var(--warn);font-variant-numeric:tabular-nums;flex:none}
+.esc .stop{margin-left:auto}
 .reply{display:grid;gap:8px}
 .reply .input{width:100%}
 .dec .why.err{color:var(--red);margin-bottom:12px;-webkit-line-clamp:4}

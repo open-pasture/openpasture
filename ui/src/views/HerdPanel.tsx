@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Paddock, type Polygon } from "../api";
 import { areaHa, centroid, inside } from "../geo";
-import { behindOf, collarLabel, store, useStore } from "../store";
+import { behindOf, collarLabel, outOf, store, useStore } from "../store";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { age, clock, useNow } from "../util";
 
@@ -39,6 +39,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const move = bstat?.move;
   const sweeping = move?.status === "sweeping";
   const behind = behindOf(move, collars);
+  const out = outOf(bstat);
   // Where the move goes: the paddock the target mostly covers, if any.
   const moveTo = move && targetPaddock(move.target, state.paddocks);
   const sentence = (d: Decision) =>
@@ -169,6 +170,20 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         </>}
       </section>
 
+      {out.length > 0 && (
+        <section className="esc" aria-label="Out">
+          {out.map((e) => (
+            <div key={e.id} className="acts">
+              <button type="button" className="behind" onClick={() => onFocusCollar(e.collar_id)}>
+                {collars.find((c) => c.id === e.collar_id)?.label ?? "Collar"} out
+              </button>
+              {e.remaining_m >= 1 && <span className="rem mono" title="To the herd's boundary">{Math.round(e.remaining_m)} m</span>}
+              <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>
+            </div>
+          ))}
+        </section>
+      )}
+
       </>}
 
       <ul className="collars" onMouseLeave={() => onHoverCollar(undefined)}>
@@ -178,7 +193,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
           </li>
         )}
         {collars.map((c) => (
-          <li key={c.id} data-state={c.state} data-behind={behind.includes(c.id) || undefined}>
+          <li key={c.id} data-state={c.state} data-behind={behind.includes(c.id) || out.some((e) => e.collar_id === c.id) || undefined}>
             <button type="button" onClick={() => onFocusCollar(c.id)} onMouseEnter={() => onHoverCollar(c.id)}
               onFocus={() => onHoverCollar(c.id)} onBlur={() => onHoverCollar(undefined)}>
               <span className="cn">{c.label}</span>

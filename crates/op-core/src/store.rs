@@ -407,6 +407,7 @@ pub fn boundary_from_row(r: &SqliteRow) -> anyhow::Result<Boundary> {
         effective_at: opt_from_db(r.try_get("effective_at")?)?,
         decision_id: r.try_get("decision_id")?,
         created_at: from_db(&r.try_get::<String, _>("created_at")?)?,
+        collar_id: r.try_get("collar_id")?,
     })
 }
 

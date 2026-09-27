@@ -32,8 +32,8 @@ pub async fn herd_collars(ctx: &Ctx, herd_id: &str) -> anyhow::Result<Vec<Collar
 pub async fn boundary_since(ctx: &Ctx, herd_id: &str, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT MIN(COALESCE(effective_at, created_at)) FROM boundaries WHERE herd_id = ? AND decision_id = (
-             SELECT decision_id FROM boundaries WHERE herd_id = ? AND COALESCE(effective_at, created_at) <= ? ORDER BY version DESC LIMIT 1)",
+        "SELECT MIN(COALESCE(effective_at, created_at)) FROM boundaries WHERE herd_id = ? AND collar_id IS NULL AND decision_id = (
+             SELECT decision_id FROM boundaries WHERE herd_id = ? AND collar_id IS NULL AND COALESCE(effective_at, created_at) <= ? ORDER BY version DESC LIMIT 1)",
     )
     .bind(herd_id)
     .bind(herd_id)
