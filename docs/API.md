@@ -1061,7 +1061,9 @@ version with no ack rides in `ack_batch` as `applied`. A collar with no fix yet 
 to send, so its telemetry-only changes wait for a refetch. Every other event goes out at once,
 in bus order; batches can arrive after events published later in the same 500 ms. Each message
 is serialized once for all sockets; a socket drops what its identity may not see; a socket (or
-the coalescer) that falls behind gets `resync`.
+the coalescer) that falls behind gets `resync`. A socket opened with a person's token closes
+within 5 s once that token is revoked, the person disabled or their role changed; the browser
+reconnects as whoever it is now. A client's close gets a close back.
 
 ## Analytics at 250 collars (op-analytics, P)
 
