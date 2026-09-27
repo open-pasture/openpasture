@@ -35,6 +35,15 @@ pub const FRESH_FIX: Duration = Duration::minutes(10);
 /// its silence holds the sweep (see [`advance`]). One quiet for longer is
 /// gone (a flat battery, a lost collar) and holds nothing.
 pub const WITH_HERD: Duration = Duration::hours(24);
+/// A collar with the herd this long without a fix (not counting time the
+/// sweep was held for an outage) is taken as gone, a flat battery or a lost
+/// collar, and listed as a straggler; until then the sweep waits for it
+/// where it was last fixed.
+pub const SILENT_DROP: Duration = Duration::minutes(15);
+/// A sweep held for silent collars goes on this long after the silence ends,
+/// so the collars that report back later (each on its own report timer)
+/// rejoin it before it moves.
+pub const RESUME_AFTER: Duration = Duration::minutes(2);
 /// `BoundaryStatus.move` keeps showing an ended move this long.
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
 /// Counts as moving up.
@@ -66,6 +75,13 @@ pub struct Sweep {
     /// (it waits for the collars): that step is staged for then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<DateTime<Utc>>,
+    /// Held for silent collars: it goes on no sooner than this
+    /// ([`RESUME_AFTER`] after the silence ended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
+    /// When the last such hold ended: silence before it doesn't count toward [`SILENT_DROP`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,8 +106,8 @@ pub struct Situation {
     pub heard: HashMap<String, DateTime<Utc>>,
     /// Collars with the herd when the move started (heard within
     /// [`WITH_HERD`] before it) that have no fresh fix now (last fix older
-    /// than [`FRESH_FIX`]).
-    pub silent: Vec<String>,
+    /// than [`FRESH_FIX`]): where and when each was last fixed.
+    pub silent: Vec<(String, LonLat, DateTime<Utc>)>,
     /// What the herd's collars hold (the strictest limits among those that hold holes).
     pub limits: CollarLimits,
 }
@@ -139,25 +155,43 @@ pub struct MoveState<'a> {
 /// A sweep only moves on what the collars say. While half or more of the
 /// collars with the herd are silent (no fix for [`FRESH_FIX`]: the farm's
 /// link or the cell is down), it holds, from its first step on: no step, no
-/// target, nobody dropped, and the stuck clocks start over when fixes come
-/// back. Fewer silent ones are listed as stragglers and left out.
+/// target, nobody dropped, and it goes on [`RESUME_AFTER`] after the silence
+/// ends, with the stuck clocks started over. Fewer silent ones hold it up
+/// where they were last fixed, never stepped past unseen, and are never
+/// dropped for being stuck (their fixes don't say so). Only one silent for
+/// [`SILENT_DROP`] outside such a hold is taken as gone and listed. An
+/// outage reaches the collars one report at a time, and so does the link
+/// coming back, so nobody is dropped on the way in or out of one.
 pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
     let mut sweep = m.sweep.clone();
     let mut stragglers = m.stragglers.to_vec();
-    let silent: Vec<&String> = sit.silent.iter().filter(|c| !stragglers.contains(c)).collect();
+    let silent: Vec<&(String, LonLat, DateTime<Utc>)> = sit.silent.iter().filter(|(c, _, _)| !stragglers.contains(c)).collect();
     let with_it = sit.positions.iter().filter(|(c, _)| !stragglers.contains(c)).count() + silent.len();
-    if !silent.is_empty() && silent.len() * 2 >= with_it {
+    let outage = !silent.is_empty() && silent.len() * 2 >= with_it;
+    if outage {
+        sweep.held_until = Some(now + RESUME_AFTER);
+    }
+    if outage || sweep.held_until.is_some_and(|t| now < t) {
         for t in sweep.animals.values_mut() {
             t.since = now;
         }
         return Outcome { next: Next::Wait, sweep, stragglers };
     }
-    stragglers.extend(silent.into_iter().cloned());
-    let fixed_at = |c: &str| sit.heard.get(c).copied().unwrap_or(now);
+    if let Some(t) = sweep.held_until.take() {
+        sweep.resumed_at = Some(t);
+    }
+    let quiet_since = |at: DateTime<Utc>| sweep.resumed_at.map_or(at, |r| r.max(at));
+    let (gone, waited): (Vec<_>, Vec<_>) = silent.into_iter().partition(|(_, _, at)| now - quiet_since(*at) >= SILENT_DROP);
+    stragglers.extend(gone.into_iter().map(|(c, _, _)| c.clone()));
+    // The rest are with the herd where they were last fixed.
+    let mut positions = sit.positions.clone();
+    positions.extend(waited.iter().map(|(c, p, _)| (c.clone(), *p)));
+    let last_fix: HashMap<&str, DateTime<Utc>> = waited.iter().map(|(c, _, at)| (c.as_str(), *at)).collect();
+    let fixed_at = |c: &str| sit.heard.get(c).or_else(|| last_fix.get(c)).copied().unwrap_or(now);
     let space = Space::new(m.target);
     let stride = stride(m.warn_m);
     for _ in 0..8 {
-        let herd: Vec<&(String, LonLat)> = sit.positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
+        let herd: Vec<&(String, LonLat)> = positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
         let animals: Vec<LonLat> = herd.iter().map(|(_, p)| *p).collect();
         let input = PlanInput {
             target: m.target,
@@ -317,7 +351,7 @@ pub(crate) async fn situation(
             heard.insert(c.id.clone(), f.at);
             positions.push((c.id, f.point));
         } else if since.is_some_and(|s| f.at >= s - WITH_HERD) {
-            silent.push(c.id);
+            silent.push((c.id, f.point, f.at));
         }
     }
     let limits = crate::shape::herd_limits(ctx, herd_id).await?;
@@ -834,7 +868,7 @@ mod tests {
         assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
         // The farm's link goes down: every collar's last fix goes stale.
         let herd = std::mem::take(&mut r.sit.positions);
-        r.sit.silent = herd.iter().map(|(c, _)| c.clone()).collect();
+        r.sit.silent = herd.iter().map(|(c, p)| (c.clone(), *p, t0())).collect();
         for m in [1, 5, 11, 30, 90] {
             assert_eq!(r.tick(t0() + Duration::minutes(m)), Next::Wait, "at {m} min");
             assert!(r.stragglers.is_empty(), "at {m} min");
@@ -846,9 +880,11 @@ mod tests {
         r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), back)).collect();
         assert_eq!(r.tick(back), Next::Wait);
         assert!(r.stragglers.is_empty());
-        // Walking up, the sweep goes on.
+        // Walking up, the sweep goes on once the rest have had time to report.
         r.shift(20.0, 12.0);
-        assert!(matches!(r.tick(back + Duration::seconds(40)), Next::Send { .. }));
+        assert_eq!(r.tick(back + Duration::seconds(40)), Next::Wait);
+        assert!(matches!(r.tick(back + RESUME_AFTER), Next::Send { .. }));
+        assert!(r.stragglers.is_empty());
     }
 
     #[test]
@@ -866,13 +902,60 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_silent_collar_is_left_out_and_listed() {
+    fn a_lone_silent_collar_holds_the_sweep_where_it_was_until_it_is_gone() {
         let mut r = Run::new(&[[50.0, 50.0], [80.0, 60.0], [100.0, 90.0], [60.0, 70.0]]);
         assert!(matches!(r.tick(t0()), Next::Send { .. }));
-        let (c, _) = r.sit.positions.pop().unwrap();
-        r.sit.silent = vec![c.clone()];
+        // One of four goes quiet at the back: the sweep isn't stepped past it unseen.
+        let (c, p) = r.sit.positions.remove(0);
+        r.sit.silent = vec![(c.clone(), p, t0())];
         r.shift(20.0, 12.0);
-        assert!(matches!(r.tick(t0() + Duration::seconds(40)), Next::Send { .. }), "one of four silent isn't an outage");
+        for m in [1, 5, 14] {
+            let t = t0() + Duration::minutes(m);
+            r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), t)).collect();
+            assert_eq!(r.tick(t), Next::Wait, "at {m} min");
+            assert!(r.stragglers.is_empty(), "at {m} min: its silence isn't being stuck");
+        }
+        // Quiet for a quarter of an hour: gone (a flat battery). Listed, and the sweep goes on.
+        let t = t0() + SILENT_DROP + Duration::seconds(1);
+        r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), t)).collect();
+        let Next::Send { polygon, .. } = r.tick(t) else { panic!("goes on without it") };
         assert_eq!(r.stragglers, vec![c]);
+        assert!(!polygon.contains(p), "it is left behind only now");
+    }
+
+    /// An outage reaches the collars one report at a time, and so does the
+    /// link coming back: at no point is anyone dropped for it.
+    #[test]
+    fn an_outage_that_comes_and_goes_collar_by_collar_drops_nobody() {
+        let pts: Vec<[f64; 2]> = (0..10).map(|i| [40.0 + 6.0 * i as f64, 40.0 + 5.0 * (i % 3) as f64]).collect();
+        let mut r = Run::new(&pts);
+        assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
+        let herd = r.sit.positions.clone();
+        let mut t = t0() + Duration::minutes(10);
+        // Their last fixes pass ten minutes old a few seconds apart.
+        for c in &herd {
+            r.sit.positions.retain(|(id, _)| id != &c.0);
+            r.sit.silent.push((c.0.clone(), c.1, t - FRESH_FIX));
+            t += Duration::seconds(6);
+            assert_eq!(r.tick(t), Next::Wait, "{} silent", r.sit.silent.len());
+            assert!(r.stragglers.is_empty(), "{} silent: {:?}", r.sit.silent.len(), r.stragglers);
+        }
+        t += Duration::minutes(30);
+        assert_eq!(r.tick(t), Next::Wait);
+        // Back, walked up a little, one report at a time.
+        for c in &herd {
+            r.sit.silent.retain(|(id, _, _)| id != &c.0);
+            r.sit.positions.push(c.clone());
+            r.sit.heard.insert(c.0.clone(), t);
+            t += Duration::seconds(6);
+            assert_eq!(r.tick(t), Next::Wait, "{} back", r.sit.positions.len());
+            assert!(r.stragglers.is_empty(), "{} back: {:?}", r.sit.positions.len(), r.stragglers);
+        }
+        // Once everyone has had time to report, the sweep goes on with all of them.
+        r.shift(20.0, 12.0);
+        let later = t + RESUME_AFTER;
+        r.sit.heard.values_mut().for_each(|h| *h = later);
+        assert!(matches!(r.tick(later), Next::Send { .. }));
+        assert!(r.stragglers.is_empty());
     }
 }

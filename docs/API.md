@@ -131,9 +131,12 @@ boundary. The server never sends an active boundary that leaves an animal outsid
 - A sweep only moves on what the collars say. While half or more of the collars with the herd
   (heard in the day before the move started, not parked) have sent no fix for 10 minutes (the
   farm's link or the cell is down), it holds, from its first step on: no step, no target, nobody
-  dropped, and the straggler clocks start over when fixes come back. A move started then sends
-  nothing until they report (`step` 0), and its first step keeps a future `effective_at`. Fewer
-  silent collars are listed as stragglers and the sweep goes on without them.
+  dropped. It goes on 2 minutes after the silence ends (collars come back one report at a time),
+  with the straggler clocks started over. A move started then sends nothing until they report
+  (`step` 0), and its first step keeps a future `effective_at`. Fewer silent collars hold the
+  sweep where they were last fixed (it never steps past an animal it can't see) and are never
+  taken as stuck; one silent for 15 minutes outside such a hold is taken as gone (a flat battery,
+  a lost collar), listed as a straggler, and the sweep goes on without it.
 - A new target replaces the running move. Stop keeps the current active boundary and ends the move.
 
 Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. The sweep

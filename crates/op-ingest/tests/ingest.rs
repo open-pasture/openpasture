@@ -792,29 +792,63 @@ async fn a_straggler_is_dropped_and_left_behind() {
 #[tokio::test]
 async fn a_sweep_waits_out_a_collar_outage() {
     let app = App::new().await;
-    let (herd, collars) = app.sweep_herd(4).await;
+    let (herd, _) = app.sweep_herd(0).await;
     app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    // One clock through the whole outage, moving forward (a fix can't be more
+    // than ten minutes ahead of the server's): the collars last reported five
+    // minutes ago, just before the farm's link went down.
+    let t0 = chrono::Utc::now();
+    let min = |m: f64| t0 + chrono::Duration::milliseconds((m * 60_000.0) as i64);
+    let spot = |i: usize, up: f64| m_at(30.0 + 17.0 * i as f64 + 1.5 * up, 25.0 + 11.0 * (i % 4) as f64 + up);
+    let mut collars = Vec::new();
+    for i in 0..4 {
+        let c = app.device(&herd).await;
+        app.fix(&c.1, spot(i, 0.0), min(-5.0)).await;
+        collars.push(c);
+    }
     let (_, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(250.0, 150.0, 300.0, 200.0)}))).await;
     assert_eq!((m["status"].as_str(), m["step"].as_u64()), (Some("sweeping"), Some(1)));
     let version = app.active(&herd).await["active"]["version"].clone();
-    // No collar reports again: the farm's link is down.
-    let now = chrono::Utc::now();
-    for min in [4, 6, 11, 30, 120] {
-        let out = op_ingest::moves::drive(&app.ctx, &herd, now + chrono::Duration::minutes(min)).await.unwrap();
-        assert!(out.is_none(), "stepped at {min} min with no fixes: {out:?}");
+    // No collar reports again. Past five minutes nobody is taken as stuck;
+    // past ten, with every fix stale, the sweep holds.
+    for m in [1.0, 4.0, 5.5, 6.0] {
+        let out = op_ingest::moves::drive(&app.ctx, &herd, min(m)).await.unwrap();
+        assert!(out.is_none(), "stepped at {m} min with no fixes: {out:?}");
     }
     let st = app.active(&herd).await;
     assert_eq!((st["move"]["status"].as_str(), st["move"]["step"].as_u64()), (Some("sweeping"), Some(1)));
     assert_eq!(st["move"]["stragglers"], json!([]));
     assert_eq!(st["active"]["version"], version, "nothing sent past the animals");
-    // Back, walked up: the sweep goes on from where they are. (Fixes can't
-    // come from the future, so "back" is the real clock; the passes above were ahead of it.)
-    let back = chrono::Utc::now();
+    // Back, walked up. It waits a little for collars still to report, then goes on from where they are.
     for (i, (_, key)) in collars.iter().enumerate() {
-        app.fix(key, m_at(30.0 + 17.0 * i as f64 + 60.0, 25.0 + 11.0 * (i % 4) as f64 + 40.0), back).await;
+        app.fix(key, spot(i, 40.0), min(7.0)).await;
     }
-    let m2 = op_ingest::moves::drive(&app.ctx, &herd, back + chrono::Duration::seconds(40)).await.unwrap().expect("a step");
+    assert!(op_ingest::moves::drive(&app.ctx, &herd, min(7.1)).await.unwrap().is_none());
+    let m2 = op_ingest::moves::drive(&app.ctx, &herd, min(8.1)).await.unwrap().expect("a step");
     assert_eq!((m2.step, m2.stragglers.len()), (2, 0));
+}
+
+#[tokio::test]
+async fn an_outage_reaching_the_collars_one_report_at_a_time_drops_nobody() {
+    let app = App::new().await;
+    let (herd, collars) = app.sweep_herd(8).await;
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    let (_, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(250.0, 150.0, 300.0, 200.0)}))).await;
+    assert_eq!((m["status"].as_str(), m["step"].as_u64()), (Some("sweeping"), Some(1)));
+    let version = app.active(&herd).await["active"]["version"].clone();
+    // Each collar's last report lands 15 s after the one before, where it stands; then the link goes.
+    let now = chrono::Utc::now();
+    for (i, (_, key)) in collars.iter().enumerate() {
+        app.fix(key, m_at(30.0 + 17.0 * i as f64, 25.0 + 11.0 * (i % 4) as f64), now + chrono::Duration::seconds(15 * i as i64)).await;
+    }
+    // Their fixes pass ten minutes old one by one: passes every 5 s see one, two, three … of eight silent.
+    for k in 0..40 {
+        let at = now + op_ingest::moves::FRESH_FIX + chrono::Duration::seconds(5 * k + 1);
+        assert!(op_ingest::moves::drive(&app.ctx, &herd, at).await.unwrap().is_none_or(|m| m.stragglers.is_empty()), "pass {k}");
+    }
+    let st = app.active(&herd).await;
+    assert_eq!(st["move"]["stragglers"], json!([]), "nobody dropped on the way into the outage");
+    assert_eq!((st["move"]["step"].as_u64(), st["active"]["version"].clone()), (Some(1), version));
 }
 
 #[tokio::test]
@@ -845,16 +879,20 @@ async fn a_move_started_while_the_collars_are_silent_sends_nothing_until_they_re
     let st = app.active(&herd).await;
     assert_eq!(st["active"]["version"], version, "no target sent blind");
     assert!(st["staged"].as_array().is_none_or(|a| a.is_empty()), "nor staged: {st}");
-    for min in [1, 20, 90] {
-        assert!(op_ingest::moves::drive(&app.ctx, &herd, chrono::Utc::now() + chrono::Duration::minutes(min)).await.unwrap().is_none());
+    // One clock, moving forward (a fix can't be more than ten minutes ahead of the server's).
+    let t0 = chrono::Utc::now();
+    for s in [30, 60] {
+        assert!(op_ingest::moves::drive(&app.ctx, &herd, t0 + chrono::Duration::seconds(s)).await.unwrap().is_none());
     }
     assert!(app.active(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
-    // They report: the first step is planned from where they are, for the farmer's time.
-    let back = chrono::Utc::now();
+    // They report: after a little wait for the rest, the first step is planned from where they are, for the farmer's time.
+    let back = t0 + chrono::Duration::seconds(90);
     for (i, (_, key)) in collars.iter().enumerate() {
         app.fix(key, m_at(30.0 + 17.0 * i as f64, 25.0 + 11.0 * (i % 4) as f64), back).await;
     }
-    let m1 = op_ingest::moves::drive(&app.ctx, &herd, back + chrono::Duration::seconds(1)).await.unwrap().expect("the first step");
+    assert!(op_ingest::moves::drive(&app.ctx, &herd, back + chrono::Duration::seconds(1)).await.unwrap().is_none());
+    let resume = t0 + chrono::Duration::seconds(60) + op_ingest::moves::RESUME_AFTER + chrono::Duration::seconds(1);
+    let m1 = op_ingest::moves::drive(&app.ctx, &herd, resume).await.unwrap().expect("the first step");
     assert_eq!(m1.step, 1);
     let st = app.active(&herd).await;
     assert_eq!(st["active"]["version"], version);
