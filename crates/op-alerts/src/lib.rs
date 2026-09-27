@@ -10,6 +10,8 @@
 // @J
 // @A-engine
 // @A-notify
+pub mod hosting;
+pub mod notify;
 // @D
 // @K-animals
 // @K-files
@@ -42,6 +44,8 @@ pub fn router() -> axum::Router<Ctx> {
         // @J
         // @A-engine
         // @A-notify
+        notify::api::router(),
+        hosting::router(),
         // @D
         // @K-animals
         // @K-files
@@ -74,6 +78,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @J
     // @A-engine
     // @A-notify
+    notify::sender::spawn(ctx.clone()).await?;
     // @D
     // @K-animals
     // @K-files

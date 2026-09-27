@@ -540,6 +540,81 @@ answer causes (`decision.approved`, `decision.rejected`, `decision.applied`) car
 through MCP `propose_boundary` keeps its caller as `inputs.by`.
 <!-- @A-engine -->
 <!-- @A-notify -->
+
+## Texting and delivery (op-alerts)
+
+Farm side. `/api/notify/*` is the owner's; `/api/messages` is for managers and up (it shows phone
+numbers).
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/notify/channels` | `Channels` |
+| PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why) |
+| POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients |
+| POST | `/api/notify/verify` | `{ user_id }` → `{ via: "sms"\|"relay", verified?: true }`; 400 no phone · 409 already verified or nothing can text · 429 within 30 s · 502 the provider's words |
+| POST | `/api/notify/verify/confirm` | `{ user_id, code }` → `{ verified: true, phone_verified_at }`; 400 wrong or no code · 410 expired · 429 after 5 tries |
+| GET | `/api/messages` | `?direction=in\|out&limit=&from=&to=&user_id=` → `MessageLog[]`, newest first (limit 100, at most 1,000) |
+| GET/PUT | `/api/notify/hosting` | `Hosting` (PUT is a merge patch) |
+
+```ts
+Channels = {
+  sms: { from? /* E.164, or a Messaging Service SID MG… */ },
+  whatsapp: { from?, template_sid? /* HX…, one {{1}} body variable, used for alerts; replies go as text */ },
+  email: { host?, port /* 587 */, user?, from?, tls: "starttls"|"tls"|"none" },
+  webhook: { url? },
+  relay: { enabled /* only after the relay answered GET /v1/notify/recipients with 200 */, checked_at? },
+  twilio_api_base /* "https://api.twilio.com" */,
+  secrets: { name: "twilio_account_sid"|"twilio_auth_token"|"smtp_password"|"webhook_secret"|"hosted_url"|"hosted_api_key", set }[],
+  configured: ("sms"|"whatsapp"|"email"|"webhook"|"relay")[],   // what can send now
+}
+ChannelsPatch = merge patch over the config (null clears) + { secrets?: { [name]: value | null }, relay?: { enabled } }
+Hosting  = { enabled /* false */, per_key_minute /* 30 */, per_key_day /* 500 */, deadman_after_min /* 15 */ }
+```
+
+Anything that wants to reach a person enqueues a message (`op_core::messages::enqueue`); the sender
+delivers it. It claims at most 10 queued messages at a time and 4 per channel, and a message is
+sent once however many senders run. A send that may work later goes back in the queue: Twilio,
+email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A 4xx from
+Twilio fails at once with Twilio's words (`"Twilio 21211: The 'To' number … is not a valid phone
+number."`). Twilio texts are `sent` and read back at 30 s, 2 min and 10 min until Twilio says
+delivered (`delivered`) or undelivered (`failed` with the reason), so failed deliveries show
+without a public URL. A message for a channel that isn't set up fails ("SMS isn't set up.").
+
+- **Twilio**: `POST {twilio_api_base}/2010-04-01/Accounts/{sid}/Messages.json`, basic auth, form
+  `To`, `From` (or `MessagingServiceSid`), `Body`. WhatsApp uses `whatsapp:` addresses and, with a
+  template and for anything but a reply, `ContentSid` + `ContentVariables {"1": text}`.
+- **Email**: the farm's SMTP server, plain text, subject from the message (default "openpasture").
+- **Webhook**: `POST url` with `{ "type": "alert", "alert": Alert, "text" }` for an alert (else
+  `{ "type": "message", "message": MessageLog }`) and
+  `X-Openpasture-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`. Check it
+  over the raw body, e.g. `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`, and
+  refuse an old `t`. A 2xx is `delivered`; 408, 429 and 5xx are retried.
+- **Relay**: `POST {hosted_url}/v1/notify` with `Authorization: Bearer <hosted_api_key>` (the
+  hosted brain's URL and key; the URL defaults to `https://api.openpasture.dev`). The message id is
+  the idempotency key, so a retry is sent once. An address with `@` goes as email, else SMS.
+
+**Phone verification.** A person's phone gets texts only once it is proven by a 6-digit code:
+through the farm's own SMS, else through the relay (which texts its own code). The code text is
+the first text a number gets: `openpasture code 123456. Reply STOP to opt out.` Codes work for 10
+minutes and 5 tries, one new code per 30 s; they are stored hashed together with the phone they
+went to (a code sent to an old number never proves a new one) and the message log keeps the text
+with the code masked. Changing a phone clears its verification.
+
+Relay host side (a server with `notify.hosting.enabled`, texting for the `oph_` keys it issued from
+its own channels):
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| POST | `/v1/notify` | `{ idempotency_key, channel: "sms"\|"whatsapp"\|"email", to, text, subject?, kind? }` → 202 `{ id, status: "queued"\|"duplicate" }` |
+| POST | `/v1/notify/recipients` | `{ channel, to, deadman? }` → 202 `{ status: "sent"\|"verified" }` (texts or emails a code) |
+| POST | `/v1/notify/recipients/verify` | `{ channel, to, code }` → 200 `{ verified: true }`; 404 no code · 400 wrong · 410 expired · 429 after 5 tries |
+| GET | `/v1/notify/recipients` | `[{ channel, to, verified_at?, deadman }]` for the calling key |
+
+Every `/v1/notify*` call: 401 without a key this server issued, 403 while hosting is off. `POST
+/v1/notify` also: 403 recipient not verified, 409 when this server itself sends through a relay
+(loop guard), 503 when it can't send that channel, 429 over `per_key_minute` or `per_key_day`
+(codes count too). A repeated idempotency key is answered `duplicate` and sent once.
+
 <!-- @D -->
 
 ## Map features (op-core)
