@@ -521,6 +521,15 @@ fn on_strips(strips: &[Polygon], g: &Polygon) -> f64 {
     shares(strips, g).iter().zip(strips).map(|(f, s)| f * s.area_ha()).sum::<f64>() / area
 }
 
+/// How much of `g` lies in the schedule's paddock (0 to 1); on its strips
+/// when the paddock is gone from the map.
+async fn on_paddock(ctx: &Ctx, s: &Schedule, g: &Polygon) -> anyhow::Result<f64> {
+    Ok(match ctx.store().get_paddock(&s.paddock_id).await? {
+        Some(p) => shares(&[Polygon::from_ring(g.outer_ring())], &p.geometry)[0],
+        None => on_strips(&s.strips, g),
+    })
+}
+
 /// What opening strip `k` stages when the herd has `ground`, then each
 /// back-fence close step.
 ///
@@ -628,8 +637,11 @@ pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackF
     if let Some(axis) = axis.filter(|_| steps > 1) {
         for s in 1..steps {
             let keep = 1.0 - s as f64 / steps as f64;
-            let part = part_toward(&region, behind.as_ref(), ahead.as_ref(), axis, keep);
-            closes.push(sn.local.one(&part).ok_or_else(|| format!("Strip {}'s back fence can't close in {steps} steps. Close it in one.", k + 1))?);
+            // A step that would fall apart (ground that bends round) is left
+            // out: the next one takes its ground too.
+            if let Some(p) = sn.local.one(&part_toward(&region, behind.as_ref(), ahead.as_ref(), axis, keep)) {
+                closes.push(p);
+            }
         }
     }
     closes.push(last);
@@ -760,8 +772,7 @@ fn rechain(s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec<i64>, active: &Boun
             }
             continue;
         }
-        let o = opening(&s.strips, Some(&ground), k as usize, &bf)
-            .or_else(|_| opening(&s.strips, Some(&ground), k as usize, &BackFence { close_steps: 1, ..bf }))?;
+        let o = opening(&s.strips, Some(&ground), k as usize, &bf)?;
         let open_at = rows[oi].at;
         let next = rows.iter().filter(|r| r.open() && r.pending() && r.strip != k && r.at > open_at).map(|r| r.at).min();
         let mut this = false;
@@ -1504,11 +1515,12 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
         if settled(ctx, &s, at).await? {
             settle_due(ctx, &s, &mut rows, &mut gone, at).await?;
             // What is still to come starts from the ground the herd is on. A
-            // herd moved mostly off the strips (a draw or MOVE elsewhere whose
-            // decision this schedule never saw) isn't dragged back onto them.
+            // herd moved mostly off the paddock since the schedule was made (a
+            // draw or MOVE elsewhere whose decision this schedule never saw)
+            // isn't dragged back onto its strips.
             if let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active {
-                if active.decision_id != s.id && on_strips(&s.strips, &active.geometry) < 0.5 {
-                    tracing::warn!(schedule = %s.id, version = active.version, "the herd was moved off the schedule's strips");
+                if active.decision_id != s.id && active.created_at > s.created_at && on_paddock(ctx, &s, &active.geometry).await? < 0.5 {
+                    tracing::warn!(schedule = %s.id, version = active.version, "the herd was moved off the schedule's paddock");
                     return give_up(ctx, s, rows, gone, &active).await;
                 }
                 if let Err(e) = rechain(&s, &mut rows, &mut gone, &active) {

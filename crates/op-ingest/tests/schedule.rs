@@ -994,3 +994,26 @@ async fn a_boundary_mostly_off_the_strips_ends_the_schedule_on_the_next_pass() {
     // The collars drop anything of the schedule's still staged.
     assert!(app.status(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
 }
+
+#[tokio::test]
+async fn a_schedule_over_part_of_the_paddock_starts_from_the_whole_of_it() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let dev = app.collar(&herd, CollarLimits::V0).await;
+    // The herd has the whole paddock; the farmer strip-grazes its west third.
+    let (st, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    assert_eq!((st, m["status"].as_str()), (StatusCode::CREATED, Some("done")), "{m}");
+    app.report(&dev, json!({"fixes": [fix(m_at(250.0, 100.0), Utc::now())]})).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let mut n = new_schedule(&herd, &pad, start, quick_fence());
+    n.strips = strips()[..2].to_vec();
+    let s = sched::create(&app.ctx, n, &every(start)).await.unwrap();
+    let s = sched::get(&app.ctx, &s.id).await.unwrap().unwrap();
+    assert_eq!(s.status, ScheduleStatus::Active, "the herd's paddock is where the strips are");
+    let ms = app.moves(&s).await;
+    let open1 = ms.iter().find(|m| m.index == 0 && m.step == 0).unwrap();
+    assert_eq!(open1.state, MoveState::Staged);
+    assert!(open1.geometry.contains(m_at(250.0, 100.0)), "nobody left outside at the open");
+    sched::drive(&app.ctx, &s.id, Utc::now() + Duration::seconds(61)).await.unwrap();
+    assert_eq!(sched::get(&app.ctx, &s.id).await.unwrap().unwrap().status, ScheduleStatus::Active);
+}
