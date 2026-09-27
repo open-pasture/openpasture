@@ -1,0 +1,464 @@
+{
+  "full": [
+    {
+      "name": "get_farm",
+      "description": "The farm record, its herds, and the decision settings.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "list_paddocks",
+      "description": "Every paddock: id, name, status, area in hectares, GeoJSON geometry, notes, last grazed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_herd",
+      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_herd_positions",
+      "description": "Latest fix and fence state for each collar in the herd.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_boundary_status",
+      "description": "The herd's active and staged boundaries, any proposal waiting on the farmer, each collar's latest ack, and the move: the target the herd is being swept into (status sweeping, done or stopped; step; remaining_m from the back line to the target; stragglers dropped from the sweep).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_signals",
+      "description": "Grazing signals per paddock: rest days, grazing pressure from collars, forage and recovery from imagery, feed budget, weather risk, cue pressure.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_land_report",
+      "description": "Land report for a paddock: weather history and forecast, imagery, climate, water. Unavailable sections say why. Cached for six hours.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paddock_id": {
+            "type": "string"
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "Fetch fresh instead of using a report under six hours old."
+          }
+        },
+        "required": [
+          "paddock_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "search_knowledge",
+      "description": "Search grazing principles and this farm's own lessons. Ask about the specific situation, e.g. \"residual before heavy rain\".",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "list_decisions",
+      "description": "Recent decisions, newest first, with status, reasoning, the farmer's response and outcome.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_decision",
+      "description": "One decision by id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "decision_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "run_sql",
+      "description": "Read-only SQL over fixes, cues, acks, boundaries, decisions, collars, animals, paddocks, herds. Times: `t` is unix ms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "max_rows": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "propose_boundary",
+      "description": "Propose moving a herd: a paddock, a GeoJSON Polygon boundary, or both, with plain reasons. Recorded as a decision; the herd's autonomy decides whether it waits for the farmer, runs on a timer, or goes to the collars now.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          },
+          "to_paddock_id": {
+            "type": "string",
+            "description": "Paddock to move to. Its shape is the boundary unless geometry is given."
+          },
+          "geometry": {
+            "type": "object",
+            "description": "GeoJSON Polygon, [longitude, latitude], 3-64 corners."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Two to four short lines, each a reason tied to a fact."
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "reasoning"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    }
+  ],
+  "brain": [
+    {
+      "name": "get_farm",
+      "description": "The farm record, its herds, and the decision settings.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "list_paddocks",
+      "description": "Every paddock: id, name, status, area in hectares, GeoJSON geometry, notes, last grazed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_herd",
+      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_herd_positions",
+      "description": "Latest fix and fence state for each collar in the herd.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_boundary_status",
+      "description": "The herd's active and staged boundaries, any proposal waiting on the farmer, each collar's latest ack, and the move: the target the herd is being swept into (status sweeping, done or stopped; step; remaining_m from the back line to the target; stragglers dropped from the sweep).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_signals",
+      "description": "Grazing signals per paddock: rest days, grazing pressure from collars, forage and recovery from imagery, feed budget, weather risk, cue pressure.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string",
+            "description": "Herd id. Optional when the farm has one herd."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_land_report",
+      "description": "Land report for a paddock: weather history and forecast, imagery, climate, water. Unavailable sections say why. Cached for six hours.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "paddock_id": {
+            "type": "string"
+          },
+          "refresh": {
+            "type": "boolean",
+            "description": "Fetch fresh instead of using a report under six hours old."
+          }
+        },
+        "required": [
+          "paddock_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "search_knowledge",
+      "description": "Search grazing principles and this farm's own lessons. Ask about the specific situation, e.g. \"residual before heavy rain\".",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "list_decisions",
+      "description": "Recent decisions, newest first, with status, reasoning, the farmer's response and outcome.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "herd_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "get_decision",
+      "description": "One decision by id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "decision_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "run_sql",
+      "description": "Read-only SQL over fixes, cues, acks, boundaries, decisions, collars, animals, paddocks, herds. Times: `t` is unix ms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "max_rows": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    }
+  ]
+}
