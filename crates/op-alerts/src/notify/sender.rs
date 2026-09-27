@@ -2,7 +2,11 @@
 //! at a time and 4 in flight per channel), hands each to its channel and marks
 //! it `sent`, `delivered` or `failed`. A send that may work later is queued
 //! again with a backoff (Twilio, email and relay 5 s, 30 s, 2 min; webhook 1 s,
-//! 5 s, 25 s). Twilio texts are then read back at 30 s, 2 min and 10 min after
+//! 5 s, 25 s). A provider this server can't reach at all (the farm's internet
+//! is down) never saw the message, so that isn't counted as a try: it is
+//! tried again every minute or sooner for up to [`OFFLINE_KEEP_H`] hours. An
+//! alert's text that had to wait isn't sent once its alert has resolved.
+//! Twilio texts are then read back at 30 s, 2 min and 10 min after
 //! sending until Twilio says delivered or undelivered, so a failed delivery
 //! shows without a public URL.
 //!
@@ -39,6 +43,38 @@ pub fn backoff(channel: &str, attempts: u32) -> Option<chrono::Duration> {
     };
     let i = usize::try_from(attempts).ok()?.checked_sub(1)?;
     steps.get(i).map(|s| chrono::Duration::seconds(*s))
+}
+
+/// Hours a message waits for a provider this server can't reach at all.
+pub const OFFLINE_KEEP_H: i64 = 6;
+/// Longest wait between two tries while it can't.
+pub const OFFLINE_EVERY_S: i64 = 60;
+/// A message this old has waited (a retry, an outage).
+const WAITED_S: i64 = 60;
+
+/// When to try again a message `age` old whose provider couldn't be reached:
+/// soon at first, then every minute; `None` after [`OFFLINE_KEEP_H`] hours.
+pub fn offline_backoff(age: chrono::Duration) -> Option<chrono::Duration> {
+    (age < chrono::Duration::hours(OFFLINE_KEEP_H)).then(|| chrono::Duration::seconds(age.num_seconds().clamp(5, OFFLINE_EVERY_S)))
+}
+
+/// Why a text or email that waited isn't worth sending any more: every
+/// alert it tells about (one text can cover a group) resolved. (The
+/// webhook, a record for other systems, gets it anyway.)
+async fn stale(ctx: &Ctx, m: &MessageLog, now: DateTime<Utc>) -> anyhow::Result<Option<&'static str>> {
+    let waited = m.kind == "alert" && m.channel != "webhook" && now - m.created_at >= chrono::Duration::seconds(WAITED_S);
+    let Some(alert_id) = m.alert_id.as_deref().filter(|_| waited) else {
+        return Ok(None);
+    };
+    let (known, open): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(status != 'resolved'), 0) FROM alerts
+         WHERE id = ?1 OR id IN (SELECT alert_id FROM alert_notifications WHERE message_id = ?2)",
+    )
+    .bind(alert_id)
+    .bind(&m.id)
+    .fetch_one(ctx.db())
+    .await?;
+    Ok((known > 0 && open == 0).then_some("Resolved before it could be sent."))
 }
 
 /// One pass over every channel: claim what is due at `now` (≤ 4 per channel,
@@ -88,6 +124,16 @@ async fn deliver_batch(ctx: &Ctx, kind: &str, batch: Vec<MessageLog>, now: DateT
 }
 
 async fn deliver(ctx: &Ctx, ch: &dyn Channel, m: &MessageLog, now: DateTime<Utc>) {
+    match stale(ctx, m, now).await {
+        Ok(Some(why)) => {
+            if let Err(e) = messages::mark(ctx, &m.id, "failed", None, Some(why), None).await {
+                tracing::error!("marking {}: {e:#}", m.id);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(message = %m.id, "checking its alert: {e:#}"),
+    }
     let res = ch.send(m).await;
     let marked = match res {
         Ok(d) => {
@@ -99,6 +145,14 @@ async fn deliver(ctx: &Ctx, ch: &dyn Channel, m: &MessageLog, now: DateTime<Utc>
         Err(ChannelError::Retry(why)) => match backoff(&m.channel, m.attempts) {
             Some(wait) => messages::mark(ctx, &m.id, "queued", None, Some(&why), Some(now + wait)).await,
             None => messages::mark(ctx, &m.id, "failed", None, Some(&format!("{why} Gave up after {} tries.", m.attempts)), None).await,
+        },
+        Err(ChannelError::Offline(why)) => match offline_backoff(now - m.created_at) {
+            Some(wait) => {
+                // The provider never saw it: not one of its tries.
+                let _ = sqlx::query("UPDATE messages SET attempts = MAX(attempts - 1, 0) WHERE id = ?").bind(&m.id).execute(ctx.db()).await;
+                messages::mark(ctx, &m.id, "queued", None, Some(&why), Some(now + wait)).await
+            }
+            None => messages::mark(ctx, &m.id, "failed", None, Some(&format!("{why} Gave up after {OFFLINE_KEEP_H} h.")), None).await,
         },
         Err(ChannelError::Fail(why)) => messages::mark(ctx, &m.id, "failed", None, Some(&why), None).await,
     };
@@ -137,7 +191,7 @@ pub async fn poll_statuses(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<usiz
         match tw.status(sid).await {
             Ok(Status::Delivered) => messages::mark(ctx, &m.id, "delivered", None, None, None).await?,
             Ok(Status::Failed(why)) => messages::mark(ctx, &m.id, "failed", None, Some(&why), None).await?,
-            Ok(Status::Pending(_)) | Err(ChannelError::Retry(_)) => next_poll(ctx, &m, Some(now)).await?,
+            Ok(Status::Pending(_)) | Err(ChannelError::Retry(_) | ChannelError::Offline(_)) => next_poll(ctx, &m, Some(now)).await?,
             Err(ChannelError::Fail(why)) => {
                 tracing::warn!(message = %m.id, "Twilio status check refused: {why}");
                 next_poll(ctx, &m, None).await?;
@@ -271,5 +325,12 @@ mod tests {
         assert_eq!(secs("whatsapp"), vec![Some(5), Some(30), Some(120), None]);
         assert_eq!(secs("webhook"), vec![Some(1), Some(5), Some(25), None]);
         assert_eq!(backoff("sms", 0), None);
+    }
+
+    #[test]
+    fn offline_waits_up_to_a_minute_for_six_hours() {
+        let at = |s: i64| offline_backoff(chrono::Duration::seconds(s)).map(|d| d.num_seconds());
+        assert_eq!([at(0), at(20), at(90), at(5 * 3600)], [Some(5), Some(20), Some(60), Some(60)]);
+        assert_eq!(at(6 * 3600), None);
     }
 }

@@ -61,7 +61,9 @@ async fn get_channels(State(ctx): State<Ctx>) -> ApiResult<Json<ChannelsView>> {
 /// the relay (`GET {hosted_url}/v1/notify/recipients`) and turns it on only on
 /// a 200; so does a new relay key or URL while it is on. When the relay says
 /// no, the rest is saved, the relay is off, and the answer is a 400 with the
-/// relay's words.
+/// relay's words. When the relay becomes the way this server texts, phones
+/// the relay hasn't verified for this key are unverified here
+/// ([`verify::relay_took_over`]).
 async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<ChannelsView>> {
     let Value::Object(mut body) = body else { return Err(ApiError::bad_request("Expected a JSON object.")) };
     let secrets = match body.remove("secrets") {
@@ -82,6 +84,7 @@ async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> 
         Some(_) => return Err(ApiError::bad_request("relay is an object.")),
     };
     let current = load(&ctx).await?;
+    let before = configured_channels(&ctx).await?;
     let mut next: ChannelsConfig = patch::apply(&current, &Value::Object(body), &[])?;
     next.relay = current.relay.clone();
     clean(&mut next)?;
@@ -113,10 +116,14 @@ async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> 
     }
 
     let mut refused = None;
+    let mut known = None;
     match want_relay {
         Some(false) => next.relay = RelayConfig::default(),
         _ if (want_relay == Some(true) && !current.relay.enabled) || (next.relay.enabled && relay_secret_changed) => match check_relay(&ctx).await {
-            Ok(()) => next.relay = RelayConfig { enabled: true, checked_at: Some(now()) },
+            Ok(list) => {
+                next.relay = RelayConfig { enabled: true, checked_at: Some(now()) };
+                known = Some(list);
+            }
             Err(why) => {
                 next.relay = RelayConfig::default();
                 refused = Some(why);
@@ -128,13 +135,31 @@ async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> 
     if let Some(why) = refused {
         return Err(ApiError::bad_request(why));
     }
+    // The relay texts for this server now (a new relay, a new key, or its own
+    // Twilio gone): phones verified some other way need proving to it.
+    let texts_by_relay = |c: &[&str]| c.contains(&"relay") && !c.contains(&"sms");
+    if texts_by_relay(&configured_channels(&ctx).await?) && (!texts_by_relay(&before) || known.is_some()) {
+        if let Some(relay) = Relay::from_secrets(&ctx)? {
+            let list = match known {
+                Some(l) => Ok(l),
+                None => relay.recipients().await,
+            };
+            match list {
+                Ok(list) => {
+                    verify::relay_took_over(&ctx, &relay, &list).await?;
+                }
+                Err(e) => tracing::warn!("reading the relay's recipients after the switch: {}", e.message()),
+            }
+        }
+    }
     Ok(Json(view(&ctx).await?))
 }
 
-/// The relay answers `GET /v1/notify/recipients` with 200 for this key.
-async fn check_relay(ctx: &Ctx) -> Result<(), String> {
+/// The relay answers `GET /v1/notify/recipients` with 200 for this key: the
+/// numbers it has for it.
+async fn check_relay(ctx: &Ctx) -> Result<Vec<super::relay::Recipient>, String> {
     let Some(relay) = Relay::from_secrets(ctx).map_err(|e| e.to_string())? else { return Err("Add the relay key first.".into()) };
-    relay.recipients().await.map(|_| ()).map_err(|e| e.message().to_owned())
+    relay.recipients().await.map_err(|e| e.message().to_owned())
 }
 
 /// Trim, drop empties and check the shapes a farmer types.

@@ -568,3 +568,60 @@ async fn the_message_log_lists_newest_first_with_filters() {
     let (s, _) = call(&a, "GET", "/api/messages?direction=sideways", None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
+
+/// A local port nothing listens on: connecting is refused at once, as when
+/// the farm's internet is down.
+fn closed_port() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    format!("http://127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn a_text_waits_out_an_internet_outage_and_goes_when_twilio_is_back() {
+    let (_d, ctx) = ctx().await;
+    let twilio = Receiver::start().await;
+    setup_twilio(&ctx, &twilio, None).await;
+    let (s, _) = call(&app(&ctx), "PUT", "/api/notify/channels", Some(json!({ "twilio_api_base": closed_port() }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let id = queued(&ctx, "p1", "sms", TO, "Cows: move to P4 (30.6 ac, 3 d)? Reply Y or N. Code 4821").await;
+
+    // Five minutes (and more) without a connection: still queued, soon at first, then every minute.
+    let t0 = now();
+    let mut t = t0;
+    let mut waits = Vec::new();
+    while t - t0 < Span::minutes(90) {
+        run_once(&ctx, t).await.unwrap();
+        let m = message(&ctx, &id).await;
+        assert_eq!((m.status.as_str(), m.error.as_deref(), m.attempts), ("queued", Some("Twilio can't be reached."), 0), "the provider never saw it");
+        let next = next_attempt_at(&ctx, &id).await.unwrap();
+        waits.push((next - t).num_seconds());
+        t = next;
+    }
+    assert_eq!(waits[0], 5);
+    assert!(waits.iter().all(|w| (5..=60).contains(w)), "{waits:?}");
+    assert_eq!(*waits.last().unwrap(), 60);
+
+    // The internet is back: it goes on the next try, once.
+    let (s, _) = call(&app(&ctx), "PUT", "/api/notify/channels", Some(json!({ "twilio_api_base": twilio.url }))).await;
+    assert_eq!(s, StatusCode::OK);
+    run_once(&ctx, t).await.unwrap();
+    let m = message(&ctx, &id).await;
+    assert_eq!((m.status.as_str(), m.attempts), ("sent", 1));
+    assert_eq!(twilio.texts().len(), 1);
+
+    // A 5xx after an outage still gets its own 4 tries.
+    twilio.reply(503, json!({}));
+    let id2 = queued(&ctx, "p2", "sms", TO, "Cows: 180 of 250 collars silent 25m").await;
+    run_once(&ctx, t + Span::seconds(1)).await.unwrap();
+    assert_eq!(message(&ctx, &id2).await.status, "queued");
+
+    // Six hours without a connection: failed, and it says so.
+    let (s, _) = call(&app(&ctx), "PUT", "/api/notify/channels", Some(json!({ "twilio_api_base": closed_port() }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let id3 = queued(&ctx, "p3", "sms", TO, "214 outside P3").await;
+    run_once(&ctx, now() + Span::hours(6)).await.unwrap();
+    let m = message(&ctx, &id3).await;
+    assert_eq!((m.status.as_str(), m.error.as_deref()), ("failed", Some("Twilio can't be reached. Gave up after 6 h.")));
+}

@@ -185,3 +185,110 @@ async fn with_only_the_relay_the_host_texts_and_checks_the_code() {
     assert!(verified.is_some());
     assert_eq!(deadman, 1, "owners hear when the farm server goes quiet");
 }
+
+#[tokio::test]
+async fn switching_from_the_farms_twilio_to_the_relay_asks_to_verify_again() {
+    let host = Host::start().await;
+    let (_d, farm) = ctx().await;
+    let twilio = Receiver::start().await;
+    setup_twilio(&farm, &twilio, None).await;
+    let a = app(&farm);
+    // Two people verified on the farm's own Twilio; the relay already knows one of them for this key.
+    let hank = person(&farm, Some(PHONE), Role::Hand).await;
+    let mia = users::create_user(&farm, NewUser { name: "Mia".into(), role: Role::Manager, phone: Some("+15155550124".into()), email: None }).await.unwrap().id;
+    for id in [&hank, &mia] {
+        call(&a, "POST", "/api/notify/verify", Some(json!({ "user_id": id }))).await;
+        let (s, v) = call(&a, "POST", "/api/notify/verify/confirm", Some(json!({ "user_id": id, "code": last_code(&twilio) }))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    host.verify_recipient("sms", "+15155550124").await;
+    let host_texts = host.twilio.texts().len();
+
+    // Twilio goes, the relay comes on.
+    let body = json!({ "secrets": { "twilio_auth_token": null, "hosted_url": host.url, "hosted_api_key": host.key }, "relay": { "enabled": true } });
+    let (s, v) = call(&a, "PUT", "/api/notify/channels", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["configured"], json!(["relay"]));
+    // Hank's phone isn't proven to the relay: unverified here, so Verify shows again; Mia's stays.
+    assert!(verified_at(&farm, &hank).await.is_none());
+    assert!(verified_at(&farm, &mia).await.is_some());
+    assert_eq!(host.twilio.texts().len(), host_texts, "nobody is texted a code unasked");
+    let (deadman,): (i64,) = sqlx::query_as("SELECT deadman FROM notify_recipients WHERE address = '+15155550124'").fetch_one(host.ctx.db()).await.unwrap();
+    assert_eq!(deadman, 1, "a manager hears when the farm server goes quiet");
+    // Mia's alerts go through the relay and the host takes them.
+    let mut o = out("alert:x:1", "relay", "+15155550124", "214 outside P3, 6m. Reply OK to ack");
+    o.user_id = Some(mia.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    assert_eq!(message(&farm, &m.id).await.status, "sent");
+    // Hank verifies through the relay, and then his texts go too.
+    let (s, v) = call(&a, "POST", "/api/notify/verify", Some(json!({ "user_id": hank }))).await;
+    assert_eq!((s, v.clone()), (StatusCode::OK, json!({ "via": "relay" })), "{v}");
+    let (s, v) = call(&a, "POST", "/api/notify/verify/confirm", Some(json!({ "user_id": hank, "code": last_code(&host.twilio) }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(verified_at(&farm, &hank).await.is_some());
+
+    // Saving the settings again changes nothing.
+    let (s, _) = call(&a, "PUT", "/api/notify/channels", Some(json!({ "relay": { "enabled": true } }))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(verified_at(&farm, &hank).await.is_some() && verified_at(&farm, &mia).await.is_some());
+}
+
+#[tokio::test]
+async fn turning_the_relay_on_beside_the_farms_own_twilio_keeps_every_phone() {
+    let host = Host::start().await;
+    let (_d, farm) = ctx().await;
+    let twilio = Receiver::start().await;
+    setup_twilio(&farm, &twilio, None).await;
+    let a = app(&farm);
+    let hank = person(&farm, Some(PHONE), Role::Hand).await;
+    call(&a, "POST", "/api/notify/verify", Some(json!({ "user_id": hank }))).await;
+    call(&a, "POST", "/api/notify/verify/confirm", Some(json!({ "user_id": hank, "code": last_code(&twilio) }))).await;
+    let body = json!({ "secrets": { "hosted_url": host.url, "hosted_api_key": host.key }, "relay": { "enabled": true } });
+    let (s, v) = call(&a, "PUT", "/api/notify/channels", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["configured"], json!(["sms", "relay"]));
+    assert!(verified_at(&farm, &hank).await.is_some(), "texts still go by the farm's own Twilio");
+    // Twilio removed later: now the relay texts, and Hank needs proving to it.
+    let (s, _) = call(&a, "PUT", "/api/notify/channels", Some(json!({ "secrets": { "twilio_auth_token": null } }))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(verified_at(&farm, &hank).await.is_none());
+}
+
+#[tokio::test]
+async fn a_phone_the_relay_says_it_doesnt_know_shows_verify_again() {
+    let host = Host::start().await;
+    let (_d, farm) = ctx().await;
+    let a = app(&farm);
+    let body = json!({ "secrets": { "hosted_url": host.url, "hosted_api_key": host.key }, "relay": { "enabled": true } });
+    let (s, v) = call(&a, "PUT", "/api/notify/channels", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Hank's phone was verified another way (the farm's own Twilio before an
+    // upgrade, or the relay lost him): the relay refuses his texts.
+    let hank = person(&farm, Some(PHONE), Role::Manager).await;
+    users::set_phone_verified(&farm, &hank, chrono::Utc::now()).await.unwrap();
+    let mut o = out("alert:x:1", "relay", PHONE, "214 outside P3, 6m. Reply OK to ack");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    let got = message(&farm, &m.id).await;
+    assert_eq!((got.status.as_str(), got.error.as_deref()), ("failed", Some("That recipient isn't verified.")));
+    // So the phone isn't counted as reachable any more, and Verify (a relay code) works again.
+    assert!(verified_at(&farm, &hank).await.is_none());
+    let (s, v) = call(&a, "POST", "/api/notify/verify", Some(json!({ "user_id": hank }))).await;
+    assert_eq!((s, v.clone()), (StatusCode::OK, json!({ "via": "relay" })), "{v}");
+    let (s, v) = call(&a, "POST", "/api/notify/verify/confirm", Some(json!({ "user_id": hank, "code": last_code(&host.twilio) }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut o = out("alert:x:2", "relay", PHONE, "214 outside P3, 9m. Reply OK to ack");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    assert_eq!(message(&farm, &m.id).await.status, "sent");
+    // A refusal for any other reason leaves the phone as it is.
+    let mut o = out("alert:x:3", "relay", "+15155550999", "214 outside P3");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    assert_eq!(message(&farm, &m.id).await.status, "failed");
+    assert!(verified_at(&farm, &hank).await.is_some(), "a refusal for another number never touches Hank's");
+}

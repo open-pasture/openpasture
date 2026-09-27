@@ -109,6 +109,25 @@ async fn prompted(ctx: &Ctx, to: &str, ago: Duration) {
     sqlx::query("UPDATE messages SET created_at = ? WHERE id = ?").bind(to_db(&(now() - ago))).bind(&m.id).execute(ctx.db()).await.unwrap();
 }
 
+/// Decision `dec`'s own text (its `decision_waiting` alert, with its code)
+/// sent `to` `ago` before now: it opens the reply window and is what a bare
+/// Y answers.
+async fn asked(t: &T, to: &str, ago: Duration, dec: &str) {
+    let ctx = t.ctx();
+    let a = t.f.open_kind("decision_waiting").await.into_iter().find(|a| a.targets.contains(&("decision".into(), dec.to_owned()))).expect("decision_waiting");
+    let mut o = notify_support::out(
+        &format!("alert:{}:{to}:{}", a.id, sid()),
+        "sms",
+        to,
+        &format!("{}? Reply Y or N. Code {}", a.title, a.data["code"].as_str().unwrap()),
+    );
+    o.alert_id = Some(a.id.clone());
+    o.decision_id = Some(dec.to_owned());
+    let m = op_core::messages::enqueue(ctx, o).await.unwrap();
+    op_core::messages::mark(ctx, &m.id, "sent", Some(&sid()), None, None).await.unwrap();
+    sqlx::query("UPDATE messages SET created_at = ? WHERE id = ?").bind(to_db(&(now() - ago))).bind(&m.id).execute(ctx.db()).await.unwrap();
+}
+
 /// A MOVE to P2 proposed 40 minutes before `t0`, with its `decision_waiting`
 /// alert open (and so its code).
 async fn proposal(t: &T, herd: &str) -> (String, String) {
@@ -179,7 +198,7 @@ async fn the_webhook_takes_only_what_twilio_signed_over_the_public_url() {
     let t = farm().await;
     let ctx = t.ctx();
     let (dec, _) = proposal(&t, &t.f.herd).await;
-    prompted(ctx, MIA, mins(5)).await;
+    asked(&t, MIA, mins(5), &dec).await;
     let path = "/hooks/twilio/sms?farm=cows";
     let signed_url = "https://farm.example/hooks/twilio/sms?farm=cows";
     let s1 = sid();
@@ -295,7 +314,7 @@ async fn polling_takes_a_y_from_twilio_once_without_a_public_url() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(inbound::mode(ctx).await.unwrap(), inbound::Mode::Polling);
     let (dec, _) = proposal(&t, &t.f.herd).await;
-    prompted(ctx, MIA, mins(5)).await;
+    asked(&t, MIA, mins(5), &dec).await;
 
     // Yesterday's "Y" (before checking began) is never acted on.
     let start = now();
@@ -353,7 +372,7 @@ async fn each_command_answers_in_words_and_roles_are_kept() {
     let _other = t.f.collar(Some("215"), now() - mins(1)).await;
     let (dec, code) = proposal(&t, &t.f.herd).await;
     for p in [CODY, MIA, HANK, VERA] {
-        prompted(ctx, p, mins(10)).await;
+        asked(&t, p, mins(10), &dec).await;
     }
 
     // STATUS: anyone.
@@ -392,7 +411,7 @@ async fn each_command_answers_in_words_and_roles_are_kept() {
     assert_eq!(status, "applied");
     assert_eq!(inputs["farmer_response"]["action"], "approve");
     assert_eq!(inputs["farmer_response"]["by"], json!({"via": "text", "user_id": t.id(MIA), "name": "Mia"}));
-    assert_eq!(reply(&t, MIA, "y").await, "No decision is waiting for an answer.");
+    assert_eq!(reply(&t, MIA, "y").await, "Cows: move to P2 is already approved.");
     // A reminder for an answered decision goes nowhere.
     let late = op_alerts::inbound::reminders::run_due(ctx, now() + mins(200)).await.unwrap();
     assert!(late.is_empty());
@@ -467,6 +486,11 @@ async fn a_code_is_needed_after_the_reply_window_and_accepted_with_it() {
         (id, ())
     };
     prompted(ctx, CODY, Duration::hours(2)).await;
+    // Nothing asked Cody about it: the reply asks (nothing is decided), and the next N answers that.
+    assert_eq!(reply(&t, CODY, "n").await, "Cows: stay in P2? Reply Y or N");
+    assert_eq!(decision_status(ctx, &dec2).await.0, "proposed");
+    let asking = replies_to(ctx, CODY).await.pop().unwrap();
+    op_core::messages::mark(ctx, &asking.id, "sent", Some(&sid()), None, None).await.unwrap();
     assert_eq!(reply(&t, CODY, "n").await, "Rejected. Nothing sent for Cows.");
     assert_eq!(decision_status(ctx, &dec2).await.0, "rejected");
     let (s, v) = t.f.owner("PUT", "/api/texting", Some(json!({"approve_window_h": 1}))).await;
@@ -503,6 +527,303 @@ async fn several_decisions_get_a_numbered_list() {
     assert_eq!(decision_status(ctx, &cows_dec).await.0, "rejected");
     let (_, inputs) = decision_status(ctx, &cows_dec).await;
     assert_eq!(inputs["farmer_response"]["by"]["name"], "Cody");
+}
+
+/// Mark the last reply to `to` sent (it reached the phone).
+async fn reply_sent(ctx: &Ctx, to: &str) -> MessageLog {
+    let r = replies_to(ctx, to).await.pop().expect("a reply");
+    op_core::messages::mark(ctx, &r.id, "sent", Some(&sid()), None, None).await.unwrap();
+    r
+}
+
+#[tokio::test]
+async fn a_bare_y_answers_only_the_decision_its_text_asked_about() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    // 06:00: Mia is asked about the MOVE to P2.
+    let (p2, _) = proposal(&t, &t.f.herd).await;
+    asked(&t, MIA, mins(25), &p2).await;
+    // 06:20: a new proposal (to P3) replaces it, as cycle::record does; nobody was texted about it yet.
+    let p3 = t.f.decision("MOVE", "proposed", now(), None).await;
+    sqlx::query("UPDATE decisions SET to_paddock_id = ? WHERE id = ?").bind(&t.f.paddocks[2]).bind(&p3).execute(ctx.db()).await.unwrap();
+    op_ingest::supersede_proposals(ctx, &t.f.herd, &p3).await.unwrap();
+    t.f.eval(t0()).await;
+    // 06:25: her "Y" to the P2 text decides nothing; the reply says what waits now.
+    let r = reply(&t, MIA, "Y").await;
+    assert_eq!(r, "Cows: move to P2 was replaced. Cows: move to P3? Reply Y or N");
+    assert_eq!(decision_status(ctx, &p3).await.0, "proposed");
+    assert_eq!(decision_status(ctx, &p2).await.0, "superseded");
+    let asking = reply_sent(ctx, MIA).await;
+    assert_eq!(asking.decision_id.as_deref(), Some(p3.as_str()));
+    // Now she has seen P3: her next Y answers it.
+    assert_eq!(reply(&t, MIA, "y").await, "Approved. Cows moving to P3.");
+    assert_eq!(decision_status(ctx, &p3).await.0, "applied");
+
+    // Another herd's proposal that was never texted to her.
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (_, h) = t.f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": t.f.paddocks[2]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    let (cows, _) = proposal(&t, &t.f.herd).await;
+    asked(&t, MIA, mins(10), &cows).await;
+    let hf = t.f.decision("MOVE", "proposed", now() - mins(5), None).await;
+    sqlx::query("UPDATE decisions SET herd_id = ? WHERE id = ?").bind(&heifers).bind(&hf).execute(ctx.db()).await.unwrap();
+    // Cody approves the Cows in the app.
+    let owner = op_core::Actor { via: Via::Local, user_id: Some(t.id(CODY)), name: Some("Cody".into()) };
+    op_engine::cycle::respond(ctx, &cows, op_engine::cycle::Response::Approve, None, None, owner).await.unwrap();
+    // Mia's "y" to the Cows text never approves the Heifers.
+    assert_eq!(reply(&t, MIA, "y").await, "Cows: move to P2 is already approved. Heifers: move to P2? Reply Y or N");
+    assert_eq!(decision_status(ctx, &hf).await.0, "proposed");
+    // Nor does a list number she never got a list for.
+    let t2 = farm().await;
+    let (a, _) = proposal(&t2, &t2.f.herd).await;
+    prompted(t2.ctx(), MIA, mins(1)).await;
+    assert_eq!(
+        reply(&t2, MIA, "y 1").await,
+        "Cows: move to P2 (40.9 ac, 5 d)? Reply Y or N. Code ".to_owned() + &t2.f.open_kind("decision_waiting").await[0].data["code"].as_str().unwrap()
+    );
+    assert_eq!(decision_status(t2.ctx(), &a).await.0, "proposed");
+}
+
+#[tokio::test]
+async fn a_bare_y_after_texts_about_two_waiting_decisions_gets_the_list() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (_, h) = t.f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": t.f.paddocks[2]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    // Both herds' decision texts reached Mia (or both herds' briefs at 06:30).
+    let (cows, cows_code) = proposal(&t, &t.f.herd).await;
+    let (hf, _) = proposal(&t, &heifers).await;
+    asked(&t, MIA, mins(12), &cows).await;
+    asked(&t, MIA, mins(10), &hf).await;
+    // Her bare "y" could mean either: nothing is decided, she gets the numbered list.
+    assert_eq!(reply(&t, MIA, "y").await, "2 decisions waiting. 1. Cows: move to P2. 2. Heifers: move to P2. Reply Y or N and the number, like Y 1.");
+    assert_eq!((decision_status(ctx, &cows).await.0, decision_status(ctx, &hf).await.0), ("proposed".into(), "proposed".into()));
+    assert_eq!(reply(&t, MIA, "y 2").await, "Approved. Heifers moving to P2.");
+    assert_eq!(decision_status(ctx, &cows).await.0, "proposed");
+    // A second bare "n" (a resent text, or meant for the Heifers) still decides nothing: it names the Cows' decision with its code.
+    let r = reply(&t, MIA, "n").await;
+    assert!(r.starts_with("Heifers: move to P2 is already approved. Cows: move to P2 ") && r.ends_with(&format!("Code {cows_code}")), "{r}");
+    assert_eq!(decision_status(ctx, &cows).await.0, "proposed");
+    reply_sent(ctx, MIA).await;
+    assert_eq!(reply(&t, MIA, "N").await, "Rejected. Nothing sent for Cows.");
+}
+
+#[tokio::test]
+async fn a_code_still_answers_after_its_alert_is_resolved_by_hand() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (dec, code) = proposal(&t, &t.f.herd).await;
+    // A hand clicks Resolve on "Move to P2?"; the decision still waits and its alert stays closed.
+    let a = t.f.open_kind("decision_waiting").await.remove(0);
+    let hank = op_core::users::get_user(ctx, &t.id(HANK)).await.unwrap().unwrap();
+    op_alerts::engine::store::resolve_by(ctx, &a.id, &op_alerts::inbound::act::actor(&hank), now()).await.unwrap();
+    t.f.eval(t0() + mins(1)).await;
+    assert!(t.f.open_kind("decision_waiting").await.is_empty());
+    // A LATER reminder still carries the code, and the code still answers (outside the window).
+    let d = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(&dec).fetch_one(ctx.db()).await.unwrap();
+    let d = op_core::store::decision_from_row(&d).unwrap();
+    let again = op_alerts::inbound::act::prompt(ctx, &d, now()).await.unwrap();
+    assert!(again.ends_with(&format!("Code {code}")), "{again}");
+    assert_eq!(reply(&t, MIA, &format!("Y {code}")).await, "Approved. Cows moving to P2.");
+    assert_eq!(decision_status(ctx, &dec).await.0, "applied");
+}
+
+#[tokio::test]
+async fn ok_never_acks_a_decision_prompt() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (dec, _) = proposal(&t, &t.f.herd).await;
+    // The decision text goes out through routing, like any alert.
+    let texts = t.f.route(t0() + mins(2)).await;
+    let to_mia: Vec<&MessageLog> = texts.iter().filter(|m| m.address == MIA).collect();
+    assert_eq!(to_mia.len(), 1, "{texts:?}");
+    op_core::messages::mark(ctx, &to_mia[0].id, "sent", Some(&sid()), None, None).await.unwrap();
+    assert_eq!(reply(&t, MIA, "OK").await, "A decision takes Y or N, not OK.");
+    let a = t.f.open_kind("decision_waiting").await;
+    assert_eq!((a.len(), a[0].acked_at.is_none()), (1, true), "the prompt isn't acked");
+    assert_eq!(decision_status(ctx, &dec).await.0, "proposed");
+    // An escape texted before the prompt is what OK acks.
+    let c = t.f.collar(Some("031"), now()).await;
+    t.f.outside(&c, t0() - mins(30), t0() - mins(1)).await;
+    t.f.escape(&c, "returning", t0() - mins(30), None).await;
+    t.f.eval(t0() + mins(3)).await;
+    for m in t.f.route(t0() + mins(4)).await.iter().filter(|m| m.address == MIA) {
+        op_core::messages::mark(ctx, &m.id, "sent", Some(&sid()), None, None).await.unwrap();
+    }
+    let escaped = t.f.open_kind("escaped").await;
+    assert_eq!(reply(&t, MIA, "ok").await, format!("Acked: {}.", escaped[0].title));
+}
+
+#[tokio::test]
+async fn a_decision_text_that_waited_out_an_outage_isnt_sent_once_answered() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (dec, _) = proposal(&t, &t.f.herd).await;
+    let texts = t.f.route(t0() + mins(2)).await;
+    let to_mia = texts.iter().find(|m| m.address == MIA).expect("Mia's prompt").clone();
+    // The farm's internet is down: the prompt waits in the queue.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}", l.local_addr().unwrap().port())
+    };
+    let (s, _) = call(&notify_support::app(ctx), "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": closed}))).await;
+    assert_eq!(s, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now()).await.unwrap();
+    assert_eq!(notify_support::message(ctx, &to_mia.id).await.status, "queued");
+    // Meanwhile Cody answers in the app, and the prompt's alert clears.
+    let owner = op_core::Actor { via: Via::Local, user_id: Some(t.id(CODY)), name: Some("Cody".into()) };
+    op_engine::cycle::respond(ctx, &dec, op_engine::cycle::Response::Approve, None, None, owner).await.unwrap();
+    t.f.eval(t0() + mins(3)).await;
+    assert!(t.f.open_kind("decision_waiting").await.is_empty());
+    // Back online: the stale prompt doesn't go.
+    let (s, _) = call(&notify_support::app(ctx), "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": t.twilio.url}))).await;
+    assert_eq!(s, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now() + mins(2)).await.unwrap();
+    let m = notify_support::message(ctx, &to_mia.id).await;
+    assert_eq!((m.status.as_str(), m.error.as_deref()), ("failed", Some("Resolved before it could be sent.")));
+    assert!(t.twilio.texts().iter().all(|h| h.form()["To"] != MIA));
+}
+
+#[tokio::test]
+async fn a_grouped_text_that_waited_out_an_outage_goes_while_any_of_its_alerts_is_open() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    // Two animals outside in one window: one text for both.
+    for (tag, at) in [("214", t0()), ("031", t0() + Duration::seconds(20))] {
+        let c = t.f.collar(Some(tag), at).await;
+        t.f.outside(&c, at - mins(6), at + mins(600)).await;
+        t.f.eval(at).await;
+    }
+    let texts = t.f.route(t0() + Duration::seconds(90)).await;
+    let to_mia = texts.iter().find(|m| m.address == MIA).expect("Mia's text").clone();
+    assert!(to_mia.text.starts_with("2 outside P1"), "{}", to_mia.text);
+    // The farm's internet is down, and meanwhile the first animal walks back in.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}", l.local_addr().unwrap().port())
+    };
+    let a = notify_support::app(ctx);
+    assert_eq!(call(&a, "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": closed}))).await.0, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now()).await.unwrap();
+    assert_eq!(notify_support::message(ctx, &to_mia.id).await.status, "queued");
+    let first = to_mia.alert_id.clone().unwrap();
+    let hank = op_core::users::get_user(ctx, &t.id(HANK)).await.unwrap().unwrap();
+    op_alerts::engine::store::resolve_by(ctx, &first, &op_alerts::inbound::act::actor(&hank), now()).await.unwrap();
+    // Back online: the other animal is still out, so the text goes.
+    assert_eq!(call(&a, "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": t.twilio.url}))).await.0, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now() + mins(2)).await.unwrap();
+    assert_eq!(notify_support::message(ctx, &to_mia.id).await.status, "sent");
+    assert!(t.twilio.texts().iter().any(|h| h.form()["To"] == MIA));
+}
+
+#[tokio::test]
+async fn later_reminders_skip_people_who_stopped_or_changed() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (_dec, _) = proposal(&t, &t.f.herd).await;
+    let rae = t.f.person("Rae", Role::Manager, Some("+15155550128"), true, None).await;
+    for p in [CODY, MIA, "+15155550128"] {
+        prompted(ctx, p, mins(1)).await;
+        assert!(reply(&t, p, "later").await.starts_with("OK. I'll ask again at "));
+    }
+    // Mia texts STOP; Cody's phone changes; Rae is switched off.
+    sms(&t, MIA, "STOP").await;
+    op_core::users::update_user(ctx, &t.id(CODY), op_core::users::UserPatch { phone: Some(Some("+15155550199".into())), ..Default::default() }).await.unwrap();
+    op_core::users::update_user(ctx, &rae, op_core::users::UserPatch { disabled: Some(true), ..Default::default() }).await.unwrap();
+    let due = op_alerts::inbound::reminders::run_due(ctx, now() + mins(61)).await.unwrap();
+    assert!(due.is_empty(), "{due:?}");
+    // They are done, not waiting to go later.
+    assert!(op_alerts::inbound::reminders::run_due(ctx, now() + mins(120)).await.unwrap().is_empty());
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM text_reminders WHERE done_at IS NULL").fetch_one(ctx.db()).await.unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn where_asks_which_herd_when_a_tag_repeats() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (_, h) = t.f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": t.f.paddocks[2]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    let cows = t.f.collar(Some("105"), now() - mins(3)).await;
+    let hf = t.f.collar(Some("105"), now() - mins(7)).await;
+    sqlx::query("UPDATE collars SET herd_id = ? WHERE id = ?").bind(&heifers).bind(&hf).execute(ctx.db()).await.unwrap();
+    sqlx::query("UPDATE animals SET herd_id = ? WHERE collar_id = ?").bind(&heifers).bind(&hf).execute(ctx.db()).await.unwrap();
+    let w = reply(&t, HANK, "where is 105").await;
+    assert!(w.starts_with("2 animals are tagged 105. Cows: 105, in P1, 3m ago. Heifers: 105, "), "{w}");
+    assert!(w.ends_with("Add the herd for a map link, like WHERE 105 Cows."), "{w}");
+    assert!(!w.contains("maps.google.com"), "{w}");
+    // With the herd: that one, with its link.
+    let fix: String = sqlx::query_scalar("SELECT last_fix FROM collars WHERE id = ?").bind(&cows).fetch_one(ctx.db()).await.unwrap();
+    let fix: Value = serde_json::from_str(&fix).unwrap();
+    let (lon, lat) = (fix["point"][0].as_f64().unwrap(), fix["point"][1].as_f64().unwrap());
+    assert_eq!(reply(&t, HANK, "where 105 cows").await, format!("105, in P1, 3m ago. https://maps.google.com/?q={lat:.6},{lon:.6}"));
+    assert!(reply(&t, HANK, "where is 105 in Heifers").await.starts_with("105, "));
+    assert_eq!(reply(&t, HANK, "where is 105 Steers").await, "No animal 105 Steers.");
+}
+
+#[tokio::test]
+async fn questions_run_one_at_a_time_per_person_and_are_capped() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    // A brain that takes its time, so questions pile up while it thinks.
+    let hits: Arc<Mutex<u32>> = Default::default();
+    let h = hits.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move || {
+            let h = h.clone();
+            async move {
+                *h.lock().unwrap() += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                axum::Json(json!({ "choices": [{ "finish_reason": "stop", "message": { "role": "assistant", "content": "About 3 days." } }] }))
+            }
+        }),
+    );
+    let url = serve(app).await;
+    ctx.secrets().set("compatible_base_url", &url).unwrap();
+    ctx.update_settings(&json!({"brain": {"id": "compatible", "model": "local"}})).await.unwrap();
+    // A burst of 10 from one phone: one is asked, one reply says why, the rest are logged.
+    let mut told = 0;
+    for i in 0..10 {
+        let r = sms(&t, VERA, &format!("How much grass is left, try {i}?")).await;
+        if let Some(m) = &r.reply {
+            assert_eq!(m.text, op_alerts::inbound::questions::BUSY);
+            told += 1;
+        } else if i > 0 {
+            assert_eq!((r.message.status.as_str(), r.message.error.as_deref()), ("ignored", Some("A question of theirs is being answered.")));
+        }
+    }
+    assert_eq!(told, 1);
+    let got = wait_reply(ctx, VERA, 2).await;
+    assert!(got.iter().any(|m| m.text == "About 3 days."), "{got:?}");
+    assert_eq!(*hits.lock().unwrap(), 1, "one brain run for the burst");
+    // Once answered, the next question goes.
+    let r = sms(&t, VERA, "And P2?").await;
+    assert!(r.reply.is_none());
+    wait_reply(ctx, VERA, 3).await;
+    // Another person isn't held up by Vera.
+    assert!(sms(&t, HANK, "Is the water trough full?").await.reply.is_none());
+    wait_reply(ctx, HANK, 1).await;
+}
+
+#[tokio::test]
+async fn questions_are_capped_per_person_per_hour() {
+    use op_alerts::inbound::questions::{self, Admit, PER_HOUR};
+    let (_d, ctx) = notify_support::ctx().await;
+    let t = now();
+    for i in 0..PER_HOUR {
+        assert!(matches!(questions::admit(&ctx, "usr_vera", t + Duration::seconds(i as i64)), Admit::Ask(_)), "question {i}");
+    }
+    let over = |at| match questions::admit(&ctx, "usr_vera", at) {
+        Admit::Refuse { tell, why } => (tell, why),
+        Admit::Ask(_) => panic!("asked over the cap"),
+    };
+    assert_eq!(over(t + mins(5)), (Some(questions::capped_text()), "Too many questions this hour."));
+    assert_eq!(over(t + mins(6)), (None, "Too many questions this hour."), "told once");
+    assert!(matches!(questions::admit(&ctx, "usr_hank", t + mins(6)), Admit::Ask(_)), "one person's cap is theirs");
+    assert!(matches!(questions::admit(&ctx, "usr_vera", t + mins(61)), Admit::Ask(_)), "an hour on");
+    assert!(op_alerts::text::is_gsm7(&questions::capped_text()) && op_alerts::text::is_gsm7(questions::BUSY));
 }
 
 // ---- opting out, verification --------------------------------------------------------------
@@ -797,6 +1118,163 @@ async fn the_relay_inbox_goes_to_the_key_that_last_texted_and_delivers_once() {
     assert_eq!((last.text.as_str(), last.status.as_str(), last.error.as_deref()), ("status", "ignored", Some("Texts in are off.")));
     assert!(replies_to(&farm_b, CODY).await.is_empty());
     let _ = farm_a;
+}
+
+/// Farm `key` posts a text to `to` through the host, which sends it.
+async fn relay_post(host: &notify_support::Host, key: &str, id: &str, to: &str, text: &str, prompt: bool) {
+    let (s, v) = call_with(
+        &notify_support::app(&host.ctx),
+        "POST",
+        "/v1/notify",
+        Some(json!({"idempotency_key": id, "channel": "sms", "to": to, "text": text, "prompt": prompt})),
+        &[("authorization", &format!("Bearer {key}"))],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
+}
+
+/// The texts waiting in `key`'s inbox (taken: the next call starts after them).
+async fn take(host: &notify_support::Host, key: &str) -> Vec<String> {
+    let (_, v) = inbox(host, key, "", 0).await;
+    let texts: Vec<String> = v["messages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().to_owned()).collect();
+    inbox(host, key, v["cursor"].as_str().unwrap(), 0).await;
+    texts
+}
+
+#[tokio::test]
+async fn a_text_to_the_relay_reaches_only_the_farm_it_answers() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    relay_post(&host, &key_a, "ntf_a1", CODY, "Cows: move to P4? Reply Y or N. Code 4821", true).await;
+    text(&host.ctx, "sms", CODY, "Y 4821").await;
+    assert_eq!(take(&host, &key_a).await, ["Y 4821"]);
+
+    // Farm B only asks the relay to verify the same number: its code is now the last text to it.
+    let auth = format!("Bearer {key_b}");
+    let (s, v) =
+        call_with(&notify_support::app(&host.ctx), "POST", "/v1/notify/recipients", Some(json!({"channel": "sms", "to": CODY})), &[("authorization", &auth)])
+            .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    // Cody's texts still reach farm A, the only farm he is verified for; none are dropped.
+    for t in ["STOP MOVE 4821", "status", "y"] {
+        let r = text(&host.ctx, "sms", CODY, t).await;
+        assert_eq!((r.message.status.as_str(), r.message.error.as_deref()), ("received", None), "{t}");
+    }
+    assert_eq!(take(&host, &key_a).await, ["STOP MOVE 4821", "status", "y"]);
+    assert!(take(&host, &key_b).await.is_empty());
+
+    // Farm B verifies him too and texts last; then its key is deleted: its old texts don't win.
+    let code = notify_support::last_code(&host.twilio);
+    let (s, _) = call_with(
+        &notify_support::app(&host.ctx),
+        "POST",
+        "/v1/notify/recipients/verify",
+        Some(json!({"channel": "sms", "to": CODY, "code": code})),
+        &[("authorization", &auth)],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    relay_post(&host, &key_b, "ntf_b1", CODY, "Heifers: 031 outside P2. Reply OK to ack", false).await;
+    text(&host.ctx, "sms", CODY, "OK").await;
+    assert_eq!(take(&host, &key_b).await, ["OK"], "the last farm to text him");
+    // A code goes to the farm whose text carried it, a bare Y to the only farm that asked.
+    text(&host.ctx, "sms", CODY, "y 4821").await;
+    text(&host.ctx, "sms", CODY, "N").await;
+    assert_eq!(take(&host, &key_a).await, ["y 4821", "N"]);
+    assert!(take(&host, &key_b).await.is_empty());
+    // Both farms asked: a bare answer could be either's, so the host asks for the code.
+    relay_post(&host, &key_b, "ntf_b2", CODY, "Heifers: move to P7? Reply Y or N. Code 1234", true).await;
+    let r = text(&host.ctx, "sms", CODY, "Y").await;
+    let asked = r.reply.expect("the host asks which");
+    assert_eq!((asked.channel.as_str(), asked.text.as_str()), ("sms", "More than one farm asked you. Add the code from the text you mean, like Y 4821."));
+    assert!(op_alerts::text::septets(&asked.text) <= 160);
+    text(&host.ctx, "sms", CODY, "later 1234").await;
+    text(&host.ctx, "sms", CODY, "Y4821").await;
+    assert!(take(&host, &key_a).await == ["Y4821"]);
+    assert_eq!(take(&host, &key_b).await, ["later 1234"]);
+    let key_b_id = op_brain::hosted::check_key(&host.ctx, &key_b).await.unwrap().unwrap();
+    assert!(op_brain::hosted::delete_key(&host.ctx, &key_b_id).await.unwrap());
+    let r = text(&host.ctx, "sms", CODY, "status").await;
+    assert_eq!((r.message.status.as_str(), r.message.error.as_deref()), ("received", None));
+    assert_eq!(take(&host, &key_a).await, ["status"]);
+}
+
+#[tokio::test]
+async fn a_relay_host_farm_never_acts_on_other_farms_texts() {
+    let host = notify_support::Host::start().await;
+    let (_da, farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    // The host runs a farm of its own, where Cody is the owner with a decision waiting.
+    let u = op_core::users::create_user(&host.ctx, op_core::users::NewUser { name: "Cody".into(), role: Role::Owner, phone: Some(CODY.into()), email: None })
+        .await
+        .unwrap();
+    op_core::users::set_phone_verified(&host.ctx, &u.id, now()).await.unwrap();
+    // Farm A's brief asks Cody about its decision; it goes through the host flagged as asking.
+    let mut brief = notify_support::out("brief:a", "relay", CODY, "Cows: MOVE to P4 (30.6 ac).\nReply Y or N.");
+    brief.kind = "brief".into();
+    brief.decision_id = Some("dec_farm_a".into());
+    op_core::messages::enqueue(&farm_a, brief).await.unwrap();
+    assert_eq!(op_alerts::notify::sender::run_once(&farm_a, now()).await.unwrap(), 1);
+    op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM relay_prompts").fetch_one(host.ctx.db()).await.unwrap();
+    assert_eq!(n, 1, "the farm said its brief asks");
+    // Farm A's texts don't open the host farm's reply window.
+    assert!(op_alerts::inbound::act::last_prompt_to(&host.ctx, CODY).await.unwrap().is_none());
+    // Cody's bare Y goes to farm A, which asked; the host's own farm doesn't take it.
+    let r = text(&host.ctx, "sms", CODY, "Y").await;
+    assert!(r.reply.is_none());
+    assert_eq!(take(&host, &key_a).await, ["Y"]);
+    assert!(replies_to(&host.ctx, CODY).await.is_empty());
+}
+
+/// `(verified_at, attempts)` of `key`'s recipient row for `phone` on the host.
+async fn recipient_row(host: &notify_support::Host, key: &str, phone: &str) -> (Option<String>, i64) {
+    let key_id = op_brain::hosted::check_key(&host.ctx, key).await.unwrap().unwrap();
+    sqlx::query_as("SELECT verified_at, attempts FROM notify_recipients WHERE key_id = ? AND address = ?")
+        .bind(key_id)
+        .bind(phone)
+        .fetch_one(host.ctx.db())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_texted_code_verifies_whichever_farm_asked_for_it() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    let app = notify_support::app(&host.ctx);
+    let ask = |key: String| {
+        let app = app.clone();
+        async move {
+            let (s, v) =
+                call_with(&app, "POST", "/v1/notify/recipients", Some(json!({"channel": "sms", "to": MIA})), &[("authorization", &format!("Bearer {key}"))])
+                    .await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        }
+    };
+    ask(key_a.clone()).await;
+    let code_a = notify_support::last_code(&host.twilio);
+    ask(key_b.clone()).await;
+    let code_b = notify_support::last_code(&host.twilio);
+    // Mia texts back farm A's code (the older one): farm A's is verified, farm B's untouched.
+    text(&host.ctx, "sms", MIA, &code_a).await;
+    let (a_at, _) = recipient_row(&host, &key_a, MIA).await;
+    let (b_at, b_tries) = recipient_row(&host, &key_b, MIA).await;
+    assert!(a_at.is_some());
+    assert_eq!((b_at, b_tries), (None, 0));
+    assert_eq!(take(&host, &key_a).await, [code_a.clone()]);
+    assert!(take(&host, &key_b).await.is_empty());
+    // A wrong code costs farm B's code one try; its own code then verifies it.
+    let wrong = if code_b == "000000" { "111111" } else { "000000" };
+    text(&host.ctx, "sms", MIA, wrong).await;
+    assert_eq!(recipient_row(&host, &key_b, MIA).await, (None, 1));
+    text(&host.ctx, "sms", MIA, &code_b).await;
+    assert!(recipient_row(&host, &key_b, MIA).await.0.is_some());
+    assert_eq!(take(&host, &key_b).await, [code_b]);
 }
 
 #[tokio::test]

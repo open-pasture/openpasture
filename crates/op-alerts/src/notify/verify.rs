@@ -204,8 +204,63 @@ async fn confirm_by_relay(ctx: &Ctx, user_id: &str, phone: &str, code: &str) -> 
             },
             if r.status == 404 { "Send a code first.".to_owned() } else { r.message },
         )),
-        Err(ChannelError::Retry(m) | ChannelError::Fail(m)) => Err(ApiError::new(axum::http::StatusCode::BAD_GATEWAY, m)),
+        Err(ChannelError::Retry(m) | ChannelError::Offline(m) | ChannelError::Fail(m)) => Err(ApiError::new(axum::http::StatusCode::BAD_GATEWAY, m)),
     }
+}
+
+/// The relay has just become how this server texts (a new relay or key, or
+/// the farm's own Twilio SMS gone), with `known` its recipients for this key.
+/// The relay texts only numbers proven to it, so a phone verified through the
+/// farm's own Twilio would get nothing: it loses `phone_verified_at` here, and
+/// Verify (a code from the relay) shows beside it again. Phones the relay
+/// already verified for this key stay verified, their dead-man flag set by
+/// role. Returns how many need verifying.
+pub async fn relay_took_over(ctx: &Ctx, relay: &Relay, known: &[super::relay::Recipient]) -> anyhow::Result<usize> {
+    let mut unverified = 0;
+    for u in users::list_users(ctx).await? {
+        let (Some(phone), Some(_)) = (&u.phone, u.phone_verified_at) else { continue };
+        match known.iter().find(|r| r.channel == "sms" && &r.to == phone && r.verified_at.is_some()) {
+            Some(r) => {
+                let deadman = u.role >= Role::Manager && u.disabled_at.is_none();
+                if r.deadman != deadman {
+                    match relay.add_recipient("sms", phone, deadman).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(r)) => tracing::warn!(user = %u.id, "the relay kept the dead-man flag: {}", r.message),
+                        Err(e) => tracing::warn!(user = %u.id, "the relay kept the dead-man flag: {}", e.message()),
+                    }
+                }
+            }
+            None => {
+                sqlx::query("UPDATE users SET phone_verified_at = NULL WHERE id = ?").bind(&u.id).execute(ctx.db()).await?;
+                sqlx::query("DELETE FROM phone_codes WHERE user_id = ?").bind(&u.id).execute(ctx.db()).await?;
+                unverified += 1;
+            }
+        }
+    }
+    if unverified > 0 {
+        tracing::info!(unverified, "the relay texts for this server now; phones it hasn't verified need verifying again");
+    }
+    Ok(unverified)
+}
+
+/// The relay refused a text to `phone`: it hasn't proven that number for
+/// this key (verified here some other way, e.g. on the farm's own Twilio
+/// before the relay took over, or the relay lost it). While the relay is how
+/// this server texts, the phone loses `phone_verified_at` so routing stops
+/// counting on it and Verify (a relay code) shows beside it again. Returns
+/// how many people that was.
+pub async fn relay_forgot(ctx: &Ctx, phone: &str) -> anyhow::Result<usize> {
+    let c = configured_channels(ctx).await?;
+    if !c.contains(&"relay") || c.contains(&"sms") {
+        return Ok(0);
+    }
+    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM users WHERE phone = ? AND phone_verified_at IS NOT NULL").bind(phone).fetch_all(ctx.db()).await?;
+    for (id,) in &ids {
+        sqlx::query("UPDATE users SET phone_verified_at = NULL WHERE id = ?").bind(id).execute(ctx.db()).await?;
+        sqlx::query("DELETE FROM phone_codes WHERE user_id = ?").bind(id).execute(ctx.db()).await?;
+        tracing::info!(user = %id, "the relay doesn't know this phone for this server; it needs verifying again");
+    }
+    Ok(ids.len())
 }
 
 async fn verified(ctx: &Ctx, user_id: &str) -> ApiResult<Verified> {

@@ -2,6 +2,8 @@
 //! with `Authorization: Bearer <hosted_api_key>` and the host sends them from
 //! its own number. The farm's message id is the idempotency key, so a retry
 //! after a lost answer is sent once. The same key covers the hosted brain.
+//! A text that asks the person about a decision goes with `prompt: true`, so
+//! the host knows which farm a bare Y or N back to its shared number answers.
 
 use op_core::Ctx;
 use op_core::alert::MessageLog;
@@ -11,6 +13,7 @@ use serde_json::{Value, json};
 use super::{Channel, ChannelError, Delivery, http, net_error, secret};
 
 pub struct Relay {
+    ctx: Ctx,
     url: String,
     key: String,
 }
@@ -39,7 +42,7 @@ impl Relay {
     pub fn from_secrets(ctx: &Ctx) -> anyhow::Result<Option<Self>> {
         let Some(key) = secret(ctx, "hosted_api_key")? else { return Ok(None) };
         let url = secret(ctx, "hosted_url")?.unwrap_or_else(|| op_brain::api::HOSTED_DEFAULT_URL.into());
-        Ok(Some(Self { url: url.trim_end_matches('/').to_owned(), key }))
+        Ok(Some(Self { ctx: ctx.clone(), url: url.trim_end_matches('/').to_owned(), key }))
     }
 
     /// Which relay channel carries an address: email when it has an `@`,
@@ -136,9 +139,25 @@ impl Channel for Relay {
         if let Some(s) = &msg.subject {
             body["subject"] = json!(s);
         }
+        // A text that asks about a decision: a bare Y or N to the relay's shared number comes back here.
+        match crate::inbound::act::asks_for_answer(&self.ctx, &msg.id).await {
+            Ok(true) => body["prompt"] = json!(true),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(message = %msg.id, "reading whether a text asks about a decision: {e:#}"),
+        }
         match self.call(reqwest::Method::POST, "/v1/notify", Some(body)).await? {
             Ok(v) => Ok(Delivery::sent(v.get("id").and_then(Value::as_str).map(str::to_owned))),
-            Err(r) => Err(refused(r)),
+            Err(r) => {
+                // The relay doesn't know this phone for our key: it needs proving to it.
+                if r.status == 403
+                    && r.message == crate::hosting::outbound::NOT_VERIFIED
+                    && channel == "sms"
+                    && let Err(e) = super::verify::relay_forgot(&self.ctx, to).await
+                {
+                    tracing::warn!(message = %msg.id, "unverifying a phone the relay doesn't know: {e:#}");
+                }
+                Err(refused(r))
+            }
         }
     }
 }

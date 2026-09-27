@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { User } from "../../api";
 import type { Texting } from "./api";
-import { canBrief, personOf, reachable, repliesLine, validTime, withPerson } from "./logic";
+import { briefChannels, canBrief, personOf, reachable, repliesLine, validTime, withPerson } from "./logic";
 
 const base: Texting = {
   inbound: true, poll_s: 10, approve_window_h: 12, brief: { enabled: false, time: "06:30" },
@@ -41,8 +41,16 @@ describe("the brief", () => {
     expect(reachable(user({ phone: "+15155550123", phone_verified_at: "2026-09-27T00:00:00Z" }), ["sms"])).toBe(true);
     expect(reachable(user({ phone: "+15155550123", phone_verified_at: "2026-09-27T00:00:00Z" }), ["email"])).toBe(false);
     expect(reachable(user({ email: "cody@farm.example" }), ["email"])).toBe(true);
-    expect(reachable(user({ email: "cody@farm.example" }), ["relay"])).toBe(true);
+    expect(reachable(user({ email: "cody@farm.example" }), ["relay"])).toBe(false);
     expect(reachable(user({ email: "cody@farm.example", disabled_at: "2026-09-27T00:00:00Z" }), ["email"])).toBe(false);
+  });
+
+  test("goes by WhatsApp only with an approved template", () => {
+    expect(briefChannels({ configured: ["whatsapp", "email"], whatsapp: {} })).toEqual(["email"]);
+    expect(briefChannels({ configured: ["whatsapp"], whatsapp: { template_sid: "HX0123" } })).toEqual(["whatsapp"]);
+    const phone = user({ phone: "+15155550123", phone_verified_at: "2026-09-27T00:00:00Z" });
+    expect(reachable(phone, briefChannels({ configured: ["whatsapp"], whatsapp: {} }))).toBe(false);
+    expect(canBrief(briefChannels({ configured: ["whatsapp"], whatsapp: {} }))).toBe(false);
   });
 
   test("times are HH:MM", () => {
