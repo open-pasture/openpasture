@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { fmt, num } from "./units";
+import { fmt, num, type Quantity, type Units } from "./units";
+// op_core::units' answers for the same inputs (crates/op-core/tests/units_vectors.rs keeps it current).
+import vectors from "./units.vectors.json";
 
 const metric = fmt("metric");
 const imperial = fmt("imperial");
@@ -69,5 +71,29 @@ describe("parsing input", () => {
     expect(imperial.toDisplay(5, "len")).toBe(16);
     expect(imperial.toDisplay(12.4, "area")).toBe(30.6);
     expect(metric.toDisplay(12.44, "area")).toBe(12.4);
+  });
+});
+
+describe("the same digits as op_core::units", () => {
+  const cases: [Units, Quantity][] = (["metric", "imperial"] as const).flatMap((u) =>
+    (["area", "len", "height", "mass", "per_head"] as const).map((q): [Units, Quantity] => [u, q]),
+  );
+  test.each(cases)("%s %s", (units, q) => {
+    const f = fmt(units);
+    const text = (x: number) =>
+      q === "area" ? f.area(x) : q === "len" ? f.len(x) : q === "height" ? f.height(x) : q === "mass" ? f.mass(x) : f.perHead(x);
+    const rust: string[] = (vectors as Record<Units, Record<Quantity, string[]>>)[units][q];
+    expect(rust.length).toBe(vectors.si.length);
+    const differ = vectors.si.flatMap((x, i) => (text(x) === rust[i] ? [] : [`${x} → ${text(x)}, op_core ${rust[i]}`]));
+    expect(differ).toEqual([]);
+  });
+
+  test.each(["metric", "imperial"] as const)("%s density", (units) => {
+    const f = fmt(units);
+    const rust = vectors[units].density;
+    const differ = vectors.density_in.flatMap(([au, ha], i) =>
+      f.density(au, ha) === rust[i] ? [] : [`${au} AU on ${ha} → ${f.density(au, ha)}, op_core ${rust[i]}`],
+    );
+    expect(differ).toEqual([]);
   });
 });
