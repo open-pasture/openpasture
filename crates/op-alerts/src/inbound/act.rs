@@ -10,6 +10,14 @@
 //! from one number and codes from it stop counting for the hour. Roles:
 //! answering, LATER and STOP MOVE need a manager; OK a hand; STATUS, WHERE
 //! and questions anyone on the farm.
+//!
+//! A bare Y or N answers the decision the newest text that asked this number
+//! about one was about ([`ASKS`]: the decision's own text, a brief, a LATER
+//! reminder), and only while that decision still waits. When it doesn't (it
+//! was answered or replaced), or nothing asked, nothing is decided: the reply
+//! names what is waiting now, with its code, and that text is what the next
+//! bare Y answers. A code names its decision by the newest `decision_waiting`
+//! alert for it, open or resolved by hand, while the decision waits.
 
 use chrono::{DateTime, Duration, Utc};
 use op_brain::{AskError, AskRequest};
@@ -49,6 +57,9 @@ pub struct Out {
     pub decision_id: Option<String>,
     /// Kept on the inbound text as its `error` (e.g. a wrong code).
     pub note: Option<String>,
+    /// The reply asks about `decision_id` (Y or N), so the next bare Y or N
+    /// answers that decision.
+    pub prompt: bool,
 }
 
 impl Out {
@@ -145,14 +156,46 @@ pub async fn run(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User, 
 /// (the decision prompt among them) or a brief. Replies don't count, or
 /// texting us anything would open the window for whoever can fake that
 /// number's caller id.
+/// A relay host's outbox holds other farms' texts too (idempotency keys
+/// `relay:<key>:…`): they never open this farm's window or ask about its
+/// decisions.
 pub async fn last_prompt_to(ctx: &Ctx, address: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
     let (t,): (Option<String>,) = sqlx::query_as(
-        "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND kind IN ('alert', 'brief') AND status IN ('sending', 'sent', 'delivered')",
+        "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND kind IN ('alert', 'brief') AND status IN ('sending', 'sent', 'delivered')
+           AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'relay:%')",
     )
     .bind(address)
     .fetch_one(ctx.db())
     .await?;
     opt_from_db(t)
+}
+
+/// SQL over a `messages` row `m` of this farm: the text asked its person to
+/// answer decision `m.decision_id` with Y or N. That is the decision's own
+/// text (its `decision_waiting` alert), a brief that asks, a LATER reminder,
+/// or a reply that named a decision to answer. Other alerts about a decision
+/// (a stalled move) don't ask; neither do a relay host's texts for other farms.
+pub const ASKS: &str = "m.decision_id IS NOT NULL AND (m.idempotency_key IS NULL OR m.idempotency_key NOT LIKE 'relay:%') AND (
+       (m.kind = 'alert' AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = m.alert_id AND a.kind = 'decision_waiting'))
+    OR m.kind = 'brief'
+    OR (m.kind = 'reply' AND (m.idempotency_key LIKE 'later:%' OR m.idempotency_key LIKE 'prompt:%')))";
+
+/// Whether message `id` of this farm asks its person about a decision ([`ASKS`]).
+pub async fn asks_for_answer(ctx: &Ctx, id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM messages m WHERE m.id = ? AND {ASKS})")).bind(id).fetch_one(ctx.db()).await?)
+}
+
+/// The decision the newest text that reached `address` since `since` asked about.
+async fn prompted_decision(ctx: &Ctx, address: &str, since: DateTime<Utc>) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT m.decision_id FROM messages m WHERE m.address = ? AND m.direction = 'out' AND m.status IN ('sending', 'sent', 'delivered')
+           AND m.created_at >= ? AND {ASKS}
+         ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1"
+    ))
+    .bind(address)
+    .bind(to_db(&since))
+    .fetch_optional(ctx.db())
+    .await?)
 }
 
 async fn in_window(ctx: &Ctx, cfg: &TextingConfig, address: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
@@ -169,14 +212,17 @@ async fn wrong_codes(ctx: &Ctx, address: &str, now: DateTime<Utc>) -> anyhow::Re
     Ok(n)
 }
 
-/// Decisions whose `decision_waiting` alert carries `code`; `open` only
-/// while unresolved.
-async fn decisions_by_code(ctx: &Ctx, code: &str, open: bool) -> anyhow::Result<Vec<String>> {
-    let sql = format!(
-        "SELECT targets FROM alerts WHERE kind = 'decision_waiting' AND json_extract(data, '$.code') = ? {} ORDER BY opened_at DESC",
-        if open { "AND status != 'resolved'" } else { "" }
-    );
-    let rows: Vec<(String,)> = sqlx::query_as(&sql).bind(code).fetch_all(ctx.db()).await?;
+/// Decisions whose newest `decision_waiting` alert carries `code`, open or
+/// resolved (by hand, while the decision still waits, or since it was answered).
+async fn decisions_by_code(ctx: &Ctx, code: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.targets FROM alerts a WHERE a.kind = 'decision_waiting' AND json_extract(a.data, '$.code') = ?
+           AND NOT EXISTS (SELECT 1 FROM alerts b WHERE b.key = a.key AND (b.opened_at > a.opened_at OR (b.opened_at = a.opened_at AND b.id > a.id)))
+         ORDER BY a.opened_at DESC",
+    )
+    .bind(code)
+    .fetch_all(ctx.db())
+    .await?;
     let mut out = Vec::new();
     for (targets,) in rows {
         let t: Vec<(String, String)> = serde_json::from_str(&targets).unwrap_or_default();
@@ -310,7 +356,7 @@ async fn pick_decision(
                 return Ok(Err(Out::say("Too many wrong codes from this number. Try again in an hour.")));
             }
             let mut found = Vec::new();
-            for id in decisions_by_code(ctx, code, true).await? {
+            for id in decisions_by_code(ctx, code).await? {
                 if let Some(d) = decision(ctx, &id).await?.filter(|d| d.status == DecisionStatus::Proposed) {
                     found.push(d);
                 }
@@ -325,35 +371,73 @@ async fn pick_decision(
             Ok(Err(Out::say(format!("Add the code from the decision's text, like {verb} 4821."))))
         }
         Pick::Only => {
-            let mut all = pending(ctx, user).await?;
-            match all.len() {
-                0 => Ok(Err(Out::say("No decision is waiting for an answer."))),
-                1 => Ok(Ok(all.remove(0))),
-                _ => {
+            let all = pending(ctx, user).await?;
+            let since = now - Duration::hours(cfg.approve_window_h as i64);
+            let asked = match prompted_decision(ctx, &msg.address, since).await? {
+                Some(id) => decision(ctx, &id).await?,
+                None => None,
+            };
+            match asked {
+                // The decision the text they answer asked about, still waiting.
+                Some(d) if d.status == DecisionStatus::Proposed && answerable(&d) => Ok(Ok(d)),
+                // It was answered or replaced since: say so and what waits now.
+                Some(gone) => {
                     let herds = ctx.store().list_herds().await?;
                     let paddocks = ctx.store().list_paddocks().await?;
-                    let ids: Vec<String> = all.iter().map(|d| d.id.clone()).collect();
-                    save_list(ctx, user, "decision", &ids).await?;
-                    let items: Vec<String> = all.iter().map(|d| phrase(d, &herds, &paddocks)).collect();
-                    let how = if verb == "LATER" {
-                        "Reply LATER and the number, like LATER 1.".to_owned()
-                    } else {
-                        "Reply Y or N and the number, like Y 1.".to_owned()
-                    };
-                    Ok(Err(Out::say(list_text("decisions", &items, &how, max))))
+                    let head = gone_text(&gone, &herds, &paddocks);
+                    let same: Vec<Decision> = all.iter().filter(|d| d.herd_id == gone.herd_id).cloned().collect();
+                    let waiting = if same.is_empty() { all } else { same };
+                    Ok(Err(waiting_reply(ctx, user, Some(&head), waiting, verb, max, now).await?))
                 }
+                // Nothing asked about one. LATER only sets a reminder, so it may take the only one.
+                None if verb == "LATER" && all.len() == 1 => Ok(Ok(all.into_iter().next().expect("one"))),
+                None => Ok(Err(waiting_reply(ctx, user, None, all, verb, max, now).await?)),
             }
         }
         Pick::Number(i) => {
-            let ids = match saved_list(ctx, cfg, user, "decision", now).await? {
-                Some(ids) => ids,
-                None => pending(ctx, user).await?.into_iter().map(|d| d.id).collect(),
+            let Some(ids) = saved_list(ctx, cfg, user, "decision", now).await? else {
+                // No list was texted to pick from: text it (nothing is decided).
+                let all = pending(ctx, user).await?;
+                return Ok(Err(waiting_reply(ctx, user, None, all, verb, max, now).await?));
             };
             let Some(id) = ids.get(i - 1) else { return Ok(Err(Out::say(format!("There's no decision {i}. Reply {verb} for the list.")))) };
             match decision(ctx, id).await? {
                 Some(d) if d.status == DecisionStatus::Proposed => Ok(Ok(d)),
                 _ => Ok(Err(Out::say(format!("Decision {i} is already answered.")))),
             }
+        }
+    }
+}
+
+/// "Cows: move to P4 was replaced." and the like, for a decision a text
+/// asked about that no longer waits.
+fn gone_text(d: &Decision, herds: &[Herd], paddocks: &[Paddock]) -> String {
+    let what = phrase(d, herds, paddocks);
+    match d.status {
+        DecisionStatus::Superseded => format!("{what} was replaced."),
+        DecisionStatus::Approved | DecisionStatus::Applied => format!("{what} is already approved."),
+        DecisionStatus::Rejected => format!("{what} was rejected."),
+        _ => format!("{what} isn't waiting any more."),
+    }
+}
+
+/// The reply when a Y, N or LATER doesn't name a waiting decision: `head`
+/// (what happened to the one asked about), then what waits: its prompt with
+/// its code (the next bare Y answers that one), or the numbered list.
+#[allow(clippy::too_many_arguments)]
+async fn waiting_reply(ctx: &Ctx, user: &User, head: Option<&str>, waiting: Vec<Decision>, verb: &str, max: usize, now: DateTime<Utc>) -> anyhow::Result<Out> {
+    let lead = head.map(|h| format!("{} ", fit(h, 150))).unwrap_or_default();
+    match waiting.as_slice() {
+        [] => Ok(Out::say(head.map_or_else(|| "No decision is waiting for an answer.".to_owned(), |h| fit(h, max)))),
+        [one] => Ok(Out { text: Some(format!("{lead}{}", prompt(ctx, one, now).await?)), decision_id: Some(one.id.clone()), note: None, prompt: true }),
+        many => {
+            let herds = ctx.store().list_herds().await?;
+            let paddocks = ctx.store().list_paddocks().await?;
+            let ids: Vec<String> = many.iter().map(|d| d.id.clone()).collect();
+            save_list(ctx, user, "decision", &ids).await?;
+            let items: Vec<String> = many.iter().map(|d| phrase(d, &herds, &paddocks)).collect();
+            let how = if verb == "LATER" { "Reply LATER and the number, like LATER 1." } else { "Reply Y or N and the number, like Y 1." };
+            Ok(Out::say(format!("{lead}{}", list_text("decisions", &items, how, max - septets(&lead)))))
         }
     }
 }
@@ -372,9 +456,9 @@ async fn answer(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User, a
         Ok(done) => {
             let herds = ctx.store().list_herds().await?;
             let paddocks = ctx.store().list_paddocks().await?;
-            Ok(Out { text: Some(answered(&done, &herds, &paddocks)), decision_id: Some(done.id.clone()), note: None })
+            Ok(Out { text: Some(answered(&done, &herds, &paddocks)), decision_id: Some(done.id.clone()), ..Default::default() })
         }
-        Err(e) if e.status.is_client_error() => Ok(Out { text: Some(fit(&gsm7(&e.message), 160)), decision_id: Some(d.id), note: None }),
+        Err(e) if e.status.is_client_error() => Ok(Out { text: Some(fit(&gsm7(&e.message), 160)), decision_id: Some(d.id), ..Default::default() }),
         Err(e) => anyhow::bail!("answering {}: {}", d.id, e.message),
     }
 }
@@ -392,11 +476,14 @@ fn answered(d: &Decision, herds: &[Herd], paddocks: &[Paddock]) -> String {
     }
 }
 
-/// The approval prompt again: the alert's own text (with its code) while the
-/// decision's alert is open, else "Cows: move to P4? Reply Y or N".
+/// The approval prompt of a waiting decision again: its `decision_waiting`
+/// alert's text with its code (the newest one, even if a hand resolved it
+/// while the decision still waits), else "Cows: move to P4? Reply Y or N".
 pub async fn prompt(ctx: &Ctx, d: &Decision, now: DateTime<Utc>) -> anyhow::Result<String> {
-    let row =
-        sqlx::query("SELECT * FROM alerts WHERE key = ? AND status != 'resolved'").bind(format!("decision_waiting:{}", d.id)).fetch_optional(ctx.db()).await?;
+    let row = sqlx::query("SELECT * FROM alerts WHERE key = ? ORDER BY opened_at DESC, id DESC LIMIT 1")
+        .bind(format!("decision_waiting:{}", d.id))
+        .fetch_optional(ctx.db())
+        .await?;
     if let Some(r) = row {
         let a = store::alert_from_row(&r)?;
         return Ok(text::alert_text(&a, None, &TextCtx::of(ctx, now).await?));
@@ -426,25 +513,36 @@ async fn later(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User, pi
         .execute(ctx.db())
         .await?;
     let tz = TextCtx::of(ctx, now).await?.tz;
-    Ok(Out { text: Some(format!("OK. I'll ask again at {}.", text::clock(due, tz))), decision_id: Some(d.id), note: None })
+    Ok(Out { text: Some(format!("OK. I'll ask again at {}.", text::clock(due, tz))), decision_id: Some(d.id), ..Default::default() })
 }
 
 // ---- alerts -------------------------------------------------------------------------------
 
-/// OK: ack every alert the last alert text to this person covered.
+/// OK: ack every alert the last alert text to this person covered. A
+/// decision's own text isn't one: acking it would leave the decision waiting
+/// while the reply read like an answer, so OK passes over it.
 async fn ack(ctx: &Ctx, user: &User, now: DateTime<Utc>) -> anyhow::Result<Out> {
     if !can(user, Role::Hand) {
         return Ok(Out::say("Your role can't ack alerts."));
     }
     let last: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT id, alert_id FROM messages WHERE user_id = ? AND direction = 'out' AND kind = 'alert' AND alert_id IS NOT NULL
-           AND status IN ('sending', 'sent', 'delivered')
-         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        "SELECT m.id, m.alert_id FROM messages m WHERE m.user_id = ? AND m.direction = 'out' AND m.kind = 'alert' AND m.alert_id IS NOT NULL
+           AND m.status IN ('sending', 'sent', 'delivered')
+           AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.id = m.alert_id AND a.kind = 'decision_waiting')
+         ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1",
     )
     .bind(&user.id)
     .fetch_optional(ctx.db())
     .await?;
-    let Some((message_id, first)) = last else { return Ok(Out::say("No alert has been texted to you.")) };
+    let Some((message_id, first)) = last else {
+        let asked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messages m JOIN alerts a ON a.id = m.alert_id WHERE m.user_id = ? AND m.direction = 'out' AND a.kind = 'decision_waiting')",
+        )
+        .bind(&user.id)
+        .fetch_one(ctx.db())
+        .await?;
+        return Ok(Out::say(if asked { "A decision takes Y or N, not OK." } else { "No alert has been texted to you." }));
+    };
     let mut ids: Vec<String> = first.into_iter().collect();
     for (id,) in sqlx::query_as::<_, (String,)>("SELECT alert_id FROM alert_notifications WHERE message_id = ? ORDER BY rowid")
         .bind(&message_id)
@@ -566,35 +664,100 @@ async fn status(ctx: &Ctx, now: DateTime<Utc>, max: usize) -> anyhow::Result<Str
 
 // ---- where --------------------------------------------------------------------------------
 
-/// WHERE: an animal's last fix in words, how old it is, and a map link.
-pub async fn where_is(ctx: &Ctx, tag: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
-    let label = nm(tag);
-    let animal: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT tag, collar_id FROM animals WHERE lower(tag) = lower(?) AND removed_at IS NULL ORDER BY created_at LIMIT 1")
+/// One animal (or collar) a WHERE names.
+struct Found {
+    herd_id: String,
+    collar_id: Option<String>,
+}
+
+/// Active animals with this tag (any case), else collars with this name, in `herd` when given.
+async fn find_tag(ctx: &Ctx, tag: &str, herd: Option<&str>) -> anyhow::Result<Vec<Found>> {
+    let animals: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT herd_id, collar_id FROM animals WHERE lower(tag) = lower(?) AND removed_at IS NULL AND (?2 IS NULL OR herd_id = ?2) ORDER BY created_at, id",
+    )
+    .bind(tag.trim())
+    .bind(herd)
+    .fetch_all(ctx.db())
+    .await?;
+    if !animals.is_empty() {
+        return Ok(animals.into_iter().map(|(herd_id, collar_id)| Found { herd_id, collar_id }).collect());
+    }
+    let collars: Vec<(String, String)> =
+        sqlx::query_as("SELECT herd_id, id FROM collars WHERE lower(name) = lower(?) AND (?2 IS NULL OR herd_id = ?2) ORDER BY created_at, id")
             .bind(tag.trim())
-            .fetch_optional(ctx.db())
+            .bind(herd)
+            .fetch_all(ctx.db())
             .await?;
-    let collar_id = match animal {
-        Some((_, Some(c))) => Some(c),
-        Some((_, None)) => return Ok(format!("{label} has no collar.")),
-        None => {
-            sqlx::query_scalar::<_, String>("SELECT id FROM collars WHERE lower(name) = lower(?) LIMIT 1").bind(tag.trim()).fetch_optional(ctx.db()).await?
-        }
-    };
-    let Some(collar_id) = collar_id else { return Ok(format!("No animal {label}.")) };
-    let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&collar_id).fetch_optional(ctx.db()).await?;
-    let Some(collar) = row.map(|r| op_core::store::collar_from_row(&r)).transpose()? else { return Ok(format!("No animal {label}.")) };
-    let Some(fix) = collar.last_fix.clone() else { return Ok(format!("{label} has no position yet.")) };
+    Ok(collars.into_iter().map(|(herd_id, c)| Found { herd_id, collar_id: Some(c) }).collect())
+}
+
+/// Where one collar is: `(place words with its age, map link)`, or why not.
+async fn place_of(ctx: &Ctx, label: &str, collar_id: Option<&str>, now: DateTime<Utc>) -> anyhow::Result<Result<(String, String), String>> {
+    let Some(collar_id) = collar_id else { return Ok(Err(format!("{label} has no collar."))) };
+    let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(collar_id).fetch_optional(ctx.db()).await?;
+    let Some(collar) = row.map(|r| op_core::store::collar_from_row(&r)).transpose()? else { return Ok(Err(format!("No animal {label}."))) };
+    let Some(fix) = collar.last_fix.clone() else { return Ok(Err(format!("{label} has no position yet."))) };
     let place = op_core::place::describe(ctx, fix.point).await?.map(|p| gsm7(&p));
     let [lon, lat] = fix.point;
     let link = format!("https://maps.google.com/?q={lat:.6},{lon:.6}");
     let age = text::age(fix.at, now);
-    let head = if collar.state == op_core::FenceState::Outside { format!("{label} is outside") } else { label };
-    let where_words = match place {
+    let head = if collar.state == op_core::FenceState::Outside { format!("{label} is outside") } else { label.to_owned() };
+    let words = match place {
         Some(p) => format!("{head}, {p}, {age} ago."),
         None => format!("{head}, {age} ago."),
     };
-    Ok(format!("{} {link}", fit(&where_words, 320 - link.len() - 1)))
+    Ok(Ok((words, link)))
+}
+
+/// WHERE: an animal's last fix in words, how old it is, and a map link. A
+/// tag used in more than one herd gets one line per herd and how to pick
+/// ("WHERE 105 Cows"), never one of them quietly.
+pub async fn where_is(ctx: &Ctx, tag: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+    let mut label = nm(tag);
+    let mut found = find_tag(ctx, tag, None).await?;
+    if found.is_empty() {
+        // "105 Cows", "105 in Cows": a tag and the herd it is in.
+        let herds = ctx.store().list_herds().await?;
+        let words: Vec<&str> = tag.split_whitespace().collect();
+        for i in (1..words.len()).rev() {
+            let rest = &words[i..];
+            let rest = if rest.len() > 1 && rest[0].eq_ignore_ascii_case("in") { &rest[1..] } else { rest };
+            let name = rest.join(" ");
+            let Some(h) = herds.iter().find(|h| h.name.trim().eq_ignore_ascii_case(&name)) else { continue };
+            let t = words[..i].join(" ");
+            found = find_tag(ctx, &t, Some(&h.id)).await?;
+            if !found.is_empty() {
+                label = nm(&t);
+                break;
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(format!("No animal {label}.")),
+        [one] => Ok(match place_of(ctx, &label, one.collar_id.as_deref(), now).await? {
+            Ok((words, link)) => format!("{} {link}", fit(&words, 320 - link.len() - 1)),
+            Err(why) => why,
+        }),
+        many => {
+            let herds = ctx.store().list_herds().await?;
+            let mut many: Vec<&Found> = many.iter().collect();
+            many.sort_by_key(|f| herd_name(&herds, &f.herd_id).to_lowercase());
+            let mut lines = Vec::new();
+            for f in &many {
+                let herd = herd_name(&herds, &f.herd_id);
+                let line = match place_of(ctx, &label, f.collar_id.as_deref(), now).await? {
+                    Ok((words, _)) => words,
+                    Err(why) => why,
+                };
+                lines.push(format!("{herd}: {line}"));
+            }
+            let example = herd_name(&herds, &many[0].herd_id);
+            let head = format!("{} animals are tagged {label}.", many.len());
+            let tail = format!(" Add the herd for a map link, like WHERE {label} {example}.");
+            let body = fit(&format!("{head} {}", lines.join(" ")), 320 - septets(&tail));
+            Ok(format!("{body}{tail}"))
+        }
+    }
 }
 
 // ---- stop move --------------------------------------------------------------------------
@@ -617,7 +780,7 @@ async fn stop_move(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User
             if wrong_codes(ctx, &msg.address, now).await? >= MAX_WRONG_CODES {
                 return Ok(Out::say("Too many wrong codes from this number. Try again in an hour."));
             }
-            let ids = decisions_by_code(ctx, code, false).await?;
+            let ids = decisions_by_code(ctx, code).await?;
             match running.iter().find(|(_, d)| ids.contains(d)) {
                 Some((h, _)) => h.clone(),
                 None => return Ok(Out { text: Some(format!("No running move has code {code}.")), note: Some(WRONG_CODE.into()), ..Default::default() }),
@@ -661,7 +824,7 @@ async fn stop_move(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User
             } else {
                 format!("Stopped. {herd} keep the boundary they have.")
             };
-            Ok(Out { text: Some(text), decision_id, note: None })
+            Ok(Out { text: Some(text), decision_id, ..Default::default() })
         }
         Err(e) if e.status.is_client_error() => Ok(Out::say(fit(&gsm7(&e.message), 160))),
         Err(e) => anyhow::bail!("stopping the move: {}", e.message),

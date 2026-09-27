@@ -21,6 +21,7 @@ pub mod api;
 pub mod commands;
 pub mod hook;
 pub mod poll;
+pub mod questions;
 pub mod relay;
 pub mod reminders;
 pub mod state;
@@ -169,10 +170,14 @@ pub async fn receive(ctx: &Ctx, m: Inbound) -> anyhow::Result<Option<Received>> 
     }
     let cmd = commands::parse(&msg.text);
 
-    // A relay host: a text from a farm's recipient goes to that farm.
+    // A relay host: a text from a farm's recipient goes to the farm it answers.
     let mut forwarded = 0;
     if matches!(msg.channel.as_str(), "sms" | "whatsapp") && crate::hosting::load(ctx).await?.enabled {
-        forwarded = crate::hosting::inbox::route(ctx, &msg, &cmd).await?;
+        match crate::hosting::inbox::route(ctx, &msg, &cmd, user.as_ref()).await? {
+            crate::hosting::inbox::Route::Asked(reply) => return Ok(Some(Received { message: msg, reply: Some(reply) })),
+            crate::hosting::inbox::Route::Farms(n) => forwarded = n,
+            crate::hosting::inbox::Route::Host => {}
+        }
         if forwarded > 0 && !matches!(cmd, Command::OptOut | Command::OptIn) {
             return Ok(Some(Received { message: msg, reply: None }));
         }
@@ -202,7 +207,7 @@ async fn handle(ctx: &Ctx, cfg: &TextingConfig, msg: MessageLog, user: &User, cm
     if user.phone_verified_at.is_none() {
         return match cmd {
             Command::Code(code) => match act::confirm_code(ctx, user, &code).await? {
-                Some(text) => replied(ctx, msg, user, text, None).await,
+                Some(text) => replied(ctx, msg, user, text, None, false).await,
                 None => ignored(ctx, msg, "That code didn't verify the phone.").await,
             },
             // Mirror the carrier's opt-out even before the phone is verified.
@@ -224,7 +229,7 @@ async fn handle(ctx: &Ctx, cfg: &TextingConfig, msg: MessageLog, user: &User, cm
         if matches!(cmd, Command::OptIn) || commands::twilio_opt_in(&msg.text) {
             prefs::set_sms_opt_out(ctx, &user.id, false).await?;
             return match msg.channel.as_str() {
-                "whatsapp" => replied(ctx, msg, user, act::OPTED_IN.into(), None).await,
+                "whatsapp" => replied(ctx, msg, user, act::OPTED_IN.into(), None, false).await,
                 _ => Ok(Some(Received { message: msg, reply: None })),
             };
         }
@@ -236,33 +241,46 @@ async fn handle(ctx: &Ctx, cfg: &TextingConfig, msg: MessageLog, user: &User, cm
             prefs::set_sms_opt_out(ctx, &user.id, true).await?;
             // On SMS the carrier (Twilio) confirms STOP itself, and nothing more may go to the number.
             match msg.channel.as_str() {
-                "whatsapp" => replied(ctx, msg, user, act::OPTED_OUT.into(), None).await,
+                "whatsapp" => replied(ctx, msg, user, act::OPTED_OUT.into(), None, false).await,
                 _ => Ok(Some(Received { message: msg, reply: None })),
             }
         }
         // Already opted in; HELP and INFO are Twilio's to answer.
         Command::OptIn | Command::Reserved => Ok(Some(Received { message: msg, reply: None })),
         // Six digits from a verified phone aren't a code any more: a question like any other.
-        Command::Question(q) | Command::Code(q) => {
-            spawn_question(ctx.clone(), cfg.clone(), msg.clone(), user.clone(), q);
-            Ok(Some(Received { message: msg, reply: None }))
-        }
+        Command::Question(q) | Command::Code(q) => match questions::admit(ctx, &user.id, op_core::time::now()) {
+            questions::Admit::Ask(turn) => {
+                spawn_question(ctx.clone(), cfg.clone(), msg.clone(), user.clone(), q, turn);
+                Ok(Some(Received { message: msg, reply: None }))
+            }
+            questions::Admit::Refuse { tell: Some(text), why } => {
+                messages::mark(ctx, &msg.id, "ignored", None, Some(why), None).await?;
+                replied(ctx, msg, user, text, None, false).await
+            }
+            questions::Admit::Refuse { tell: None, why } => ignored(ctx, msg, why).await,
+        },
         cmd => {
             let out = act::run(ctx, cfg, &msg, user, cmd).await?;
             if let Some(why) = &out.note {
                 messages::mark(ctx, &msg.id, "received", None, Some(why), None).await?;
             }
             match out.text {
-                Some(text) => replied(ctx, msg, user, text, out.decision_id).await,
+                Some(text) => replied(ctx, msg, user, text, out.decision_id, out.prompt).await,
                 None => Ok(Some(Received { message: msg, reply: None })),
             }
         }
     }
 }
 
-fn spawn_question(ctx: Ctx, cfg: TextingConfig, msg: MessageLog, user: User, q: String) {
+/// Answer a question in the background, in its turn ([`questions`]).
+fn spawn_question(ctx: Ctx, cfg: TextingConfig, msg: MessageLog, user: User, q: String, turn: questions::Turn) {
     tokio::spawn(async move {
-        let text = act::ask(&ctx, &cfg, &msg, &user, &q).await;
+        let text = {
+            let _slot = turn.run_slot().await;
+            act::ask(&ctx, &cfg, &msg, &user, &q).await
+        };
+        // Answered: their next question may go (before they can see this answer).
+        drop(turn);
         if let Err(e) = reply(&ctx, &msg, &user, text, None).await {
             tracing::warn!(message = %msg.id, "queueing the answer to a text: {e:#}");
         }
@@ -275,18 +293,24 @@ async fn ignored(ctx: &Ctx, msg: MessageLog, why: &str) -> anyhow::Result<Option
     Ok(Some(Received { message, reply: None }))
 }
 
-async fn replied(ctx: &Ctx, msg: MessageLog, user: &User, text: String, decision_id: Option<String>) -> anyhow::Result<Option<Received>> {
-    let r = reply(ctx, &msg, user, text, decision_id).await?;
+async fn replied(ctx: &Ctx, msg: MessageLog, user: &User, text: String, decision_id: Option<String>, prompt: bool) -> anyhow::Result<Option<Received>> {
+    let r = send_reply(ctx, &msg, user, text, decision_id, prompt).await?;
     let message = messages::get_message(ctx, &msg.id).await?.unwrap_or(msg);
     Ok(Some(Received { message, reply: Some(r) }))
 }
 
 /// Queue the reply to text `msg`, on its channel, to its number (once per text).
 pub async fn reply(ctx: &Ctx, msg: &MessageLog, user: &User, text: String, decision_id: Option<String>) -> anyhow::Result<MessageLog> {
+    send_reply(ctx, msg, user, text, decision_id, false).await
+}
+
+/// [`reply`]; a `prompt` asks about `decision_id` (its idempotency key starts
+/// `prompt:`, see [`act::ASKS`]), so the next bare Y or N answers that one.
+async fn send_reply(ctx: &Ctx, msg: &MessageLog, user: &User, text: String, decision_id: Option<String>, prompt: bool) -> anyhow::Result<MessageLog> {
     messages::enqueue(
         ctx,
         Outbound {
-            idempotency_key: format!("reply:{}", msg.id),
+            idempotency_key: format!("{}:{}", if prompt && decision_id.is_some() { "prompt" } else { "reply" }, msg.id),
             channel: reply_channel(&msg.channel).into(),
             to: msg.address.clone(),
             text,

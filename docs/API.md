@@ -715,7 +715,7 @@ numbers).
 | Method | Path | Returns |
 | --- | --- | --- |
 | GET | `/api/notify/channels` | `Channels` |
-| PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why) |
+| PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why). When the relay becomes how this server texts (it turns on or gets a new key or URL while the farm has no Twilio SMS, or Twilio goes while it is on), phones the relay hasn't verified for this key lose `phone_verified_at`, so Verify (a code from the relay) shows beside them again; phones it has keep theirs and get the dead-man flag by role |
 | POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients |
 | POST | `/api/notify/verify` | `{ user_id }` → `{ via: "sms"\|"relay", verified?: true }`; 400 no phone · 409 already verified or nothing can text · 429 within 30 s · 502 the provider's words |
 | POST | `/api/notify/verify/confirm` | `{ user_id, code }` → `{ verified: true, phone_verified_at }`; 400 wrong or no code · 410 expired · 429 after 5 tries |
@@ -725,7 +725,7 @@ numbers).
 ```ts
 Channels = {
   sms: { from? /* E.164, or a Messaging Service SID MG… */ },
-  whatsapp: { from?, template_sid? /* HX…, one {{1}} body variable, used for alerts; replies go as text */ },
+  whatsapp: { from?, template_sid? /* HX…, one {{1}} body variable, used for alerts and briefs; replies go as text. Without it WhatsApp isn't offered for alerts or briefs (only replies within 24 h) */ },
   email: { host?, port /* 587 */, user?, from?, tls: "starttls"|"tls"|"none" },
   webhook: { url? },
   relay: { enabled /* only after the relay answered GET /v1/notify/recipients with 200 */, checked_at? },
@@ -740,7 +740,12 @@ Hosting  = { enabled /* false */, per_key_minute /* 30 */, per_key_day /* 500 */
 Anything that wants to reach a person enqueues a message (`op_core::messages::enqueue`); the sender
 delivers it. It claims at most 10 queued messages at a time and 4 per channel, and a message is
 sent once however many senders run. A send that may work later goes back in the queue: Twilio,
-email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A 4xx from
+email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A provider
+this server can't connect to at all (the farm's internet or DNS is down, the connection refused)
+never saw the message, so that isn't counted as a try: the message stays `queued` and is tried
+again after 5 s, then as often as every minute, for up to 6 h (then `failed`, "… can't be reached.
+Gave up after 6 h."). An alert's text or email that had to wait (a minute or more) isn't sent once
+its alert has resolved (`failed`, "Resolved before it could be sent."). A 4xx from
 Twilio fails at once with Twilio's words (`"Twilio 21211: The 'To' number … is not a valid phone
 number."`). Twilio texts are `sent` and read back at 30 s, 2 min and 10 min until Twilio says
 delivered (`delivered`) or undelivered (`failed` with the reason), so failed deliveries show
@@ -752,12 +757,16 @@ without a public URL. A message for a channel that isn't set up fails ("SMS isn'
 - **Email**: the farm's SMTP server, plain text, subject from the message (default "openpasture").
 - **Webhook**: `POST url` with `{ "type": "alert", "alert": Alert, "text" }` for an alert (else
   `{ "type": "message", "message": MessageLog }`) and
-  `X-Openpasture-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`. Check it
+  `x-openpasture-signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`. Check it
   over the raw body, e.g. `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`, and
   refuse an old `t`. A 2xx is `delivered`; 408, 429 and 5xx are retried.
 - **Relay**: `POST {hosted_url}/v1/notify` with `Authorization: Bearer <hosted_api_key>` (the
   hosted brain's URL and key; the URL defaults to `https://api.openpasture.dev`). The message id is
-  the idempotency key, so a retry is sent once. An address with `@` goes as email, else SMS.
+  the idempotency key, so a retry is sent once. An address with `@` goes as email, else SMS. A
+  text that asks the person about a decision (the decision's own text, a brief that asks, a LATER
+  reminder, a reply naming what waits) goes with `prompt: true`. People are offered, and alerts
+  and briefs go, by the relay only as SMS: the relay texts only addresses proven to it, and the farm
+  can prove phones, not email addresses, so email needs the farm's own SMTP.
 
 **Phone verification.** A person's phone gets texts only once it is proven by a 6-digit code:
 through the farm's own SMS, else through the relay (which texts its own code). The code text is
@@ -771,7 +780,7 @@ its own channels):
 
 | Method | Path | Returns |
 | --- | --- | --- |
-| POST | `/v1/notify` | `{ idempotency_key, channel: "sms"\|"whatsapp"\|"email", to, text, subject?, kind? }` → 202 `{ id, status: "queued"\|"duplicate" }` |
+| POST | `/v1/notify` | `{ idempotency_key, channel: "sms"\|"whatsapp"\|"email", to, text, subject?, kind?, prompt? /* the text asks about a decision */ }` → 202 `{ id, status: "queued"\|"duplicate" }` |
 | POST | `/v1/notify/recipients` | `{ channel, to, deadman? }` → 202 `{ status: "sent"\|"verified" }` (texts or emails a code) |
 | POST | `/v1/notify/recipients/verify` | `{ channel, to, code }` → 200 `{ verified: true }`; 404 no code · 400 wrong · 410 expired · 429 after 5 tries |
 | GET | `/v1/notify/recipients` | `[{ channel, to, verified_at?, deadman }]` for the calling key |
@@ -1463,30 +1472,41 @@ verification ("Phone verified. Reply STATUS any time.").
 
 | Text | Needs | Does |
 | --- | --- | --- |
-| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers the waiting decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`); several waiting → a numbered list, `Y 2` picks |
-| `LATER` [code \| number] | manager | the approval prompt again in an hour (the decision's own timer is unchanged) |
-| `OK` | hand | acks the alerts the last alert text to that person covered |
+| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers a decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`). A bare Y or N answers the decision the newest text asking this number about one was about, while it still waits; when it was answered or replaced, or nothing asked, nothing is decided and the reply names what waits now, with its code ("Cows: move to P2 was replaced. Cows: move to P3? Reply Y or N"), which the next Y answers; several waiting → a numbered list, `Y 2` picks (a number with no list texted gets the list) |
+| `LATER` [code \| number] | manager | the approval prompt again in an hour (the decision's own timer is unchanged); not sent if by then the person texted STOP, was switched off, isn't a manager, or that number isn't their verified phone |
+| `OK` | hand | acks the alerts the last alert text to that person covered; a decision's own text is passed over (it takes Y or N) |
 | `STATUS` | anyone | each herd: head, paddock, a running move, open alerts, what waits for an answer |
-| `WHERE IS <tag>`, `WHERE <tag>` | anyone | the last fix in words, its age and `https://maps.google.com/?q=<lat>,<lon>` |
+| `WHERE IS <tag>`, `WHERE <tag>` [herd] | anyone | the last fix in words, its age and `https://maps.google.com/?q=<lat>,<lon>`. A tag used in more than one herd gets one line per herd (no link) and "Add the herd for a map link, like WHERE 105 Cows."; `WHERE 105 Cows` or `WHERE 105 in Cows` picks |
 | `STOP MOVE` [code \| number] | manager | stops the running move where it is |
 | `STOP` / `START` | anyone | opts out / in (Twilio's words mirrored: STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, OPTOUT; UNSTOP, and YES for a number that opted out). No reply on SMS, where Twilio confirms |
 | `HELP`, `INFO` | | Twilio answers; nothing from us |
-| anything else | anyone | the farm's brain answers with read tools (never `run_sql`), ≤ 320 characters on SMS, 1,000 on WhatsApp; a brain that doesn't answer questions → the list of texts |
+| anything else | anyone | the farm's brain answers with read tools (never `run_sql`), ≤ 320 characters on SMS, 1,000 on WhatsApp; a brain that doesn't answer questions → the list of texts. One question per person at a time and 20 an hour, 2 at once on the farm (the rest wait their turn); a question over a limit isn't asked, the first one over it is told why ("One question at a time. …", "That's 20 questions this hour. …"), the rest are logged `ignored` |
 
 A Y, N or STOP MOVE without the decision's 4-digit code counts only within `approve_window_h` of
 our last alert or brief to that number (replies don't count, so texting us can't open the window);
 after that the code from the approval text is needed ("Y 4821"). Five wrong codes in an hour from
-one number and codes from it stop counting for the hour.
+one number and codes from it stop counting for the hour. A code names the decision whose newest
+`decision_waiting` alert carries it, also after a hand resolved that alert while the decision still
+waits. On a relay host, other farms' texts (idempotency keys `relay:…`) never open its own farm's
+window or ask about its decisions.
 
 **The morning brief.** At `brief.time` farm time (while `brief.enabled`), everyone with the brief on
 gets each of their herds' brief (`GET /api/brief`'s `text`, ≤ 480 characters) on every way their
 alerts reach them. Once a farm day; a server that was down then sends it within two hours, not
-later. A brief opens the reply window like an alert.
+later. A brief opens the reply window like an alert, and a bare Y or N to a brief that asks
+("Reply Y or N.") answers the decision it asked about.
 
-**The relay's inbox** (host side). A text to the relay's number from a verified recipient goes to
-the key whose text to that number was the host's last; STOP and START go to every key that has the
+**The relay's inbox** (host side). A text to the relay's number reaches only farms whose key has
+that number verified, and of those the one it answers: a Y, N, LATER or STOP MOVE with a decision's
+code goes to the farm whose text carried "Code 4821"; a bare one goes to the one farm that asked
+the person about a decision (`prompt: true`) in the last 12 h, and when more than one did, the host
+answers itself: "More than one farm asked you. Add the code from the text you mean, like Y 4821.";
+anything else goes to the farm whose text to that number was the host's last. The host's own farm
+counts as one of them when it has a verified person with that phone; a key that only asked to
+verify the number, or was deleted, never does. STOP and START go to every key that has the
 number (Twilio opts a phone out per sender number, so STOP to the shared number stops every farm on
-it); a code from a recipient being verified verifies it and goes on to the key that asked. The
+it); a 6-digit code from a recipient being verified is tried against every key's pending code for
+that number and verifies, and goes on to, the key whose code it is (a wrong one uses a try of each). The
 long-poll waits up to `wait` seconds for a text; rows up to the `since` a farm sends back are
 delivered and deleted. **Dead-man**: a key that polled before and has been quiet for more than
 `notify.hosting.deadman_after_min` texts its `deadman` recipients once per outage ("openpasture:

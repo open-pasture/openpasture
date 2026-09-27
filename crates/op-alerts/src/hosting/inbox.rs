@@ -6,10 +6,22 @@
 //! GET /v1/notify/inbox?since=<cursor>&wait=<s>  → {messages: [{id, channel, from, text, at}], cursor}
 //! ```
 //!
-//! - Only verified recipients' texts are routed, to the key whose text to
-//!   that number was the last this host sent (its idempotency key starts
-//!   `relay:<key id>:`). A 6-digit code from a recipient still being verified
-//!   verifies it (the key that asked last) and is routed too, so the farm
+//! - A text only ever reaches farms whose key proved the number it came from
+//!   (a verified recipient), and of those the one it answers:
+//!   - a Y, N, LATER or STOP MOVE with a decision's 4-digit code goes to the
+//!     farm whose text carried that code ("… Code 4821");
+//!   - a bare Y, N, LATER or STOP MOVE goes to the one farm that asked the
+//!     person about a decision in the last [`PROMPT_HOURS`] (the farm flags
+//!     those texts when it posts them); when more than one did, this host
+//!     answers itself and asks for the code;
+//!   - anything else goes to the farm whose text to that number was the last
+//!     this host sent (its idempotency key starts `relay:<key id>:`).
+//!
+//!   This server's own farm is one of the candidates when it has a verified
+//!   person with that phone (its texts carry no `relay:` key); a key that
+//!   only asked to verify the number, or was deleted, never is.
+//! - A 6-digit code from a recipient still being verified verifies the key
+//!   whose pending code it is (any of them) and is routed there, so the farm
 //!   can confirm the person's phone.
 //! - STOP and START (and Twilio's other opt-out and opt-in words) go to every
 //!   key that has the number: Twilio opts a phone out per sender number, so
@@ -35,13 +47,14 @@ use chrono::{DateTime, Utc};
 use op_core::alert::MessageLog;
 use op_core::messages::{Outbound, enqueue};
 use op_core::time::{from_db, now, opt_from_db, to_db};
+use op_core::users::User;
 use op_core::{ApiError, ApiResult, Ctx, id};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tokio::sync::Notify;
 
 use super::{caller, can_send, key_prefix};
-use crate::inbound::commands::Command;
+use crate::inbound::commands::{Command, Pick};
 use crate::notify::verify::{CODE_MINUTES, MAX_ATTEMPTS};
 use crate::notify::{code_hash, same};
 
@@ -170,92 +183,288 @@ async fn put(ctx: &Ctx, key_id: &str, msg: &MessageLog) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The key whose text to `address` was the last one this host sent.
-async fn last_texting_key(ctx: &Ctx, address: &str) -> anyhow::Result<Option<String>> {
-    let key: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT idempotency_key FROM messages WHERE address = ? AND direction = 'out' AND status IN ('sending', 'sent', 'delivered')
-         ORDER BY created_at DESC, rowid DESC LIMIT 1",
-    )
-    .bind(address)
-    .fetch_optional(ctx.db())
-    .await?;
-    Ok(key.and_then(|(k,)| k).and_then(|k| k.strip_prefix("relay:").and_then(|r| r.split_once(':')).map(|(id, _)| id.to_owned())))
+/// Hours a relayed decision text counts as what a bare Y or N answers.
+pub const PROMPT_HOURS: i64 = 12;
+/// The reply when a bare answer could be for more than one farm.
+pub fn which_farm_text(verb: &str) -> String {
+    format!("More than one farm asked you. Add the code from the text you mean, like {verb} 4821.")
 }
 
-/// A code texted back by a recipient still being verified: the key that
-/// asked last, when it is that key's code.
+/// Statuses of a text that reached the person.
+const REACHED: &str = "('sending', 'sent', 'delivered')";
+
+/// Who a text to this host's number goes to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Route {
+    /// This server's own farm handles it (or nobody: it is logged ignored).
+    Host,
+    /// Handed to this many farms' inboxes.
+    Farms(usize),
+    /// A bare answer more than one farm could be waiting for: this host
+    /// asked for the code instead (the queued reply).
+    Asked(MessageLog),
+}
+
+/// One farm a text may be for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Farm {
+    Key(String),
+    /// This server's own farm.
+    Host,
+}
+
+/// Keys that proved `address` on `channel`.
+async fn verified_keys(ctx: &Ctx, channel: &str, address: &str) -> anyhow::Result<Vec<String>> {
+    let keys: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT key_id FROM notify_recipients WHERE channel = ? AND address = ? AND verified_at IS NOT NULL ORDER BY key_id")
+            .bind(channel)
+            .bind(address)
+            .fetch_all(ctx.db())
+            .await?;
+    Ok(keys.into_iter().map(|(k,)| k).collect())
+}
+
+/// Whose text a `messages` row of this server is: the key in a `relay:<key>:`
+/// idempotency key, else this server's own farm.
+fn sender_of(idempotency_key: Option<&str>) -> Farm {
+    match idempotency_key.and_then(|k| k.strip_prefix("relay:")).and_then(|r| r.split_once(':')) {
+        Some((id, _)) => Farm::Key(id.to_owned()),
+        None => Farm::Host,
+    }
+}
+
+/// When `farm`'s last text that reached `address` was sent.
+async fn last_text(ctx: &Ctx, address: &str, farm: &Farm) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let t: (Option<String>,) = match farm {
+        Farm::Key(k) => {
+            sqlx::query_as(&format!(
+                "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED} AND idempotency_key >= ? AND idempotency_key < ?"
+            ))
+            .bind(address)
+            .bind(key_prefix(k))
+            .bind(format!("relay:{k};"))
+            .fetch_one(ctx.db())
+            .await?
+        }
+        Farm::Host => {
+            sqlx::query_as(&format!(
+                "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED}
+                   AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'relay:%')"
+            ))
+            .bind(address)
+            .fetch_one(ctx.db())
+            .await?
+        }
+    };
+    opt_from_db(t.0)
+}
+
+/// Of `farms`, the one whose text to `address` was the last this host sent
+/// (the first when none has one).
+async fn newest(ctx: &Ctx, address: &str, farms: &[Farm]) -> anyhow::Result<Farm> {
+    let mut best: Option<(DateTime<Utc>, &Farm)> = None;
+    for f in farms {
+        if let Some(t) = last_text(ctx, address, f).await?
+            && best.is_none_or(|(b, _)| t > b)
+        {
+            best = Some((t, f));
+        }
+    }
+    Ok(best.map_or_else(|| farms[0].clone(), |(_, f)| f.clone()))
+}
+
+/// "Code 4821" (any case) as a whole code in `text`.
+pub fn carries_code(text: &str, code: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    let needle = format!("code {code}");
+    low.match_indices(&needle).any(|(i, m)| !low[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Of `farms`, the one whose newest text to `address` carried decision code `code`.
+async fn by_code(ctx: &Ctx, address: &str, code: &str, farms: &[Farm]) -> anyhow::Result<Option<Farm>> {
+    let rows: Vec<(Option<String>, String)> = sqlx::query_as(&format!(
+        "SELECT idempotency_key, text FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED} AND instr(text, ?) > 0
+         ORDER BY created_at DESC, rowid DESC LIMIT 50"
+    ))
+    .bind(address)
+    .bind(code)
+    .fetch_all(ctx.db())
+    .await?;
+    Ok(rows.iter().filter(|(_, text)| carries_code(text, code)).map(|(k, _)| sender_of(k.as_deref())).find(|f| farms.contains(f)))
+}
+
+/// Of `farms`, those that asked `address` about a decision in the last [`PROMPT_HOURS`].
+async fn asked(ctx: &Ctx, address: &str, farms: &[Farm], now: DateTime<Utc>) -> anyhow::Result<Vec<Farm>> {
+    let since = to_db(&(now - chrono::Duration::hours(PROMPT_HOURS)));
+    let mut out = Vec::new();
+    for f in farms {
+        let n: i64 = match f {
+            Farm::Key(k) => {
+                sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM relay_prompts p JOIN messages m ON m.id = p.message_id
+                     WHERE p.key_id = ? AND p.address = ? AND p.at >= ? AND m.status IN {REACHED}"
+                ))
+                .bind(k)
+                .bind(address)
+                .bind(&since)
+                .fetch_one(ctx.db())
+                .await?
+            }
+            Farm::Host => {
+                sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM messages m WHERE m.address = ? AND m.direction = 'out' AND m.status IN {REACHED} AND m.created_at >= ? AND {}",
+                    crate::inbound::act::ASKS
+                ))
+                .bind(address)
+                .bind(&since)
+                .fetch_one(ctx.db())
+                .await?
+            }
+        };
+        if n > 0 {
+            out.push(f.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Note that the relayed text `message_id` asked `address` about a decision.
+pub async fn record_prompt(ctx: &Ctx, message_id: &str, key_id: &str, address: &str) -> anyhow::Result<()> {
+    let t = now();
+    sqlx::query("DELETE FROM relay_prompts WHERE at < ?").bind(to_db(&(t - chrono::Duration::days(2)))).execute(ctx.db()).await?;
+    sqlx::query("INSERT INTO relay_prompts (message_id, key_id, address, at) VALUES (?, ?, ?, ?) ON CONFLICT(message_id) DO NOTHING")
+        .bind(message_id)
+        .bind(key_id)
+        .bind(address)
+        .bind(to_db(&t))
+        .execute(ctx.db())
+        .await?;
+    Ok(())
+}
+
+/// A code texted back by a recipient still being verified: it is tried
+/// against every key's pending code for that number, and verifies the key
+/// whose code it is. A wrong code uses up one try of each pending code; a
+/// right one costs the other keys' codes nothing.
 async fn verify_by_text(ctx: &Ctx, channel: &str, address: &str, code: &str) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, key_id, code_hash, attempts, sent_at FROM notify_recipients
-         WHERE channel = ? AND address = ? AND verified_at IS NULL AND code_hash IS NOT NULL ORDER BY sent_at DESC LIMIT 1",
+         WHERE channel = ? AND address = ? AND verified_at IS NULL AND code_hash IS NOT NULL ORDER BY sent_at DESC, id",
     )
     .bind(channel)
     .bind(address)
-    .fetch_optional(ctx.db())
+    .fetch_all(ctx.db())
     .await?;
-    let Some(r) = row else { return Ok(None) };
-    let rid: String = r.try_get("id")?;
-    let key_id: String = r.try_get("key_id")?;
-    let hash: String = r.try_get("code_hash")?;
-    let sent_at = opt_from_db(r.try_get("sent_at")?)?;
-    if r.try_get::<i64, _>("attempts")? >= MAX_ATTEMPTS || sent_at.is_none_or(|t| now() - t > chrono::Duration::minutes(CODE_MINUTES)) {
-        return Ok(None);
+    let mut tried = Vec::new();
+    for r in &rows {
+        let sent_at = opt_from_db(r.try_get("sent_at")?)?;
+        if r.try_get::<i64, _>("attempts")? >= MAX_ATTEMPTS || sent_at.is_none_or(|t| now() - t > chrono::Duration::minutes(CODE_MINUTES)) {
+            continue;
+        }
+        let rid: String = r.try_get("id")?;
+        // Count the try before comparing, so parallel guesses can't skip the limit.
+        let n = sqlx::query("UPDATE notify_recipients SET attempts = attempts + 1 WHERE id = ? AND attempts < ?")
+            .bind(&rid)
+            .bind(MAX_ATTEMPTS)
+            .execute(ctx.db())
+            .await?
+            .rows_affected();
+        if n == 1 {
+            tried.push((rid, r.try_get::<String, _>("key_id")?, r.try_get::<String, _>("code_hash")?));
+        }
     }
-    let n = sqlx::query("UPDATE notify_recipients SET attempts = attempts + 1 WHERE id = ? AND attempts < ?")
-        .bind(&rid)
-        .bind(MAX_ATTEMPTS)
-        .execute(ctx.db())
-        .await?
-        .rows_affected();
-    if n == 0 || !same(&hash, &code_hash(&[&key_id, channel, address, code])) {
-        return Ok(None);
-    }
+    let Some(i) = tried.iter().position(|(_, key_id, hash)| same(hash, &code_hash(&[key_id, channel, address, code]))) else { return Ok(None) };
+    let (rid, key_id, _) = tried.remove(i);
     sqlx::query("UPDATE notify_recipients SET verified_at = ?, code_hash = NULL, attempts = 0 WHERE id = ?")
         .bind(to_db(&now()))
         .bind(&rid)
         .execute(ctx.db())
         .await?;
+    for (other, ..) in &tried {
+        sqlx::query("UPDATE notify_recipients SET attempts = attempts - 1 WHERE id = ? AND attempts > 0").bind(other).execute(ctx.db()).await?;
+    }
     Ok(Some(key_id))
 }
 
-/// Where a text to this host's own number goes. Returns how many farms it
-/// went to (0: it's the host's own to handle).
-pub async fn route(ctx: &Ctx, msg: &MessageLog, cmd: &Command) -> anyhow::Result<usize> {
+/// The decision pick of a command that answers one (Y, N, LATER, STOP MOVE).
+fn answer_pick(cmd: &Command) -> Option<(&Pick, &'static str)> {
+    match cmd {
+        Command::Answer { approve: true, pick } => Some((pick, "Y")),
+        Command::Answer { approve: false, pick } => Some((pick, "N")),
+        Command::Later(pick) => Some((pick, "LATER")),
+        Command::StopMove(pick) => Some((pick, "STOP MOVE")),
+        _ => None,
+    }
+}
+
+/// Where a text to this host's own number goes. `own` is this server's own
+/// person with that phone, if any.
+pub async fn route(ctx: &Ctx, msg: &MessageLog, cmd: &Command, own: Option<&User>) -> anyhow::Result<Route> {
     let (channel, address) = (msg.channel.as_str(), msg.address.as_str());
+    let keys = verified_keys(ctx, channel, address).await?;
     match cmd {
         Command::OptOut | Command::OptIn => {
-            let keys: Vec<(String,)> =
-                sqlx::query_as("SELECT DISTINCT key_id FROM notify_recipients WHERE channel = ? AND address = ? AND verified_at IS NOT NULL ORDER BY key_id")
-                    .bind(channel)
-                    .bind(address)
-                    .fetch_all(ctx.db())
-                    .await?;
-            for (k,) in &keys {
+            for k in &keys {
                 put(ctx, k, msg).await?;
             }
-            return Ok(keys.len());
+            return Ok(if keys.is_empty() { Route::Host } else { Route::Farms(keys.len()) });
         }
         Command::Code(code) => {
             if let Some(k) = verify_by_text(ctx, channel, address, code).await? {
                 put(ctx, &k, msg).await?;
-                return Ok(1);
+                return Ok(Route::Farms(1));
+            }
+            // This server's own person still proving the phone.
+            if own.is_some_and(|u| u.phone_verified_at.is_none()) {
+                return Ok(Route::Host);
             }
         }
         _ => {}
     }
-    let Some(key_id) = last_texting_key(ctx, address).await? else { return Ok(0) };
-    let verified: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM notify_recipients WHERE key_id = ? AND channel = ? AND address = ? AND verified_at IS NOT NULL")
-            .bind(&key_id)
-            .bind(channel)
-            .bind(address)
-            .fetch_optional(ctx.db())
-            .await?;
-    if verified.is_none() {
-        return Ok(0);
+    if keys.is_empty() {
+        return Ok(Route::Host);
     }
-    put(ctx, &key_id, msg).await?;
-    Ok(1)
+    let mut farms: Vec<Farm> = keys.into_iter().map(Farm::Key).collect();
+    if own.is_some_and(|u| u.phone_verified_at.is_some()) {
+        farms.push(Farm::Host);
+    }
+    let to = match answer_pick(cmd) {
+        Some((Pick::Code(code), _)) => match by_code(ctx, address, code, &farms).await? {
+            Some(f) => f,
+            None => newest(ctx, address, &farms).await?,
+        },
+        Some((_, verb)) => {
+            let asking = asked(ctx, address, &farms, now()).await?;
+            match asking.as_slice() {
+                [one] => one.clone(),
+                [] => newest(ctx, address, &farms).await?,
+                _ => {
+                    let reply = enqueue(
+                        ctx,
+                        Outbound {
+                            idempotency_key: format!("reply:{}", msg.id),
+                            channel: crate::inbound::reply_channel(channel).into(),
+                            to: address.to_owned(),
+                            text: which_farm_text(verb),
+                            kind: "reply".into(),
+                            user_id: own.map(|u| u.id.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    return Ok(Route::Asked(reply));
+                }
+            }
+        }
+        None => newest(ctx, address, &farms).await?,
+    };
+    match to {
+        Farm::Host => Ok(Route::Host),
+        Farm::Key(k) => {
+            put(ctx, &k, msg).await?;
+            Ok(Route::Farms(1))
+        }
+    }
 }
 
 // ---- dead-man -------------------------------------------------------------------------

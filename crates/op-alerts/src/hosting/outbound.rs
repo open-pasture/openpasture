@@ -1,5 +1,7 @@
 //! `POST /v1/notify`: a farm server's text or email, queued on this server's
-//! own outbox and sent from its own channel.
+//! own outbox and sent from its own channel. `prompt: true` marks a text that
+//! asks the person to answer a decision, so a bare Y or N back to the shared
+//! number finds this farm (`inbox::route`).
 
 use axum::Json;
 use axum::extract::State;
@@ -23,6 +25,10 @@ pub struct NotifyBody {
     pub subject: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    /// The text asks the person to answer a decision (Y or N), so a bare
+    /// answer to the shared number can go back to this farm.
+    #[serde(default)]
+    pub prompt: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,5 +96,8 @@ pub async fn post_notify(State(ctx): State<Ctx>, headers: HeaderMap, ApiJson(b):
         },
     )
     .await?;
+    if b.prompt && matches!(channel, "sms" | "whatsapp") {
+        super::inbox::record_prompt(&ctx, &msg.id, &key_id, &msg.address).await?;
+    }
     Ok((StatusCode::ACCEPTED, Json(Accepted { id: msg.id, status: "queued" })))
 }

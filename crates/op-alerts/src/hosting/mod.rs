@@ -4,7 +4,7 @@
 //! (`op_brain::hosted::check_key`). Off unless `notify.hosting.enabled`.
 //!
 //! ```text
-//! POST /v1/notify                    {idempotency_key, channel, to, text, subject?, kind?} → 202 {id, status: queued|duplicate}
+//! POST /v1/notify                    {idempotency_key, channel, to, text, subject?, kind?, prompt?} → 202 {id, status: queued|duplicate}
 //! POST /v1/notify/recipients         {channel, to, deadman?} → 202 {status: sent|verified}
 //! POST /v1/notify/recipients/verify  {channel, to, code} → 200 {verified: true}
 //! GET  /v1/notify/recipients         → [{channel, to, verified_at?, deadman}]
