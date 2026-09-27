@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { Animal, Collar } from "../../api";
 import type { ImportPreview, LinkedCollar } from "../../api/k-animals";
-import { cardsPossible, each, herdRows, keysCsv, mappedRows, resolve, rowLabel, rowText, sheets, spareCollars } from "./herd";
+import { cardsPossible, each, herdOfMost, herdRows, keysCsv, mappedRows, pickedFirst, pickRows, resolve, rowLabel, rowText, selectionOf, selectUrl, sheets, spareCollars } from "./herd";
+import { parseHash } from "../../util";
 
 const animal = (id: string, tag: string, more: Partial<Animal> = {}): Animal => ({ id, tag, herd_id: "h1", ...more });
 const collar = (id: string, name: string, more: Partial<Collar> = {}): Collar => ({ id, name, herd_id: "h1", state: "inside", ...more });
@@ -131,5 +132,39 @@ describe("keys and cards", () => {
     await expect(run).rejects.toThrow("409");
     await new Promise((r) => setTimeout(r, 20));
     expect(started.length).toBeLessThan(12);
+  });
+});
+
+describe("a selection handed to the table", () => {
+  const animals = [animal("a1", "214", { collar_id: "c1" }), animal("a2", "215", { collar_id: "c2" }), animal("a3", "31", { herd_id: "h2", collar_id: "c3" })];
+  const collars = [collar("c1", "C-1", { animal_id: "a1" }), collar("c2", "C-2", { animal_id: "a2" }), collar("c3", "H-1", { herd_id: "h2", animal_id: "a3" }), collar("c4", "C-4")];
+
+  test("#/herd?select= opens the Herd view with those collars, #/herd/<tag> still opens an animal", () => {
+    const url = selectUrl(["c1", "c4"]);
+    const [view, rest] = parseHash("#" + url);
+    expect(view).toBe("herd");
+    expect(selectionOf(rest)).toEqual(["c1", "c4"]);
+    expect(parseHash("#/herd/214")).toEqual(["herd", "214"]);
+    expect(parseHash("#/print/report/nrcs_528?from=2026-01-01")).toEqual(["print", "report/nrcs_528?from=2026-01-01"]);
+    expect(parseHash("#/")).toEqual(["map", ""]);
+    expect(selectionOf("214")).toEqual([]);
+    expect(selectionOf("?select=c1,,c1, c2")).toEqual(["c1", "c2"]);
+  });
+
+  test("the table shows the herd most of them are in, picks their rows and lists them first", () => {
+    expect(herdOfMost(collars, ["c1", "c3", "c4"])).toBe("h1");
+    expect(herdOfMost(collars, ["c3"])).toBe("h2");
+    expect(herdOfMost(collars, ["gone"])).toBeUndefined();
+    const rows = herdRows(animals, collars, "h1", "active");
+    const picked = pickRows(rows, ["c2", "c4", "c3"]);
+    expect([...picked].sort()).toEqual(["a2", "c4"]);
+    expect(pickedFirst(rows, picked).map((r) => r.id)).toEqual(["a2", "c4", "a1"]);
+  });
+
+  test("250 lassoed collars make a hash of about 8 kB and come back whole", () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `col_01M3H7MFM10GBAHERFMVRW${String(i).padStart(4, "0")}`);
+    const url = selectUrl(ids);
+    expect(url.length).toBeLessThan(8000);
+    expect(selectionOf(parseHash("#" + url)[1])).toEqual(ids);
   });
 });

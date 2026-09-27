@@ -6,13 +6,16 @@ import { collarLabel, store, useStore } from "../../store";
 import { Button, Menu } from "../../ui";
 import { Table, type Column } from "../../ui/Table";
 import { age, useNow } from "../../util";
+import { views } from "../../registry";
+import { selectUrl } from "../k-animals/herd";
 import type { ToolProps } from "../../map/tools";
 import type { OverlayCtx } from "../../map/overlays";
 import { caughtIn, drag, lassoLayers, removeLasso, setLasso } from "./freehand";
 
 interface Caught { ids: string[]; ring: LonLat[] }
 
-// Drag around animals to select them, then move them to another herd or list them.
+// Drag around animals to select them, then move them to another herd or list them (in the Herd
+// view, selected there, when it exists).
 // Opened with l (drag to draw) or by shift-dragging on the map (it opens with that selection).
 export function LassoTool({ map, ctx, done }: ToolProps) {
   const [sel, setSel] = useState<Caught | undefined>(() => peek("lasso"));
@@ -90,7 +93,9 @@ export function LassoTool({ map, ctx, done }: ToolProps) {
         <Menu trigger={<span className={"btn quiet sm" + (busy ? " busy" : "")}>Move to herd</span>}
           items={others.map((h) => ({ label: h.name, onSelect: () => void moveTo(h.id) }))} />
       )}
-      {picked.length > 0 && <Button small onClick={() => ctx.openSheet(<Picked ids={sel.ids} ctx={ctx} />)}>Show in table</Button>}
+      {picked.length > 0 && <Button small onClick={() => (views.has("herd")
+        ? void (location.hash = selectUrl(picked.map((c) => c.id)))
+        : ctx.openSheet(<Picked ids={sel.ids} ctx={ctx} />))}>Show in table</Button>}
       <Button small kind="plain" onClick={() => { ctx.openSheet(null); setErr(undefined); setSel(undefined); }}>Clear</Button>
       {err && <span className="mono err cerr">{err}</span>}
     </div>
