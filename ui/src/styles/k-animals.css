@@ -1,0 +1,73 @@
+/* K-animals: the Herd view, animal pages, collar cards. Patterns from app.css and base.css. */
+
+/* herd view: bar, a flow (import, link) when open, the table */
+.herdv{display:grid;grid-template-rows:auto auto auto minmax(0,1fr);height:100%;min-height:0}
+.hbar{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);min-height:53px}
+.hbar .hname{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.hbar .menutrigger .hname::after{content:"";display:inline-block;width:5px;height:5px;margin-left:.5rem;border-right:1.5px solid var(--fg3);border-bottom:1.5px solid var(--fg3);transform:translateY(-3px) rotate(45deg)}
+.hfilter{width:200px;flex:none}
+.hcount{font-size:12px}
+.hacts{margin-left:auto;display:flex;align-items:center;gap:6px}
+.hacts>.mono{font-size:12px;margin-right:6px}
+.hflow{display:grid;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);animation:fade .2s both;min-width:0}
+.hline{display:flex;align-items:center;gap:12px;font-size:12.5px}
+.hline .sp{flex:1}
+.hflow .warn{color:var(--warn)}
+.hflow .err{font-size:12px}
+.hpeek{width:auto}
+.hpeek th{position:static;padding:4px 32px 4px 0}
+.hpeek td,.hpeek td:first-child{padding:4px 32px 4px 0;border-bottom:0;color:var(--fg2)}
+.herrs{font-size:12px;line-height:20px;color:var(--fg2)}
+.herrs li span{margin-right:12px}
+.hmsg{padding:8px 16px;font-size:12px;border-bottom:1px solid var(--line)}
+.htable{min-height:0}
+.htable .tblbox{gap:0}
+.htable .low{color:var(--warn)}
+.tagl{color:var(--fg)}
+.tagl:hover,.tagl:focus-visible{color:var(--grass)}
+
+/* inline edit: a value that turns into an input */
+.editv{font:inherit;color:inherit;text-align:left;width:100%;min-height:20px;cursor:text;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.editv:hover{color:var(--fg)}
+.input.editin{width:100%;padding:1px 6px;font-size:12px;line-height:18px;border-radius:6px}
+select.input.editin{padding-right:22px}
+.kv .editv{text-align:right}
+.kv .input.editin{width:180px;text-align:right}
+
+/* animal page: facts and actions beside the track */
+.apage{display:grid;grid-template-columns:minmax(320px,400px) minmax(0,1fr);height:100%;min-height:0}
+.aside{overflow:auto;padding:16px 20px 40px;border-right:1px solid var(--line);display:grid;align-content:start;gap:20px}
+.back{font-size:12px;color:var(--fg3);justify-self:start}
+.back:hover{color:var(--fg)}
+.afacts{display:grid;gap:10px}
+.atag{font-size:28px;font-weight:600;letter-spacing:-.02em;line-height:1.2;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.atag .editv{width:auto}
+.atag .input.editin{font-size:20px;line-height:28px;width:160px}
+.atag .aname{font-size:16px;font-weight:400;color:var(--fg2);letter-spacing:0}
+.aacts{display:grid;gap:12px;padding-top:4px;border-top:1px solid var(--line)}
+.aacts>.acts{padding-top:12px}
+.aacts.keyed{padding-top:12px;justify-items:start}
+.aacts.keyed .copy{width:100%}
+.aform{display:grid;gap:10px;animation:fade .2s both}
+.aform .input[type=date]{width:auto}
+.aform p{font-size:12px}
+.aacts .err{font-size:12px}
+.amap{position:relative;min-width:0}
+.amap .map{position:absolute;inset:0}
+.amap .over{position:absolute;top:12px;left:12px;z-index:2}
+.amap .over .seg{background:rgba(11,12,9,.85)}
+
+/* collar cards: 3 across, 4 down, one sheet per page */
+.cards{display:grid;gap:24px}
+.cardsheet{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(4,1fr);width:180mm;height:240mm;margin:0 auto;border:1px solid #e6e6e6}
+.card{margin:0;display:grid;justify-items:center;align-content:center;gap:6px;padding:4mm;border:1px dashed #dcdcdc}
+.card .qr{width:38mm}
+.card .qr svg{width:100%;height:auto}
+.card figcaption{display:grid;justify-items:center;gap:2px;color:#111}
+.card b{font-size:20px;font-weight:600;letter-spacing:-.01em}
+.card figcaption .mono{font-size:10px;color:#555}
+@media print{
+  .cards{gap:0}
+  .cardsheet{border:0;break-after:page}
+  .cardsheet:last-child{break-after:auto}
+}

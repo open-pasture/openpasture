@@ -1,6 +1,7 @@
 //! One emulated collar, without I/O: an animal grazing with its herd, a GNSS
-//! receiver with noise, and the V0 firmware (geofence, cue policy, boundary
-//! validation and staging) from op-geo and op-protocol.
+//! receiver with noise, and the firmware (geofence with holes, cue policy with
+//! kinds and episodes, slots and config; see `firmware.rs`) from op-geo and
+//! op-protocol.
 //!
 //! The animal knows nothing about where a boundary is. It grazes, rests and
 //! keeps near its herd; when its own collar cues, it turns away from the
@@ -9,9 +10,11 @@
 
 use chrono::{DateTime, Utc};
 use op_geo::projection::Projection;
-use op_geo::{Cue, CueCommand, CueConfig, Geofence, GeofenceConfig, LonLat};
-use op_protocol::{Ack, AckStatus, BoundaryCommand, VerifyingKey, WireCue, WireFix};
+use op_geo::{CollarLimits, Cue, CueCommand, CueConfig, Geofence, GeofenceConfig, LonLat, Polygon};
+use op_protocol::{Ack, VerifyingKey, WireCue, WireEpisode, WireFix};
 use rand::Rng;
+
+use crate::firmware::Firmware;
 
 /// Width of the warning zone the collars use.
 const WARN_M: f64 = 5.0;
@@ -26,10 +29,20 @@ pub struct Area {
     ring: Vec<LonLat>,
 }
 
+/// Room for any shape: an area takes a boundary as the collar holds it.
+const ANY: CollarLimits = CollarLimits { outer: 1 << 20, holes: 1 << 12, hole_vertices: 1 << 20, total: 1 << 22, slots: 1, slot_bytes: 0 };
+
 impl Area {
+    /// One ring.
+    #[cfg(test)]
     pub fn new(ring: &[LonLat]) -> Option<Area> {
-        let fence = Geofence::new(GeofenceConfig::default(), ring, 0).ok()?;
-        Some(Area { fence, ring: ring.to_vec() })
+        Self::from_polygon(&Polygon::from_ring(ring.to_vec()))
+    }
+
+    /// An outer ring and holes: inside the ring and outside every hole.
+    pub fn from_polygon(p: &Polygon) -> Option<Area> {
+        let fence = Geofence::from_polygon(GeofenceConfig::default(), p, 0, &ANY).ok()?;
+        Some(Area { fence, ring: p.outer_ring() })
     }
 
     /// Signed distance to the edge in metres, + inside.
@@ -231,86 +244,97 @@ pub fn gnss_fix<R: Rng + ?Sized>(truth: LonLat, at: DateTime<Utc>, rng: &mut R) 
     })
 }
 
-/// Check a downloaded boundary is signed by our server and meant for this
-/// collar's herd, then parse it.
-pub fn accept(raw: &serde_json::Value, server_key: &VerifyingKey, herd_id: &str) -> anyhow::Result<BoundaryCommand> {
-    op_protocol::verify_json(raw, server_key)?;
-    let cmd: BoundaryCommand = serde_json::from_value(raw.clone())?;
-    cmd.check_herd(herd_id)?;
-    Ok(cmd)
-}
-
+/// The fence the collar enforces for the boundary it holds.
 struct Held {
-    cmd: BoundaryCommand,
+    version: u32,
     fence: Geofence,
-    area: Option<Area>,
+    area: Area,
 }
 
-/// An emulated V0 collar on an animal.
+/// An emulated collar on an animal: the animal, its GNSS receiver, and the
+/// firmware (fence, cue policy, slots, config) from op-geo and op-protocol.
 pub struct Collar {
     pub animal: Animal,
     pub battery: f64,
+    pub firmware: Firmware,
     held: Option<Held>,
-    staged: Vec<BoundaryCommand>,
     cue: Cue,
     last_cue: Option<CueCommand>,
     /// The herd's paddock, a wire fence until the first boundary arrives.
     paddock: Option<Area>,
+    /// Episodes that ended, for the next report.
+    episodes: Vec<WireEpisode>,
+    /// Fix attempts and fixes got since the last report.
+    pub fix_attempts: u32,
+    pub fix_ok: u32,
 }
 
 /// Battery drain per hour.
 const DRAIN_PER_HOUR: f64 = 0.004;
 
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
 impl Collar {
-    pub fn new(animal: Animal, battery: f64, paddock: Option<Area>) -> Collar {
-        Collar { animal, battery, held: None, staged: Vec::new(), cue: Cue::new(CueConfig::default()), last_cue: None, paddock }
+    pub fn new(animal: Animal, battery: f64, paddock: Option<Area>, firmware: Firmware) -> Collar {
+        Collar {
+            animal,
+            battery,
+            firmware,
+            held: None,
+            cue: Cue::new(CueConfig::default()),
+            last_cue: None,
+            paddock,
+            episodes: Vec::new(),
+            fix_attempts: 0,
+            fix_ok: 0,
+        }
     }
 
     /// The fence being enforced.
     pub fn held_version(&self) -> Option<u32> {
-        self.held.as_ref().map(|h| h.cmd.version)
+        self.firmware.active_version()
     }
 
-    /// Newest version held or staged: what the collar asks the server past.
-    pub fn have(&self) -> u32 {
-        self.staged.iter().map(|c| c.version).chain(self.held_version()).max().unwrap_or(0)
+    /// A downloaded command (raw bytes): checked and offered to the slots.
+    pub fn offer(&mut self, wire: &[u8], server_key: &VerifyingKey, now: DateTime<Utc>) -> Option<Ack> {
+        let a = self.firmware.receive(wire, server_key, now);
+        self.follow(now);
+        a
     }
 
-    /// Validate as the firmware does, then apply now or stage for
-    /// `effective_at`. `None` for a boundary already held or staged.
-    pub fn offer(&mut self, cmd: BoundaryCommand, now: DateTime<Utc>) -> Option<Ack> {
-        if self.held_version() == Some(cmd.version) || self.staged.iter().any(|s| s.version == cmd.version) {
-            return None;
+    /// Swap the fence when the slots changed the boundary in effect. As the
+    /// firmware: unarmed until the next inside fix; a running episode ends
+    /// as `boundary_changed`.
+    fn follow(&mut self, now: DateTime<Utc>) {
+        let Some(cmd) = self.firmware.active().cloned() else { return };
+        if self.held.as_ref().is_some_and(|h| h.version == cmd.version) {
+            return;
         }
-        let ack = |status, reason: Option<String>| Ack {
-            collar_id: None,
-            command_id: cmd.command_id.clone(),
-            version: cmd.version,
-            status,
-            reason,
-            at: now,
-            ..Default::default()
+        let old = self.held.as_ref().map(|h| h.version);
+        let fence = if self.firmware.profile.is_legacy() {
+            cmd.geofence(GeofenceConfig::default())
+        } else {
+            cmd.fence(GeofenceConfig::default(), &self.firmware.profile.limits())
         };
-        if let Err(e) = cmd.validate(self.held_version()).and_then(|_| cmd.geofence(GeofenceConfig::default()).map(|_| ())) {
-            return Some(ack(AckStatus::Rejected, Some(e.to_string())));
-        }
-        if cmd.effective_at.is_some_and(|t| t > now) {
-            let a = ack(AckStatus::Received, None);
-            self.staged.push(cmd);
-            self.staged.sort_by_key(|c| c.version);
-            return Some(a);
-        }
-        let a = ack(AckStatus::Applied, None);
-        self.apply(cmd);
-        Some(a)
+        let (Ok(fence), Some(area)) = (fence, Area::from_polygon(&cmd.polygon())) else { return };
+        self.cue.rearm_at(now.timestamp_millis());
+        self.cue.set_mode(cmd.cue_mode);
+        self.collect_episodes(old);
+        self.held = Some(Held { version: cmd.version, fence, area });
     }
 
-    fn apply(&mut self, cmd: BoundaryCommand) {
-        let Ok(fence) = cmd.geofence(GeofenceConfig::default()) else { return };
-        self.staged.retain(|s| s.version > cmd.version);
-        self.held = Some(Held { area: Area::new(&cmd.boundary), cmd, fence });
-        // As the firmware: unarmed until the next inside fix.
-        self.cue.rearm();
+    fn collect_episodes(&mut self, version: Option<u32>) {
+        let eps = self.cue.take_episodes();
+        if !self.firmware.profile.is_legacy() {
+            self.episodes.extend(eps.iter().filter_map(|e| WireEpisode::from_episode(e, version)));
+        }
+    }
+
+    /// Episodes for the next report (none from firmware 0.1).
+    pub fn take_episodes(&mut self) -> Vec<WireEpisode> {
+        std::mem::take(&mut self.episodes)
     }
 
     /// The fence state at the last fix under the held boundary.
@@ -319,41 +343,48 @@ impl Collar {
         self.held.as_ref().map(|h| h.fence.state())
     }
 
-    /// Apply staged boundaries whose time has come.
-    pub fn apply_due(&mut self, now: DateTime<Utc>) -> Vec<Ack> {
-        let due: Vec<BoundaryCommand> = self.staged.iter().filter(|c| c.effective_at.is_none_or(|t| t <= now)).cloned().collect();
-        due.into_iter()
-            .map(|cmd| {
-                let a = Ack {
-                    collar_id: None,
-                    command_id: cmd.command_id.clone(),
-                    version: cmd.version,
-                    status: AckStatus::Applied,
-                    reason: None,
-                    at: now,
-                    ..Default::default()
-                };
-                self.apply(cmd);
-                a
-            })
-            .collect()
-    }
-
-    /// Move `dt` seconds, take a fix, run the fence and the cue policy.
+    /// Move `dt` seconds, take a fix, apply any staged boundary that is due
+    /// on the fix's time, run the fence and the cue policy.
     pub fn tick<R: Rng + ?Sized>(&mut self, now: DateTime<Utc>, dt: f64, herd: Option<Herd>, rng: &mut R) -> (Option<WireFix>, Option<WireCue>) {
-        let fence = self.held.as_ref().and_then(|h| h.area.as_ref());
+        let fence = self.held.as_ref().map(|h| &h.area);
         let wall = if self.held.is_none() { self.paddock.as_ref() } else { None };
         self.animal.step(dt, fence, wall, herd, self.last_cue.take(), rng);
         self.battery = (self.battery - DRAIN_PER_HOUR * dt / 3600.0).max(0.0);
-        let Some(fix) = gnss_fix(self.animal.pos, now, rng) else { return (None, None) };
+        self.fix_attempts += 1;
+        let Some(mut fix) = gnss_fix(self.animal.pos, now, rng) else { return (None, None) };
+        self.fix_ok += 1;
+        if self.firmware.tick(fix.at).is_some() {
+            self.follow(fix.at);
+        }
+        let legacy = self.firmware.profile.is_legacy();
+        if !legacy {
+            fix.hdop = Some(round1(fix.accuracy_m / 2.0));
+            fix.boundary_version = self.held.as_ref().map(|h| h.version);
+        }
         let mut cue = None;
         if let Some(h) = self.held.as_mut() {
             let r = h.fence.update(fix.point, fix.accuracy_m);
             let c = self.cue.update(&r, h.fence.config().warn_m, now.timestamp_millis());
             if c.active {
-                cue = Some(WireCue { at: now, level: c.volume, margin_m: (r.margin_m * 10.0).round() / 10.0, point: Some(fix.point), ..Default::default() });
+                let margin_m = round1(r.margin_m);
+                cue = Some(if legacy {
+                    WireCue { at: now, level: c.volume, margin_m, point: Some(fix.point), ..Default::default() }
+                } else {
+                    WireCue {
+                        at: now,
+                        kind: c.kind,
+                        level: c.volume,
+                        dur_ms: Some(u32::from(c.duration_ms)),
+                        margin_m,
+                        ring: u16::try_from(r.nearest_ring).ok(),
+                        boundary_version: Some(h.version),
+                        point: Some(fix.point),
+                    }
+                });
                 self.last_cue = Some(c);
             }
+            let version = Some(h.version);
+            self.collect_episodes(version);
         }
         (Some(fix), cue)
     }
@@ -362,8 +393,10 @@ impl Collar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::firmware::Profile;
     use op_geo::Polygon;
     use op_geo::projection::distance_m;
+    use op_protocol::{AckStatus, BoundaryCommand};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -375,14 +408,30 @@ mod tests {
         vec![p.offset(e, n), p.offset(e + w, n), p.offset(e + w, n + h), p.offset(e, n + h)]
     }
 
-    fn cmd(id: &str, version: u32, ring: Vec<LonLat>, effective_at: Option<DateTime<Utc>>) -> BoundaryCommand {
-        BoundaryCommand::from_polygon(id, version, &Polygon::from_ring(ring), effective_at).unwrap()
+    fn server() -> op_protocol::SigningKey {
+        op_protocol::SigningKey::from_bytes(&[9; 32])
+    }
+
+    /// Signed wire bytes for the herd, as the server sends them.
+    fn wire(version: u32, outer: Vec<LonLat>, holes: Vec<Vec<LonLat>>, effective_at: Option<DateTime<Utc>>) -> Vec<u8> {
+        let mut c = BoundaryCommand::from_shape(format!("bnd_{version}"), version, &Polygon::from_rings(outer, holes), effective_at).unwrap();
+        c.herd_id = Some("herd_a".into());
+        op_protocol::sign_command(&mut c, &server());
+        serde_json::to_vec(&c).unwrap()
+    }
+
+    fn firmware(p: Profile, i: usize) -> Firmware {
+        Firmware::new(p, "herd_a", &format!("col_{i}"), "https://farm.example.com/collar/v1")
     }
 
     fn herd(ring: &[LonLat], n: usize, rng: &mut StdRng) -> Vec<Collar> {
         let area = Area::new(ring).unwrap();
         let p = Projection::new(area.interior());
-        (0..n).map(|i| Collar::new(Animal::new(p.offset(10.0 * normal(rng), 10.0 * normal(rng)), i % 4 == 3, rng), 0.9, Some(area.clone()))).collect()
+        (0..n)
+            .map(|i| {
+                Collar::new(Animal::new(p.offset(10.0 * normal(rng), 10.0 * normal(rng)), i % 4 == 3, rng), 0.9, Some(area.clone()), firmware(Profile::V0, i))
+            })
+            .collect()
     }
 
     fn view(h: &[Collar], skip: usize) -> Option<Herd> {
@@ -395,7 +444,6 @@ mod tests {
         for i in 0..h.len() {
             let v = view(h, i);
             cues += h[i].tick(now, dt, v, rng).1.is_some() as usize;
-            h[i].apply_due(now);
         }
         cues
     }
@@ -411,8 +459,9 @@ mod tests {
         (inside as f64 / (steps * h.len()) as f64, cues)
     }
 
-    fn offer_all(h: &mut [Collar], c: BoundaryCommand, now: DateTime<Utc>) {
-        h.iter_mut().for_each(|x| drop(x.offer(c.clone(), now)));
+    fn offer_all(h: &mut [Collar], w: &[u8], now: DateTime<Utc>) {
+        let k = server().verifying_key();
+        h.iter_mut().for_each(|x| drop(x.offer(w, &k, now)));
     }
 
     #[test]
@@ -422,7 +471,7 @@ mod tests {
         let mut h = herd(&ring, 8, &mut rng);
         let t0 = Utc::now();
         for c in &mut h {
-            assert_eq!(c.offer(cmd("bnd_1", 1, ring.clone(), None), t0).unwrap().status, AckStatus::Applied);
+            assert_eq!(c.offer(&wire(1, ring.clone(), vec![], None), &server().verifying_key(), t0).unwrap().status, AckStatus::Applied);
         }
         let (inside, cues) = run(&mut h, &ring, t0, 1440, &mut rng);
         assert!(inside > 0.9, "inside {inside}");
@@ -430,6 +479,10 @@ mod tests {
         let c = Herd::of(h.iter().map(|a| (a.animal.pos, a.animal.vel))).unwrap().centre;
         assert!(h.iter().all(|a| distance_m(a.animal.pos, c) < 80.0), "a loose herd, not scattered");
         assert!(h.iter().all(|c| (0.85..0.9).contains(&c.battery)));
+        // Firmware 0.2 reports episodes of the cues it played, under the boundary held.
+        let eps: Vec<WireEpisode> = h.iter_mut().flat_map(|c| c.take_episodes()).collect();
+        assert!(!eps.is_empty());
+        assert!(eps.iter().all(|e| e.boundary_version == Some(1) && e.cues >= 1));
     }
 
     #[test]
@@ -467,10 +520,10 @@ mod tests {
         let (old, new) = (rect(0.0, 0.0, 100.0, 100.0), rect(130.0, 0.0, 100.0, 100.0));
         let mut h = herd(&old, 6, &mut rng);
         let t0 = Utc::now();
-        offer_all(&mut h, cmd("b1", 1, old.clone(), None), t0);
+        offer_all(&mut h, &wire(1, old.clone(), vec![], None), t0);
         run(&mut h, &old, t0, 60, &mut rng);
         let t1 = t0 + chrono::Duration::minutes(5);
-        offer_all(&mut h, cmd("b2", 2, new.clone(), None), t1);
+        offer_all(&mut h, &wire(2, new.clone(), vec![], None), t1);
         let area = Area::new(&new).unwrap();
         for s in 0..360 {
             let before: Vec<LonLat> = h.iter().map(|c| c.animal.pos).collect();
@@ -500,10 +553,13 @@ mod tests {
         };
         let p = Projection::new(O);
         let mut h: Vec<Collar> = (0..5)
-            .map(|i| Collar::new(Animal::new(p.offset(40.0 + 6.0 * normal(&mut rng), 50.0 + 6.0 * normal(&mut rng)), i == 4, &mut rng), 0.9, None))
+            .map(|i| {
+                let a = Animal::new(p.offset(40.0 + 6.0 * normal(&mut rng), 50.0 + 6.0 * normal(&mut rng)), i == 4, &mut rng);
+                Collar::new(a, 0.9, None, firmware(Profile::V0, i))
+            })
             .collect();
         let t0 = Utc::now();
-        offer_all(&mut h, cmd("b0", 1, field, None), t0);
+        offer_all(&mut h, &wire(1, field, vec![], None), t0);
         let (mut k, mut last_step, mut waiting_since) = (0, 0, 0);
         let mut stragglers = vec![false; h.len()];
         for s in 1..=(90 * 12) {
@@ -518,7 +574,7 @@ mod tests {
             if behind.is_empty() && secs - last_step >= 30 {
                 k += 1;
                 (last_step, waiting_since) = (secs, secs);
-                offer_all(&mut h, cmd(&format!("b{k}"), k as u32 + 1, step(k), None), t0 + chrono::Duration::seconds(secs));
+                offer_all(&mut h, &wire(k as u32 + 1, step(k), vec![], None), t0 + chrono::Duration::seconds(secs));
             } else if !behind.is_empty() && secs - waiting_since >= 300 {
                 behind.iter().for_each(|&i| stragglers[i] = true);
             }
@@ -533,46 +589,49 @@ mod tests {
     }
 
     #[test]
-    fn staging_versions_and_rejects() {
-        let mut rng = StdRng::seed_from_u64(1);
-        let ring = rect(0.0, 0.0, 100.0, 100.0);
-        let mut c = Collar::new(Animal::new(O, false, &mut rng), 1.0, None);
+    fn a_hole_is_a_crossing_and_the_fence_knows_the_ring() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let p = Projection::new(O);
+        let pond = rect(60.0, 40.0, 30.0, 30.0);
+        let mut c = Collar::new(Animal::new(p.offset(50.0, 55.0), false, &mut rng), 0.9, None, firmware(Profile::V0, 0));
         let t0 = Utc::now();
-        assert_eq!(c.offer(cmd("b1", 1, ring.clone(), None), t0).unwrap().status, AckStatus::Applied);
-        assert!(c.offer(cmd("b1", 1, ring.clone(), None), t0).is_none());
-
-        let later = t0 + chrono::Duration::seconds(60);
-        assert_eq!(c.offer(cmd("b2", 2, rect(10.0, 0.0, 100.0, 100.0), Some(later)), t0).unwrap().status, AckStatus::Received);
-        assert_eq!((c.held_version(), c.have()), (Some(1), 2));
-        assert!(c.apply_due(t0 + chrono::Duration::seconds(30)).is_empty());
-        let acks = c.apply_due(later + chrono::Duration::seconds(1));
-        assert_eq!((acks.len(), acks[0].version, acks[0].status), (1, 2, AckStatus::Applied));
-        assert_eq!(c.held_version(), Some(2));
-
-        let mut bad = cmd("b3", 3, ring.clone(), None);
-        bad.boundary.truncate(2);
-        let a = c.offer(bad, later).unwrap();
+        c.offer(&wire(1, rect(0.0, 0.0, 150.0, 120.0), vec![pond.clone()], None), &server().verifying_key(), t0).unwrap();
+        // Walked into the pond: outside, cued with the outside tone about ring 1.
+        let steps = [[50.0, 55.0], [56.0, 55.0], [75.0, 55.0]];
+        let mut last = None;
+        for (i, at) in steps.iter().enumerate() {
+            c.animal.pos = p.offset(at[0], at[1]);
+            let h = c.held.as_mut().unwrap();
+            let r = h.fence.update(c.animal.pos, 1.0);
+            last = Some((r, c.cue.update(&r, 5.0, (t0 + chrono::Duration::seconds(5 * i as i64)).timestamp_millis())));
+        }
+        let (r, cmd) = last.unwrap();
+        assert_eq!((r.state, r.nearest_ring), (op_geo::GeofenceState::Outside, 1));
+        assert_eq!((cmd.active, cmd.kind), (true, Some(op_geo::CueKind::Outside)));
+        // The same boundary without the hole on a legacy collar: refused (no holes there).
+        let mut l = Collar::new(Animal::new(p.offset(50.0, 55.0), false, &mut rng), 0.9, None, firmware(Profile::Legacy, 1));
+        let a = l.offer(&wire(1, rect(0.0, 0.0, 150.0, 120.0), vec![pond], None), &server().verifying_key(), t0).unwrap();
         assert_eq!(a.status, AckStatus::Rejected);
-        assert!(a.reason.is_some());
-        let a = c.offer(cmd("b0", 1, ring, None), later);
-        assert!(a.is_some_and(|a| a.status == AckStatus::Rejected), "older than held");
-        assert_eq!(c.held_version(), Some(2));
+        assert!(l.held_version().is_none());
     }
 
     #[test]
-    fn only_boundaries_signed_by_our_server() {
-        let server = op_protocol::generate_signing_key();
-        let mut c = cmd("b1", 1, rect(0.0, 0.0, 100.0, 100.0), None);
-        op_protocol::sign_command(&mut c, &server);
-        c.herd_id = Some("herd_a".into());
-        op_protocol::sign_command(&mut c, &server);
-        let raw = serde_json::to_value(&c).unwrap();
-        assert_eq!(accept(&raw, &server.verifying_key(), "herd_a").unwrap().version, 1);
-        assert!(accept(&raw, &op_protocol::generate_signing_key().verifying_key(), "herd_a").is_err());
-        assert!(accept(&raw, &server.verifying_key(), "herd_b").is_err(), "another herd's boundary");
-        let mut tampered = raw.clone();
-        tampered["version"] = 2.into();
-        assert!(accept(&tampered, &server.verifying_key(), "herd_a").is_err());
+    fn staged_boundaries_apply_on_the_collars_own_clock() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let ring = rect(0.0, 0.0, 120.0, 90.0);
+        let mut h = herd(&ring, 1, &mut rng);
+        let t0 = op_protocol::wire_time::trunc_secs(Utc::now());
+        let k = server().verifying_key();
+        h[0].offer(&wire(1, ring.clone(), vec![], None), &k, t0);
+        h[0].offer(&wire(2, rect(0.0, 0.0, 110.0, 90.0), vec![], Some(t0 + chrono::Duration::seconds(60))), &k, t0);
+        assert_eq!((h[0].held_version(), h[0].firmware.staged()), (Some(1), vec![2]));
+        // No server in sight: fixes every 5 s apply it at its time.
+        for s in 1..=14 {
+            tick_all(&mut h, t0 + chrono::Duration::seconds(5 * s), 5.0, &mut rng);
+        }
+        assert_eq!(h[0].held_version(), Some(2));
+        let applied = h[0].firmware.pending_acks().iter().find(|a| a.version == 2 && a.status == AckStatus::Applied).unwrap().clone();
+        assert!(applied.at >= t0 + chrono::Duration::seconds(60) && applied.at <= t0 + chrono::Duration::seconds(66), "{}", applied.at);
     }
 
     #[test]

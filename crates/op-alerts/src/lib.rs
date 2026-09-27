@@ -9,7 +9,14 @@
 // @E-srv
 // @J
 // @A-engine
+pub mod alerts_api;
+pub mod engine;
+pub mod routing;
+pub mod rules;
+pub mod text;
 // @A-notify
+pub mod hosting;
+pub mod notify;
 // @D
 // @K-animals
 // @K-files
@@ -41,7 +48,10 @@ pub fn router() -> axum::Router<Ctx> {
         // @E-srv
         // @J
         // @A-engine
+        alerts_api::router(),
         // @A-notify
+        notify::api::router(),
+        hosting::router(),
         // @D
         // @K-animals
         // @K-files
@@ -73,7 +83,9 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @E-srv
     // @J
     // @A-engine
+    engine::start(ctx.clone());
     // @A-notify
+    notify::sender::spawn(ctx.clone()).await?;
     // @D
     // @K-animals
     // @K-files
@@ -107,6 +119,9 @@ fn tools() -> Vec<ToolSpec> {
         // @E-srv
         // @J
         // @A-engine
+        alerts_api::list_alerts_tool(),
+        alerts_api::ack_alert_tool(),
+        alerts_api::resolve_alert_tool(),
         // @A-notify
         // @D
         // @K-animals

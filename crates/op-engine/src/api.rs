@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use op_core::{ApiError, ApiJson, ApiResult, Ctx, Decision, Polygon};
+use op_core::{ApiError, ApiJson, ApiResult, Ctx, Decision, Identity, Polygon, Role};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -51,8 +51,10 @@ struct RespondBody {
     note: Option<String>,
 }
 
-async fn respond(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(b): ApiJson<RespondBody>) -> ApiResult<Json<Decision>> {
-    Ok(Json(cycle::respond(&ctx, &id, b.action, b.geometry, b.note).await?))
+/// Managers and up answer; the caller is recorded as the responder.
+async fn respond(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>, ApiJson(b): ApiJson<RespondBody>) -> ApiResult<Json<Decision>> {
+    identity.require(Role::Manager)?;
+    Ok(Json(cycle::respond(&ctx, &id, b.action, b.geometry, b.note, identity.actor()).await?))
 }
 
 #[derive(Deserialize)]

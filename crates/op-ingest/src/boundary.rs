@@ -10,19 +10,21 @@ use chrono::{DateTime, Utc};
 use op_core::store::decision_from_row;
 use op_core::time::{now, to_db};
 use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Boundary, BoundaryStatus, Ctx, Event, Move, ProposedBoundary, id};
-use op_geo::{GeofenceConfig, Polygon};
-use op_protocol::{BoundaryCommand, sign_command, wire_time};
+use op_geo::Polygon;
+use op_protocol::wire_time;
 use serde::Deserialize;
 
-use crate::db;
 use crate::moves::{self, FarmerDecision};
+use crate::shape::{Prepared, prepare};
+use crate::{db, slots};
 
 pub fn router() -> Router<Ctx> {
     Router::new().route("/api/herds/{id}/boundary", get(get_status).post(post_boundary))
 }
 
-/// Options for [`send_boundary`]. Missing margins use the firmware defaults
-/// (warn 5 m, hysteresis 1 m). `effective_at` in the future stages the boundary.
+/// Options for [`send_boundary`]. Missing margins come from
+/// [`crate::margins::default_margins`] (the firmware defaults, warn 5 m and
+/// hysteresis 1 m). `effective_at` in the future stages the boundary.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SendOpts {
     pub warn_m: Option<f64>,
@@ -38,28 +40,11 @@ pub async fn send_boundary(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: Se
     send(ctx, herd_id, geometry, opts, decision_id).await.map_err(|e| anyhow::anyhow!(e.message))
 }
 
-/// Check a boundary before anything is recorded. Returns the normalised
-/// geometry and margins.
-pub(crate) fn check(geometry: &Polygon, opts: &SendOpts) -> ApiResult<(Polygon, f64, f64)> {
-    let geometry = geometry.validated()?;
-    // What a collar will check: 3-64 vertices, ranges, no crossings, no holes.
-    BoundaryCommand::from_polygon("check", 1, &geometry, None)?;
-    let d = GeofenceConfig::default();
-    let warn_m = opts.warn_m.unwrap_or(d.warn_m);
-    let hysteresis_m = opts.hysteresis_m.unwrap_or(d.hysteresis_m);
-    for (v, name) in [(warn_m, "warn_m"), (hysteresis_m, "hysteresis_m")] {
-        if !v.is_finite() || !(0.0..=1000.0).contains(&v) {
-            return Err(ApiError::bad_request(format!("{name} must be between 0 and 1000 metres.")));
-        }
-    }
-    Ok((geometry, warn_m, hysteresis_m))
-}
-
 async fn send(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: SendOpts, decision_id: &str) -> ApiResult<Boundary> {
     if ctx.store().get_herd(herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
-    let (geometry, warn_m, hysteresis_m) = check(&geometry, &opts)?;
+    let Prepared { geometry, warn_m, hysteresis_m, .. } = prepare(ctx, herd_id, &geometry, &opts).await?;
     let created_at = now();
     // Wire times are whole seconds; a time already past means now.
     let effective_at = opts.effective_at.map(wire_time::trunc_secs).filter(|t| *t > created_at);
@@ -91,13 +76,15 @@ pub(crate) struct NewBoundary<'a> {
 /// boundary newer than what it holds. The caller holds a write transaction.
 pub(crate) async fn insert_boundary(tx: &mut sqlx::SqliteConnection, b: &NewBoundary<'_>) -> ApiResult<Boundary> {
     let id = id::new_id(id::BOUNDARY);
+    // The next version comes from the version index (db::sql::NEXT_VERSION).
+    let (next,): (i64,) = sqlx::query_as(db::sql::NEXT_VERSION).fetch_one(&mut *tx).await?;
     let (version,): (i64,) = sqlx::query_as(
         "INSERT INTO boundaries (id, herd_id, version, geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at, collar_id, copy_of)
-         SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM boundaries
-         RETURNING version",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING version",
     )
     .bind(&id)
     .bind(b.herd_id)
+    .bind(next)
     .bind(serde_json::to_string(b.geometry).map_err(anyhow::Error::from)?)
     .bind(b.warn_m)
     .bind(b.hysteresis_m)
@@ -146,25 +133,44 @@ pub(crate) async fn announce(ctx: &Ctx, boundary: &Boundary) {
 
 /// A collar joined `herd_id` holding `held` from its old herd. If the herd's
 /// boundaries are all at or below that version, the collar would never ask
-/// for them, so they are stored again (same shapes, margins and times) with
-/// new versions. Returns what was re-issued.
+/// for them, so they are stored again (same shapes, margins and times, fitted
+/// again to the herd's collars now that it has joined) with new versions.
+/// Returns what was re-issued.
 pub(crate) async fn reissue_for_moved_collar(ctx: &Ctx, herd_id: &str, held: u32) -> anyhow::Result<Vec<Boundary>> {
-    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version").bind(herd_id).fetch_all(&mut *tx).await?;
-    let all = rows.iter().map(op_core::store::boundary_from_row).collect::<anyhow::Result<Vec<_>>>()?;
-    let split = db::split_boundaries(all, now());
-    let current: Vec<Boundary> = split.active.into_iter().chain(split.staged).collect();
-    if current.last().is_none_or(|b| b.version > held) {
-        return Ok(vec![]);
-    }
+    let versions = |bs: &[Boundary]| bs.iter().map(|b| b.version).collect::<Vec<_>>();
+    let mut attempt = 0;
+    let (mut tx, current, prepared) = loop {
+        let split = db::herd_boundaries(ctx.db(), herd_id, now()).await?;
+        let current: Vec<Boundary> = split.active.into_iter().chain(split.staged).collect();
+        if current.last().is_none_or(|b| b.version > held) {
+            return Ok(vec![]);
+        }
+        let mut prepared = Vec::with_capacity(current.len());
+        for b in &current {
+            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: b.effective_at };
+            prepared.push(prepare(ctx, herd_id, &b.geometry, &opts).await.map_err(|e| anyhow::anyhow!(e.message))?);
+        }
+        // Prepared outside the write lock: go ahead only if nothing was sent meanwhile.
+        let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+        let again = db::herd_boundaries_in(&mut tx, herd_id, now()).await?;
+        let again: Vec<Boundary> = again.active.into_iter().chain(again.staged).collect();
+        if versions(&again) == versions(&current) {
+            break (tx, current, prepared);
+        }
+        tx.rollback().await?;
+        attempt += 1;
+        if attempt >= 3 {
+            anyhow::bail!("the herd's boundaries kept changing");
+        }
+    };
     let created_at = now();
     let mut out = Vec::new();
-    for b in &current {
+    for (b, p) in current.iter().zip(&prepared) {
         let nb = NewBoundary {
             herd_id,
-            geometry: &b.geometry,
-            warn_m: b.warn_m,
-            hysteresis_m: b.hysteresis_m,
+            geometry: &p.geometry,
+            warn_m: p.warn_m,
+            hysteresis_m: p.hysteresis_m,
             effective_at: b.effective_at.filter(|t| *t > created_at),
             decision_id: &b.decision_id,
             created_at,
@@ -220,10 +226,12 @@ pub async fn move_herd_on_record(ctx: &Ctx, herd_id: &str, to: Option<&str>, fro
     Ok(())
 }
 
-/// Active and staged boundaries, the latest proposal awaiting the farmer, and
-/// each collar's latest ack.
+/// Active and staged boundaries, the latest proposal awaiting the farmer,
+/// each collar's latest ack, and how far each version has reached the collars.
 pub async fn boundary_status(ctx: &Ctx, herd_id: &str) -> anyhow::Result<BoundaryStatus> {
     let split = db::herd_boundaries(ctx.db(), herd_id, now()).await?;
+    let versions: Vec<_> = split.active.iter().chain(&split.staged).map(|b| (b.version, b.effective_at)).collect();
+    let slots = slots::counts(ctx.db(), herd_id, &versions).await?;
     let row =
         sqlx::query("SELECT * FROM decisions WHERE herd_id = ? AND status = 'proposed' AND geometry IS NOT NULL ORDER BY created_at DESC, id DESC LIMIT 1")
             .bind(herd_id)
@@ -237,8 +245,8 @@ pub async fn boundary_status(ctx: &Ctx, herd_id: &str) -> anyhow::Result<Boundar
         acks: db::latest_acks(ctx.db(), herd_id).await?,
         r#move: crate::moves::current_move(ctx.db(), herd_id, now()).await?,
         escapes: crate::escapes::current_escapes(ctx.db(), herd_id, now()).await?,
-        staged: vec![],
-        slots: vec![],
+        staged: split.staged,
+        slots,
     })
 }
 
@@ -263,12 +271,12 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     if ctx.store().get_herd(&herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
-    let (geometry, _, _) = check(&body.geometry, &body.opts)?;
+    let prepared = prepare(&ctx, &herd_id, &body.geometry, &body.opts).await?;
     let paddocks = ctx.store().list_paddocks().await?;
-    let to_paddock = geometry.centroid().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
+    let to_paddock = prepared.geometry.centroid().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
     let decision_id = id::new_id(id::DECISION);
     let farmer = FarmerDecision { to_paddock_id: to_paddock.as_deref(), reasoning: "Boundary drawn by the farmer." };
-    let started = moves::begin(&ctx, &herd_id, geometry, body.opts, &decision_id, Some(farmer)).await?;
+    let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer)).await?;
 
     if let Some(r) = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(&decision_id).fetch_optional(ctx.db()).await? {
         ctx.publish(Event::Decision { decision: decision_from_row(&r)? });
@@ -283,19 +291,10 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     Ok((StatusCode::CREATED, Json(started.r#move)))
 }
 
-/// The signed command a collar downloads for a stored boundary. The command
-/// id is the boundary id.
-pub fn command_for(ctx: &Ctx, b: &Boundary) -> ApiResult<BoundaryCommand> {
-    let mut cmd = BoundaryCommand::from_polygon(b.id.clone(), b.version, &b.geometry, b.effective_at)?;
-    cmd.herd_id = Some(b.herd_id.clone());
-    cmd.warn_m = Some(b.warn_m);
-    cmd.hysteresis_m = Some(b.hysteresis_m);
-    sign_command(&mut cmd, ctx.signing_key());
-    Ok(cmd)
-}
-
 /// Publish a `boundary` event when a staged boundary takes effect, so the map
-/// swaps it in without polling.
+/// swaps it in without polling. Looks boundaries up by `effective_at` (an
+/// index); one that died before its time (a higher version took effect
+/// first) is not announced.
 pub fn spawn_activation_watcher(ctx: Ctx) {
     tokio::spawn(async move {
         let mut last = now();
@@ -306,23 +305,27 @@ pub fn spawn_activation_watcher(ctx: Ctx) {
                 _ = tick.tick() => {}
             }
             let t = now();
-            let rows = sqlx::query("SELECT * FROM boundaries WHERE effective_at > ? AND effective_at <= ? AND collar_id IS NULL ORDER BY version")
-                .bind(to_db(&last))
-                .bind(to_db(&t))
-                .fetch_all(ctx.db())
-                .await;
-            last = t;
-            match rows {
-                Ok(rows) => {
-                    for r in rows {
-                        if let Ok(b) = op_core::store::boundary_from_row(&r) {
-                            tracing::info!(herd = %b.herd_id, version = b.version, "staged boundary in effect");
-                            ctx.publish(Event::Boundary { herd_id: b.herd_id.clone(), boundary: b });
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("boundary watcher: {e:#}"),
+            if let Err(e) = announce_activations(&ctx, last, t).await {
+                tracing::warn!("boundary watcher: {e:#}");
             }
+            last = t;
         }
     });
+}
+
+/// Announce herd boundaries whose `effective_at` falls in `(from, to]` and
+/// that are in effect at `to`. Returns what was announced.
+pub async fn announce_activations(ctx: &Ctx, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<Boundary>> {
+    let rows = sqlx::query(db::sql::TAKING_EFFECT).bind(to_db(&from)).bind(to_db(&to)).fetch_all(ctx.db()).await?;
+    let mut out = Vec::new();
+    for r in rows {
+        let b = op_core::store::boundary_from_row(&r)?;
+        let active = db::herd_boundaries(ctx.db(), &b.herd_id, to).await?.active;
+        if active.is_some_and(|a| a.version == b.version) {
+            tracing::info!(herd = %b.herd_id, version = b.version, "staged boundary in effect");
+            ctx.publish(Event::Boundary { herd_id: b.herd_id.clone(), boundary: b.clone() });
+            out.push(b);
+        }
+    }
+    Ok(out)
 }

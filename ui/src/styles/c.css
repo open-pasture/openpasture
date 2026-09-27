@@ -1,0 +1,32 @@
+/* C: strip tool, lasso, paddock sheet layouts */
+
+/* strip tool: the facts line and the footer sections under the bar */
+.cfoot{position:absolute;top:calc(100% + 8px);left:0;width:320px;display:grid;gap:8px;padding:10px 12px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.88);backdrop-filter:blur(6px);animation:fade .15s both}
+.cfoot:empty{display:none}
+.cfoot .cfacts{font-size:12px;color:var(--fg);white-space:pre}
+.cfoot .err{font-size:12px;white-space:normal}
+.cfoot .toolfoot{position:static;width:auto;padding:0;border:0;background:none;backdrop-filter:none;animation:none}
+.toolform.cstrip .seg{padding:2px}
+.toolform.cstrip .seg button{padding:.2rem .6rem}
+.plabel.cstrip{opacity:.55}
+.plabel.cstrip[data-tone=grass]{opacity:1}
+.chandle{width:11px;height:11px;background:var(--fg);box-shadow:0 0 0 2px rgba(11,12,9,.8);cursor:grab}
+.chandle:active{cursor:grabbing}
+
+/* lasso */
+.classo-draw,.classo-draw canvas{cursor:crosshair!important}
+.toolform .cnum{font-size:12px;padding:0 8px;color:var(--fg);white-space:nowrap}
+.toolform .cerr{font-size:12px;padding:0 8px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toolform .btn.busy{opacity:.5;pointer-events:none}
+.sheet:has(.cpicked){width:420px}
+.cpicked{display:grid;gap:8px}
+
+
+/* paddock sheet: saved layouts, copy */
+.clayouts{display:grid;gap:2px}
+.clayouts li{display:flex;align-items:center;gap:6px}
+.clayouts .lname{flex:1;min-width:0;text-align:left;font-size:13px;line-height:20px;padding:5px 8px;margin-left:-8px;border-radius:7px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.clayouts .lname:hover,.clayouts .lname:focus-visible{background:var(--bg2);color:var(--fg);outline:none}
+.clayouts form{flex:1;min-width:0}
+.clayouts .input{padding:4px 8px;font-size:13px}
+.sheet .acts+.ccopy{margin-top:-6px}

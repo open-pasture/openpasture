@@ -29,6 +29,8 @@ pub mod tools;
 // @Q
 pub mod brief;
 // @C
+pub mod layouts;
+pub mod strips;
 // @F
 // @S
 // @A3
@@ -64,6 +66,8 @@ pub fn router() -> axum::Router<Ctx> {
         // @Q
         brief::router(),
         // @C
+        strips::router(),
+        layouts::router(),
         // @F
         // @S
         // @A3

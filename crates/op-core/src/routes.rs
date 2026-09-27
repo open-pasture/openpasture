@@ -54,14 +54,11 @@ async fn require_farm(ctx: &Ctx) -> ApiResult<Farm> {
 
 // State
 
-async fn get_state(State(ctx): State<Ctx>) -> ApiResult<Json<AppState>> {
+async fn get_state(State(ctx): State<Ctx>, identity: crate::Identity) -> ApiResult<Json<AppState>> {
     let store = ctx.store();
-    Ok(Json(AppState {
-        farm: store.get_farm().await?,
-        herds: store.list_herds().await?,
-        paddocks: store.list_paddocks().await?,
-        settings: ctx.settings().await?,
-    }))
+    let mut settings = ctx.settings().await?;
+    crate::people::redact_settings(&identity, &mut settings);
+    Ok(Json(AppState { farm: store.get_farm().await?, herds: store.list_herds().await?, paddocks: store.list_paddocks().await?, settings }))
 }
 
 // Farm
@@ -243,6 +240,10 @@ async fn update_herd(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(bod
     let mut h: Herd = patch::apply(&current, &body, &["id", "created_at"])?;
     h.name = clean_name(&h.name, "The herd")?;
     check_herd(&ctx, &h).await?;
+    // K-animals: once a herd has animals, its count is theirs.
+    if h.count != current.count && crate::animals::herd_has_animals(&ctx, &h.id).await? {
+        return Err(ApiError::bad_request(crate::animals::COUNT_FOLLOWS));
+    }
     ctx.store().update_herd(&h).await?;
     if h.autonomy != current.autonomy || (h.autonomy == Autonomy::Timer && h.timer_minutes != current.timer_minutes) {
         follow_autonomy(&ctx, &h).await?;
@@ -289,6 +290,12 @@ struct NewAnimal {
     name: Option<String>,
     herd_id: String,
     collar_id: Option<String>,
+    // K-animals
+    eid: Option<String>,
+    breed: Option<String>,
+    sex: Option<Sex>,
+    born: Option<chrono::NaiveDate>,
+    notes: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -308,12 +315,16 @@ async fn find_animal(ctx: &Ctx, id: &str) -> ApiResult<Animal> {
     ctx.store().get_animal(id).await?.ok_or_else(|| ApiError::not_found("No such animal."))
 }
 
-async fn check_animal(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
+async fn check_animal(ctx: &Ctx, a: &Animal, before: Option<&Animal>) -> ApiResult<()> {
     if a.tag.trim().is_empty() {
         return Err(ApiError::bad_request("The animal needs a tag."));
     }
     if ctx.store().get_herd(&a.herd_id).await?.is_none() {
         return Err(ApiError::bad_request("No such herd."));
+    }
+    crate::animals::check_unique(ctx, a, before).await?;
+    if a.removed_at.is_some() && a.collar_id.is_some() {
+        return Err(ApiError::bad_request(format!("{} is no longer on the farm.", a.tag)));
     }
     if let Some(c) = &a.collar_id {
         if !ctx.store().collar_exists(c).await? {
@@ -329,16 +340,23 @@ async fn check_animal(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
 }
 
 async fn create_animal(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewAnimal>) -> ApiResult<(StatusCode, Json<Animal>)> {
-    let animal = Animal {
+    let mut animal = Animal {
         id: id::new_id(id::ANIMAL),
         tag: body.tag.trim().to_owned(),
         name: body.name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()),
         herd_id: body.herd_id,
         collar_id: body.collar_id.filter(|c| !c.is_empty()),
+        eid: body.eid,
+        breed: body.breed,
+        sex: body.sex,
+        born: body.born,
+        notes: body.notes,
         ..Default::default()
     };
-    check_animal(&ctx, &animal).await?;
+    crate::animals::tidy(&mut animal)?;
+    check_animal(&ctx, &animal, None).await?;
     ctx.store().insert_animal(&animal).await?;
+    animals_changed(&ctx, &[&animal.herd_id]).await?;
     Ok((StatusCode::CREATED, Json(animal)))
 }
 
@@ -347,22 +365,45 @@ async fn update_animal(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(b
     // Removal has its own route (it also unlinks and parks the collar).
     let mut a: Animal = patch::apply(&current, &body, &["id", "removed_at", "removed_reason"])?;
     a.tag = a.tag.trim().to_owned();
-    check_animal(&ctx, &a).await?;
+    crate::animals::tidy(&mut a)?;
+    check_animal(&ctx, &a, Some(&current)).await?;
     ctx.store().update_animal(&a).await?;
+    animals_changed(&ctx, &[&current.herd_id, &a.herd_id]).await?;
     Ok(Json(a))
 }
 
 async fn delete_animal(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let herd_id = ctx.store().get_animal(&id).await?.map(|a| a.herd_id);
     if !ctx.store().delete_animal(&id).await? {
         return Err(ApiError::not_found("No such animal."));
+    }
+    if let Some(h) = herd_id {
+        animals_changed(&ctx, &[&h]).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// K-animals: after animals change, each herd's count follows its animals and
+/// live clients hear about it.
+async fn animals_changed(ctx: &Ctx, herds: &[&String]) -> ApiResult<()> {
+    let mut seen: Vec<&String> = Vec::new();
+    for h in herds {
+        if seen.contains(h) {
+            continue;
+        }
+        seen.push(h);
+        crate::animals::sync_herd_count(ctx.db(), h).await?;
+        ctx.publish(crate::Event::AnimalsChanged { herd_id: Some((*h).clone()) });
+    }
+    Ok(())
+}
+
 // Settings
 
-async fn get_settings(State(ctx): State<Ctx>) -> ApiResult<Json<Settings>> {
-    Ok(Json(ctx.settings().await?))
+async fn get_settings(State(ctx): State<Ctx>, identity: crate::Identity) -> ApiResult<Json<Settings>> {
+    let mut settings = ctx.settings().await?;
+    crate::people::redact_settings(&identity, &mut settings);
+    Ok(Json(settings))
 }
 
 async fn put_settings(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Settings>> {

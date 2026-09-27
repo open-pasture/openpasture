@@ -43,7 +43,7 @@ pub fn decision_schema() -> Value {
                         }
                     }
                 ],
-                "description": "Only for MOVE with a custom boundary: a GeoJSON Polygon, [longitude, latitude], at most 64 corners. Null to use the paddock's own shape."
+                "description": "Only for MOVE with a custom boundary: a GeoJSON Polygon, [longitude, latitude], at most 128 corners. Null to use the paddock's own shape."
             },
             "reasoning": {
                 "type": "string",

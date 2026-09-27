@@ -474,7 +474,7 @@ async fn reject_racing_the_timer_never_sends_a_rejected_decision() {
             .unwrap();
         let ctx = t.ctx.clone();
         let timer = tokio::spawn(async move { cycle::apply_due(&ctx).await.unwrap() });
-        let reject = cycle::respond(&t.ctx, &d.id, cycle::Response::Reject, None, None).await;
+        let reject = cycle::respond(&t.ctx, &d.id, cycle::Response::Reject, None, None, op_core::Identity::owner(op_core::Via::Local).actor()).await;
         timer.await.unwrap();
         let now = db::get(&t.ctx, &d.id).await.unwrap().unwrap();
         match reject {

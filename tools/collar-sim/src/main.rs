@@ -2,7 +2,16 @@
 //! real collars report. It links collars through the public app API like a
 //! person would, then runs each one as a device over the real collar
 //! endpoints with its own key: fix batches, signed boundary downloads, acks.
+//!
+//! `--caps v0` (the default) and `--caps v1` run firmware 0.2 (protocol v1):
+//! a `device` block and the slot list in every report, `free`/`free_bytes`
+//! on downloads, holes, cue kinds and episodes, and the signed config from
+//! the report reply (report and poll cadence, fast mode until its GNSS time,
+//! herd, endpoint). `--caps legacy` runs firmware 0.1. Staged boundaries
+//! apply on each collar's own clock, and acks are kept until the server
+//! takes them, so a collar cut off from the server behaves as in the field.
 
+mod firmware;
 mod herd;
 
 use std::collections::HashMap;
@@ -11,10 +20,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use clap::Parser;
+use firmware::{Firmware, Profile};
 use op_geo::LonLat;
 use op_geo::projection::Projection;
-use op_protocol::{Ack, PositionReport, VerifyingKey, WireCue, WireFix};
+use op_protocol::{Health, PositionReport, VerifyingKey, WireCue, WireEpisode, WireFix};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -43,9 +54,13 @@ struct Args {
     /// Seconds between fixes.
     #[arg(long, default_value_t = 5)]
     fix_secs: u64,
-    /// Fixes per report.
+    /// Fixes per report, until a config sets the cadence (legacy: always).
     #[arg(long, default_value_t = 2)]
     batch: u32,
+    /// Firmware the collars run: v0 or v1 (0.2, protocol v1, with V0 or V1
+    /// limits) or legacy (0.1: one ring of 64 corners, no config).
+    #[arg(long, value_enum, default_value_t = Profile::V0)]
+    caps: Profile,
 }
 
 /// A collar this tool linked. Keys are only ever shown once, so they live here.
@@ -130,8 +145,8 @@ impl Api {
     }
 }
 
-fn outer_ring(geometry: &Value) -> Option<Vec<LonLat>> {
-    serde_json::from_value::<op_geo::Polygon>(geometry.clone()).ok().map(|p| p.outer_ring())
+fn polygon(geometry: &Value) -> Option<op_geo::Polygon> {
+    serde_json::from_value::<op_geo::Polygon>(geometry.clone()).ok()
 }
 
 #[tokio::main]
@@ -154,15 +169,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Where the animals start, fenced in until the first boundary: the herd's paddock, else
     // the active boundary, else a 150 m square at the farm centre.
-    let paddock = st["paddocks"].as_array().and_then(|ps| ps.iter().find(|p| p["id"] == herd["paddock_id"])).and_then(|p| outer_ring(&p["geometry"]));
+    let paddock = st["paddocks"].as_array().and_then(|ps| ps.iter().find(|p| p["id"] == herd["paddock_id"])).and_then(|p| polygon(&p["geometry"]));
     let status = api.get(&format!("/api/herds/{herd_id}/boundary")).await?;
-    let ring = paddock.or_else(|| outer_ring(&status["active"]["geometry"])).or_else(|| {
+    let shape = paddock.or_else(|| polygon(&status["active"]["geometry"])).or_else(|| {
         farm_center.map(|c| {
             let p = Projection::new(c);
-            vec![p.offset(-75.0, -75.0), p.offset(75.0, -75.0), p.offset(75.0, 75.0), p.offset(-75.0, 75.0)]
+            op_geo::Polygon::from_ring(vec![p.offset(-75.0, -75.0), p.offset(75.0, -75.0), p.offset(75.0, 75.0), p.offset(-75.0, 75.0)])
         })
     });
-    let area = ring.as_deref().and_then(Area::new).context("the herd has no paddock and the farm has no centre")?;
+    let area = shape.as_ref().and_then(Area::from_polygon).context("the herd has no paddock and the farm has no centre")?;
 
     // Reuse collars from earlier runs that still exist; link the rest.
     let path = state_path(&args);
@@ -213,11 +228,11 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     let world: World = Arc::new(Mutex::new(HashMap::new()));
-    println!("running {} collars, a fix every {} s; ctrl-c to stop", mine.len(), args.fix_secs);
+    println!("running {} {:?} collars, a fix every {} s; ctrl-c to stop", mine.len(), args.caps, args.fix_secs);
     let mut tasks = Vec::new();
     for l in mine {
         let start = last.get(&l.collar_id).copied();
-        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1) };
+        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps };
         tasks.push(tokio::spawn(run_collar(l, start, area.clone(), world.clone(), api.http.clone(), cfg)));
     }
     tokio::select! {
@@ -246,6 +261,7 @@ fn herd_view(world: &World, except: &str) -> Option<Herd> {
 struct Run {
     fix_secs: u64,
     batch: u32,
+    profile: Profile,
 }
 
 /// The device side of the protocol for one collar.
@@ -263,8 +279,8 @@ enum Outcome {
 }
 
 impl Device {
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.l.endpoint.trim_end_matches('/'))
+    fn url(&self, fw: &Firmware, path: &str) -> String {
+        format!("{}{path}", fw.endpoint.current.trim_end_matches('/'))
     }
 
     fn outcome(&self, what: &str, res: reqwest::Result<reqwest::Response>) -> (Outcome, Option<reqwest::Response>) {
@@ -280,42 +296,58 @@ impl Device {
         }
     }
 
-    async fn report(&self, rep: &PositionReport) -> Outcome {
-        let res = self.http.post(self.url("/report")).bearer_auth(&self.l.key).json(rep).send().await;
-        self.outcome("report", res).0
+    /// Send a report; the reply (latest version, maybe a config) when it got through.
+    async fn report(&self, fw: &Firmware, rep: &PositionReport) -> (Outcome, Option<Value>) {
+        let res = self.http.post(self.url(fw, "/report")).bearer_auth(&self.l.key).json(rep).send().await;
+        match self.outcome("report", res) {
+            (Outcome::Ok, Some(r)) => (Outcome::Ok, Some(r.json::<Value>().await.unwrap_or(Value::Null))),
+            (o, _) => (o, None),
+        }
     }
 
-    async fn ack(&self, mut a: Ack) -> Outcome {
-        a.collar_id = Some(self.l.collar_id.clone());
-        let res = self.http.post(self.url("/ack")).bearer_auth(&self.l.key).json(&a).send().await;
-        self.outcome("ack", res).0
+    /// Deliver owed acks, oldest first, until one doesn't get through.
+    async fn deliver_acks(&self, fw: &mut Firmware) -> Outcome {
+        while let Some(a) = fw.pending_acks().first().cloned() {
+            let res = self.http.post(self.url(fw, "/ack")).bearer_auth(&self.l.key).json(&a).send().await;
+            match self.outcome("ack", res).0 {
+                Outcome::Ok => fw.ack_done(),
+                o => return o,
+            }
+        }
+        Outcome::Ok
     }
 
-    /// Download, verify and offer every boundary past what the collar has.
-    async fn sync(&self, collar: &mut Collar) -> Outcome {
+    /// Download, verify and offer every boundary past what the collar holds.
+    async fn sync(&self, collar: &mut Collar, now: DateTime<Utc>) -> Outcome {
         for _ in 0..4 {
-            let res = self.http.get(self.url(&format!("/boundary?have={}", collar.have()))).bearer_auth(&self.l.key).send().await;
+            let url = self.url(&collar.firmware, &format!("/boundary?{}", collar.firmware.boundary_query()));
+            let res = self.http.get(url).bearer_auth(&self.l.key).send().await;
             let r = match self.outcome("boundary", res) {
                 (Outcome::Ok, Some(r)) if r.status() == reqwest::StatusCode::OK => r,
                 (Outcome::Ok, _) => return Outcome::Ok,
                 (o, _) => return o,
             };
-            let Ok(raw) = r.json::<Value>().await else { return Outcome::Failed };
-            let cmd = match herd::accept(&raw, &self.server_key, &self.l.herd_id) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("{}: ignored a boundary: {e}", self.l.tag);
-                    return Outcome::Ok;
-                }
+            let Ok(bytes) = r.bytes().await else { return Outcome::Failed };
+            let Some(a) = collar.offer(&bytes, &self.server_key, now) else {
+                eprintln!("{}: ignored a download that names no boundary", self.l.tag);
+                return Outcome::Ok;
             };
-            let Some(a) = collar.offer(cmd, chrono::Utc::now()) else { return Outcome::Ok };
-            println!("{}: boundary v{} {}", self.l.tag, a.version, a.status.as_str());
-            if let o @ (Outcome::Unlinked | Outcome::Failed) = self.ack(a).await {
+            match a.code {
+                Some(code) => println!("{}: boundary v{} {} ({})", self.l.tag, a.version, a.status.as_str(), code.as_str()),
+                None => println!("{}: boundary v{} {}", self.l.tag, a.version, a.status.as_str()),
+            }
+            if let o @ (Outcome::Unlinked | Outcome::Failed) = self.deliver_acks(&mut collar.firmware).await {
                 return o;
             }
         }
         Outcome::Ok
     }
+}
+
+/// Keep the newest `max` entries of a batch the server hasn't taken yet.
+fn cap<T>(v: &mut Vec<T>, max: usize) {
+    let over = v.len().saturating_sub(max);
+    v.drain(..over);
 }
 
 async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, http: reqwest::Client, cfg: Run) {
@@ -329,58 +361,122 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
         if area.margin(p) > 0.0 { p } else { area.interior() }
     });
     let id = l.collar_id.clone();
+    let firmware = Firmware::new(cfg.profile, &l.herd_id, &l.collar_id, &l.endpoint);
     let dev = Device { http, l, server_key };
     let stubborn = rng.gen_bool(0.2);
-    let mut collar = Collar::new(Animal::new(pos, stubborn, &mut rng), rng.gen_range(0.82..1.0), Some(area));
+    let mut collar = Collar::new(Animal::new(pos, stubborn, &mut rng), rng.gen_range(0.82..1.0), Some(area), firmware);
     world.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), (pos, [0.0, 0.0]));
 
     // Stagger so collars don't report in lockstep.
     tokio::time::sleep(Duration::from_millis(rng.gen_range(0..cfg.fix_secs * 1000))).await;
+    let booted = chrono::Utc::now();
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.fix_secs));
-    let (mut fixes, mut cues): (Vec<WireFix>, Vec<WireCue>) = (Vec::new(), Vec::new());
-    let mut n = 0u32;
-    loop {
+    let (mut fixes, mut cues, mut episodes): (Vec<WireFix>, Vec<WireCue>, Vec<WireEpisode>) = (Vec::new(), Vec::new(), Vec::new());
+    // Before a config: a report every `batch` fixes and a poll after it.
+    let every = (cfg.fix_secs * u64::from(cfg.batch)) as i64;
+    let (mut last_report, mut last_poll): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = (None, None);
+    let mut shown: Option<(i64, i64)> = None;
+    'run: loop {
         tick.tick().await;
-        // Receivers time fixes to the second.
+        // Receivers time fixes to the second; this is the collar's GNSS clock.
         let now = op_protocol::wire_time::trunc_secs(chrono::Utc::now());
         let herd = herd_view(&world, &id);
+        let held = collar.held_version();
         let (fix, cue) = collar.tick(now, cfg.fix_secs as f64, herd, &mut rng);
+        if collar.held_version() != held {
+            println!("{}: boundary v{} applied", dev.l.tag, collar.held_version().unwrap_or(0));
+        }
         world.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), (collar.animal.pos, collar.animal.vel));
         fixes.extend(fix);
         cues.extend(cue);
-        for a in collar.apply_due(now) {
-            println!("{}: boundary v{} applied", dev.l.tag, a.version);
-            if let Outcome::Unlinked = dev.ack(a).await {
-                break;
+        episodes.extend(collar.take_episodes());
+
+        let (report_s, poll_s) = collar.firmware.cadence(now).map_or((every, every), |(r, p)| (i64::from(r), i64::from(p)));
+        if shown != Some((report_s, poll_s)) {
+            let fast = collar.firmware.config().and_then(|c| c.fast_until.filter(|t| *t > now).map(|t| format!(" until {}", t.format("%H:%M:%S"))));
+            println!("{}: reporting every {report_s} s, polling every {poll_s} s{}", dev.l.tag, fast.unwrap_or_default());
+            shown = Some((report_s, poll_s));
+        }
+        let due = |last: Option<DateTime<Utc>>, every: i64| last.is_none_or(|t| (now - t).num_seconds() >= every);
+        let mut poll = due(last_poll, poll_s) && last_report.is_some();
+        if due(last_report, report_s) {
+            if let Outcome::Unlinked = dev.deliver_acks(&mut collar.firmware).await {
+                break 'run;
+            }
+            let version = collar.held_version();
+            let legacy = collar.firmware.profile.is_legacy();
+            let device = collar.firmware.device();
+            let rep = PositionReport {
+                collar_id: Some(id.clone()),
+                boundary_version: version,
+                device: device.clone(),
+                slots: collar.firmware.slots(),
+                // A fix's own version only when it differs from the report's.
+                fixes: fixes
+                    .iter()
+                    .cloned()
+                    .map(|mut f| {
+                        if f.boundary_version == version {
+                            f.boundary_version = None;
+                        }
+                        f
+                    })
+                    .collect(),
+                cues: cues.clone(),
+                episodes: episodes.clone(),
+                battery: Some((collar.battery * 1000.0).round() / 1000.0),
+                health: (!legacy).then(|| Health {
+                    fix_attempts: Some(collar.fix_attempts),
+                    fix_ok: Some(collar.fix_ok),
+                    uptime_s: Some((now - booted).num_seconds().max(0) as u64),
+                    ..Default::default()
+                }),
+            };
+            last_report = Some(now);
+            match dev.report(&collar.firmware, &rep).await {
+                (Outcome::Ok, reply) => {
+                    fixes.clear();
+                    cues.clear();
+                    episodes.clear();
+                    (collar.fix_attempts, collar.fix_ok) = (0, 0);
+                    collar.firmware.endpoint.succeeded();
+                    collar.firmware.reported(device.as_ref());
+                    let reply = reply.unwrap_or(Value::Null);
+                    if let Some(c) = reply.get("config").filter(|c| !c.is_null()) {
+                        match collar.firmware.apply_config(c, &dev.server_key, now) {
+                            Ok(c) => println!(
+                                "{}: config v{} herd {} report {} s, fast {} s{}",
+                                dev.l.tag,
+                                c.version,
+                                c.herd_id.as_deref().unwrap_or("-"),
+                                c.report_s,
+                                c.fast_report_s.map_or("-".into(), |f| f.to_string()),
+                                c.fast_until.map_or(String::new(), |t| format!(" until {}", t.format("%H:%M:%S")))
+                            ),
+                            Err(code) => println!("{}: config refused ({})", dev.l.tag, code.as_str()),
+                        }
+                    }
+                    let latest = reply.get("latest_version").and_then(Value::as_u64).unwrap_or(0);
+                    poll |= latest > u64::from(collar.firmware.have());
+                }
+                (Outcome::Unlinked, _) => break 'run,
+                // Keep the batch, like a collar out of coverage; cap it.
+                (Outcome::Failed, _) => {
+                    cap(&mut fixes, 2000);
+                    cap(&mut cues, 2000);
+                    cap(&mut episodes, 500);
+                    if collar.firmware.endpoint.failed(now) {
+                        println!("{}: back to {} after a day without the new endpoint", dev.l.tag, collar.firmware.endpoint.current);
+                    }
+                    poll = false;
+                }
             }
         }
-        n += 1;
-        if n % cfg.batch != 0 {
-            continue;
-        }
-        let rep = PositionReport {
-            collar_id: Some(id.clone()),
-            boundary_version: collar.held_version(),
-            fixes: fixes.clone(),
-            cues: cues.clone(),
-            battery: Some((collar.battery * 1000.0).round() / 1000.0),
-            health: None,
-            ..Default::default()
-        };
-        match dev.report(&rep).await {
-            Outcome::Ok => {
-                fixes.clear();
-                cues.clear();
+        if poll {
+            last_poll = Some(now);
+            if let Outcome::Unlinked = dev.sync(&mut collar, now).await {
+                break 'run;
             }
-            Outcome::Unlinked => break,
-            // Keep the batch, like a collar out of coverage; cap it.
-            Outcome::Failed => {
-                let over = fixes.len().saturating_sub(2000);
-                fixes.drain(..over);
-            }
-        }
-        if let Outcome::Unlinked = dev.sync(&mut collar).await {
-            break;
         }
     }
     println!("{}: collar {id} was removed in the app; stopping it", dev.l.tag);
