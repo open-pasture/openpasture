@@ -1,0 +1,55 @@
+/* Stream B: paddock sheet facts and weather, layer values, the Decisions timeline, Behaviour,
+   the boundary tool's options, "/" search. Tokens and patterns from base.css and app.css. */
+
+/* paddock sheet */
+.sheet .bfacts{margin-top:-4px}
+.sheet .bfacts li{padding:2px 0}
+.bheight{display:flex;align-items:center;gap:8px;font-size:13px}
+.bheight .mono.dim{font-size:12px}
+.bheight .err{font-size:11.5px}
+.bweather{font-size:12px;line-height:20px;color:var(--fg3)}
+.bweather li:first-child{color:var(--fg2)}
+
+/* layer values under the paddock names */
+.blabel{font-family:var(--mono);font-size:10.5px;color:var(--fg2);pointer-events:none;text-shadow:0 1px 2px rgba(0,0,0,.9),0 0 6px rgba(0,0,0,.6);font-variant-numeric:tabular-nums}
+
+/* boundary tool: "warn 16 ft", "now" */
+.toolform .bopt.btn.plain{font-family:var(--mono);font-size:12px;font-weight:400;color:var(--fg3);padding-left:6px;padding-right:6px}
+.toolform .bopt.btn.plain:hover{color:var(--fg)}
+.toolform span.bopt{display:inline-flex;align-items:center;gap:6px;padding-left:6px;font-family:var(--mono);font-size:12px}
+.toolform span.bopt .input{width:auto;background:var(--bg)}
+.toolform .input.btime{width:96px;background:var(--bg);padding-top:4px;padding-bottom:4px}
+
+/* data: decisions timeline */
+.btl{padding:4px 0 12px}
+.btl li>button,.btl li>div{display:grid;grid-template-columns:112px 1fr auto;column-gap:16px;width:100%;text-align:left;padding:8px 16px;line-height:20px}
+.btl li>button:hover,.btl li>button:focus-visible{background:var(--bg2);outline:none}
+.btl .when{font-size:11.5px;grid-row:1}
+.btl .what{font-size:14px;color:var(--fg);min-width:0}
+.btl .st{font-size:11.5px;color:var(--fg3)}
+.btl .st[data-status=applied]{color:var(--grass)}
+.btl .st[data-status=failed]{color:var(--red)}
+.btl .how{grid-column:2/4;font-size:11.5px;white-space:pre}
+.btl .why{grid-column:2/4;font-size:13px;color:var(--fg2);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+
+/* data: behaviour */
+.bbehave{padding:4px 0 12px}
+.bbehave .tblfilter{margin:0 16px}
+.bspark{display:inline-flex;align-items:center;gap:8px}
+
+/* top bar: "/" search */
+.bfind{color:var(--fg3);display:grid;place-items:center;width:28px;height:28px;border-radius:8px}
+.bfind:hover,.bfind:focus-visible{color:var(--fg);background:var(--bg2);outline:none}
+.bsearch{position:relative;width:280px}
+.bsearch .input{width:100%}
+.bhits{position:absolute;top:calc(100% + 6px);right:0;left:0;z-index:30;background:var(--bg2);border:1px solid var(--line2);border-radius:10px;padding:4px;box-shadow:0 20px 60px rgba(0,0,0,.55);animation:fade .12s both;max-height:420px;overflow:auto}
+.bhits button{display:flex;justify-content:space-between;align-items:baseline;gap:16px;width:100%;text-align:left;padding:6px 12px;border-radius:7px;color:var(--fg2);font-size:13px}
+.bhits button span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bhits button .mono{font-size:11px;flex:none}
+.bhits li[aria-selected=true] button{background:var(--panel);color:var(--fg)}
+
+/* a knowledge entry in the side sheet */
+.bknow{display:grid;gap:8px}
+.bknow h3{font-size:16px;font-weight:600;letter-spacing:-.01em;line-height:1.3}
+.bknow .mono{font-size:11.5px;margin-top:-4px}
+.bknow .body{font-size:13px;line-height:20px;color:var(--fg2);max-height:60vh;overflow:auto}

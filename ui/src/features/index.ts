@@ -14,6 +14,7 @@ import "./hub-ui";
 // @K-files
 // @I
 // @B
+import "./b";
 // @G
 // @P
 // @Q
