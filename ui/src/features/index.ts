@@ -8,6 +8,7 @@ import "./hub-ui";
 // @E-srv
 // @J
 // @A-engine
+import "./a-engine";
 // @A-notify
 // @D
 // @K-animals
