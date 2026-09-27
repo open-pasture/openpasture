@@ -1,0 +1,4 @@
+/* P: the herd panel's one-line summary once a herd has more collars than rows fit */
+.collars .sum{display:flex;align-items:baseline;gap:12px;padding:4px 8px;font-size:12px;line-height:20px;color:var(--fg2);font-variant-numeric:tabular-nums}
+.collars .sum button{display:inline;width:auto;padding:0;margin:0;border-radius:0;color:var(--warn);font:inherit}
+.collars .sum button:hover,.collars .sum button:focus-visible{background:none;color:var(--fg);outline:none}

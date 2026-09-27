@@ -1,7 +1,8 @@
 import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type TextareaHTMLAttributes } from "react";
 import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
-import { behindOf, outOf, store, useStore } from "../store";
+import { behindOf, collarLabels, outOf, store, useStore } from "../store";
+import { drawable, undrawn } from "../store/live";
 import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
@@ -29,6 +30,7 @@ export function MapView() {
   const state = useStore((s) => s.state)!;
   const herdId = useStore((s) => s.herdId);
   const collars = useStore((s) => s.collars);
+  const animalList = useStore((s) => s.animals);
   const bstat = useStore((s) => (s.herdId ? s.boundary[s.herdId] : undefined));
   const decisions = useStore((s) => s.decisions);
 
@@ -70,13 +72,15 @@ export function MapView() {
     onLoad(m, () => {
       addFarmLayers(m);
       sweep.current = new SweepView(m);
-      animals.current = new Animals(m);
+      animals.current = new Animals(m, (id) => collarLabels().get(id));
       addTopSlot(m);
       labels.current = new Labels(m);
       draw.current = createDraw(m);
+      const rings = new Rings(m);
+      rings.onChange = () => refocus.current();
       host.current = {
         map: m,
-        rings: new Rings(m),
+        rings,
         herdId: () => store.get().herdId,
         openSheet: (node) => setSheet(node === null ? undefined : { k: "node", node }),
       };
@@ -95,6 +99,13 @@ export function MapView() {
       const tag = store.get().animals.find((a) => a.id === c.animal_id || a.collar_id === c.id)?.tag;
       location.hash = `/herd/${encodeURIComponent(tag ?? c.id)}`;
     });
+    // Hovering an animal rings it and shows its name; nothing is labelled otherwise.
+    m.on("mousemove", (e) => {
+      if (modeRef.current.k !== "idle" || !m.getLayer("animals")) return;
+      const id = m.queryRenderedFeatures(e.point, { layers: ["animals"] })[0]?.properties?.id as string | undefined;
+      if (id !== hovered.current) hoverRef.current(id);
+    });
+    m.on("mouseout", () => hovered.current && hoverRef.current(undefined));
     let overAnimal = false;
     m.on("mousemove", (e) => {
       if (!views.has("herd") || modeRef.current.k !== "idle") return;
@@ -191,6 +202,18 @@ export function MapView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map, stragglerKey]);
 
+  // In a big herd trails follow the animals that matter now: rung by an overlay (alerts), hovered.
+  const hovered = useRef<string>(undefined);
+  const refocus = useRef(() => {});
+  refocus.current = () => animals.current?.focus([...(host.current?.rings.ids() ?? []), ...(hovered.current ? [hovered.current] : [])]);
+  const hover = (id?: string) => {
+    hovered.current = id;
+    animals.current?.highlight(id);
+    refocus.current();
+  };
+  const hoverRef = useRef(hover);
+  hoverRef.current = hover;
+
   const flyTo = (ids: string[]) => {
     const pts = ids.map((id) => animals.current?.where(id)).filter((p): p is LonLat => !!p);
     if (!map || !pts.length) return;
@@ -199,15 +222,22 @@ export function MapView() {
     map.fitBounds([[Math.min(...lon), Math.min(...lat)], [Math.max(...lon), Math.max(...lat)]], { padding: 120, maxZoom: map.getZoom(), duration: 700 });
   };
 
-  // animals: membership from the collar list, motion from live fixes
-  const collarKey = collars.map((c) => c.id).join();
+  // animals: membership from the collar list (parked collars and removed animals are not
+  // drawn), motion from live positions
+  const drawn = useMemo(() => drawable(collars, animalList), [collars, animalList]);
+  const hidden = useMemo(() => undrawn(collars, animalList), [collars, animalList]);
+  const hiddenRef = useRef(hidden);
+  hiddenRef.current = hidden;
+  const drawnKey = drawn.map((c) => c.id).join();
   useEffect(() => {
     if (!map || !animals.current) return;
-    animals.current.set(
-      store.get().collars.filter((c) => c.last_fix).map((c) => ({ id: c.id, point: c.last_fix!.point, state: c.state })),
-    );
-  }, [map, collarKey]);
-  useEffect(() => store.onFix((e) => animals.current?.move(e.collar_id, e.fix.point, e.state)), []);
+    animals.current.set(drawn.map((c) => ({ id: c.id, point: c.last_fix!.point, state: c.state, herd: c.herd_id })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, drawnKey]);
+  useEffect(() => store.onPositions((items, herdId) => {
+    const hide = hiddenRef.current;
+    animals.current?.moveMany(items.filter((it) => !hide.has(it.collar_id)).map((it) => ({ id: it.collar_id, point: it.fix.point, state: it.state, herd: herdId })));
+  }), []);
 
   const cancel = useCallback(() => {
     const cur = modeRef.current;
@@ -298,7 +328,7 @@ export function MapView() {
       <HerdPanel onChange={change} changing={mode.k === "change"} onFocusCollar={(id) => {
         const p = animals.current?.where(id);
         if (p && map) map.easeTo({ center: p, duration: 600 });
-      }} onFocusCollars={flyTo} onHoverCollar={(id) => animals.current?.highlight(id)} />
+      }} onFocusCollars={flyTo} onHoverCollar={hover} />
     </div>
   );
 }

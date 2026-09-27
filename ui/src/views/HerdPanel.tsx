@@ -2,12 +2,15 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Paddock, type Polygon } from "../api";
 import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
-import { behindOf, collarLabel, outOf, store, useStore } from "../store";
+import { behindOf, collarLabels, outOf, store, useStore } from "../store";
+import { summarize } from "../store/live";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { age, clock, useNow } from "../util";
 
 // Clicking Timer again steps through these.
 const TIMER_STEPS = [15, 30, 60, 120, 240, 480];
+// Above this many collars the panel shows one summary line; the Herd view has every row.
+export const LIST_UP_TO = 30;
 const mins = (m: number) => (m >= 60 && m % 60 === 0 ? `${m / 60}h` : `${m}m`);
 
 export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, onHoverCollar }: {
@@ -36,9 +39,11 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const calm = Math.ceil(now / 5000) * 5000;
   const herd = state.herds.find((h) => h.id === herdId);
   if (!herd) return <aside className="panel" />;
-  const collars = store.get().collars.filter((c) => c.herd_id === herd.id)
-    .map((c) => ({ ...c, label: collarLabel(c, animals) }))
-    .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+  const all = store.get().collars;
+  const names = collarLabels(all, animals);
+  const collars = all.filter((c) => c.herd_id === herd.id)
+    .map((c) => ({ ...c, label: names.get(c.id) ?? c.name }));
+  const byId = new Map(collars.map((c) => [c.id, c] as const));
   const latest = decisions[0];
   const live = latest && (latest.status === "running" || latest.status === "proposed") ? latest : undefined;
 
@@ -47,6 +52,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const sweeping = move?.status === "sweeping";
   const behind = behindOf(move, collars);
   const out = outOf(bstat);
+  const behindSet = new Set([...behind, ...out.map((e) => e.collar_id)]);
   // Where the move goes: the paddock the target mostly covers, if any.
   const moveTo = move && targetPaddock(move.target, state.paddocks);
   const sentence = (d: Decision) =>
@@ -175,7 +181,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
           {out.map((e) => (
             <div key={e.id} className="acts">
               <button type="button" className="behind" onClick={() => onFocusCollar(e.collar_id)}>
-                {collars.find((c) => c.id === e.collar_id)?.label ?? "Collar"} out
+                {byId.get(e.collar_id)?.label ?? "Collar"} out
               </button>
               {e.remaining_m >= 1 && <span className="rem mono" title="To the herd's boundary">{Math.round(e.remaining_m)} m</span>}
               <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>
@@ -184,6 +190,8 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         </section>
       );
 
+  const summary = collars.length > LIST_UP_TO ? summarize(collars) : undefined;
+  const rows = summary ? [] : collars.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
   const list = (
       <ul className="collars" onMouseLeave={() => onHoverCollar(undefined)}>
         {b && collars.length > 0 && (
@@ -191,8 +199,16 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             <span>v{b.version}</span><b className={done ? "ok" : undefined}>{applied}/{collars.length}</b>
           </li>
         )}
-        {collars.map((c) => (
-          <li key={c.id} data-state={c.state} data-behind={behind.includes(c.id) || out.some((e) => e.collar_id === c.id) || undefined}>
+        {summary && (
+          <li className="sum mono">
+            <span>{summary.total} collars</span>
+            {summary.outside.length > 0 && <button type="button" title="Outside the boundary" onClick={() => onFocusCollars(summary.outside)}>{summary.outside.length} out</button>}
+            {summary.warning.length > 0 && <button type="button" title="In the warning band" onClick={() => onFocusCollars(summary.warning)}>{summary.warning.length} near</button>}
+            {summary.low.length > 0 && <button type="button" title="Battery under 20%" onClick={() => onFocusCollars(summary.low)}>{summary.low.length} low</button>}
+          </li>
+        )}
+        {rows.map((c) => (
+          <li key={c.id} data-state={c.state} data-behind={behindSet.has(c.id) || undefined}>
             <button type="button" onClick={() => onFocusCollar(c.id)} onMouseEnter={() => onHoverCollar(c.id)}
               onFocus={() => onHoverCollar(c.id)} onBlur={() => onHoverCollar(undefined)}>
               <span className="cn">{c.label}</span>

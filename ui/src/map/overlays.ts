@@ -1,12 +1,13 @@
 // What streams draw on the map. An overlay mounts once the map is up and draws into
 // its slot (map/layers.ts); a layer is an overlay the Layers menu turns on and off.
 
-import type { Map as MLMap } from "maplibre-gl";
+import type { ExpressionSpecification, Map as MLMap } from "maplibre-gl";
 import type { ReactNode } from "react";
 import type { LonLat, PositionItem } from "../api";
 import { createRegistry } from "../registry";
 import { store } from "../store";
 import type { Slot } from "./layers";
+import { ANIMAL_SIZE } from "./animals-model";
 
 export type { Slot } from "./layers";
 export type Tone = "fg" | "warn" | "red" | "grass";
@@ -50,7 +51,7 @@ export const layers = createRegistry<LayerItem>("layers");
 
 type PosListener = (changed: string[]) => void;
 
-// Built from the collar list and moved by each fix, so overlays never scan the store.
+// Built from the collar list and moved by each positions batch, so overlays never scan the store.
 class Positions {
   private map = new Map<string, PositionItem>();
   private listeners = new Set<PosListener>();
@@ -66,10 +67,13 @@ class Positions {
     store.subscribe(() => {
       if (store.get().collars !== this.collars) this.rebuild();
     });
-    store.onFix((e) => {
-      const cur = this.map.get(e.collar_id);
-      this.map.set(e.collar_id, { ...cur, collar_id: e.collar_id, animal_id: e.animal_id ?? cur?.animal_id, fix: e.fix, state: e.state, last_seen: e.fix.at });
-      this.touch(e.collar_id);
+    store.onPositions((items) => {
+      for (const it of items) {
+        const cur = this.map.get(it.collar_id);
+        if (cur && Date.parse(cur.fix.at) > Date.parse(it.fix.at)) continue;
+        this.map.set(it.collar_id, { ...cur, ...it, animal_id: it.animal_id ?? cur?.animal_id, last_seen: it.last_seen ?? it.fix.at });
+        this.touch(it.collar_id);
+      }
     });
   }
 
@@ -134,12 +138,20 @@ function ringImage(hex: string) {
 // Rings on the animals source, one layer per tone in slot-top; each overlay owns a set.
 export class Rings {
   private sets = new Map<string, { ids: string[]; tone: Tone }>();
+  // Told whenever the rung animals change (the map draws their trails).
+  onChange?: () => void;
   constructor(private map: MLMap) {}
+
+  // Every animal some overlay rings now (alerts, tools): the map draws their trails.
+  ids(): Set<string> {
+    return new Set([...this.sets.values()].flatMap((s) => s.ids));
+  }
 
   set(owner: string, ids: string[], tone: Tone = "fg") {
     if (ids.length) this.sets.set(owner, { ids, tone });
     else this.sets.delete(owner);
     for (const t of Object.keys(TONES) as Tone[]) this.draw(t);
+    this.onChange?.();
   }
 
   private draw(tone: Tone) {
@@ -149,7 +161,7 @@ export class Rings {
       if (!ids.length || !this.map.getSource("animals")) return;
       if (!this.map.hasImage(id)) this.map.addImage(id, ringImage(TONES[tone]), { pixelRatio: PR });
       this.map.addLayer(
-        { id, type: "symbol", source: "animals", layout: { "icon-image": id, "icon-allow-overlap": true, "icon-ignore-placement": true } },
+        { id, type: "symbol", source: "animals", layout: { "icon-image": id, "icon-size": ANIMAL_SIZE as unknown as ExpressionSpecification, "icon-allow-overlap": true, "icon-ignore-placement": true } },
         this.map.getLayer("slot-top") ? "slot-top" : undefined,
       );
     }
