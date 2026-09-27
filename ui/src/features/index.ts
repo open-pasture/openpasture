@@ -32,6 +32,7 @@ import "./p";
 import "./c";
 // @F
 // @S
+import "./s";
 // @A3
 import "./a3";
 // @H

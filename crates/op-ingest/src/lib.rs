@@ -34,6 +34,7 @@ pub use collars::{NewLinked, collar_endpoint, collar_key_matches, create_linked_
 // @C
 // @F
 // @S
+pub mod schedule;
 // @A3
 // @H
 // @L
@@ -119,6 +120,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @C
     // @F
     // @S
+    schedule::spawn_driver(ctx.clone());
     // @A3
     // @H
     // @L

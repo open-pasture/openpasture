@@ -120,6 +120,11 @@ pub enum Event {
     // @C
     // @F
     // @S
+    /// A schedule was made, changed (a strip staged, opened, skipped or held;
+    /// times moved), paused, resumed or ended. Its moves: `GET /api/schedules/{id}/moves`.
+    Schedule {
+        schedule: crate::schedule::Schedule,
+    },
     // @A3
     // @H
     // @L

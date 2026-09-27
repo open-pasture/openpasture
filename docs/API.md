@@ -246,13 +246,13 @@ other than its own. Commands without `herd_id` (older servers) are accepted.
 ```ts
 Decision { id, herd_id, source: "brain"|"farmer"|"heuristic", brain?: BrainId, model?,
            status: "running"|"proposed"|"approved"|"applied"|"rejected"|"failed"|"superseded",
-           action?: "STAY"|"MOVE"|"NEEDS_INFO", to_paddock_id?, geometry?: Polygon,
+           action?: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD" /* HOLD: strip schedules (S) */, to_paddock_id?, geometry?: Polygon,
            reasoning?, confidence?, need?, inputs, apply_at?, boundary_id?, error?,
            created_at, responded_at?, outcome? }
 Brain    { id: BrainId, name, available: boolean, signed_in: boolean, needs: string[] /* secret names */,
            models: string[], detail?: string }
 HostedKey { id, label, created_at, last_used? }
-DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO", to_paddock_id, geometry, reasoning, confidence, need, model }
+DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need, model }
 Signals  { as_of, herd_id, current_paddock_id, position_source, herd_animal_units, feed_budget_days_current,
            behavior, risk_flags, assumptions,
            paddocks: { paddock_id, name, status, area_ha, current, rest_days, grazing_pressure, forage, recovery, risk_flags }[] }
@@ -308,7 +308,8 @@ What the engine hands a brain (`DecisionRequest.context`, also the `context` of
                   | "paddock-note" /* the paddock's standing notes */ }[],
   history: { id, created_at, source, status, action, from_paddock_id, to_paddock_id,
              reasoning, confidence, need, farmer_response?, outcome? }[] /* last 10, newest first */,
-  units }
+  units,
+  schedule /* S: the herd's strip schedule while it runs, see "Strip schedules" */ }
 ```
 
 "Where the herd is": the paddock holding at least half of the herd's collar fixes from the
@@ -397,6 +398,7 @@ Event =
   // @C
   // @F
   // @S
+  | { type: "schedule", schedule: Schedule }   // made, changed (staged, opened, skipped, held, retimed), paused, resumed or ended
   // @A3
   // @H
   // @L
@@ -1227,6 +1229,118 @@ stay with the original.
 
 <!-- @F -->
 <!-- @S -->
+
+## Strip schedules (op-ingest, op-engine)
+
+A herd walked across a paddock's strips on a cadence. Each open and each back-fence step is
+**staged on the collars ahead of time** (a boundary with `effective_at`), so strips open on the
+collars' own clocks when the server or the network is away.
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/schedules` | `?herd_id&status=active\|paused\|done\|running` | `Schedule[]` newest first (`running` = active or paused) |
+| POST | `/api/schedules` | `NewSchedule` | 201 `Schedule`; 400 bad strips/times, 409 the herd runs one already or has no boundary yet |
+| POST | `/api/schedules/preview` | `NewSchedule` | `{ schedule: Schedule, moves: ScheduledMove[] }`, checked the same way, nothing stored |
+| GET | `/api/schedules/:id` | | `Schedule` |
+| GET | `/api/schedules/:id/moves` | | `ScheduledMove[]` in time order: history, held and skipped places, the queue |
+| POST | `/api/schedules/:id/skip` | `{ index }` | `Schedule`: strip `index` (0-based) doesn't open; later strips move up one occurrence each |
+| POST | `/api/schedules/:id/hold` | | `Schedule`: today's strip again; the next open and everything after move one occurrence later |
+| POST | `/api/schedules/:id/move-now` | | `Schedule`: the next strip opens now (immediate); later opens keep their times |
+| POST | `/api/schedules/:id/time` | `{ index, at }` | `Schedule`: that open (and its back-fence steps) at `at`; 400 when it would fall before the move before it or past the next open |
+| POST | `/api/schedules/:id/pause` | | `Schedule`: nothing staged or opened until resumed |
+| POST | `/api/schedules/:id/resume` | | `Schedule`; opens that passed meanwhile move on by whole occurrences |
+| POST | `/api/schedules/:id/end` | | `Schedule` (`done`); 409 once ended |
+
+Reads are any role's; every other method is a manager's.
+
+```ts
+NewSchedule { herd_id, layout_id?, paddock_id?, strips?: Polygon[], next_index?,
+              cadence?: Cadence /* daily 07:00 */, starts_at? /* the next time the farm's clock reads cadence.at */,
+              back_fence?: BackFence }
+Cadence   { every_days /* 1-60 */, at: "HH:MM" /* farm time */ }
+BackFence { enabled: true, lag_strips: 0, close_after_min: 240, close_steps: 3, close_every_min: 10 }  // defaults
+Schedule  { id /* sch_… */, herd_id, paddock_id, layout_id?, strips: Polygon[], next_index /* next strip to open, 0-based */,
+            cadence, starts_at, back_fence, status: "active"|"paused"|"done", created_by: Actor,
+            created_at, updated_at, planned_end? /* when the last strip was planned to be done, as made */, ended_at? }
+ScheduledMove { schedule_id, index /* strip */, step /* 0 open, 1.. back-fence steps */, at, geometry /* as planned, before prepare */,
+                boundary_version?, skipped?: "late"|"skipped"|"held", state: "planned"|"staged"|"done"|"skipped",
+                applied_at? /* the first collar's own apply time */ }
+```
+
+**Strips and shapes.** `strips` are copied (a layout re-cuts when its paddock is reshaped); with
+`layout_id` and no `strips` they come from the layout, and the paddock from the layout, else the
+herd's. The first strip to open (`next_index`) defaults to the one after the strip the herd's
+boundary covers now, so the usual start is: send strip 1 (`POST /api/herds/:id/boundary`), then
+schedule. Without a back fence, opening strip k stages `strips[0..=k]`. With one it stages
+`strips[p-lag..=k]` (p = the strip opened before, so the animals keep the ground they stand on;
+skipped strips in between are old ground too), then `close_steps` steps `close_after_min` after
+the open and `close_every_min` apart sweep the old ground from the far side, the last being
+`strips[k-lag..=k]`. Every shape goes through `prepare` when it is staged (exclusions active at
+its time, fitting).
+
+**Times.** Occurrence 0 is `starts_at`; occurrence n is `cadence.at` on the farm-local date
+n × `every_days` days later, so "daily 07:00" opens at 07:00 local on both sides of a DST change
+(a time the clocks skip opens just after the gap; in a repeated hour, the first).
+
+**Staging.** Staged versions must rise with their times, so the staged moves are always a prefix
+of the queue in time order. How far ahead: what the smallest `free` and `free_bytes` among the
+herd's reporting collars allow (parked collars, and collars silent 20 minutes, are left out; they
+are restaged when they report), never more than `limits.slots - 1`. The server works `free` out
+from what each collar holds (`collar_slots`): its slots less the alive herd versions it holds that
+aren't this schedule's, counting the herd's active version whether or not it holds it yet; bytes
+the same way with `CollarLimits::record_bytes`. A V0 collar takes 15 moves ahead: at an open and
+three back-fence steps a day, about 3.75 days. A schedule's boundaries carry its id as `decision_id`.
+
+**Immediates.** A sweep step, a farmer's draw or any immediate herd boundary drops the staged
+moves on the collars. The schedule stages again above it when the sequence settles: at the end of
+the move, or 60 s after a lone boundary. A move whose time passed without taking effect is
+applied at once if at most 30 minutes late, else marked `late` and never applied (with the
+back-fence steps of an open that never happened); later moves go ahead. Queue edits that change
+what is staged (skip, hold, edit time, pause, end) send the herd's current strip again as a new
+immediate version so collars drop the staged moves, then stage the new plan. Move now sends the
+strip itself. An escape's pen drops only that collar's staged slots; when it ends the collar gets
+copies at the same times (see "Protocol v1 on the server").
+
+**Decisions.** While a schedule is active the daily decision is about it: the context has
+`schedule` (below). `STAY` keeps it (the next strip opens on time), `HOLD` (new action) repeats
+today's strip (as `/hold`), and a `MOVE` to another paddock ends the schedule when it applies (a
+farmer's draw included). `HOLD` without an active schedule fails the decision. `respond` with
+`reject` on a proposed `STAY` while the herd's schedule is active holds: the decision becomes
+`action: "HOLD"`, `status: "applied"`, `inputs.proposed_action: "STAY"`. The approval text reads
+`Cows: strip 4 of 12 opens 07:00. Reply Y to keep, N to hold. Code 4821`. HOLD follows the herd's
+autonomy like a MOVE (timer, auto).
+
+```ts
+// Decision context, while a schedule runs (null otherwise)
+schedule: { id, status, paddock_id, strips /* count */, strip? /* the one the herd is on, 1-based */,
+            cadence, back_fence: boolean,
+            next: { strip, of, opens_at, opens /* "07:00" | "Wed 07:00" farm time */, stored?, collars? } | null,
+            today?: { area_ha, forage_kg_dm?, days? },   // what today's strip holds for the herd
+            rule: string }
+```
+
+**Alert** `schedule_not_stored` (warning, "Next strip not on every collar [120] min before it
+opens"): the next move of an active schedule is due within `after_min` and some collar expected to
+hold it doesn't (collars on duty that report, not out on an escape, five minutes after it was
+staged). One alert per schedule, targets `("schedule", id)` and the collars that lack it:
+`Cows: 12 of 250 collars missing strip 4 (opens 07:00). Check coverage`.
+
+**Brief** line `schedule` (order 20): `Strip 4 of 12 opens 07:00, 248/250 stored`, or
+`Schedule paused before strip 4 of 12.`
+
+**MCP.** `get_schedule { herd_id? }` (read): `{ herd_id, schedule | null, moves, next? }`.
+`schedule_strips { herd_id?, layout_id? | orientation_deg + count | width_m | days, every_days?,
+at?, starts_at?, back_fence?: boolean, next_index? }` (manager): makes one; strips come from the
+layout or are cut across the herd's paddock. Neither is a decision-brain tool.
+
+**Reports.** `paddock_record` and `nrcs_528` gain "Planned days" (a schedule's `planned_end` less
+the stay's start) and "Residual at exit" (the measured height nearest the day out, within two
+days; `residual_cm`, else `height_cm`), each only when some row has a value.
+
+**Moves.** A sweep now waits only on its own staged first step (a farmer's target sent for
+later), not on a schedule's staged boundaries; `move_stalled`'s "waiting on a staged boundary"
+reads the same way.
+
 <!-- @A3 -->
 
 ## Texts in and the morning brief (op-alerts)

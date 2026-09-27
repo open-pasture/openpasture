@@ -215,6 +215,11 @@ pub async fn assemble(ctx: &Ctx, herd: &Herd, fetch_land: bool, log: &(dyn Fn(St
         .map(|(k, r)| (k.clone(), json!({ "report_id": r["report_id"], "source": r["source"], "as_of": r["as_of"], "sections": r["sections"] })))
         .collect();
 
+    // @S: while a strip schedule runs, the daily call is about it.
+    let schedule = crate::schedules::context(ctx, herd, now).await?;
+    if !schedule.is_null() {
+        log("The herd is on a strip schedule.".into());
+    }
     let context = json!({
         "as_of": time::to_db(&now),
         "farm": farm,
@@ -234,6 +239,7 @@ pub async fn assemble(ctx: &Ctx, herd: &Herd, fetch_land: bool, log: &(dyn Fn(St
         "observations": observations,
         "history": history.iter().map(history_entry).collect::<Vec<_>>(),
         "units": ctx.settings().await?.units,
+        "schedule": schedule,
     });
     Ok(Assembled {
         context,

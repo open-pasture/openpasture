@@ -64,10 +64,18 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const behindSet = new Set([...behind, ...out.map((e) => e.collar_id)]);
   // Where the move goes: the paddock the target mostly covers, if any.
   const moveTo = move && targetPaddock(move.target, state.paddocks);
+  // S: a call about a strip schedule names the next strip; N holds today's strip.
+  const onSchedule = (d: Decision) => {
+    const sc = (d.inputs as { schedule?: { status?: string; next?: { strip: number; of: number; opens: string } } } | undefined)?.schedule;
+    return sc?.status === "active" ? sc.next : undefined;
+  };
   const sentence = (d: Decision) =>
     d.action === "MOVE" ? `Move to ${pad(d.to_paddock_id) ?? "the new boundary"}.`
-      : d.action === "STAY" ? `Stay in ${pad(herd.paddock_id) ?? "place"}.`
-        : d.need ?? "Needs more information.";
+      : d.action === "STAY" && onSchedule(d) ? `Strip ${onSchedule(d)!.strip} of ${onSchedule(d)!.of} opens ${onSchedule(d)!.opens}.`
+        : d.action === "STAY" ? `Stay in ${pad(herd.paddock_id) ?? "place"}.`
+          : d.action === "HOLD" ? "Hold today's strip."
+            : d.need ?? "Needs more information.";
+  const keeps = !!live && live.action === "STAY" && !!onSchedule(live);
 
   const act = async (f: () => Promise<unknown>) => {
     setBusy(true);
@@ -158,10 +166,10 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             {live.reasoning && <Why key={live.id} text={live.reasoning} />}
             {live.apply_at && <p className="clock">{clock(Date.parse(live.apply_at) - now)}</p>}
             {manage && <div className="acts">
-              <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>Reject</Button>
+              <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>{keeps ? "Hold" : "Reject"}</Button>
               {live.geometry && <Button small disabled={busy || changing} onClick={onChange}>Change</Button>}
               <Button small kind="primary" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "approve" }))}>
-                {live.apply_at ? "Send now" : "Approve"}
+                {live.apply_at ? "Send now" : keeps ? "Keep" : "Approve"}
               </Button>
             </div>}
           </>

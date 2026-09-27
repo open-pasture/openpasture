@@ -395,6 +395,9 @@ pub enum DecisionAction {
     Stay,
     Move,
     NeedsInfo,
+    // @S
+    /// Only while a strip schedule is active: repeat today's strip one more cadence.
+    Hold,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

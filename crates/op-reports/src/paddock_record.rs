@@ -120,13 +120,17 @@ impl Report for PaddockRecord {
             Column::unit("density", "Stocking density", f.unit_label("density")).dp(1),
             Column::new("rest_days", "Rest before in").dp(1),
         ]);
+        // @S: planned vs actual days, residual height at exit.
+        let extra = crate::schedule_cols::load(ctx, &events, farm.now).await?;
+        let shown = crate::schedule_cols::shown(&extra);
+        columns.extend(crate::schedule_cols::columns(&f, shown));
         if collar {
             columns.push(Column::new("collar_days", "Collar days").dp(0));
         }
 
         let mut rows = Vec::new();
         let (mut days, mut head_days, mut au_days, mut collar_days) = (0.0, 0.0, 0.0, 0usize);
-        for e in &events {
+        for (i, e) in events.iter().enumerate() {
             let mut row = vec![json!(farm.paddock_name(&e.stay.paddock_id))];
             if fsa_field {
                 row.push(farm.paddock_prop(&e.stay.paddock_id, "fsa_field").map_or(Value::Null, Value::from));
@@ -143,6 +147,7 @@ impl Report for PaddockRecord {
                 e.au_per_ha.map_or(Value::Null, |d| n(f.convert("density", d), 1)),
                 e.rest_days.map_or(Value::Null, |r| n(r, 1)),
             ]);
+            row.extend(crate::schedule_cols::cells(&f, &extra[i], shown));
             if collar {
                 row.push(json!(e.collar_days));
             }
@@ -197,6 +202,7 @@ impl Report for PaddockRecord {
         doc.notes = common_notes(&farm, &events, p);
         doc.notes.push("Stocking density: animal units on the day in over the paddock's area then.".into());
         doc.notes.push("Rest before in: days since any herd last left the paddock.".into());
+        doc.notes.extend(crate::schedule_cols::notes(shown));
         if collar {
             doc.notes.push("Collar days: days on which collar positions place the herd in the paddock.".into());
         }

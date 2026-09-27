@@ -1,0 +1,49 @@
+/* S: strip schedules. The footer under the strip tool, the herd panel's next move and queue,
+   the time rail along the bottom of the map. Built on .seg, .check, .acts, .btn, mono lines. */
+
+/* strip tool footer */
+.sfoot{display:grid;gap:8px}
+.sfoot .sqrowf{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sfoot .seg{padding:2px}
+.sfoot .seg button{padding:.2rem .6rem}
+.sfoot input[type=time]{width:92px;padding:3px 8px}
+.sfoot .btn{margin-left:auto}
+.sline,.sfoot .err{font-size:12px;color:var(--fg2)}
+.sfoot .err{white-space:normal}
+
+/* herd panel: next move, stored line, queue by day */
+.sched{padding-top:10px;padding-bottom:10px;border-bottom:1px solid var(--line);flex:none;animation:fade .3s both}
+.snext{display:flex;align-items:baseline;gap:10px;width:100%;text-align:left;font-size:13px;line-height:20px;padding:6px 8px;margin-left:-8px;border-radius:7px;color:var(--fg)}
+button.snext:hover,button.snext:focus-visible{background:var(--bg2);outline:none}
+.snext .cd{margin-left:auto;font-size:12px;font-variant-numeric:tabular-nums}
+.sstored{font-size:12px;line-height:20px;color:var(--fg3);white-space:pre;font-variant-numeric:tabular-nums}
+.sched>.acts{margin-top:4px}
+.serr{font-size:12px;line-height:18px;color:var(--red);margin-top:4px}
+.squeue{display:grid;gap:6px;margin-top:4px;max-height:280px;overflow:auto}
+.sqday ul{display:grid}
+.sqday>p{font-size:11px;line-height:18px}
+.sqrow{display:flex;align-items:center;flex-wrap:wrap;gap:0 8px;font-size:12.5px;line-height:24px;color:var(--fg2)}
+.sqrow .st{font-size:12px;color:var(--fg);font-variant-numeric:tabular-nums;min-width:40px}
+.sqrow[data-kind=fence],.sqrow[data-kind=held],.sqrow[data-kind=skipped]{color:var(--fg3)}
+.sqrow[data-kind=fence] .st,.sqrow[data-kind=held] .st,.sqrow[data-kind=skipped] .st{color:var(--fg3)}
+.sqrow .sacts{display:flex;gap:0;margin-left:auto}
+.sqrow[data-first] .sacts{flex-basis:100%;margin:0 0 2px 40px}
+.sqrow .sacts .btn.sm{height:24px;line-height:22px}
+.sqrow .sacts .btn.sm{padding-left:6px;padding-right:6px}
+.sqrow input[type=time]{width:92px;padding:2px 6px}
+.squeue>.acts{justify-content:flex-end}
+
+/* time rail */
+.srail-host{position:absolute;left:50%;bottom:30px;transform:translateX(-50%);z-index:2;pointer-events:none}
+.srail{user-select:none;-webkit-user-select:none;display:flex;align-items:center;gap:12px;pointer-events:auto;padding:8px 12px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.82);backdrop-filter:blur(6px);animation:fade .2s both}
+.strack{position:relative;width:380px;height:24px;cursor:pointer;touch-action:none}
+.strack::before{content:"";position:absolute;left:0;right:0;top:11px;height:1px;background:var(--line2)}
+.strack:focus-visible{outline:none}
+.strack:focus-visible .sknob{box-shadow:0 0 0 2px var(--fg3)}
+.strack .stick{position:absolute;top:4px;width:1px;height:15px;background:var(--line2)}
+.strack .stick span{position:absolute;left:4px;top:-2px;font-size:10px;line-height:12px;color:var(--fg3);white-space:nowrap}
+.strack b{position:absolute;top:9px;width:3px;height:5px;margin-left:-1px;background:var(--fg3)}
+.strack b.sopen{background:var(--grass);height:7px;top:8px}
+.sknob{position:absolute;top:6px;width:9px;height:11px;margin-left:-4px;background:var(--fg)}
+.sat{font-size:12px;color:var(--fg);min-width:74px;text-align:right;font-variant-numeric:tabular-nums}
+.sat:disabled{color:var(--fg3);cursor:default}

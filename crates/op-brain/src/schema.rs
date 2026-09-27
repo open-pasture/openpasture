@@ -17,8 +17,8 @@ pub fn decision_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["STAY", "MOVE", "NEEDS_INFO"],
-                "description": "STAY in the current paddock, MOVE to another, or NEEDS_INFO when the farmer must check something first."
+                "enum": ["STAY", "MOVE", "NEEDS_INFO", "HOLD"],
+                "description": "STAY in the current paddock, MOVE to another, or NEEDS_INFO when the farmer must check something first. HOLD only while the context has an active schedule: repeat today's strip one more cadence."
             },
             "to_paddock_id": {
                 "type": ["string", "null"],
@@ -75,7 +75,7 @@ mod tests {
         // Strict mode: every property is required.
         assert_eq!(props.len(), required.len());
         assert!(props.iter().all(|p| required.contains(&p.as_str())));
-        assert_eq!(s["properties"]["action"]["enum"], json!(["STAY", "MOVE", "NEEDS_INFO"]));
+        assert_eq!(s["properties"]["action"]["enum"], json!(["STAY", "MOVE", "NEEDS_INFO", "HOLD"]));
         let geo = &s["properties"]["geometry"]["anyOf"][1];
         assert_eq!(geo["additionalProperties"], false);
     }

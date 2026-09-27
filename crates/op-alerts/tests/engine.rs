@@ -252,8 +252,10 @@ async fn rules_and_policy_read_and_validate() {
     let (s, v) = f.owner("GET", "/api/alerts/rules", None).await;
     assert_eq!(s, StatusCode::OK);
     let kinds: Vec<&str> = v["rules"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
+    // A-engine's rules first, in Settings order; later streams' follow under their anchors.
+    assert!(kinds.contains(&"schedule_not_stored"), "{kinds:?}");
     assert_eq!(
-        kinds,
+        kinds[..11],
         [
             "escaped",
             "outside",

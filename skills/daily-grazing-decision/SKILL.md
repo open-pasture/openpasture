@@ -1,6 +1,6 @@
 ---
 name: daily-grazing-decision
-description: Run one grazing decision for one herd in one decision window. Assemble context, read the signals, consult knowledge, decide STAY, MOVE, or NEEDS_INFO, submit it, handle the farmer's response, confirm the boundary with the collars, and evaluate the outcome later.
+description: Run one grazing decision for one herd in one decision window. Assemble context, read the signals, consult knowledge, decide STAY, MOVE, NEEDS_INFO (or HOLD on a strip schedule), submit it, handle the farmer's response, confirm the boundary with the collars, and evaluate the outcome later.
 version: 1.0.0
 ---
 # Daily Grazing Decision
@@ -25,6 +25,8 @@ The answer is one of:
 - `MOVE`: the herd moves to a specific land unit and a specific boundary.
 - `NEEDS_INFO`: the call depends on something the data cannot tell you. Name
   the one observation that would settle it.
+- `HOLD`: only while the herd is on a strip schedule (see "When The Herd Is On
+  A Strip Schedule"). The herd stays on today's strip one more cadence.
 
 You are working alongside the farmer. You act only within the autonomy the
 farmer set. You say what was sent to the collars and whether it was confirmed.
@@ -217,6 +219,25 @@ recovery in later imagery. Read it in the context's history, or with
 Read the outcome of the last decision before making the next one. If the herd
 kept pressing a line, if residual came in lower than you estimated, or if a
 paddock recovered slower than planned, adjust today's call and say why.
+
+## When The Herd Is On A Strip Schedule
+
+When the context has a `schedule` with `status: "active"`, the herd is being
+walked across a paddock's strips on a cadence, and each open is already staged
+on the collars. Today's call is about the schedule, not about a new paddock:
+
+- `STAY` keeps the schedule: the next strip opens on time (`schedule.next`:
+  strip k of n, `opens` in farm time, and how many collars already store it).
+- `HOLD` repeats today's strip: the next open and everything after it move one
+  cadence later, and the collars drop the staged open. Hold when today's strip
+  still has grass (`schedule.today.days` is the grazing it holds for the herd;
+  a fresh field note beats it), or when weather says don't move today.
+- `MOVE` to another paddock ends the schedule once the move applies. Only move
+  when the paddock as a whole is done or unsafe.
+
+The farmer's text answers the same way: `Y` keeps the schedule, `N` holds
+today's strip. In the reasoning, name the strip and when it opens: "Strip 4 of
+12 opens 07:00; strip 3 is grazed down to 4 inches."
 
 ## Grazing Judgment
 
