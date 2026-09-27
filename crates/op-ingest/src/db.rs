@@ -61,8 +61,9 @@ pub async fn insert_collar(db: &SqlitePool, id: &str, name: &str, herd_id: &str,
     Ok(())
 }
 
+/// Delete a collar with what the server keeps of its slots and config.
 pub async fn delete_collar(db: &SqlitePool, id: &str) -> anyhow::Result<bool> {
-    let mut tx = db.begin().await?;
+    let mut tx = op_core::store::begin_immediate(db).await?;
     let gone = sqlx::query("DELETE FROM collars WHERE id = ?").bind(id).execute(&mut *tx).await?.rows_affected() > 0;
     for t in ["collar_slots", "collar_config"] {
         sqlx::query(&format!("DELETE FROM {t} WHERE collar_id = ?")).bind(id).execute(&mut *tx).await?;

@@ -82,11 +82,12 @@ async fn get_config(State(ctx): State<Ctx>) -> ApiResult<Json<CollarsConfig>> {
     Ok(Json(load(&ctx).await?))
 }
 
-/// Save the cadence; every collar that takes configs gets a new version.
+/// Save the cadence; every collar that takes configs gets a new version
+/// (now, or on its next report if that fails).
 async fn put_config(State(ctx): State<Ctx>, ApiJson(body): ApiJson<CollarsConfig>) -> ApiResult<Json<CollarsConfig>> {
     body.validate()?;
     ctx.store().set_setting(KEY, &body).await?;
-    refresh(&ctx, Scope::All).await?;
+    refresh_quietly(&ctx, Scope::All).await;
     Ok(Json(body))
 }
 
