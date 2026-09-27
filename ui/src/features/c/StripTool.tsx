@@ -149,7 +149,7 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
       <form className="toolform cstrip" onSubmit={(e) => { e.preventDefault(); void send(); }}>
         <Segmented label="Strips by" value={by} options={options} onChange={switchBy} />
         {by === "count" && <Plain label="Strips" value={count} unit="strips" step={1} min={1} max={200} onChange={setCount} />}
-        {by === "width" && <NumberField label="Width" quantity="len" value={width} min={1} max={10_000} onChange={setWidth} width={4} />}
+        {by === "width" && <NumberField label="Width" quantity="len" value={width} min={1} max={10_000} onChange={(m) => setWidth(Math.round(m * 100) / 100)} width={4} />}
         {by === "days" && <Plain label="Days per strip" value={days} unit="d" step={0.1} min={0.1} max={365} onChange={setDays} />}
         <Plain label="Head" value={head} unit="hd" step={1} min={0} max={100_000} onChange={setHead} />
         <Button small kind="plain" onClick={done}>Cancel</Button>
