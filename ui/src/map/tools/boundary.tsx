@@ -3,6 +3,7 @@ import { api, type Polygon } from "../../api";
 import { DEFAULT_WARN_M, SendOptions, useWarnBand } from "../../features/b/sendopts";
 import type { ToolFooterProps } from "../../registry";
 import { store } from "../../store";
+import { useDefaultWarn } from "../../store/h";
 import { Button } from "../../ui";
 import { current } from "../drawn";
 import { ToolFooter, useDrawing, type ToolProps } from "../tools";
@@ -15,7 +16,9 @@ export function BoundaryTool({ map, draw, herdId, ctx, done }: ToolProps) {
   const [opts, setOpts] = useState<ToolFooterProps["opts"]>({});
   const [busy, setBusy] = useState(false);
   const polygon = geometry?.type === "Polygon" ? (geometry as Polygon) : undefined;
-  useWarnBand(map, ctx, drawn ? polygon : undefined, opts.warn_m ?? DEFAULT_WARN_M);
+  // A herd in training mode gets its training warn when the send names none (H).
+  const defaultWarn = useDefaultWarn(herdId) ?? DEFAULT_WARN_M;
+  useWarnBand(map, ctx, drawn ? polygon : undefined, opts.warn_m ?? defaultWarn);
 
   const send = async () => {
     const g = current(draw);
@@ -40,7 +43,7 @@ export function BoundaryTool({ map, draw, herdId, ctx, done }: ToolProps) {
   return (
     <>
       <form className="toolform" onSubmit={(e) => { e.preventDefault(); void send(); }}>
-        <SendOptions opts={opts} onChange={setOpts} />
+        <SendOptions opts={opts} onChange={setOpts} defaultWarn={defaultWarn} />
         <Button small kind="plain" onClick={done}>Cancel</Button>
         <Button small kind="primary" type="submit" disabled={busy}>Send</Button>
       </form>

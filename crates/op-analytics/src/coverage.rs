@@ -10,6 +10,10 @@
 //! - `fixes`: fixes that arrived ÷ fixes the collars' cadence called for
 //!   (a missed fix counts where the animal was before the gap); `n` is the
 //!   fixes called for.
+//! - `fix_rate` (H): fixes the receivers got ÷ fixes they tried, from the
+//!   collars' health reports; `n` is the attempts.
+//! - `cell` (H): the median cell signal (LTE RSRP) the collars measured, dBm;
+//!   `n` is the reports that measured it. Only boards with a modem report one.
 //!
 //! Cells with `n` under 5 are left out. `cell_m` is a multiple of 10: coarser
 //! cells are blocks of 10 m ones.
@@ -39,6 +43,10 @@ pub const MAX_CELL_M: u32 = 1000;
 pub enum Metric {
     Accuracy,
     Fixes,
+    // @H
+    #[serde(rename = "fix_rate")]
+    FixRate,
+    Cell,
 }
 
 impl Metric {
@@ -46,7 +54,9 @@ impl Metric {
         match s.trim() {
             "" | "accuracy" => Ok(Self::Accuracy),
             "fixes" => Ok(Self::Fixes),
-            _ => Err(ApiError::bad_request("`metric` must be accuracy or fixes.")),
+            "fix_rate" => Ok(Self::FixRate),
+            "cell" => Ok(Self::Cell),
+            _ => Err(ApiError::bad_request("`metric` must be accuracy, fixes, fix_rate or cell.")),
         }
     }
 
@@ -54,7 +64,8 @@ impl Metric {
     pub fn unit(self) -> &'static str {
         match self {
             Self::Accuracy => "m",
-            Self::Fixes => "ratio",
+            Self::Fixes | Self::FixRate => "ratio",
+            Self::Cell => "dBm",
         }
     }
 
@@ -64,8 +75,32 @@ impl Metric {
         match self {
             Self::Accuracy => (a.n >= MIN_N).then(|| hist_median(&a.hist)).flatten().map(|v| (round(v, 2), a.n)),
             Self::Fixes => (a.expected >= MIN_N).then(|| (round((a.got as f64 / a.expected as f64).min(1.0), 3), a.expected)),
+            Self::FixRate => (a.fix_attempts >= MIN_N).then(|| (round((a.fix_ok as f64 / a.fix_attempts as f64).min(1.0), 3), a.fix_attempts)),
+            Self::Cell => {
+                let n: u64 = a.rsrp.values().sum();
+                (n >= MIN_N).then(|| rsrp_median(&a.rsrp)).flatten().map(|v| (round(v, 1), n))
+            }
         }
     }
+}
+
+/// Median of whole-dBm readings (the mean of the two middle ones for an even count).
+pub fn rsrp_median(hist: &std::collections::BTreeMap<i32, u64>) -> Option<f64> {
+    let n: u64 = hist.values().sum();
+    if n == 0 {
+        return None;
+    }
+    let at = |k: u64| {
+        let mut seen = 0;
+        for (d, c) in hist {
+            seen += c;
+            if seen > k {
+                return *d as f64;
+            }
+        }
+        f64::NAN
+    };
+    Some(if n % 2 == 1 { at(n / 2) } else { (at(n / 2 - 1) + at(n / 2)) / 2.0 })
 }
 
 /// Median of an accuracy histogram, interpolated inside its bucket; 20 m
@@ -167,7 +202,7 @@ pub async fn coverage(ctx: &Ctx, ask: &Ask) -> anyhow::Result<Coverage> {
 }
 
 async fn blocks(ctx: &Ctx, grid: &Grid, ask: &Ask, k: i64) -> anyhow::Result<HashMap<(i64, i64), CellAgg>> {
-    let mut sql = String::from("SELECT cx, cy, n, acc_hist, expected, got FROM coverage_days WHERE date >= ? AND date <= ?");
+    let mut sql = String::from("SELECT cx, cy, n, acc_hist, expected, got, fix_attempts, fix_ok, rsrp_hist FROM coverage_days WHERE date >= ? AND date <= ?");
     if ask.herd_id.is_some() {
         sql.push_str(" AND herd_id = ?");
     }
@@ -175,8 +210,8 @@ async fn blocks(ctx: &Ctx, grid: &Grid, ask: &Ask, k: i64) -> anyhow::Result<Has
     if bounds.is_some() {
         sql.push_str(" AND cx >= ? AND cx <= ? AND cy >= ? AND cy <= ?");
     }
-    let mut q =
-        sqlx::query_as::<_, (i64, i64, i64, String, i64, i64)>(&sql).bind(ask.from.format("%Y-%m-%d").to_string()).bind(ask.to.format("%Y-%m-%d").to_string());
+    type Row = (i64, i64, i64, String, i64, i64, i64, i64, Option<String>);
+    let mut q = sqlx::query_as::<_, Row>(&sql).bind(ask.from.format("%Y-%m-%d").to_string()).bind(ask.to.format("%Y-%m-%d").to_string());
     if let Some(h) = &ask.herd_id {
         q = q.bind(h);
     }
@@ -184,9 +219,17 @@ async fn blocks(ctx: &Ctx, grid: &Grid, ask: &Ask, k: i64) -> anyhow::Result<Has
         q = q.bind(x0).bind(x1).bind(y0).bind(y1);
     }
     let mut out: HashMap<(i64, i64), CellAgg> = HashMap::new();
-    for (cx, cy, n, hist, expected, got) in q.fetch_all(ctx.db()).await? {
+    for (cx, cy, n, hist, expected, got, fix_attempts, fix_ok, rsrp) in q.fetch_all(ctx.db()).await? {
         let hist: [u64; ACC_BINS] = serde_json::from_str(&hist).unwrap_or_default();
-        let a = CellAgg { n: n.max(0) as u64, hist, expected: expected.max(0) as u64, got: got.max(0) as u64 };
+        let a = CellAgg {
+            n: n.max(0) as u64,
+            hist,
+            expected: expected.max(0) as u64,
+            got: got.max(0) as u64,
+            fix_attempts: fix_attempts.max(0) as u64,
+            fix_ok: fix_ok.max(0) as u64,
+            rsrp: CellAgg::rsrp_from_json(rsrp.as_deref()),
+        };
         out.entry((cx.div_euclid(k), cy.div_euclid(k))).or_default().merge(&a);
     }
     Ok(out)
@@ -244,11 +287,11 @@ const TOOL_MAX_CELLS: usize = 500;
 pub fn tool() -> ToolSpec {
     ToolSpec {
         name: "get_coverage",
-        description: "GNSS coverage across the farm from the collars' fixes, as square cells (default 10 m; cell_m a multiple of 10). metric accuracy: each cell's median fix accuracy in metres (lower is better; above about 5 m is weak). metric fixes: the share of expected fixes that arrived, 0 to 1 (a missed fix counts where the animal was before the gap; below about 0.9 is weak). Each cell is [longitude, latitude, value, samples] at its centre; cells with under 5 samples are left out. from/to are dates or times (RFC 3339) or relative (-7d); default the last 7 days. With more than 500 cells only the 500 weakest are returned and `truncated` says how many there were.",
+        description: "GNSS coverage across the farm from the collars' fixes, as square cells (default 10 m; cell_m a multiple of 10). metric accuracy: each cell's median fix accuracy in metres (lower is better; above about 5 m is weak). metric fixes: the share of expected fixes that arrived, 0 to 1 (a missed fix counts where the animal was before the gap; below about 0.9 is weak). metric fix_rate: the share of fix attempts the receivers got, 0 to 1, from the collars' health reports (below about 0.9 is weak). metric cell: the median LTE cell signal (RSRP) the collars measured, dBm (higher is better; below about -110 is weak; only collars with a modem report it). Each cell is [longitude, latitude, value, samples] at its centre; cells with under 5 samples are left out. from/to are dates or times (RFC 3339) or relative (-7d); default the last 7 days. With more than 500 cells only the 500 weakest are returned and `truncated` says how many there were.",
         input_schema: json!({
             "type": "object",
             "properties": {
-                "metric": { "type": "string", "enum": ["accuracy", "fixes"] },
+                "metric": { "type": "string", "enum": ["accuracy", "fixes", "fix_rate", "cell"] },
                 "from": { "type": "string", "description": "Start: RFC 3339, a date, or relative like -7d." },
                 "to": { "type": "string", "description": "End (exclusive): RFC 3339, a date, or now." },
                 "cell_m": { "type": "integer", "minimum": 10, "maximum": MAX_CELL_M, "multipleOf": 10 },
@@ -274,7 +317,7 @@ async fn tool_run(ctx: &Ctx, args: &Value) -> ApiResult<Value> {
         // Weakest first: worst accuracy, fewest fixes.
         match ask.metric {
             Metric::Accuracy => map.cells.sort_by(|a, b| b.value.total_cmp(&a.value)),
-            Metric::Fixes => map.cells.sort_by(|a, b| a.value.total_cmp(&b.value)),
+            Metric::Fixes | Metric::FixRate | Metric::Cell => map.cells.sort_by(|a, b| a.value.total_cmp(&b.value)),
         }
         map.cells.truncate(TOOL_MAX_CELLS);
     }
@@ -303,10 +346,10 @@ mod tests {
 
     #[test]
     fn values_and_the_sample_floor() {
-        let a = CellAgg { n: 4, hist: [0, 0, 4, 0, 0, 0, 0, 0], expected: 40, got: 4 };
+        let a = CellAgg { n: 4, hist: [0, 0, 4, 0, 0, 0, 0, 0], expected: 40, got: 4, ..Default::default() };
         assert_eq!(Metric::Accuracy.value(&a), None);
         assert_eq!(Metric::Fixes.value(&a), Some((0.1, 40)));
-        let b = CellAgg { n: 5, hist: [0, 0, 5, 0, 0, 0, 0, 0], expected: 5, got: 5 };
+        let b = CellAgg { n: 5, hist: [0, 0, 5, 0, 0, 0, 0, 0], expected: 5, got: 5, ..Default::default() };
         assert_eq!(Metric::Accuracy.value(&b), Some((2.5, 5)));
         assert_eq!(Metric::Fixes.value(&b), Some((1.0, 5)));
     }
@@ -315,9 +358,26 @@ mod tests {
     fn metric_words() {
         assert_eq!(Metric::parse("").unwrap(), Metric::Accuracy);
         assert_eq!(Metric::parse("fixes").unwrap(), Metric::Fixes);
-        assert!(Metric::parse("cell").is_err());
+        assert!(Metric::parse("signal").is_err());
         assert_eq!(serde_json::to_value(Metric::Fixes).unwrap(), json!("fixes"));
         let c = Cell { lon: 1.5, lat: 2.5, value: 3.0, n: 7, bbox: [0.0; 4] };
         assert_eq!(serde_json::to_value(c).unwrap(), json!([1.5, 2.5, 3.0, 7]));
+    }
+
+    #[test]
+    fn fix_rate_and_cell_signal_values() {
+        assert_eq!(Metric::parse("fix_rate").unwrap(), Metric::FixRate);
+        assert_eq!(serde_json::to_value(Metric::FixRate).unwrap(), json!("fix_rate"));
+        assert_eq!((Metric::Cell.unit(), Metric::FixRate.unit()), ("dBm", "ratio"));
+        let rsrp: std::collections::BTreeMap<i32, u64> = [(-110, 2), (-104, 1), (-99, 2)].into_iter().collect();
+        let a = CellAgg { fix_attempts: 20, fix_ok: 17, rsrp, ..Default::default() };
+        assert_eq!(Metric::FixRate.value(&a), Some((0.85, 20)));
+        assert_eq!(Metric::Cell.value(&a), Some((-104.0, 5)));
+        assert_eq!(rsrp_median(&[(-100, 1), (-90, 1)].into_iter().collect()), Some(-95.0));
+        // Too few, and none.
+        let few = CellAgg { fix_attempts: 4, fix_ok: 4, rsrp: [(-90, 4)].into_iter().collect(), ..Default::default() };
+        assert_eq!((Metric::FixRate.value(&few), Metric::Cell.value(&few)), (None, None));
+        assert_eq!(CellAgg::rsrp_from_json(a.rsrp_json().as_deref()), a.rsrp);
+        assert_eq!(CellAgg::default().rsrp_json(), None);
     }
 }

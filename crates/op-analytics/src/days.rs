@@ -7,7 +7,9 @@
 //! - `coverage_days`: per herd per UTC day per 10 m cell, the fixes that
 //!   landed there, their accuracy histogram, and how many fixes the collars'
 //!   cadence called for. A fix that never came counts in the cell of the fix
-//!   before the gap.
+//!   before the gap. From the collars' health reports (field-ready H), each
+//!   counted in the cell of that collar's fix nearest in time: fix attempts
+//!   and fixes got, and the cell signal (RSRP) as a histogram of whole dBm.
 //!
 //! A run redoes exactly the days that changed: days holding rows added since
 //! the last run (by row id), and days whose Parquet file is new or gained
@@ -17,7 +19,7 @@
 //! there is data for, Parquet included (the backfill). Today is redone as it
 //! fills, so it is always the partial day so far.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -149,6 +151,11 @@ pub struct CellAgg {
     pub expected: u64,
     /// Fixes that came.
     pub got: u64,
+    /// GNSS fix attempts and fixes got, from health reports (H).
+    pub fix_attempts: u64,
+    pub fix_ok: u64,
+    /// Health reports by the cell signal they measured, whole dBm (H).
+    pub rsrp: BTreeMap<i32, u64>,
 }
 
 impl CellAgg {
@@ -167,6 +174,60 @@ impl CellAgg {
         self.expected += o.expected;
         for (a, b) in self.hist.iter_mut().zip(o.hist) {
             *a += b;
+        }
+        self.fix_attempts += o.fix_attempts;
+        self.fix_ok += o.fix_ok;
+        for (dbm, k) in &o.rsrp {
+            *self.rsrp.entry(*dbm).or_default() += k;
+        }
+    }
+
+    fn add_health(&mut self, h: &Hx) {
+        if let (Some(a), Some(ok)) = (h.attempts, h.ok) {
+            self.fix_attempts += u64::from(a);
+            self.fix_ok += u64::from(ok.min(a));
+        }
+        if let Some(r) = h.rsrp_dbm.filter(|r| r.is_finite() && (-200.0..0.0).contains(r)) {
+            *self.rsrp.entry(r.round() as i32).or_default() += 1;
+        }
+    }
+
+    /// `[[dBm, reports], …]` for `coverage_days.rsrp_hist`, `None` when empty.
+    pub fn rsrp_json(&self) -> Option<String> {
+        (!self.rsrp.is_empty()).then(|| serde_json::to_string(&self.rsrp.iter().map(|(d, k)| [*d as i64, *k as i64]).collect::<Vec<_>>()).unwrap_or_default())
+    }
+
+    /// Reads `coverage_days.rsrp_hist`.
+    pub fn rsrp_from_json(s: Option<&str>) -> BTreeMap<i32, u64> {
+        let pairs: Vec<[i64; 2]> = s.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        pairs.into_iter().filter(|p| p[1] > 0).map(|p| (p[0] as i32, p[1] as u64)).collect()
+    }
+}
+
+/// A health report as the aggregator keeps it: when, the fix attempts and
+/// fixes got in its period, and the cell signal it measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Hx {
+    t: i64,
+    attempts: Option<u32>,
+    ok: Option<u32>,
+    rsrp_dbm: Option<f64>,
+}
+
+/// Count each report in the cell of the collar's fix nearest in time (`fixes`
+/// sorted by time, `prev` the last one before the day), within
+/// [`MAX_GAP_MS`]; reports with no fix that near count nowhere.
+fn health_cells(fixes: &[Fx], prev: Option<Fx>, health: &[Hx], cells: &mut HashMap<CellKey, CellAgg>) {
+    for h in health {
+        let i = fixes.partition_point(|f| f.t < h.t);
+        let mut best: Option<Fx> = prev.filter(|p| p.t <= h.t);
+        for f in [i.checked_sub(1).and_then(|j| fixes.get(j)), fixes.get(i)].into_iter().flatten() {
+            if best.is_none_or(|b| (f.t - h.t).abs() < (b.t - h.t).abs()) {
+                best = Some(*f);
+            }
+        }
+        if let Some(f) = best.filter(|f| (f.t - h.t).abs() <= MAX_GAP_MS) {
+            cells.entry((f.herd, f.cx, f.cy)).or_default().add_health(h);
         }
     }
 }
@@ -275,6 +336,17 @@ fn fix_schema() -> SchemaRef {
         Field::new("lon", DataType::Float64, true),
         Field::new("lat", DataType::Float64, true),
         Field::new("accuracy_m", DataType::Float64, true),
+    ]))
+}
+
+fn health_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("collar_id", DataType::Utf8, true),
+        Field::new("t", DataType::Int64, true),
+        Field::new("fix_attempts", DataType::Int64, true),
+        Field::new("fix_ok", DataType::Int64, true),
+        Field::new("rsrp_dbm", DataType::Float64, true),
     ]))
 }
 
@@ -394,6 +466,33 @@ fn file_fixes(path: &Path, grid: Grid, herds: &mut Herds) -> anyhow::Result<(Has
     Ok((by, max_id))
 }
 
+/// A day file's health reports with fix counts or a cell signal, grouped by
+/// collar, and its highest row id.
+fn file_health(path: &Path) -> anyhow::Result<(HashMap<String, Vec<Hx>>, i64)> {
+    let mut by: HashMap<String, Vec<Hx>> = HashMap::new();
+    let mut max_id = 0;
+    read_day_file(path, &health_schema(), |b| {
+        let c = Cols::new(b);
+        let (ids, collar, t, att, ok, rsrp) = (c.i64("id"), c.str("collar_id"), c.i64("t"), c.i64("fix_attempts"), c.i64("fix_ok"), c.f64("rsrp_dbm"));
+        for i in 0..b.num_rows() {
+            if let Some(id) = get_i64(ids, i) {
+                max_id = max_id.max(id);
+            }
+            let (Some(cid), Some(t)) = (get_str(collar, i), get_i64(t, i)) else { continue };
+            let h = Hx {
+                t,
+                attempts: get_i64(att, i).and_then(|v| u32::try_from(v).ok()),
+                ok: get_i64(ok, i).and_then(|v| u32::try_from(v).ok()),
+                rsrp_dbm: get_f64(rsrp, i),
+            };
+            if h.attempts.is_some() || h.rsrp_dbm.is_some() {
+                by.entry(cid.to_owned()).or_default().push(h);
+            }
+        }
+    })?;
+    Ok((by, max_id))
+}
+
 /// A day file's battery readings grouped by collar, and its highest row id.
 fn file_battery(path: &Path) -> anyhow::Result<(HashMap<String, Vec<(i64, f64)>>, i64)> {
     let mut by: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
@@ -429,6 +528,7 @@ fn existing(path: PathBuf) -> Option<PathBuf> {
 const DAY_FIXES: &str = "SELECT id, herd_id, t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? ORDER BY t";
 const PREV_FIX: &str = "SELECT t, lon, lat, herd_id FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? ORDER BY t DESC LIMIT 1";
 const NEXT_FIX: &str = "SELECT MIN(t) FROM fixes WHERE collar_id = ? AND t >= ? AND t < ?";
+const DAY_HEALTH: &str = "SELECT id, t, fix_attempts, fix_ok, rsrp_dbm FROM health WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? AND (fix_attempts IS NOT NULL OR rsrp_dbm IS NOT NULL) ORDER BY t";
 const DAY_BATTERY: &str = "SELECT id, t, battery FROM health WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? AND battery IS NOT NULL ORDER BY t";
 
 fn collars_sql(table: &str) -> String {
@@ -485,8 +585,8 @@ async fn coverage_day(ctx: &Ctx, grid: Grid, date: NaiveDate) -> anyhow::Result<
     sqlx::query("DELETE FROM coverage_days WHERE date = ?").bind(&d).execute(&mut *tx).await?;
     for chunk in rows.chunks(200) {
         let sql = format!(
-            "INSERT INTO coverage_days (date, herd_id, cx, cy, n, acc_hist, expected, got) VALUES {}",
-            vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ")
+            "INSERT INTO coverage_days (date, herd_id, cx, cy, n, acc_hist, expected, got, fix_attempts, fix_ok, rsrp_hist) VALUES {}",
+            vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ")
         );
         let mut q = sqlx::query(&sql);
         for (h, x, y, a) in chunk {
@@ -498,7 +598,10 @@ async fn coverage_day(ctx: &Ctx, grid: Grid, date: NaiveDate) -> anyhow::Result<
                 .bind(a.n as i64)
                 .bind(serde_json::to_string(&a.hist)?)
                 .bind(a.expected as i64)
-                .bind(a.got as i64);
+                .bind(a.got as i64)
+                .bind(a.fix_attempts as i64)
+                .bind(a.fix_ok as i64)
+                .bind(a.rsrp_json());
         }
         q.execute(&mut *tx).await?;
     }
@@ -538,8 +641,15 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
         None => HashMap::new(),
     };
 
+    let (mut cold_health, cold_health_max) = match existing(day_path(&dir, "health", date)) {
+        Some(p) => blocking(move || file_health(&p)).await?,
+        None => (HashMap::new(), 0),
+    };
+
     let mut collars: BTreeSet<String> = cold.keys().cloned().collect();
     collars.extend(hot_collars(conn, "fixes").await?);
+    collars.extend(cold_health.keys().cloned());
+    collars.extend(hot_collars(conn, "health").await?);
     let mut cells: HashMap<CellKey, CellAgg> = HashMap::new();
     let mut max_id = cold_max;
     for collar in &collars {
@@ -556,7 +666,13 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
             fixes.push(Fx { t: r.try_get(2)?, cx: cx as i32, cy: cy as i32, acc: acc.map_or(f32::NAN, |a| a as f32), herd: herds.get(herd.as_deref()) });
         }
         drop(rows);
-        if fixes.is_empty() {
+        let mut health = cold_health.remove(collar).unwrap_or_default();
+        let hot: Vec<(i64, i64, Option<i64>, Option<i64>, Option<f64>)> =
+            sqlx::query_as(DAY_HEALTH).bind(collar).bind(ds).bind(de).bind(cold_health_max).fetch_all(&mut *conn).await?;
+        for (_, t, att, ok, rsrp) in hot {
+            health.push(Hx { t, attempts: att.and_then(|v| u32::try_from(v).ok()), ok: ok.and_then(|v| u32::try_from(v).ok()), rsrp_dbm: rsrp });
+        }
+        if fixes.is_empty() && health.is_empty() {
             continue;
         }
 
@@ -577,7 +693,10 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        collar_day((ds, de), prev, &mut fixes, next, &mut cells);
+        if !fixes.is_empty() {
+            collar_day((ds, de), prev, &mut fixes, next, &mut cells);
+        }
+        health_cells(&fixes, prev, &health, &mut cells);
     }
     Ok((herds, cells, max_id, mtime))
 }
@@ -805,8 +924,12 @@ pub async fn aggregate(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Aggregat
 
     // A day that fails is logged and tried again next run: the mark only
     // moves once every changed day has been written.
+    let health_top = top_id(ctx, "health").await?;
+    let health_days: Vec<NaiveDate> = changed_days(ctx, "health", health_top, 0).await?.into_iter().filter(|d| *d <= last).collect();
     let top = top_id(ctx, "fixes").await?;
-    let days: Vec<NaiveDate> = changed_days(ctx, "fixes", top, MAX_GAP_MS).await?.into_iter().filter(|d| *d <= last).collect();
+    let mut days: BTreeSet<NaiveDate> = changed_days(ctx, "fixes", top, MAX_GAP_MS).await?.into_iter().filter(|d| *d <= last).collect();
+    // Health reports count on the coverage grid too (fix rate, cell signal).
+    days.extend(health_days.iter().copied());
     let mut ok = true;
     if !days.is_empty() {
         let grid = match grid(ctx).await? {
@@ -826,14 +949,14 @@ pub async fn aggregate(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Aggregat
             }
         }
     }
+    let coverage_ok = ok;
     if ok {
         set_mark(ctx, "fixes", top).await?;
     }
 
-    let top = top_id(ctx, "health").await?;
-    let days: Vec<NaiveDate> = changed_days(ctx, "health", top, 0).await?.into_iter().filter(|d| *d <= last).collect();
-    let mut ok = true;
-    for d in days {
+    let top = health_top;
+    let mut ok = coverage_ok;
+    for d in health_days {
         match battery_day(ctx, d).await {
             Ok(0) => {}
             Ok(_) => done.battery.push(d),
@@ -998,6 +1121,7 @@ mod tests {
             (bind(PREV_FIX), "fixes_collar_t (collar_id=? AND t>? AND t<?)"),
             (bind(NEXT_FIX), "fixes_collar_t (collar_id=? AND t>? AND t<?)"),
             (bind(DAY_BATTERY), "health_collar_t (collar_id=? AND t>? AND t<?)"),
+            (bind(DAY_HEALTH), "health_collar_t (collar_id=? AND t>? AND t<?)"),
             (collars_sql("fixes"), "fixes_collar_t (collar_id>?)"),
             (collars_sql("health"), "health_collar_t (collar_id>?)"),
         ] {

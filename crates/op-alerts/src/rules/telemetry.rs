@@ -23,7 +23,27 @@ const COVERAGE: f64 = 0.8;
 
 /// Every fix (sampled every 5 minutes) within `threshold` m of their median
 /// for `after_min`: the collar is lying on the ground, or the animal is down.
+/// A collar with an IMU (H) says so itself: still for [`IMU_STILL_MIN`] (or
+/// `after_min`, if sooner) and tilted past [`IMU_TILT_DEG`], a collar lying on
+/// its side, not on a neck.
 pub struct DropOff;
+
+// @H
+/// An IMU collar still this long, tilted past [`IMU_TILT_DEG`], has come off.
+pub const IMU_STILL_MIN: i64 = 45;
+pub const IMU_TILT_DEG: f64 = 60.0;
+
+/// The newest health report of a collar within 15 minutes, when it carries
+/// motion (`still_s`, `tilt_deg`): `(t, still_s, tilt_deg)`.
+async fn imu_reading(ctx: &Ctx, collar_id: &str, now: DateTime<Utc>) -> anyhow::Result<Option<(i64, f64, f64)>> {
+    let row: Option<(i64, Option<f64>, Option<f64>)> =
+        sqlx::query_as("SELECT t, still_s, tilt_deg FROM health WHERE collar_id = ? AND t >= ? ORDER BY t DESC LIMIT 1")
+            .bind(collar_id)
+            .bind((now - Duration::minutes(15)).timestamp_millis())
+            .fetch_optional(ctx.db())
+            .await?;
+    Ok(row.and_then(|(t, still, tilt)| Some((t, still?, tilt?))))
+}
 
 #[async_trait]
 impl Rule for DropOff {
@@ -50,6 +70,30 @@ impl Rule for DropOff {
         // Only collars with a fresh fix whose track reaches back to the window's start.
         let fresh = f.units.iter().filter(|u| u.collar.last_fix.as_ref().is_some_and(|x| now - x.at <= Duration::minutes(15)));
         for u in fresh {
+            // @H: an IMU decides on its own.
+            if let Some((t, still_s, tilt)) = imu_reading(ctx, &u.collar.id, now).await? {
+                let need = window.num_seconds().min(IMU_STILL_MIN * 60) as f64;
+                if still_s >= need && tilt > IMU_TILT_DEG {
+                    let herd = f.herd(&u.collar.herd_id);
+                    let since = op_core::time::from_unix_ms(t) - Duration::seconds(still_s as i64);
+                    let mut data = json!({ "label": u.label, "herd": herd.name, "since": ts(&since), "imu": true, "tilt_deg": tilt.round() });
+                    if let Some(p) = &herd.paddock {
+                        data["paddock"] = json!(p);
+                    }
+                    out.push(Candidate {
+                        key: format!("drop_off:{}", u.collar.id),
+                        subject: ("collar".into(), u.collar.id.clone()),
+                        herd_id: Some(u.collar.herd_id.clone()),
+                        title: format!("{} not moving", u.label),
+                        body: None,
+                        at: u.collar.last_fix.as_ref().map(|x| x.point),
+                        targets: collar_targets(u),
+                        data,
+                        severity: None,
+                    });
+                }
+                continue;
+            }
             let rows = sqlx::query(
                 "WITH RECURSIVE s(k, t) AS (SELECT 0, ?1 UNION ALL SELECT k + 1, t + ?2 FROM s WHERE k + 1 < ?3)
                  SELECT s.k, f.lon, f.lat FROM s JOIN fixes f ON f.id = (

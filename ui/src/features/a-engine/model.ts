@@ -103,7 +103,7 @@ export function circle(center: LonLat, radiusM: number, n = 48): LonLat[] {
 }
 
 // The slow ring on an unacked critical alert: radius (px) and opacity at time t (ms).
-export function pulse(t: number, period = 2400): { radius: number; opacity: number } {
+export function beat(t: number, period = 2400): { radius: number; opacity: number } {
   const p = (t % period) / period;
   return { radius: 7 + 17 * p, opacity: 0.7 * (1 - p) };
 }

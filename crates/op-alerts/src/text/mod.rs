@@ -248,6 +248,7 @@ pub fn rollup_title(kind: &str, n: usize, paddock: Option<&str>) -> String {
         // @S
         "schedule_not_stored" => format!("{n} missing the next strip"),
         // @H
+        "fit_check_due" => format!("{n} fit checks due"),
         other => format!("{n} {}", other.replace('_', " ")),
     }
 }
@@ -517,6 +518,7 @@ pub fn group_text(alerts: &[Alert], place: Option<&str>, t: &TextCtx) -> String 
                 // @S
                 "schedule_not_stored" => return alert_text(a, place, t),
                 // @H
+                "fit_check_due" => "fit check due".into(),
                 other => other.replace('_', " "),
             };
             list_text(&format!("{total} {phrase}:"), &labels)

@@ -13,6 +13,7 @@
 
 mod firmware;
 mod herd;
+mod sensors;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,6 +62,16 @@ struct Args {
     /// limits) or legacy (0.1: one ring of 64 corners, no config).
     #[arg(long, value_enum, default_value_t = Profile::V0)]
     caps: Profile,
+    /// Collars have an IMU: reports carry seconds without moving and tilt.
+    #[arg(long)]
+    imu: bool,
+    /// This many collars come off their animals within the first few
+    /// minutes and lie where they fell.
+    #[arg(long, default_value_t = 0)]
+    drop: usize,
+    /// Collars report the LTE-M cell they measure (signal, quality, band).
+    #[arg(long)]
+    cell: bool,
 }
 
 /// A collar this tool linked. Keys are only ever shown once, so they live here.
@@ -229,10 +240,11 @@ async fn main() -> anyhow::Result<()> {
 
     let world: World = Arc::new(Mutex::new(HashMap::new()));
     println!("running {} {:?} collars, a fix every {} s; ctrl-c to stop", mine.len(), args.caps, args.fix_secs);
+    let radio = args.cell.then(|| sensors::Radio::near(area.interior()));
     let mut tasks = Vec::new();
-    for l in mine {
+    for (i, l) in mine.into_iter().enumerate() {
         let start = last.get(&l.collar_id).copied();
-        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps };
+        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio };
         tasks.push(tokio::spawn(run_collar(l, start, area.clone(), world.clone(), api.http.clone(), cfg)));
     }
     tokio::select! {
@@ -262,6 +274,10 @@ struct Run {
     fix_secs: u64,
     batch: u32,
     profile: Profile,
+    imu: bool,
+    /// This collar comes off its animal.
+    drop: bool,
+    radio: Option<sensors::Radio>,
 }
 
 /// The device side of the protocol for one collar.
@@ -365,6 +381,12 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
     let dev = Device { http, l, server_key };
     let stubborn = rng.gen_bool(0.2);
     let mut collar = Collar::new(Animal::new(pos, stubborn, &mut rng), rng.gen_range(0.82..1.0), Some(area), firmware);
+    if cfg.imu {
+        collar.motion = Some(sensors::Motion::new(chrono::Utc::now()));
+    }
+    if cfg.drop {
+        collar.fall = Some(sensors::Fall::at(chrono::Utc::now() + chrono::Duration::seconds(rng.gen_range(60..180))));
+    }
     world.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), (pos, [0.0, 0.0]));
 
     // Stagger so collars don't report in lockstep.
@@ -382,7 +404,12 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
         let now = op_protocol::wire_time::trunc_secs(chrono::Utc::now());
         let herd = herd_view(&world, &id);
         let held = collar.held_version();
+        let fallen = collar.fallen();
         let (fix, cue) = collar.tick(now, cfg.fix_secs as f64, herd, &mut rng);
+        if !fallen && collar.fallen() {
+            let p = collar.position();
+            println!("{}: collar fell off its animal at [{:.6}, {:.6}]", dev.l.tag, p[0], p[1]);
+        }
         if collar.held_version() != held {
             println!("{}: boundary v{} applied", dev.l.tag, collar.held_version().unwrap_or(0));
         }
@@ -425,11 +452,17 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
                 cues: cues.clone(),
                 episodes: episodes.clone(),
                 battery: Some((collar.battery * 1000.0).round() / 1000.0),
-                health: (!legacy).then(|| Health {
-                    fix_attempts: Some(collar.fix_attempts),
-                    fix_ok: Some(collar.fix_ok),
-                    uptime_s: Some((now - booted).num_seconds().max(0) as u64),
-                    ..Default::default()
+                health: (!legacy).then(|| {
+                    let imu = collar.imu(now);
+                    Health {
+                        fix_attempts: Some(collar.fix_attempts),
+                        fix_ok: Some(collar.fix_ok),
+                        uptime_s: Some((now - booted).num_seconds().max(0) as u64),
+                        still_s: imu.map(|m| m.0),
+                        tilt_deg: imu.map(|m| m.1),
+                        cell: cfg.radio.map(|r| r.measure(collar.position(), now, &mut rng)),
+                        ..Default::default()
+                    }
                 }),
             };
             last_report = Some(now);
