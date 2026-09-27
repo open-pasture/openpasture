@@ -524,7 +524,9 @@ async fn test_sends_now_and_says_what_happened() {
     setup_webhook(&ctx, &hook).await;
     let (_, v) = call(&a, "POST", "/api/notify/test", Some(json!({ "channel": "webhook" }))).await;
     assert_eq!(v, json!({ "ok": true, "detail": "Delivered" }));
-    assert_eq!(hook.hits()[0].json()["message"]["kind"], "test");
+    let body = hook.hits()[0].json();
+    assert_eq!(body["message"]["kind"], "test");
+    assert_eq!(body["message"]["text"], "openpasture test.");
 
     let (s, _) = call(&a, "POST", "/api/notify/test", Some(json!({ "channel": "pigeon" }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);

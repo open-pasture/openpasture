@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use super::relay::Relay;
 use super::twilio::Twilio;
 use super::verify::{self, CodeSent, Verified};
-use super::{ChannelsConfig, RelayConfig, SECRETS, Sent, TEST_TEXT, channel, draft, label, load, record_sent, save, secret, set};
+use super::{ChannelsConfig, RelayConfig, SECRETS, Sent, TEST_NOTE, TEST_TEXT, channel, draft, label, load, record_sent, save, secret, set};
 
 pub fn router() -> Router<Ctx> {
     Router::new()
@@ -285,7 +285,8 @@ async fn test(State(ctx): State<Ctx>, ApiJson(b): ApiJson<TestBody>) -> ApiResul
         _ => return Err(ApiError::bad_request("Nothing to test.")),
     };
     let subject = (kind == "email" || (kind == "relay" && to.contains('@'))).then_some("openpasture test");
-    let msg = draft(kind, &to, "test", TEST_TEXT, subject);
+    let text = if subject.is_some() || kind == "webhook" { TEST_NOTE } else { TEST_TEXT };
+    let msg = draft(kind, &to, "test", text, subject);
     let res = ch.send(&msg).await;
     let (status, provider_id, error) = match &res {
         Ok(d) => (d.status.clone(), d.provider_id.clone(), None),
@@ -298,7 +299,7 @@ async fn test(State(ctx): State<Ctx>, ApiJson(b): ApiJson<TestBody>) -> ApiResul
         Sent {
             channel: kind.into(),
             to: to.clone(),
-            text: TEST_TEXT.into(),
+            text: text.into(),
             subject: subject.map(Into::into),
             kind: "test".into(),
             status: status.clone(),

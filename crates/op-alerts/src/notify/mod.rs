@@ -367,6 +367,9 @@ pub fn masked_code_text() -> String {
 /// opt-out line too.
 pub const TEST_TEXT: &str = "openpasture test. Reply STOP to opt out.";
 
+/// A test email or webhook (nothing to opt out of by reply).
+pub const TEST_NOTE: &str = "openpasture test.";
+
 /// Every character is in the GSM 03.38 default alphabet or its extension
 /// table, so a text goes as 7-bit (160 characters a part) and not UCS-2.
 pub fn is_gsm7(s: &str) -> bool {
