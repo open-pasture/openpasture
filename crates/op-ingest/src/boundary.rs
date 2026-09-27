@@ -237,6 +237,8 @@ pub async fn boundary_status(ctx: &Ctx, herd_id: &str) -> anyhow::Result<Boundar
         acks: db::latest_acks(ctx.db(), herd_id).await?,
         r#move: crate::moves::current_move(ctx.db(), herd_id, now()).await?,
         escapes: crate::escapes::current_escapes(ctx.db(), herd_id, now()).await?,
+        staged: vec![],
+        slots: vec![],
     })
 }
 

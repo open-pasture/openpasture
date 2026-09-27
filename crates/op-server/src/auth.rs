@@ -15,6 +15,12 @@
 //!
 //! Collar endpoints (`/collar/v1`) use collar keys (op-ingest); `/v1/decide`
 //! uses hosted keys (op-brain).
+//!
+//! Every request leaves the guard with an [`Identity`] in its extensions:
+//! the app token and local requests are the owner (`app_token` / `local`), a
+//! brain token is [`Identity::brain`] with its tool allowlist as a
+//! [`ToolScope`], and everything outside `/api` and `/mcp` is anonymous
+//! (those endpoints authenticate themselves).
 
 use std::net::SocketAddr;
 
@@ -22,7 +28,8 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use op_core::{ApiError, Ctx};
+use op_core::tools::ToolScope;
+use op_core::{ApiError, Ctx, Identity, Via};
 
 /// Origins of the Vite dev server, allowed when dev CORS is on.
 pub const DEV_ORIGINS: [&str; 2] = ["http://localhost:5173", "http://127.0.0.1:5173"];
@@ -99,9 +106,10 @@ fn given_token(req: &Request) -> Option<String> {
     bearer.or_else(|| req.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token="))).map(str::to_owned))
 }
 
-pub async fn guard(State(st): State<AuthState>, req: Request, next: Next) -> Response {
+pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
     if !protected(path) {
+        req.extensions_mut().insert(Identity::anonymous());
         return next.run(req).await;
     }
     let brain_scope = (path == "/mcp" || path.starts_with("/mcp/")) && req.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "scope=brain"));
@@ -111,7 +119,13 @@ pub async fn guard(State(st): State<AuthState>, req: Request, next: Next) -> Res
             Ok(s) => s.server.app_token,
             Err(e) => return ApiError::from(e).into_response(),
         };
-        if eq(given.as_bytes(), app_token.as_bytes()) || (brain_scope && st.ctx.check_brain_token(&given)) {
+        if eq(given.as_bytes(), app_token.as_bytes()) {
+            req.extensions_mut().insert(Identity::owner(Via::AppToken));
+            return next.run(req).await;
+        }
+        if brain_scope && let Some(tools) = st.ctx.check_brain_token(&given) {
+            req.extensions_mut().insert(Identity::brain());
+            req.extensions_mut().insert(ToolScope::Only(tools));
             return next.run(req).await;
         }
         // A stale token from the browser falls through to the local check.
@@ -126,6 +140,7 @@ pub async fn guard(State(st): State<AuthState>, req: Request, next: Next) -> Res
     if (upgrade || unsafe_method) && !origin_ok(req.headers(), st.dev) {
         return ApiError::new(StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
     }
+    req.extensions_mut().insert(Identity::owner(Via::Local));
     next.run(req).await
 }
 

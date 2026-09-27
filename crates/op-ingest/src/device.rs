@@ -75,6 +75,8 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
     let paddocks = ctx.store().list_paddocks().await?;
     let health = rep.health.clone().unwrap_or_default();
 
+    let latest_version = held.staged.last().or(held.active.as_ref()).map(|b| b.version);
+
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     // The collar as it is now: another report for it may have just landed.
     let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&collar.id).fetch_optional(&mut *tx).await?;
@@ -82,6 +84,24 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
         Some(r) => op_core::store::collar_from_row(&r)?,
         None => return Err(ApiError::unauthorized("Unknown collar key.")),
     };
+    // A parked collar (charging, on the shelf, in repair) says nothing about
+    // grazing: only its battery, health and last contact are kept.
+    if collar.parked_at.is_some() {
+        insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health).await?;
+        collar.last_seen = Some(received);
+        if rep.battery.is_some() {
+            collar.battery = rep.battery;
+        }
+        sqlx::query("UPDATE collars SET last_seen = ?, battery = ? WHERE id = ?")
+            .bind(collar.last_seen.as_ref().map(to_db))
+            .bind(collar.battery)
+            .bind(&collar.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        ctx.publish(Event::Collar { collar });
+        return Ok(Json(ReportResponse { latest_version, ..Default::default() }));
+    }
     let fence_for = |state: FenceState| {
         let b = split.active.as_ref()?;
         let cfg = GeofenceConfig { warn_m: b.warn_m, hysteresis_m: b.hysteresis_m, ..GeofenceConfig::default() };
@@ -97,6 +117,8 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
 
     let mut events = Vec::with_capacity(rep.cues.len() + 2);
     let mut state = if fence.is_some() { collar.state } else { FenceState::Unknown };
+    // Since the first fix outside after the last one in (as escapes count it).
+    let mut outside_since = if collar.state == FenceState::Outside { collar.outside_since } else { None };
     let mut latest_fix = collar.last_fix.clone();
     let mut latest_event = None;
     for wf in &rep.fixes {
@@ -111,6 +133,11 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
         };
         if newer {
             state = fix_state;
+            if fix_state != FenceState::Outside {
+                outside_since = None;
+            } else if outside_since.is_none() {
+                outside_since = Some(wf.at);
+            }
         }
         let fix = Fix {
             at: wf.at,
@@ -167,13 +194,53 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
         .bind(rep.boundary_version.map(|v| v as i64))
         .execute(&mut *tx)
         .await?;
-        events.push(Event::Cue { collar_id: collar.id.clone(), at: cue.at, level: cue.level, margin_m: cue.margin_m });
+        events.push(Event::Cue { collar_id: collar.id.clone(), at: cue.at, level: cue.level, margin_m: cue.margin_m, kind: None, ring: None });
     }
+    insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health).await?;
+
+    collar.last_seen = Some(received);
+    if rep.battery.is_some() {
+        collar.battery = rep.battery;
+    }
+    if rep.boundary_version.is_some() {
+        collar.boundary_version = rep.boundary_version;
+    }
+    collar.state = state;
+    collar.outside_since = if state == FenceState::Outside { outside_since } else { None };
+    collar.last_fix = latest_fix;
+    sqlx::query("UPDATE collars SET last_seen = ?, battery = ?, boundary_version = ?, state = ?, last_fix = ?, outside_since = ? WHERE id = ?")
+        .bind(collar.last_seen.as_ref().map(to_db))
+        .bind(collar.battery)
+        .bind(collar.boundary_version.map(|v| v as i64))
+        .bind(collar.state.as_str())
+        .bind(collar.last_fix.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?)
+        .bind(collar.outside_since.as_ref().map(to_db))
+        .bind(&collar.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    for e in events {
+        ctx.publish(e);
+    }
+    ctx.publish(Event::Collar { collar });
+    Ok(Json(ReportResponse { latest_version, ..Default::default() }))
+}
+
+/// One `health` row per report: battery and receiver health over time.
+async fn insert_health(
+    tx: &mut sqlx::SqliteConnection,
+    collar_id: &str,
+    herd_id: &str,
+    received: chrono::DateTime<chrono::Utc>,
+    rep: &PositionReport,
+    health: &op_protocol::Health,
+) -> ApiResult<()> {
     sqlx::query(
         "INSERT INTO health (collar_id, herd_id, at, t, battery, sats, cn0, ttf_s, fixes, cues, boundary_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&collar.id)
-    .bind(&herd_id)
+    .bind(collar_id)
+    .bind(herd_id)
     .bind(to_db(&received))
     .bind(unix_ms(&received))
     .bind(rep.battery)
@@ -185,33 +252,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
     .bind(rep.boundary_version.map(|v| v as i64))
     .execute(&mut *tx)
     .await?;
-
-    collar.last_seen = Some(received);
-    if rep.battery.is_some() {
-        collar.battery = rep.battery;
-    }
-    if rep.boundary_version.is_some() {
-        collar.boundary_version = rep.boundary_version;
-    }
-    collar.state = state;
-    collar.last_fix = latest_fix;
-    sqlx::query("UPDATE collars SET last_seen = ?, battery = ?, boundary_version = ?, state = ?, last_fix = ? WHERE id = ?")
-        .bind(collar.last_seen.as_ref().map(to_db))
-        .bind(collar.battery)
-        .bind(collar.boundary_version.map(|v| v as i64))
-        .bind(collar.state.as_str())
-        .bind(collar.last_fix.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?)
-        .bind(&collar.id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-
-    for e in events {
-        ctx.publish(e);
-    }
-    ctx.publish(Event::Collar { collar });
-    let latest_version = held.staged.last().or(held.active.as_ref()).map(|b| b.version);
-    Ok(Json(ReportResponse { latest_version, ..Default::default() }))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -254,6 +295,7 @@ async fn ack(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(a): Api
     if last.is_some_and(|(s,)| s == a.status.as_str()) {
         return Ok(StatusCode::NO_CONTENT);
     }
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     sqlx::query("INSERT INTO acks (collar_id, herd_id, command_id, version, status, reason, at, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&collar.id)
         .bind(&collar.herd_id)
@@ -263,12 +305,29 @@ async fn ack(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(a): Api
         .bind(&a.reason)
         .bind(to_db(&a.at))
         .bind(to_db(&now()))
-        .execute(ctx.db())
+        .execute(&mut *tx)
         .await?;
+    // The collar's latest boundary state: the highest version it acked, and
+    // that version's latest status. A late ack for a lower version changes nothing.
+    sqlx::query(
+        "INSERT INTO collar_boundary_state (collar_id, herd_id, version, status, code, command_id, at) VALUES (?, ?, ?, ?, NULL, ?, ?)
+         ON CONFLICT(collar_id) DO UPDATE SET herd_id = excluded.herd_id, version = excluded.version, status = excluded.status,
+             code = excluded.code, command_id = excluded.command_id, at = excluded.at
+         WHERE excluded.version >= collar_boundary_state.version",
+    )
+    .bind(&collar.id)
+    .bind(&collar.herd_id)
+    .bind(a.version as i64)
+    .bind(a.status.as_str())
+    .bind(&a.command_id)
+    .bind(to_db(&a.at))
+    .execute(&mut *tx)
+    .await?;
     if a.status == AckStatus::Applied && collar.boundary_version.is_none_or(|v| a.version > v) {
         collar.boundary_version = Some(a.version);
-        sqlx::query("UPDATE collars SET boundary_version = ? WHERE id = ?").bind(a.version as i64).bind(&collar.id).execute(ctx.db()).await?;
+        sqlx::query("UPDATE collars SET boundary_version = ? WHERE id = ?").bind(a.version as i64).bind(&collar.id).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     tracing::info!(collar = %collar.id, version = a.version, status = a.status.as_str(), "boundary ack");
     ctx.publish(Event::Ack { collar_id: collar.id.clone(), herd_id: collar.herd_id.clone(), version: a.version, status: a.status, reason: a.reason });
     ctx.publish(Event::Collar { collar });

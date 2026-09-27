@@ -384,7 +384,14 @@ mod tests {
     #[tokio::test]
     async fn brain_logs_progress() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "herd_1".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req = DecisionRequest {
+            herd_id: "herd_1".into(),
+            context: fixture::context(),
+            instructions: String::new(),
+            mcp_url: String::new(),
+            tools: vec![],
+            log: tx,
+        };
         let out = HeuristicBrain.decide(req).await.unwrap();
         assert_eq!(out.action, Action::Move);
         assert!(rx.recv().await.unwrap().starts_with("Heuristic"));

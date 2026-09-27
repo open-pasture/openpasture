@@ -12,6 +12,32 @@ members = [
     "crates/op-cli",
     "tools/collar-sim",
     "apps/desktop/src-tauri",
+    # @HUB
+    "crates/op-alerts",
+    "crates/op-import",
+    "crates/op-reports",
+    # @HUB-UI
+    # @E-lib
+    # @E-srv
+    # @J
+    # @A-engine
+    # @A-notify
+    # @D
+    # @K-animals
+    # @K-files
+    # @I
+    # @B
+    # @G
+    # @P
+    # @Q
+    # @C
+    # @F
+    # @S
+    # @A3
+    # @H
+    # @L
+    # @M
+    # @Z
 ]
 
 [workspace.package]
@@ -31,6 +57,9 @@ op-analytics = { path = "crates/op-analytics" }
 op-brain = { path = "crates/op-brain" }
 op-engine = { path = "crates/op-engine" }
 op-server = { path = "crates/op-server" }
+op-alerts = { path = "crates/op-alerts" }
+op-import = { path = "crates/op-import" }
+op-reports = { path = "crates/op-reports" }
 
 # Runtime and web
 tokio = { version = "1", features = ["full"] }
@@ -81,6 +110,44 @@ tzf-rs = { version = "2.1", default-features = false, features = ["bundled"] }
 tempfile = "3"
 tokio-tungstenite = "0.26"
 
+# @HUB
+# Texting and alerts: Twilio signatures (HMAC-SHA1), webhook signatures
+# (HMAC-SHA256), SMTP. lettre uses rustls with the ring provider, like reqwest.
+hmac = "0.12"
+sha1 = "0.10"
+hex = "0.4"
+form_urlencoded = "1.2"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
+# Imports: CSV, zip (deflate only), shapefiles, KML, GPX; QR cards (SVG only).
+csv = "1.4"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+shapefile = "0.9"
+quick-xml = "0.42"
+gpx = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
 [workspace.lints.rust]
 # Debug binaries that link datafusion are big enough that macOS ld notes the
 # size of their __eh_frame section. The note is harmless.
@@ -88,6 +155,11 @@ linker_messages = "allow"
 
 [profile.dev.package.sqlx-macros]
 opt-level = 3
+
+# Dependencies without debug info (workspace crates keep it): smaller debug
+# targets and faster links.
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 strip = true

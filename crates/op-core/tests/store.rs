@@ -52,6 +52,7 @@ async fn record_crud() {
         notes: None,
         grazed_until: None,
         created_at: time::now(),
+        props: Default::default(),
     };
     store.insert_paddock(&pad).await.unwrap();
     assert_eq!(store.get_paddock(&pad.id).await.unwrap().unwrap(), pad);
@@ -69,7 +70,7 @@ async fn record_crud() {
     store.insert_herd(&herd).await.unwrap();
     assert_eq!(store.list_herds().await.unwrap(), vec![herd.clone()]);
 
-    let animal = Animal { id: id::new_id(id::ANIMAL), tag: "A1".into(), name: None, herd_id: herd.id.clone(), collar_id: None };
+    let animal = Animal { id: id::new_id(id::ANIMAL), tag: "A1".into(), name: None, herd_id: herd.id.clone(), collar_id: None, ..Default::default() };
     store.insert_animal(&animal).await.unwrap();
     assert_eq!(store.list_animals(Some(&herd.id)).await.unwrap(), vec![animal.clone()]);
 
@@ -196,13 +197,13 @@ async fn concurrent_settings_updates_keep_both() {
         assert_eq!(serde_json::to_value(&s.units).unwrap(), json!(units));
     }
     // Brain tokens: valid until dropped.
-    let t = ctx.mint_brain_token(std::time::Duration::from_secs(60));
+    let t = ctx.mint_brain_token(std::time::Duration::from_secs(60), vec![]);
     let s = t.as_str().to_owned();
-    assert!(ctx.check_brain_token(&s));
-    assert!(!ctx.check_brain_token("opb_nope"));
+    assert!(ctx.check_brain_token(&s).is_some());
+    assert!(ctx.check_brain_token("opb_nope").is_none());
     drop(t);
-    assert!(!ctx.check_brain_token(&s));
-    let t = ctx.mint_brain_token(std::time::Duration::from_millis(1));
+    assert!(ctx.check_brain_token(&s).is_none());
+    let t = ctx.mint_brain_token(std::time::Duration::from_millis(1), vec![]);
     std::thread::sleep(std::time::Duration::from_millis(5));
-    assert!(!ctx.check_brain_token(t.as_str()), "expired");
+    assert!(ctx.check_brain_token(t.as_str()).is_none(), "expired");
 }

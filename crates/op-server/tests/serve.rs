@@ -117,7 +117,7 @@ async fn token_required_unless_local() {
     assert!(body["error"].as_str().unwrap().contains("collar key"), "{body}");
 
     // A brain token opens /mcp?scope=brain only, and dies with its guard.
-    let bt = ctx.mint_brain_token(std::time::Duration::from_secs(60));
+    let bt = ctx.mint_brain_token(std::time::Duration::from_secs(60), vec![]);
     let brain_bearer = format!("Bearer {}", bt.as_str());
     let mcp = |uri: &str, auth: &str| {
         req(

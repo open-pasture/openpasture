@@ -91,7 +91,7 @@ impl Brain for AnthropicBrain {
             "model": self.model,
             "max_tokens": 4096,
             "system": SYSTEM,
-            "messages": [{ "role": "user", "content": build_prompt(&req.instructions, &req.context, &decision_schema(), false) }],
+            "messages": [{ "role": "user", "content": build_prompt(&req.instructions, &req.context, &decision_schema(), &[]) }],
             "tools": [{
                 "name": "submit_decision",
                 "description": "Submit the grazing decision for this herd.",
@@ -169,7 +169,7 @@ impl Brain for OpenAiBrain {
             None => compatible_models(&self.base, self.key.as_deref()).await.ok().and_then(|m| m.into_iter().next()).context("choose a model")?,
         };
         req.say(format!("Asking {model}"));
-        let prompt = build_prompt(&req.instructions, &req.context, &decision_schema(), false);
+        let prompt = build_prompt(&req.instructions, &req.context, &decision_schema(), &[]);
         let messages = json!([{ "role": "system", "content": SYSTEM }, { "role": "user", "content": prompt }]);
         let formats = [
             Some(json!({ "type": "json_schema", "json_schema": { "name": "grazing_decision", "strict": true, "schema": decision_schema() } })),

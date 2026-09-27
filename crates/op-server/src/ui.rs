@@ -1,5 +1,5 @@
-//! The built UI, embedded. Unknown paths outside `/api`, `/collar`, `/mcp` and
-//! `/v1` fall back to index.html.
+//! The built UI, embedded. Unknown paths outside `/api`, `/collar`, `/mcp`,
+//! `/v1` and `/hooks` fall back to index.html.
 
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -11,7 +11,7 @@ use rust_embed::RustEmbed;
 struct Assets;
 
 fn is_api(path: &str) -> bool {
-    ["api", "collar", "mcp", "v1"].iter().any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    ["api", "collar", "mcp", "v1", "hooks"].iter().any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
 
 pub async fn handler(uri: Uri) -> Response {

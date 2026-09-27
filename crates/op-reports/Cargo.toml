@@ -1,0 +1,77 @@
+[package]
+name = "op-reports"
+description = "Reports: paddock grazing record, NRCS 528, organic season, lease head-days, welfare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-analytics.workspace = true
+op-engine.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+csv.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[lints]
+workspace = true

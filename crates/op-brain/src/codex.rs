@@ -196,7 +196,7 @@ impl Brain for CodexBrain {
         let last = dir.path().join("last-message.txt");
         let (mcp_url, mcp_token) = crate::split_mcp_token(&req.mcp_url);
         let args = args(dir.path(), &schema, &last, &mcp_url, mcp_token.is_some(), self.model.as_deref());
-        let prompt = build_full_prompt(&req.instructions, &req.context, &decision_schema(), !req.mcp_url.is_empty());
+        let prompt = build_full_prompt(&req.instructions, &req.context, &decision_schema(), req.prompt_tools());
         // HOME is the empty run dir; sign-in still comes from the real CODEX_HOME.
         let mut env = vec![("HOME".to_owned(), dir.path().display().to_string()), ("CODEX_HOME".to_owned(), codex_home())];
         if let Some(t) = mcp_token {
@@ -300,6 +300,7 @@ EOF"#
             context: fixture::context(),
             instructions: "Decide.".into(),
             mcp_url: "http://127.0.0.1:1/mcp".into(),
+            tools: crate::claude::MCP_TOOLS.iter().map(|t| t.to_string()).collect(),
             log: tx,
         };
         let out = CodexBrain::new(codex, Some("gpt-5.5".into())).decide(req).await.unwrap();
@@ -319,7 +320,8 @@ EOF"#
         let bin = tempfile::tempdir().unwrap();
         let codex = fake_codex(bin.path(), r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit."}}"#);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req =
+            DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), tools: vec![], log: tx };
         let err = CodexBrain::new(codex, None).decide(req).await.unwrap_err();
         assert!(format!("{err:#}").contains("usage limit"), "{err:#}");
     }
@@ -329,7 +331,8 @@ EOF"#
         let bin = tempfile::tempdir().unwrap();
         let codex = script(bin.path(), "codex", "cat >/dev/null; sleep 30");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req =
+            DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), tools: vec![], log: tx };
         let mut brain = CodexBrain::new(codex, None);
         brain.timeout = Duration::from_millis(500);
         let t = std::time::Instant::now();
@@ -344,7 +347,8 @@ EOF"#
         let pidfile = bin.path().join("grandchild.pid");
         let codex = script(bin.path(), "codex", &format!("cat >/dev/null; sleep 30 & echo $! > {}; wait", pidfile.display()));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req =
+            DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), tools: vec![], log: tx };
         let mut brain = CodexBrain::new(codex, None);
         brain.timeout = Duration::from_secs(3);
         let err = brain.decide(req).await.unwrap_err();
@@ -362,7 +366,8 @@ EOF"#
         let body = format!("cat >/dev/null; printf 'garbage \\377\\376 line\\n'; cat <<'EOF'\n{STREAM}\nEOF");
         let codex = script(bin.path(), "codex", &body);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let req = DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), log: tx };
+        let req =
+            DecisionRequest { herd_id: "h".into(), context: fixture::context(), instructions: String::new(), mcp_url: String::new(), tools: vec![], log: tx };
         let out = CodexBrain::new(codex, None).decide(req).await.unwrap();
         assert_eq!(out.to_paddock_id.as_deref(), Some("pad_creek"));
     }
