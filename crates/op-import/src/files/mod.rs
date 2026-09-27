@@ -22,6 +22,8 @@ mod crs;
 mod dwell;
 mod geojson;
 mod kml;
+// @X1 collar data wins over imported history
+pub mod overlap;
 mod paddocks;
 mod pending;
 mod points;
