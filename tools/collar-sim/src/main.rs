@@ -365,6 +365,7 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
             cues: cues.clone(),
             battery: Some((collar.battery * 1000.0).round() / 1000.0),
             health: None,
+            ..Default::default()
         };
         match dev.report(&rep).await {
             Outcome::Ok => {

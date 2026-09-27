@@ -100,7 +100,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
             .await?;
         tx.commit().await?;
         ctx.publish(Event::Collar { collar });
-        return Ok(Json(ReportResponse { latest_version }));
+        return Ok(Json(ReportResponse { latest_version, ..Default::default() }));
     }
     let fence_for = |state: FenceState| {
         let b = split.active.as_ref()?;
@@ -224,7 +224,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
         ctx.publish(e);
     }
     ctx.publish(Event::Collar { collar });
-    Ok(Json(ReportResponse { latest_version }))
+    Ok(Json(ReportResponse { latest_version, ..Default::default() }))
 }
 
 /// One `health` row per report: battery and receiver health over time.

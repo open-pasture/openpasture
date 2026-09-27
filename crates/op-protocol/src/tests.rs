@@ -168,3 +168,274 @@ fn command_geofence_uses_overrides() {
     assert_eq!(gf.version(), 3);
     assert!(gf.margin_m([-92.395, 38.125]) > 400.0);
 }
+
+// ---- Protocol v1 ----
+
+/// Signed with seed bytes 00..1f by the code before protocol v1 (base e1ac4ec).
+const GOLDEN_V0: &str = r#"{"command_id":"bnd_01J8V0GOLDEN","herd_id":"herd_01J7GOLDEN","version":57,"effective_at":"2026-09-27T12:00:00Z","boundary":[[-92.41,38.12],[-92.4,38.12],[-92.4,38.13],[-92.41,38.13]],"warn_m":5.0,"hysteresis_m":1.0,"sig":"lsSq582udh5guEV7Y6NRw8kmI6XHaaFTOqOjTQZMw9DBg8mvFcHb8s6gROO0S5YQh20IAXxtiEPTKFxs+6+iCg=="}"#;
+const GOLDEN_V0_BARE: &str = r#"{"command_id":"bnd_x","version":3,"boundary":[[-92.41,38.12],[-92.4,38.12],[-92.4,38.13],[-92.41,38.13]],"sig":"EAMXMzOMqAqfcCJ9qm0L2TDcdLR/50XmQIXrBPc2wruZD1XNPKQqDdFYe3ot3Weo0t3qRC7eyyh5qGgs7UFdCA=="}"#;
+
+fn seed_key() -> SigningKey {
+    SigningKey::from_bytes(&core::array::from_fn(|i| i as u8))
+}
+
+fn home() -> Polygon {
+    serde_json::from_value(json!({"type": "Polygon", "coordinates": [[[-92.41, 38.12], [-92.40, 38.12], [-92.40, 38.13], [-92.41, 38.13], [-92.41, 38.12]]]}))
+        .unwrap()
+}
+
+#[test]
+fn v0_commands_serialize_and_sign_byte_for_byte_as_before() {
+    let key = seed_key();
+    let mut cmd = BoundaryCommand::from_polygon("bnd_01J8V0GOLDEN", 57, &home(), Some(t("2026-09-27T12:00:00Z"))).unwrap();
+    cmd.herd_id = Some("herd_01J7GOLDEN".into());
+    cmd.warn_m = Some(5.0);
+    cmd.hysteresis_m = Some(1.0);
+    sign_command(&mut cmd, &key);
+    assert_eq!(serde_json::to_string(&cmd).unwrap(), GOLDEN_V0);
+    let mut bare = BoundaryCommand::from_polygon("bnd_x", 3, &home(), None).unwrap();
+    sign_command(&mut bare, &key);
+    assert_eq!(serde_json::to_string(&bare).unwrap(), GOLDEN_V0_BARE);
+    assert_eq!(encode_public_key(&key.verifying_key()), "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=");
+}
+
+#[test]
+fn old_signatures_verify() {
+    let pk = seed_key().verifying_key();
+    for golden in [GOLDEN_V0, GOLDEN_V0_BARE] {
+        let parsed: BoundaryCommand = serde_json::from_str(golden).unwrap();
+        verify_command(&parsed, &pk).unwrap();
+        verify_json(&serde_json::from_str(golden).unwrap(), &pk).unwrap();
+        assert_eq!(verify_wire(golden.as_bytes(), &pk).unwrap(), parsed);
+        assert!(parsed.holes.is_empty() && parsed.collar_id.is_none() && parsed.cue_mode == CueMode::Audio);
+    }
+}
+
+#[test]
+fn new_fields_are_omitted_when_empty_and_signed_when_present() {
+    let key = seed_key();
+    let mut cmd = BoundaryCommand::from_shape("bnd_1", 9, &home(), None).unwrap();
+    let json = serde_json::to_string(&cmd).unwrap();
+    for field in ["holes", "collar_id", "cue_mode", "herd_id", "effective_at", "warn_m", "sig"] {
+        assert!(!json.contains(field), "{field} in {json}");
+    }
+    cmd.holes = vec![vec![[-92.406, 38.124], [-92.404, 38.124], [-92.404, 38.126]]];
+    cmd.collar_id = Some("col_a".into());
+    cmd.cue_mode = CueMode::Track;
+    sign_command(&mut cmd, &key);
+    let json = serde_json::to_string(&cmd).unwrap();
+    assert!(
+        json.contains(r#""collar_id":"col_a","version":9"#) && json.contains(r#""holes":[[[-92.406,38.124]"#) && json.contains(r#""cue_mode":"track""#),
+        "{json}"
+    );
+    verify_command(&cmd, &key.verifying_key()).unwrap();
+    for tamper in [
+        |c: &mut BoundaryCommand| c.holes.clear(),
+        |c: &mut BoundaryCommand| c.collar_id = Some("col_b".into()),
+        |c: &mut BoundaryCommand| c.cue_mode = CueMode::Audio,
+    ] {
+        let mut c = cmd.clone();
+        tamper(&mut c);
+        assert_eq!(verify_command(&c, &key.verifying_key()), Err(ProtocolError::BadSignature));
+    }
+    // An explicit "audio" parses to the default.
+    let explicit: BoundaryCommand = serde_json::from_str(r#"{"command_id":"b","version":1,"boundary":[],"cue_mode":"audio"}"#).unwrap();
+    assert_eq!(explicit.cue_mode, CueMode::Audio);
+    // Other wire types: nothing new appears until set.
+    let ack = Ack { command_id: "bnd_x".into(), version: 3, status: AckStatus::Applied, at: t("2026-09-27T12:00:00Z"), ..Default::default() };
+    assert_eq!(serde_json::to_string(&ack).unwrap(), r#"{"command_id":"bnd_x","version":3,"status":"applied","at":"2026-09-27T12:00:00Z"}"#);
+    let rep = PositionReport {
+        boundary_version: Some(3),
+        fixes: vec![WireFix { at: t("2026-09-27T12:00:00Z"), point: [-92.405, 38.125], accuracy_m: 1.8, sats: Some(9), ..Default::default() }],
+        cues: vec![WireCue { at: t("2026-09-27T12:00:00Z"), level: 2, margin_m: 1.4, ..Default::default() }],
+        battery: Some(0.81),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_string(&rep).unwrap(),
+        r#"{"boundary_version":3,"fixes":[{"at":"2026-09-27T12:00:00Z","point":[-92.405,38.125],"accuracy_m":1.8,"sats":9}],"cues":[{"at":"2026-09-27T12:00:00Z","level":2,"margin_m":1.4}],"battery":0.81}"#
+    );
+    assert_eq!(serde_json::to_string(&ReportResponse { latest_version: Some(3), ..Default::default() }).unwrap(), r#"{"latest_version":3}"#);
+}
+
+#[test]
+fn ids_are_at_most_64_bytes() {
+    let mut cmd = BoundaryCommand::from_polygon("b".repeat(64), 1, &home(), None).unwrap();
+    cmd.validate(None).unwrap();
+    cmd.check_ids().unwrap();
+    cmd.command_id = "b".repeat(65);
+    assert_eq!(cmd.validate(None), Err(ProtocolError::Invalid("command_id")));
+    assert_eq!(cmd.check_ids(), Err(RejectCode::BadJson));
+    cmd.command_id = "b".into();
+    cmd.herd_id = Some("h".repeat(65));
+    assert_eq!(cmd.check_ids(), Err(RejectCode::BadJson));
+    cmd.herd_id = None;
+    cmd.collar_id = Some(String::new());
+    assert_eq!(cmd.check_ids(), Err(RejectCode::BadJson));
+}
+
+#[test]
+fn check_codes() {
+    let d = GeofenceConfig::default();
+    let limits = CollarLimits::V0;
+    let mut cmd = BoundaryCommand::from_shape("b", 1, &home(), None).unwrap();
+    cmd.herd_id = Some("herd_a".into());
+    cmd.check(Some("herd_a"), Some("col_a"), &limits, &d).unwrap();
+    cmd.check(None, None, &limits, &d).unwrap();
+    assert_eq!(cmd.check(Some("herd_b"), None, &limits, &d), Err(RejectCode::WrongHerd));
+    cmd.collar_id = Some("col_a".into());
+    assert_eq!(cmd.check(Some("herd_a"), Some("col_b"), &limits, &d), Err(RejectCode::WrongCollar));
+    cmd.holes = vec![vec![[-92.406, 38.124], [-92.404, 38.124], [-92.404, 38.126]]];
+    cmd.check(Some("herd_a"), Some("col_a"), &limits, &d).unwrap();
+    assert_eq!(cmd.check(Some("herd_a"), Some("col_a"), &CollarLimits::LEGACY, &d), Err(RejectCode::TooManyHoles));
+    cmd.warn_m = Some(-1.0);
+    assert_eq!(cmd.check_shape(&limits, &d), Err(RejectCode::BadMargins));
+    cmd.warn_m = None;
+    cmd.boundary.push([-92.405, 38.14]);
+    assert_eq!(cmd.check_shape(&limits, &d), Err(RejectCode::SelfIntersecting));
+    // Every shape code maps to the rejection code of the same name.
+    for c in op_geo::ShapeCode::ALL {
+        assert_eq!(RejectCode::from(c).as_str(), c.as_str());
+    }
+    for c in RejectCode::ALL {
+        assert_eq!(RejectCode::parse(c.as_str()), Some(c));
+        assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+        assert_eq!(c.is_permanent(), c != RejectCode::SlotsFull);
+    }
+    assert_eq!(cmd.total_vertices(), 5 + 3);
+    assert_eq!(cmd.record_bytes(), 192 + 8 * 8);
+}
+
+#[test]
+fn contract_command_example_parses() {
+    let cmd: BoundaryCommand = serde_json::from_value(json!({
+      "command_id": "bnd_01J8...",
+      "herd_id": "herd_01J7...",
+      "collar_id": "col_01J9...",
+      "version": 57,
+      "effective_at": "2026-09-27T12:00:00Z",
+      "boundary": [[-92.41,38.12],[-92.4,38.12],[-92.4,38.13],[-92.41,38.13]],
+      "holes": [[[-92.406,38.124],[-92.404,38.124],[-92.404,38.126]]],
+      "cue_mode": "track",
+      "warn_m": 5.0,
+      "hysteresis_m": 1.0,
+      "sig": "base64..."
+    }))
+    .unwrap();
+    assert_eq!((cmd.holes.len(), cmd.cue_mode, cmd.collar_id.as_deref()), (1, CueMode::Track, Some("col_01J9...")));
+    cmd.check_shape(&CollarLimits::V0, &GeofenceConfig::default()).unwrap();
+    let gf = cmd.fence(GeofenceConfig::default(), &CollarLimits::V0).unwrap();
+    assert!(gf.margin_m([-92.4045, 38.1245]) < 0.0, "in the hole");
+    assert!(cmd.geofence(GeofenceConfig::default()).unwrap().margin_m([-92.4045, 38.1245]) > 0.0, "the one-ring fence ignores holes");
+}
+
+#[test]
+fn readme_v1_report_parses() {
+    let report: PositionReport = serde_json::from_value(json!({
+      "boundary_version": 57,
+      "device": {"fw": "0.2.0", "caps": ["holes","slots","collar_id","cue_mode","episodes","config"],
+                 "limits": {"outer":128,"holes":16,"hole_vertices":32,"total":384,"slots":16,"slot_bytes":24576},
+                 "config_version": 3},
+      "slots": [{"version":57,"status":"applied"},{"version":58,"status":"received","effective_at":"2026-09-27T12:00:00Z"}],
+      "fixes": [{"at":"2026-09-27T11:00:00Z","point":[-92.405,38.124],"accuracy_m":1.8,"sats":9,"cn0":41.0,"hdop":0.9}],
+      "cues": [{"at":"2026-09-27T11:00:00Z","kind":"warn","level":2,"dur_ms":300,"margin_m":1.4,"ring":2,"boundary_version":57}],
+      "episodes": [{"start":"2026-09-27T10:59:50Z","end":"2026-09-27T11:00:10Z","boundary_version":57,"ring":2,"cues":4,"max_level":3,"min_margin_m":0.8,"outcome":"turned_back"}],
+      "battery": 0.81,
+      "health": {"fix_attempts":120,"fix_ok":118,
+                 "cell": {"rsrp_dbm":-104,"rsrq_db":-11,"snr_db":6,"mode":"ltem","band":12,"cell_id":"1A2B3C","tac":1234,"at":"2026-09-27T11:00:00Z"},
+                 "still_s":40,"tilt_deg":12,"temp_c":21.5,"battery_v":3.31,"charging":true,"uptime_s":86400,"reset":"power_on"}
+    }))
+    .unwrap();
+    report.validate().unwrap();
+    let device = report.device.as_ref().unwrap();
+    assert_eq!(device.limits_or_default(), CollarLimits::V0);
+    assert!(caps::ALL.iter().all(|c| device.has(c)));
+    assert_eq!(device.config_version, Some(3));
+    let slots = report.slots.as_ref().unwrap();
+    assert_eq!((slots[1].version, slots[1].status), (58, AckStatus::Received));
+    assert_eq!(report.fixes[0].hdop, Some(0.9));
+    assert_eq!((report.cues[0].kind, report.cues[0].ring, report.cues[0].dur_ms), (Some(CueKind::Warn), Some(2), Some(300)));
+    assert_eq!(report.episodes[0].outcome, EpisodeOutcome::TurnedBack);
+    let h = report.health.as_ref().unwrap();
+    assert_eq!((h.fix_ok, h.cell.as_ref().unwrap().rsrp_dbm, h.charging, h.reset.as_deref()), (Some(118), Some(-104.0), Some(true), Some("power_on")));
+    // Round trip keeps every field.
+    let back: PositionReport = serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+    assert_eq!(back, report);
+
+    // Empty slots differ from absent ones.
+    let empty: PositionReport = serde_json::from_value(json!({"slots": []})).unwrap();
+    assert_eq!(empty.slots, Some(vec![]));
+    assert_eq!(PositionReport::default().slots, None);
+}
+
+#[test]
+fn device_defaults() {
+    assert_eq!(DeviceInfo::default().limits_or_default(), CollarLimits::LEGACY);
+    assert_eq!(DeviceInfo { caps: vec!["holes".into()], ..Default::default() }.limits_or_default(), CollarLimits::V0);
+    let v1 = DeviceInfo { caps: vec!["slots".into()], limits: Some(CollarLimits::V1), ..Default::default() };
+    assert_eq!(v1.limits_or_default(), CollarLimits::V1);
+}
+
+#[test]
+fn report_validation_covers_new_fields() {
+    let ok = PositionReport::default();
+    ok.validate().unwrap();
+    let bad_limits = PositionReport {
+        device: Some(DeviceInfo { caps: vec!["holes".into()], limits: Some(CollarLimits { outer: 0, ..CollarLimits::V0 }), ..Default::default() }),
+        ..Default::default()
+    };
+    assert_eq!(bad_limits.validate(), Err(ProtocolError::Invalid("device limits")));
+    let rejected_slot = PositionReport { slots: Some(vec![SlotReport { version: 1, status: AckStatus::Rejected, effective_at: None }]), ..Default::default() };
+    assert_eq!(rejected_slot.validate(), Err(ProtocolError::Invalid("slots")));
+    let at = t("2026-09-27T12:00:00Z");
+    let backwards =
+        PositionReport { episodes: vec![WireEpisode { start: at, end: at - chrono::Duration::seconds(1), ..Default::default() }], ..Default::default() };
+    assert_eq!(backwards.validate(), Err(ProtocolError::Invalid("episode")));
+    let nan = PositionReport { health: Some(Health { temp_c: Some(f64::NAN), ..Default::default() }), ..Default::default() };
+    assert_eq!(nan.validate(), Err(ProtocolError::Invalid("health")));
+}
+
+#[test]
+fn ack_codes_parse_leniently() {
+    let ack: Ack =
+        serde_json::from_value(json!({"command_id":"b","version":2,"status":"rejected","code":"hole_too_close","at":"2026-09-27T12:00:00Z"})).unwrap();
+    assert_eq!(ack.code, Some(RejectCode::HoleTooClose));
+    assert!(serde_json::to_string(&ack).unwrap().contains(r#""code":"hole_too_close""#));
+    // A newer firmware's code doesn't make the server refuse the ack.
+    let ack: Ack =
+        serde_json::from_value(json!({"command_id":"b","version":2,"status":"rejected","code":"from_the_future","at":"2026-09-27T12:00:00Z"})).unwrap();
+    assert_eq!(ack.code, None);
+    let reject: ConfigReject = serde_json::from_value(json!({"version": 3, "code": "bad_config"})).unwrap();
+    assert_eq!(reject.code, Some(RejectCode::BadConfig));
+}
+
+#[test]
+fn episodes_convert_from_the_cue_policy() {
+    let e = op_geo::Episode {
+        start: 1_790_000_000_000,
+        end: 1_790_000_012_000,
+        ring: 2,
+        cues: 4,
+        max_level: 3,
+        min_margin_m: 0.8,
+        outcome: EpisodeOutcome::Crossed,
+    };
+    let w = WireEpisode::from_episode(&e, Some(57)).unwrap();
+    assert_eq!((w.end - w.start).num_seconds(), 12);
+    assert_eq!((w.ring, w.boundary_version, w.outcome), (2, Some(57), EpisodeOutcome::Crossed));
+    assert_eq!(serde_json::to_value(&w).unwrap()["outcome"], "crossed");
+}
+
+#[test]
+fn report_response_carries_the_config() {
+    let mut config = ConfigCommand { command_id: "cfg_1".into(), collar_id: "col_a".into(), version: 2, report_s: 60, poll_s: 60, ..Default::default() };
+    sign_config(&mut config, &seed_key());
+    let r = ReportResponse { latest_version: Some(7), config: Some(config.clone()) };
+    let json = serde_json::to_string(&r).unwrap();
+    let back: ReportResponse = serde_json::from_str(&json).unwrap();
+    verify_config(back.config.as_ref().unwrap(), &seed_key().verifying_key()).unwrap();
+    // The config object's own bytes verify the way a collar checks them.
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let wire = serde_json::to_string(&v["config"]).unwrap();
+    assert_eq!(verify_config_wire(wire.as_bytes(), &seed_key().verifying_key()).unwrap(), config);
+}
