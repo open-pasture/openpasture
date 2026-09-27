@@ -391,7 +391,7 @@ pub async fn has_legacy_collars(ctx: &Ctx, herd_id: &str) -> anyhow::Result<bool
 /// What the move driver sees for the herd at `at` when a new move starts
 /// (its active boundary, paddock, fresh positions and limits), for previewing a sweep.
 pub async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Result<moves::Situation> {
-    moves::situation(ctx, herd_id, at, None).await
+    moves::situation(ctx, herd_id, at, None, None).await
 }
 
 /// Squares (`[west, south, east, north]`) clipped to `shape`, as one GeoJSON

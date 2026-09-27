@@ -121,9 +121,15 @@ boundary. The server never sends an active boundary that leaves an animal outsid
   toward the target. Sides tighten around the herd as it bunches. The next step goes out only
   once the collars report every animal in the sweep ahead of the next back line, and at most one
   step every 30 s. The last step is the target itself.
-- An animal that doesn't move up for 5 minutes becomes a **straggler**. It's dropped from the
-  sweep (the next step may leave it outside, and it is never cued there; see the collar rule)
-  and listed on the move for the farmer.
+- An animal whose fixes show it not moving up for 5 minutes becomes a **straggler**. It's dropped
+  from the sweep (the next step may leave it outside, and it is never cued there; see the collar
+  rule) and listed on the move for the farmer.
+- A sweep only moves on what the collars say. While half or more of the collars with the herd
+  (heard in the day before the move started, not parked) have sent no fix for 10 minutes (the
+  farm's link or the cell is down), it holds, from its first step on: no step, no target, nobody
+  dropped, and the straggler clocks start over when fixes come back. A move started then sends
+  nothing until they report (`step` 0), and its first step keeps a future `effective_at`. Fewer
+  silent collars are listed as stragglers and the sweep goes on without them.
 - A new target replaces the running move. Stop keeps the current active boundary and ends the move.
 
 Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. The sweep
@@ -133,8 +139,9 @@ instead (the hull of the herd, buffered by `0.6 × warn_m`). A step goes out whe
 is at least `max(2 m, 0.3 × warn_m)` ahead of the last. The last step is sent when every animal in
 the sweep is inside the target by `warn_m + 2` m, or when the back line has reached the target's
 rear edge and every animal is at least 1.5 m inside it. Only animals holding the sweep up (behind
-the next back line, or not held by the next step) run the 5-minute straggler clock; moving up 1 m
-restarts it, and so does every step. Animals already outside the active boundary when a move
+the next back line, or not held by the next step) run the 5-minute straggler clock, timed by
+their own fixes (silence never counts as being stuck); moving up 1 m restarts it, and so does
+every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
 starts are listed as stragglers at once. When the old active boundary and the target don't touch
 (paddocks drawn with a gap), the first step spans the convex hull of both, so the herd has a way
 across. Every step is a new boundary version under the move's decision (`decision_id`), signed

@@ -750,17 +750,97 @@ async fn a_straggler_is_dropped_and_left_behind() {
     for (i, (_, key)) in collars.iter().enumerate().skip(1) {
         app.fix(key, m_at(30.0 + 17.0 * i as f64 + 60.0, 25.0 + 11.0 * (i % 4) as f64 + 40.0), now).await;
     }
-    app.fix(&collars[0].1, m_at(30.0, 25.0), now).await;
-    for s in [40, 120, 240] {
-        let out = op_ingest::moves::drive(&app.ctx, &herd, now + chrono::Duration::seconds(s)).await.unwrap();
+    // Its fixes keep saying so.
+    for s in [0, 40, 120, 240] {
+        app.fix(&collars[0].1, m_at(30.0, 25.0), now + chrono::Duration::seconds(s)).await;
+        let out = op_ingest::moves::drive(&app.ctx, &herd, now + chrono::Duration::seconds(s.max(40))).await.unwrap();
         assert!(out.is_none(), "held for the straggler at {s} s");
     }
+    app.fix(&collars[0].1, m_at(30.0, 25.0), now + chrono::Duration::seconds(320)).await;
     let m2 = op_ingest::moves::drive(&app.ctx, &herd, now + chrono::Duration::seconds(320)).await.unwrap().expect("goes on without it");
     assert_eq!(m2.stragglers, vec![collars[0].0.clone()]);
     assert_eq!(m2.step, 2);
     let st = app.active(&herd).await;
     assert!(!poly(&st["active"]["geometry"]).contains(m_at(30.0, 25.0)));
     assert_eq!(st["move"]["stragglers"], json!([collars[0].0]));
+}
+
+#[tokio::test]
+async fn a_sweep_waits_out_a_collar_outage() {
+    let app = App::new().await;
+    let (herd, collars) = app.sweep_herd(4).await;
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    let (_, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(250.0, 150.0, 300.0, 200.0)}))).await;
+    assert_eq!((m["status"].as_str(), m["step"].as_u64()), (Some("sweeping"), Some(1)));
+    let version = app.active(&herd).await["active"]["version"].clone();
+    // No collar reports again: the farm's link is down.
+    let now = chrono::Utc::now();
+    for min in [4, 6, 11, 30, 120] {
+        let out = op_ingest::moves::drive(&app.ctx, &herd, now + chrono::Duration::minutes(min)).await.unwrap();
+        assert!(out.is_none(), "stepped at {min} min with no fixes: {out:?}");
+    }
+    let st = app.active(&herd).await;
+    assert_eq!((st["move"]["status"].as_str(), st["move"]["step"].as_u64()), (Some("sweeping"), Some(1)));
+    assert_eq!(st["move"]["stragglers"], json!([]));
+    assert_eq!(st["active"]["version"], version, "nothing sent past the animals");
+    // Back, walked up: the sweep goes on from where they are. (Fixes can't
+    // come from the future, so "back" is the real clock; the passes above were ahead of it.)
+    let back = chrono::Utc::now();
+    for (i, (_, key)) in collars.iter().enumerate() {
+        app.fix(key, m_at(30.0 + 17.0 * i as f64 + 60.0, 25.0 + 11.0 * (i % 4) as f64 + 40.0), back).await;
+    }
+    let m2 = op_ingest::moves::drive(&app.ctx, &herd, back + chrono::Duration::seconds(40)).await.unwrap().expect("a step");
+    assert_eq!((m2.step, m2.stragglers.len()), (2, 0));
+}
+
+#[tokio::test]
+async fn a_move_started_while_the_collars_are_silent_sends_nothing_until_they_report() {
+    let app = App::new().await;
+    let (herd, collars) = app.sweep_herd(0).await;
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    let version = app.active(&herd).await["active"]["version"].clone();
+    assert!(collars.is_empty());
+    // The link went down half an hour ago: every collar's last fix is that old.
+    let then = chrono::Utc::now() - chrono::Duration::minutes(30);
+    let mut collars = Vec::new();
+    for i in 0..4 {
+        let c = app.device(&herd).await;
+        app.fix(&c.1, m_at(30.0 + 17.0 * i as f64, 25.0 + 11.0 * (i % 4) as f64), then).await;
+        collars.push(c);
+    }
+    // The farmer sends the corner, for two hours from now.
+    let later = op_protocol::wire_time::trunc_secs(chrono::Utc::now() + chrono::Duration::hours(2));
+    let (_, m) = app
+        .call(
+            "POST",
+            &format!("/api/herds/{herd}/boundary"),
+            Some(json!({"geometry": m_rect(250.0, 150.0, 300.0, 200.0), "effective_at": op_protocol::wire_time::format(&later)})),
+        )
+        .await;
+    assert_eq!((m["status"].as_str(), m["step"].as_u64()), (Some("sweeping"), Some(0)), "{m}");
+    let st = app.active(&herd).await;
+    assert_eq!(st["active"]["version"], version, "no target sent blind");
+    assert!(st["staged"].as_array().is_none_or(|a| a.is_empty()), "nor staged: {st}");
+    for min in [1, 20, 90] {
+        assert!(op_ingest::moves::drive(&app.ctx, &herd, chrono::Utc::now() + chrono::Duration::minutes(min)).await.unwrap().is_none());
+    }
+    assert!(app.active(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
+    // They report: the first step is planned from where they are, for the farmer's time.
+    let back = chrono::Utc::now();
+    for (i, (_, key)) in collars.iter().enumerate() {
+        app.fix(key, m_at(30.0 + 17.0 * i as f64, 25.0 + 11.0 * (i % 4) as f64), back).await;
+    }
+    let m1 = op_ingest::moves::drive(&app.ctx, &herd, back + chrono::Duration::seconds(1)).await.unwrap().expect("the first step");
+    assert_eq!(m1.step, 1);
+    let st = app.active(&herd).await;
+    assert_eq!(st["active"]["version"], version);
+    let staged = st["staged"].as_array().unwrap();
+    assert_eq!(staged.len(), 1);
+    assert_eq!(staged[0]["effective_at"], json!(op_protocol::wire_time::format(&later)));
+    let step = poly(&staged[0]["geometry"]);
+    for (i, _) in collars.iter().enumerate() {
+        assert!(step.contains(m_at(30.0 + 17.0 * i as f64, 25.0 + 11.0 * (i % 4) as f64)), "collar {i} inside the first step");
+    }
 }
 
 #[tokio::test]
