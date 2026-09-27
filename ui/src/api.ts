@@ -108,7 +108,7 @@ export interface NewCollar { collar: Collar; key: string; endpoint: string; publ
 export type DecisionStatus = "running" | "proposed" | "approved" | "applied" | "rejected" | "failed" | "superseded";
 export interface Decision {
   id: string; herd_id: string; source: "brain" | "farmer" | "heuristic"; brain?: BrainId; model?: string;
-  status: DecisionStatus; action?: "STAY" | "MOVE" | "NEEDS_INFO"; to_paddock_id?: string; geometry?: Polygon;
+  status: DecisionStatus; action?: "STAY" | "MOVE" | "NEEDS_INFO" | "HOLD" /* HOLD: strip schedules (S) */; to_paddock_id?: string; geometry?: Polygon;
   reasoning?: string; confidence?: number; need?: string; inputs: unknown; apply_at?: string; boundary_id?: string;
   error?: string; created_at: string; responded_at?: string; outcome?: unknown;
 }
