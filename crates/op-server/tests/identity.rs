@@ -111,7 +111,7 @@ async fn a_brain_token_opens_only_brain_mcp_with_its_tools() {
     // The app token sees everything; with ?scope=brain it narrows to the brain tools.
     let app_bearer = format!("Bearer {}", ctx.settings().await.unwrap().server.app_token);
     let (_, v) = mcp(&app, "/mcp", &app_bearer, 6, "tools/list", json!({})).await;
-    assert_eq!(tool_names(&v).len(), 12);
+    assert_eq!(tool_names(&v), ctx.tools().list().iter().map(|t| t.name).collect::<Vec<_>>());
     let (_, v) = mcp(&app, "/mcp?scope=brain", &app_bearer, 7, "tools/list", json!({})).await;
     assert_eq!(tool_names(&v), ctx.tools().brain_tools());
 

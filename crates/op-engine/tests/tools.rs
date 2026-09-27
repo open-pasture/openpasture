@@ -36,20 +36,26 @@ async fn mcp_tool_list_is_unchanged_and_brain_scope_drops_writes() {
     let app = op_core::with_identity(Router::new().merge(op_engine::router()).with_state(ctx.clone()), Identity::owner(Via::Local));
     let before: Value = serde_json::from_str(&fixture("mcp_tools_list.json")).unwrap();
     let full = list(&app, "/mcp").await;
-    assert_eq!(full["result"]["tools"], before["full"], "names, descriptions, schemas, annotations and order");
+    // The existing tools come first, unchanged; tools added under the anchors in
+    // `tools.rs` (get_morning_brief, …) follow them.
+    let tools = full["result"]["tools"].as_array().unwrap();
+    assert_eq!(Value::from(tools[..12].to_vec()), before["full"], "names, descriptions, schemas, annotations and order");
     let brain = list(&app, "/mcp?scope=brain").await;
     assert_eq!(brain["result"]["tools"], before["brain"]);
     assert!(!brain["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "propose_boundary"));
 
-    // The registry holds the same tools: 11 brain read tools, one manager write.
+    // The registry holds the same tools first: 11 brain read tools, one manager
+    // write. Tools added after them are never offered to the decision brain.
     let specs = ctx.tools().list();
-    assert_eq!(specs.len(), 12);
+    assert_eq!(specs.len(), tools.len());
+    let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+    assert_eq!(names[..12], [&op_engine::mcp::READ_TOOLS[..], &op_engine::mcp::WRITE_TOOLS[..]].concat()[..]);
     assert_eq!(ctx.tools().brain_tools(), op_engine::mcp::READ_TOOLS);
     let propose = ctx.tools().get("propose_boundary").unwrap();
     assert!(!propose.read && !propose.brain && propose.min_role == op_core::Role::Manager);
     // Registering again changes nothing.
     op_engine::register_tools(&ctx);
-    assert_eq!(ctx.tools().list().len(), 12);
+    assert_eq!(ctx.tools().list().len(), specs.len());
 }
 
 #[test]

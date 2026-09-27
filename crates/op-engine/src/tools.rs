@@ -129,6 +129,7 @@ pub fn specs() -> Vec<ToolSpec> {
         // @G
         // @P
         // @Q
+        crate::brief::tool(),
         // @C
         // @F
         // @S
