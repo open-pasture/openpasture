@@ -12,6 +12,7 @@ import "./hub-ui";
 // @D
 // @K-animals
 // @K-files
+import "./k-files";
 // @I
 // @B
 // @G
