@@ -143,6 +143,21 @@ pub fn feed_budget_days(available_kg_dm: f64, herd_animal_units: f64, intake: f6
     Some(round((available_kg_dm.max(0.0) * utilization / net).min(365.0), 1))
 }
 
+/// Days `kg_dm` of standing forage above the residual feed `animal_units`:
+/// the one grazing-days rule every figure uses (the signals' feed budget, a
+/// paddock's grazing days, strip days and strips sized by days, the pre-send
+/// check): [`DEFAULT_UTILIZATION`] of it eaten at
+/// [`DEFAULT_INTAKE_KG_DM_PER_AU_DAY`] per AU a day, no regrowth, to 0.1 d,
+/// capped at 365. `None` without animals.
+pub fn grazing_days(kg_dm: f64, animal_units: f64) -> Option<f64> {
+    feed_budget_days(kg_dm, animal_units, DEFAULT_INTAKE_KG_DM_PER_AU_DAY, DEFAULT_UTILIZATION, 0.0)
+}
+
+/// The forage (kg DM) that feeds `animal_units` for `days` by [`grazing_days`].
+pub fn forage_for_days(days: f64, animal_units: f64) -> f64 {
+    days * animal_units * DEFAULT_INTAKE_KG_DM_PER_AU_DAY / DEFAULT_UTILIZATION
+}
+
 fn rows<'a>(section: Option<&'a Value>, key: &str) -> Vec<&'a Map<String, Value>> {
     section.and_then(|s| s.get(key)).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_object).collect()).unwrap_or_default()
 }

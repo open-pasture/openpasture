@@ -3,8 +3,12 @@
 //! semicolon or tab separated, UTF-8 (with or without a byte order mark),
 //! UTF-16 ("Unicode text") or Windows-1252.
 
-/// Header cells (unique, never empty) and the rows under them, every row as
-/// wide as the header. Rows with nothing in them are left out.
+use std::collections::HashSet;
+
+/// Header cells (unique, never empty) and the rows under them. A row keeps
+/// only the cells the file gives it, up to its last non-empty one: a cell
+/// past a row's end reads as empty ([`cell`]), so a short row costs no more
+/// than its text. Rows with nothing in them are left out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Table {
     pub columns: Vec<String>,
@@ -13,12 +17,25 @@ pub struct Table {
 
 /// Most rows one file may hold.
 pub const MAX_ROWS: usize = 50_000;
+/// Most columns a row may fill. Herd exports have a few dozen; a row wider
+/// than this is a broken export, and reading it would cost memory for nothing.
+pub const MAX_COLUMNS: usize = 256;
 
 impl Table {
     /// The column's index by name.
     pub fn col(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c == name)
     }
+
+    /// A row as wide as the header, for showing it.
+    pub fn padded(&self, row: &[String]) -> Vec<String> {
+        (0..self.columns.len()).map(|i| cell(row, i).to_owned()).collect()
+    }
+}
+
+/// Cell `i` of a row; empty past the row's end.
+pub fn cell(row: &[String], i: usize) -> &str {
+    row.get(i).map_or("", String::as_str)
 }
 
 /// Read a delimited text file whose first non-empty row is the header.
@@ -28,12 +45,23 @@ pub fn read(bytes: &[u8]) -> Result<Table, String> {
     let mut rdr = csv::ReaderBuilder::new().delimiter(delim).has_headers(false).flexible(true).trim(csv::Trim::All).from_reader(text.as_bytes());
     let mut header: Option<Vec<String>> = None;
     let mut rows: Vec<Vec<String>> = Vec::new();
-    for rec in rdr.records() {
-        let rec = rec.map_err(|e| format!("The file isn't readable as CSV: {e}."))?;
-        let cells: Vec<String> = rec.iter().map(|c| c.trim().to_owned()).collect();
-        if cells.iter().all(|c| c.is_empty()) {
+    let mut rec = csv::StringRecord::new();
+    loop {
+        match rdr.read_record(&mut rec) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) => return Err(format!("The file isn't readable as CSV: {e}.")),
+        }
+        // Up to the last cell with something in it; trailing empty cells add nothing.
+        let len = (0..rec.len()).rev().find(|&i| rec.get(i).is_some_and(|c| !c.trim().is_empty())).map_or(0, |i| i + 1);
+        if len == 0 {
             continue;
         }
+        if len > MAX_COLUMNS {
+            let line = rec.position().map_or(0, |p| p.line());
+            return Err(format!("Row {line} has more than {MAX_COLUMNS} columns."));
+        }
+        let cells: Vec<String> = rec.iter().take(len).map(|c| c.trim().to_owned()).collect();
         if header.is_none() {
             header = Some(cells);
             continue;
@@ -48,18 +76,17 @@ pub fn read(bytes: &[u8]) -> Result<Table, String> {
     };
     let width = rows.iter().map(Vec::len).chain([header.len()]).max().unwrap_or(0);
     let mut columns: Vec<String> = Vec::with_capacity(width);
+    let mut taken: HashSet<String> = HashSet::with_capacity(width);
     for i in 0..width {
         let base = header.get(i).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| format!("Column {}", i + 1));
         let mut name = base.clone();
         let mut n = 2;
-        while columns.contains(&name) {
+        while taken.contains(&name) {
             name = format!("{base} ({n})");
             n += 1;
         }
+        taken.insert(name.clone());
         columns.push(name);
-    }
-    for r in &mut rows {
-        r.resize(width, String::new());
     }
     Ok(Table { columns, rows })
 }
@@ -120,7 +147,7 @@ mod tests {
     fn commas_semicolons_and_tabs() {
         let t = read(b"Tag,Name\n214,Daisy\n\n215,\n").unwrap();
         assert_eq!(t.columns, ["Tag", "Name"]);
-        assert_eq!(t.rows, [vec!["214", "Daisy"], vec!["215", ""]]);
+        assert_eq!(t.rows, [vec!["214", "Daisy"], vec!["215"]]);
         let t = read("\u{feff}Tag;Naam\r\n214;Daisy\r\n".as_bytes()).unwrap();
         assert_eq!(t.columns, ["Tag", "Naam"]);
         assert_eq!(t.rows, [vec!["214", "Daisy"]]);
@@ -135,10 +162,36 @@ mod tests {
     }
 
     #[test]
-    fn blank_and_repeated_headers_get_names_and_short_rows_are_padded() {
+    fn blank_and_repeated_headers_get_names_and_short_rows_read_empty() {
         let t = read(b"Tag,,Tag\n1,2,3,4\n5\n").unwrap();
         assert_eq!(t.columns, ["Tag", "Column 2", "Tag (2)", "Column 4"]);
-        assert_eq!(t.rows[1], ["5", "", "", ""]);
+        assert_eq!(t.rows[1], ["5"]);
+        assert_eq!((cell(&t.rows[1], 0), cell(&t.rows[1], 3)), ("5", ""));
+        assert_eq!(t.padded(&t.rows[1]), ["5", "", "", ""]);
+    }
+
+    #[test]
+    fn one_wide_row_does_not_widen_the_others() {
+        // The shape that held 630 MB: a header, one row of 5,000 commas, 5,000 one-cell rows.
+        let mut csv = String::from("tag\n1");
+        csv += &",".repeat(5000);
+        csv += "\n";
+        csv += &"x\n".repeat(5000);
+        let t = read(csv.as_bytes()).unwrap();
+        assert_eq!(t.columns, ["tag"]);
+        assert_eq!(t.rows.len(), 5001);
+        assert_eq!(t.rows.iter().map(Vec::len).sum::<usize>(), 5001);
+
+        // Real cells past the cap: refused, saying where.
+        let mut wide = String::from("tag\n214\n");
+        wide += &vec!["x"; MAX_COLUMNS + 1].join(",");
+        assert_eq!(read(wide.as_bytes()), Err("Row 3 has more than 256 columns.".to_owned()));
+        let mut header = vec!["c"; MAX_COLUMNS + 1].join(",");
+        header += "\n1\n";
+        assert_eq!(read(header.as_bytes()), Err("Row 1 has more than 256 columns.".to_owned()));
+        // 256 is fine, and their names stay unique.
+        let t = read(format!("{}\n1\n", vec!["Tag"; MAX_COLUMNS].join(",")).as_bytes()).unwrap();
+        assert_eq!((t.columns.len(), t.columns[255].as_str()), (256, "Tag (256)"));
     }
 
     #[test]

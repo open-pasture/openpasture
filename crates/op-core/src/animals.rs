@@ -8,16 +8,16 @@
 
 use std::collections::HashMap;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::SqliteExecutor;
+use sqlx::{SqliteConnection, SqliteExecutor};
 
-use crate::domain::{Animal, Collar, Sex};
+use crate::domain::{Animal, Collar, DbEnum, Sex};
 use crate::error::{ApiError, ApiResult};
 use crate::identity::Role;
 use crate::tools::{ToolCall, ToolSpec};
-use crate::{Ctx, store};
+use crate::{Ctx, store, time};
 
 pub const MAX_TAG: usize = 64;
 const MAX_NAME: usize = 200;
@@ -99,6 +99,35 @@ pub fn parse_born(s: &str, month_first: bool) -> Result<NaiveDate, String> {
     NaiveDate::from_ymd_opt(y, m, d).ok_or_else(bad)
 }
 
+/// Whether one file's slash birth dates are month first: what its dates that
+/// read only one way show (13/4/2022 is day first, 4/13/2022 month first;
+/// the more common when they disagree), else `default` (the farm's zone).
+/// Read once per file, so 5/4/2022 means the same day on every row.
+pub fn month_first_in<'a>(dates: impl IntoIterator<Item = &'a str>, default: bool) -> bool {
+    let (mut day, mut month) = (0usize, 0usize);
+    for t in dates {
+        let t = t.trim();
+        if t.contains('.') {
+            continue;
+        }
+        let parts: Vec<&str> = t.split(['/', '-']).map(str::trim).collect();
+        if parts.len() != 3 || parts[0].len() == 4 {
+            continue;
+        }
+        let (Ok(a), Ok(b)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else { continue };
+        if a > 12 && b <= 12 {
+            day += 1;
+        } else if b > 12 && a <= 12 {
+            month += 1;
+        }
+    }
+    match day.cmp(&month) {
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => default,
+    }
+}
+
 fn tidy_text(v: &mut Option<String>, max: usize, what: &str) -> ApiResult<()> {
     if let Some(s) = v.take() {
         let s = s.trim();
@@ -178,6 +207,101 @@ pub async fn sync_herd_count<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -> a
     .fetch_optional(e)
     .await?;
     Ok(row.map(|(n,)| n.max(0) as u32))
+}
+
+/// [`sync_herd_count`] for a herd animals just left (moved to another herd
+/// or deleted): its count is its active animals even when none are left, so
+/// the last one leaving sets it to 0 rather than leaving it at 1. With no
+/// animal rows left the farmer can set the count again.
+pub async fn sync_after_leaving<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -> anyhow::Result<Option<u32>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE herds SET count = (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         WHERE id = ?1 AND count != (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         RETURNING count",
+    )
+    .bind(herd_id)
+    .fetch_optional(e)
+    .await?;
+    Ok(row.map(|(n,)| n.max(0) as u32))
+}
+
+/// Take an animal off the farm as `a` says (`removed_at`, `removed_reason`;
+/// its collar comes off) and off its herd's count: the count drops by it
+/// now, and a removal dated earlier takes the head off the herd's history
+/// from that date too ([`backdate_removal`]), so reports stop counting it
+/// then. `false` when the animal was already removed (or is gone): nothing
+/// changes then.
+///
+/// The mark, the collar coming off and the count are one write transaction,
+/// so the history counted the animal up to here and nothing else has
+/// counted its removal: its head comes off from its date, the count drops by
+/// one, and then follows the herd's active animals, taking in an animal
+/// added or moved at the same moment whose own recount hasn't run yet (its
+/// recount then finds nothing to change). No guess from the count and the
+/// animals, which such an animal throws off.
+pub async fn remove_animal(ctx: &Ctx, a: &Animal) -> anyhow::Result<bool> {
+    let at = a.removed_at.ok_or_else(|| anyhow::anyhow!("remove_animal needs removed_at"))?;
+    let mut tx = store::begin_immediate(ctx.db()).await?;
+    let marked = sqlx::query("UPDATE animals SET removed_at = ?, removed_reason = ?, collar_id = NULL WHERE id = ? AND removed_at IS NULL")
+        .bind(time::to_db(&at))
+        .bind(a.removed_reason.map(|r| r.as_db()))
+        .bind(&a.id)
+        .execute(&mut *tx)
+        .await?;
+    if marked.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE collars SET animal_id = NULL WHERE animal_id = ?").bind(&a.id).execute(&mut *tx).await?;
+    backdate_removal(&mut tx, &a.herd_id, &a.id, at).await?;
+    sqlx::query("UPDATE herds SET count = MAX(count - 1, 0) WHERE id = ?").bind(&a.herd_id).execute(&mut *tx).await?;
+    sync_herd_count(&mut *tx, &a.herd_id).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// An animal of `herd_id` left the farm at `at` but is only now taken off
+/// the count. Every herd history row from `at` on counted it, so each drops
+/// by one, and a row at `at` starts the lower count there (in the paddock the
+/// herd was in then): head-days, AU-days and AUM run at the lower count from
+/// the day it left, not from the day it was entered. A date at or before the
+/// animal's record began means it never counted: the rows from its record on
+/// drop, and nothing before them changes (even for a record begun this
+/// very millisecond). Call before the count itself changes (the trigger's
+/// row for that is right as it is). A removal dated now or later changes
+/// nothing here.
+pub async fn backdate_removal(conn: &mut SqliteConnection, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+    if at >= time::now() {
+        return Ok(());
+    }
+    let created: Option<String> = sqlx::query_scalar("SELECT created_at FROM animals WHERE id = ?").bind(animal_id).fetch_optional(&mut *conn).await?;
+    let created = created.as_deref().map(time::from_db).transpose()?;
+    let from_record = created.is_some_and(|c| at <= c);
+    let at = created.filter(|_| from_record).unwrap_or(at);
+    let at_db = time::to_db(&at);
+    let exact: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? AND at = ? LIMIT 1").bind(herd_id).bind(&at_db).fetch_optional(&mut *conn).await?;
+    if !from_record && exact.is_none() {
+        // The herd as it stood just before `at`, one head fewer from then.
+        let before: Option<(i64, Option<String>, String, String)> =
+            sqlx::query_as("SELECT count, paddock_id, name, species FROM herd_history WHERE herd_id = ? AND at < ? ORDER BY at DESC, id DESC LIMIT 1")
+                .bind(herd_id)
+                .bind(&at_db)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some((count, paddock, name, species)) = before {
+            sqlx::query("INSERT INTO herd_history (herd_id, at, count, paddock_id, name, species, source) VALUES (?, ?, ?, ?, ?, ?, 'changed')")
+                .bind(herd_id)
+                .bind(&at_db)
+                .bind(count)
+                .bind(paddock)
+                .bind(name)
+                .bind(species)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    sqlx::query("UPDATE herd_history SET count = MAX(count - 1, 0) WHERE herd_id = ? AND at >= ?").bind(herd_id).bind(&at_db).execute(&mut *conn).await?;
+    Ok(())
 }
 
 // The list_animals tool
@@ -290,6 +414,15 @@ mod tests {
         assert!(parse_born("2021", true).is_err());
         assert!(parse_born("2/30/2022", true).is_err());
         assert!(parse_born("spring", true).is_err());
+    }
+
+    #[test]
+    fn a_file_reads_its_birth_dates_one_way() {
+        assert!(!month_first_in(["13/4/2022", "5/4/2022"], true), "13/4 says day first");
+        assert!(month_first_in(["4/13/2022", "5/4/2022"], false), "4/13 says month first");
+        assert!(month_first_in(["5/4/2022", "2022-04-13", "01.04.2022"], true), "nothing to go on: the zone's");
+        assert!(!month_first_in(["5/4/2022"], false));
+        assert!(!month_first_in(["13/4/2022", "14/4/2022", "4/15/2022"], true), "the more common");
     }
 
     #[test]

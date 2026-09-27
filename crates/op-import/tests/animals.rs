@@ -192,6 +192,42 @@ async fn previews_take_files_up_to_five_megabytes() {
 }
 
 #[tokio::test]
+async fn one_wide_row_is_cheap_and_a_row_past_256_columns_is_refused() {
+    let app = App::new().await;
+    // A header, one row of 5,000 commas and 5,000 one-cell rows: every row
+    // used to be padded to 5,001 cells (630 MB held for 30 minutes).
+    let csv = format!("Tag\n214{}\n{}", ",".repeat(5000), "x\n".repeat(5000));
+    let started = Instant::now();
+    let p = app.preview(csv.into_bytes()).await;
+    assert!(started.elapsed().as_secs_f64() < 2.0, "{:?}", started.elapsed());
+    assert_eq!((p["total"].as_u64(), p["columns"].clone()), (Some(5001), json!(["Tag"])));
+    assert_eq!(p["rows"][0], json!(["214"]));
+    // The preview shows each row as wide as the header.
+    let p = app.preview(b"Tag,Name,Breed\n214\n215,Bella\n".to_vec()).await;
+    assert_eq!(p["rows"], json!([["214", "", ""], ["215", "Bella", ""]]));
+    assert_eq!(app.commit(&p).await["created"], 2);
+
+    let wide = format!("Tag\n214\n{}\n", vec!["x"; 257].join(","));
+    let (s, e) = app.csv("/api/animals/import/preview", wide.clone()).await;
+    assert_eq!((s, e["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Row 3 has more than 256 columns.")));
+    let (s, e) = app.csv(&format!("/api/collars/bulk?herd_id={}", app.herd), wide).await;
+    assert_eq!((s, e["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Row 3 has more than 256 columns.")));
+}
+
+#[tokio::test]
+async fn a_preview_outlives_many_newer_ones() {
+    // Previews are kept by bytes, not by count: sixteen newer ones (other
+    // tests in this binary make as many in parallel) don't push one out.
+    let app = App::new().await;
+    let p = app.preview(b"Tag\n214\n".to_vec()).await;
+    for i in 0..40 {
+        app.preview(format!("Tag\n{}\n", 300 + i).into_bytes()).await;
+    }
+    assert_eq!(app.commit(&p).await["created"], 1);
+    assert_eq!(app.commit(&p).await["unchanged"], 1);
+}
+
+#[tokio::test]
 async fn a_commit_creates_or_updates_by_tag_and_twice_changes_nothing() {
     let app = App::new().await;
     let mut events = app.ctx.subscribe();
@@ -258,6 +294,16 @@ async fn european_files_read_day_first_and_keep_quoted_notes() {
     let p = app.preview(fixture("tag_iso_utf16.txt")).await;
     assert_eq!(app.commit(&p).await["created"], 2);
     assert_eq!(app.animal("7").await.eid.as_deref(), Some("982000323456789"));
+
+    // A day-first file on this US farm: 13/04 says so, and 05/04 is April 5 too.
+    let p = app.preview(b"Tag,DOB\n501,13/04/2021\n502,05/04/2021\n".to_vec()).await;
+    assert_eq!(app.commit(&p).await["created"], 2);
+    let d = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d);
+    assert_eq!((app.animal("501").await.born, app.animal("502").await.born), (d(2021, 4, 13), d(2021, 4, 5)));
+    // A month-first one: 05/04 is May 4.
+    let p = app.preview(b"Tag,DOB\n601,04/13/2021\n602,05/04/2021\n".to_vec()).await;
+    assert_eq!(app.commit(&p).await["created"], 2);
+    assert_eq!(app.animal("602").await.born, d(2021, 5, 4));
 }
 
 #[tokio::test]
@@ -333,6 +379,13 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
     let app = App::new().await;
     let herd = app.herd_of(250).await;
     assert_eq!(app.count().await, 250);
+    // The herd and its animals on record since Sep 1.
+    for sql in [
+        "UPDATE herd_history SET at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+        "UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+    ] {
+        sqlx::query(sql).bind(&app.herd).execute(app.ctx.db()).await.unwrap();
+    }
     let mut events = app.ctx.subscribe();
     for (tag, collar, _) in &herd[..3] {
         let a = app.animal(tag).await;
@@ -345,6 +398,11 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
         assert!(c.parked_at.is_some());
     }
     assert_eq!(app.count().await, 247);
+    // Sold on Sep 20, entered now: the history drops to 247 on Sep 20.
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&app.herd).fetch_all(app.ctx.db()).await.unwrap();
+    assert_eq!(&rows[..2], [("2026-09-01T12:00:00.000Z".to_owned(), 250), ("2026-09-20T15:00:00.000Z".to_owned(), 247)]);
+    assert!(rows[2..].iter().all(|(at, n)| at.as_str() > "2026-09-26" && *n == 247), "{rows:?}");
     let mut kinds = Vec::new();
     while let Ok(e) = events.try_recv() {
         kinds.push(match e {
@@ -368,6 +426,57 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
     let events = app.ctx.store().list_events(Some(("animal", &first.id)), 10).await.unwrap();
     assert_eq!(events[0].title, "1 sold");
     assert_eq!(events[0].payload["by"], "Cody");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removals_and_new_animals_at_once_each_count_from_their_own_date() {
+    // Five sold on Sep 20 are entered while five new ones are registered in
+    // the same herd. A new animal recounts the herd; landing between a
+    // removal's mark and its count, it used to take that removal's backdate
+    // with it, so the sold head kept counting until they were entered.
+    let app = App::new().await;
+    let csv: String = std::iter::once("Tag\n".to_owned()).chain((1..=20).map(|i| format!("{i}\n"))).collect();
+    let p = app.preview(csv.into_bytes()).await;
+    assert_eq!(app.commit(&p).await["created"], 20);
+    for sql in [
+        "UPDATE herd_history SET at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+        "UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+    ] {
+        sqlx::query(sql).bind(&app.herd).execute(app.ctx.db()).await.unwrap();
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 1..=5 {
+        let (router, removed, new) = (app.router.clone(), herd_animal_id(&app, &i.to_string()).await, format!("{}", 100 + i));
+        let herd = app.herd.clone();
+        tasks.spawn(async move {
+            let call = |path: String, body: Value| {
+                let router = router.clone();
+                async move {
+                    let req =
+                        Request::builder().method("POST").uri(path).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+                    router.oneshot(req).await.unwrap().status()
+                }
+            };
+            let (a, b) = tokio::join!(
+                call(format!("/api/animals/{removed}/remove"), json!({"reason": "sold", "at": "2026-09-20T15:00:00Z"})),
+                call("/api/animals".into(), json!({"tag": new, "herd_id": herd})),
+            );
+            assert_eq!((a, b), (StatusCode::OK, StatusCode::CREATED));
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.unwrap();
+    }
+    assert_eq!(app.count().await, 20);
+    // 20 head from Sep 1, 15 from Sep 20 until the new ones came today.
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&app.herd).fetch_all(app.ctx.db()).await.unwrap();
+    let before_today: Vec<(&str, i64)> = rows.iter().filter(|(at, _)| at.as_str() < "2026-09-26").map(|(at, n)| (at.get(..10).unwrap(), *n)).collect();
+    assert_eq!(before_today.last(), Some(&("2026-09-20", 15)), "{rows:?}");
+    assert_eq!(before_today.iter().rev().find(|(at, _)| *at == "2026-09-01").map(|(_, n)| *n), Some(20), "{rows:?}");
+    assert_eq!(before_today.len(), 3, "{rows:?}");
+    // Today's rows run from 15 plus the new ones, back to 20 once all are in.
+    assert_eq!(rows.last().map(|(_, n)| *n), Some(20), "{rows:?}");
 }
 
 async fn herd_animal_id(app: &App, tag: &str) -> String {

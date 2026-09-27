@@ -117,6 +117,31 @@ async fn patch_herd(app: &App, herd: &str, body: Value) {
     app.ok("PATCH", &format!("/api/herds/{herd}"), body).await;
 }
 
+/// Register `n` animals in the herd, tags from `from`: its count follows them
+/// (one history row for the new count). Returns their ids.
+async fn register(app: &App, herd: &str, from: u32, n: u32) -> Vec<String> {
+    let mut ids = Vec::new();
+    for tag in from..from + n {
+        let a = op_core::Animal { id: op_core::id::new_id(op_core::id::ANIMAL), tag: tag.to_string(), herd_id: herd.to_owned(), ..Default::default() };
+        app.ctx.store().insert_animal(&a).await.unwrap();
+        ids.push(a.id);
+    }
+    op_core::animals::sync_herd_count(app.ctx.db(), herd).await.unwrap();
+    ids
+}
+
+/// Take the animals off the farm (weaned or sold); the count follows.
+async fn take_off(app: &App, herd: &str, ids: &[String]) {
+    for id in ids {
+        sqlx::query("UPDATE animals SET removed_at = '2025-10-01T12:00:00.000Z', removed_reason = 'sold' WHERE id = ?")
+            .bind(id)
+            .execute(app.ctx.db())
+            .await
+            .unwrap();
+    }
+    op_core::animals::sync_herd_count(app.ctx.db(), herd).await.unwrap();
+}
+
 /// Cows (100 head) through September 2025, Chicago time 07:00 = 12:00 UTC:
 /// in P1 from Sep 1, P2 Sep 6, 10 sold Sep 8, P3 Sep 11, P1 Sep 15, P2 Sep 21.
 async fn grazing(app: &App) -> (Farm, String) {
@@ -364,8 +389,115 @@ async fn a_mix_sets_animal_units_and_a_stay_running_now_has_no_out() {
     assert_eq!(column(ev, "au"), [json!(130.5)]);
     assert_eq!(column(ev, "out"), [Value::Null]);
     let notes = doc["notes"].as_array().unwrap();
-    assert!(notes.contains(&json!("Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 90 pairs, 10 bulls).")), "{notes:?}");
+    let note = "Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 90 pairs, 10 bulls: 130.5 AU at 100 head).";
+    assert!(notes.contains(&json!(note)), "{notes:?}");
     assert!(notes.contains(&json!("A blank out date means the herd is still there; its days run to now.")));
+}
+
+#[tokio::test]
+async fn a_pair_mix_reads_calves_registered_as_head_as_calves_at_side() {
+    // 100 cows and their 100 calves registered as animals: the herd counts 200.
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Pairs", 0, Some(&f.p2)).await;
+    register(&app, &h, 1, 100).await;
+    let calves = register(&app, &h, 1001, 100).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z"; 3]).await;
+    app.ok("PUT", "/api/reports/settings", json!({"herds": {h.clone(): {"mix": {"cows": 100, "pairs": true}}}})).await;
+    app.ok("PUT", &format!("/api/leases/{}", f.p2), json!({"landowner": "Jane Doe", "rate_per": "pair_month", "rate_amount": 30.0})).await;
+
+    // Sep 1 12:00 UTC to Oct 1 05:00 UTC: 29 days 17 hours at 200 head.
+    let hd = 200.0 * (29.0 + 17.0 / 24.0);
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    // 100 pairs × 1.3 = 130 AU over 200 head, not 200 × 1.3 = 260.
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(200)], vec![json!(130.0)]));
+    assert_eq!(column(ev, "head_days"), [json!(round(hd, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(round(hd * 0.65, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(3862.1)]);
+    let notes = doc["notes"].as_array().unwrap();
+    let note =
+        "Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 100 pairs: 130 AU at 100 to 200 head, calves at side counted or not).";
+    assert!(notes.contains(&json!(note)), "{notes:?}");
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "au"), column(rec, "aud")), (vec![json!(130.0)], vec![json!(3862.1)]));
+
+    // 100 pairs a day: 5,941.7 head-days are 2,970.8 pair-days, 97.7 pair-months, $2,931.74.
+    let s = &app.report("lease_head_days", SEPT).await["sections"][0];
+    assert_eq!(column(s, "pair_months"), [json!(97.7)]);
+    assert_eq!(column(s, "amount"), [json!(round(hd / 2.0 / 30.4 * 30.0, 2))]);
+    assert_eq!(column(s, "amount"), [json!(2931.74)]);
+
+    // Weaned in October: the calves leave and the count drops to 100, a pair
+    // to a head. September still reads 200 head as 130 AU; October, 100 head
+    // at 1.3 AU each is the same 130.
+    take_off(&app, &h, &calves).await;
+    sqlx::query("UPDATE herd_history SET at = '2025-10-01T12:00:00.000Z' WHERE herd_id = ? AND count = 100").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let doc = app.report("paddock_record", "from=2025-09-01&to=2025-10-02").await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(200)], vec![json!(130.0)]));
+    // Sep 1 12:00 to Oct 1 12:00 UTC at 200 head (30 days), then to the end
+    // of Oct 2 (Oct 3 05:00 UTC) at 100 head (1 d 17 h): 130 AU all along.
+    let days = 30.0 + 1.0 + 17.0 / 24.0;
+    assert_eq!(column(ev, "au_days"), [json!(round(130.0 * days, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(4122.1)]);
+    // Sold down to 90 pairs, a pair to a head, on Oct 2: 90 × 1.3.
+    let cows: Vec<String> = sqlx::query_scalar("SELECT id FROM animals WHERE herd_id = ? AND removed_at IS NULL ORDER BY CAST(tag AS INTEGER) LIMIT 10")
+        .bind(&h)
+        .fetch_all(app.ctx.db())
+        .await
+        .unwrap();
+    take_off(&app, &h, &cows).await;
+    sqlx::query("UPDATE herd_history SET at = '2025-10-02T12:00:00.000Z' WHERE herd_id = ? AND count = 90").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let doc = app.report("paddock_record", "from=2025-10-03&to=2025-10-03").await;
+    assert_eq!(column(&doc["sections"][0], "au"), [json!(117.0)]);
+}
+
+#[tokio::test]
+async fn tagging_calves_through_calving_never_moves_a_pair_mixs_animal_units() {
+    // 100 pairs in P2 from Sep 1 2025 07:00 (12:00 UTC) with the cows
+    // registered; half the calves tagged by Sep 11 (150 head), all by Sep 21 (200 head).
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Pairs", 0, Some(&f.p2)).await;
+    register(&app, &h, 1, 100).await;
+    register(&app, &h, 1001, 50).await;
+    register(&app, &h, 1051, 50).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z", "2025-09-01T12:00:00.000Z", "2025-09-11T12:00:00.000Z", "2025-09-21T12:00:00.000Z"]).await;
+    app.ok("PUT", "/api/reports/settings", json!({"herds": {h.clone(): {"mix": {"cows": 100, "pairs": true}}}})).await;
+    app.ok("PUT", &format!("/api/leases/{}", f.p2), json!({"landowner": "Jane Doe", "rate_per": "pair_month", "rate_amount": 30.0})).await;
+
+    // Sep 1 12:00 UTC to Oct 1 05:00 UTC is 29 d 17 h, 130 AU all along:
+    // 3,862.1 AU-days. Head-days: 100 × 10 + 150 × 10 + 200 × 9 d 17 h = 4,441.7.
+    let days = 29.0 + 17.0 / 24.0;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(100)], vec![json!(130.0)]));
+    assert_eq!(column(ev, "head_days"), [json!(round(1000.0 + 1500.0 + 200.0 * (9.0 + 17.0 / 24.0), 1))]);
+    assert_eq!(column(ev, "head_days"), [json!(4441.7)]);
+    assert_eq!(column(ev, "au_days"), [json!(round(130.0 * days, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(3862.1)]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!(column(rec, "aud"), [json!(3862.1)]);
+    // 100 pairs every day: 2,970.8 pair-days, 97.7 pair-months at $30, $2,931.74.
+    let s = &app.report("lease_head_days", SEPT).await["sections"][0];
+    assert_eq!(column(s, "pair_months"), [json!(97.7)]);
+    assert_eq!(column(s, "amount"), [json!(round(100.0 * days / 30.4 * 30.0, 2))]);
+    assert_eq!(column(s, "amount"), [json!(2931.74)]);
+
+    // The same counts typed by hand are a pair to a head: 150 head are 150
+    // pairs. 100 × 10 + 150 × 10 + 200 × 9 d 17 h at 1.3 AU each = 5,774.2 AU-days.
+    let by_hand = herd(&app, "By hand", 100, Some(&f.p1)).await;
+    patch_herd(&app, &by_hand, json!({"count": 150})).await;
+    patch_herd(&app, &by_hand, json!({"count": 200})).await;
+    app.date_history(&by_hand, &["2025-09-01T12:00:00.000Z", "2025-09-11T12:00:00.000Z", "2025-09-21T12:00:00.000Z"]).await;
+    app.ok("PUT", "/api/reports/settings", json!({"herds": {by_hand.clone(): {"mix": {"cows": 100, "pairs": true}}}})).await;
+    let doc = app.report("paddock_record", &format!("{SEPT}&herd_id={by_hand}")).await;
+    assert_eq!(column(&doc["sections"][0], "au_days"), [json!(round((1000.0 + 1500.0 + 200.0 * (9.0 + 17.0 / 24.0)) * 1.3, 1))]);
+    assert_eq!(column(&doc["sections"][0], "au_days"), [json!(5774.2)]);
+    let notes = doc["notes"].as_array().unwrap();
+    let note = "Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (By hand 100 pairs: 130 AU at 100 head).";
+    assert!(notes.contains(&json!(note)), "{notes:?}");
 }
 
 #[tokio::test]
@@ -394,8 +526,10 @@ async fn nrcs_528_has_fsa_numbers_header_and_signatures() {
     assert_eq!(column(rec, "field"), [json!("P1"), json!("P2"), json!("P3"), json!("P1"), json!("P2")]);
     assert_eq!(column(rec, "fsa_tract"), [json!("1234"), json!("1234"), json!("1235"), json!("1234"), json!("1234")]);
     assert_eq!(column(rec, "fsa_field"), [json!("7"), json!("8"), json!("2"), json!("7"), json!("8")]);
-    assert_eq!(column(rec, "date_in")[1], json!("2025-09-06"));
-    assert_eq!(column(rec, "date_out")[1], json!("2025-09-11"));
+    assert_eq!(column(rec, "date_in"), [json!("2025-09-01"), json!("2025-09-06"), json!("2025-09-11"), json!("2025-09-15"), json!("2025-09-21")]);
+    // The herd is still in P2 after the record's dates: out on Sep 30, the last day it covers.
+    assert_eq!(column(rec, "date_out"), [json!("2025-09-06"), json!("2025-09-11"), json!("2025-09-15"), json!("2025-09-21"), json!("2025-09-30")]);
+    assert_eq!(column(rec, "days"), [json!(5.0), json!(5.0), json!(4.0), json!(6.0), json!(9.7)]);
     assert_eq!(column(rec, "kind")[0], json!("Cattle"));
     assert_eq!(column(rec, "number"), [json!(100), json!(100), json!(90), json!(90), json!(90)]);
     assert_eq!(column(rec, "aud"), [json!(500.0), json!(470.0), json!(360.0), json!(540.0), json!(873.8)]);
@@ -533,6 +667,145 @@ async fn lease_amounts_follow_each_rate_and_the_season() {
     assert_eq!(titles, ["Bob Ames", "Jane Doe"]);
     assert_eq!(doc["signatures"], json!(["Operator", "Bob Ames", "Jane Doe"]));
     assert_eq!(column(&doc["sections"][0], "head_days"), [json!(1040.0)]);
+}
+
+/// Cows in P2 from Sep 1 2025 07:00 (12:00 UTC) with 20 animals on record.
+/// Five are sold on Sep 11 07:00, but entered today with that date.
+async fn sold_late(app: &App) -> (Farm, String) {
+    let f = farm(app).await;
+    let h = herd(app, "Cows", 20, Some(&f.p2)).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z"]).await;
+    let mut ids = Vec::new();
+    for tag in 1..=20 {
+        let a = op_core::Animal { id: op_core::id::new_id(op_core::id::ANIMAL), tag: tag.to_string(), herd_id: h.clone(), ..Default::default() };
+        app.ctx.store().insert_animal(&a).await.unwrap();
+        ids.push(a.id);
+    }
+    sqlx::query("UPDATE animals SET created_at = '2025-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let at = op_core::time::from_db("2025-09-11T12:00:00.000Z").unwrap();
+    for id in &ids[..5] {
+        let a = app.ctx.store().get_animal(id).await.unwrap().unwrap();
+        // What POST /api/animals/{id}/remove {at} does to the count and its history.
+        let sold = op_core::Animal { removed_at: Some(at), removed_reason: Some(op_core::RemovedReason::Sold), ..a };
+        assert!(op_core::animals::remove_animal(&app.ctx, &sold).await.unwrap());
+    }
+    assert_eq!(app.ctx.store().get_herd(&h).await.unwrap().unwrap().count, 15);
+    (f, h)
+}
+
+#[tokio::test]
+async fn a_removal_dated_earlier_counts_from_its_date_in_every_report() {
+    let app = App::new().await;
+    let (f, _) = sold_late(&app).await;
+    // 20 head Sep 1 12:00 UTC to Sep 11 12:00 UTC (10 days), then 15 head to
+    // the end of Sep 30 (Oct 1 05:00 UTC): 19 days 17 hours.
+    let hd = 20.0 * 10.0 + 15.0 * (19.0 + 17.0 / 24.0);
+    assert_eq!(hd, 495.625);
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "head"), [json!(20)]);
+    assert_eq!(column(ev, "days"), [json!(29.7)]);
+    assert_eq!(column(ev, "head_days"), [json!(495.6)]);
+    assert_eq!(column(ev, "au_days"), [json!(495.6)]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "number"), column(rec, "aud")), (vec![json!(20)], vec![json!(495.6)]));
+
+    app.ok("PUT", &format!("/api/leases/{}", f.p2), json!({"landowner": "Jane Doe", "rate_per": "head_day", "rate_amount": 2.0})).await;
+    let s = &app.report("lease_head_days", SEPT).await["sections"][0];
+    assert_eq!(column(s, "head_days"), [json!(495.6)]);
+    // 495.625 / 30.4 = 16.30 AUM; billed at $2 a head-day: $991.25, not $1,188.33.
+    assert_eq!(column(s, "aum"), [json!(16.3)]);
+    assert_eq!(column(s, "amount"), [json!(991.25)]);
+}
+
+#[tokio::test]
+async fn collar_days_are_days_the_herd_spent_real_time_in_the_paddock() {
+    // Cows in P2 on the record Sep 6 12:00 to Sep 11 12:00 UTC. Collars have
+    // them there 20 h a day on Sep 7-9 (4 h outside every paddock); on Sep 10
+    // they are in P3 next door all day but for three fixes (600 s) across the
+    // fence in P2. A day with a few fixes there isn't a collar day: 3, not 4.
+    let app = App::new().await;
+    let (f, h) = grazing(&app).await;
+    let row = |date: &str, paddock: &str, fixes: i64, dwell_s: f64| {
+        let (ctx, date, paddock, h) = (app.ctx.clone(), date.to_owned(), paddock.to_owned(), h.clone());
+        async move {
+            let last_t = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap().and_hms_opt(23, 0, 0).unwrap().and_utc().timestamp_millis();
+            sqlx::query("INSERT INTO analytics_paddock_days (date, herd_id, collar_id, paddock_id, fixes, dwell_s, last_t) VALUES (?, ?, 'col_1', ?, ?, ?, ?)")
+                .bind(date)
+                .bind(h)
+                .bind(paddock)
+                .bind(fixes)
+                .bind(dwell_s)
+                .bind(last_t)
+                .execute(ctx.db())
+                .await
+                .unwrap();
+        }
+    };
+    for d in ["2025-09-07", "2025-09-08", "2025-09-09"] {
+        row(d, &f.p2, 14_400, 72_000.0).await;
+        row(d, "", 2_880, 14_400.0).await;
+    }
+    row("2025-09-10", &f.p2, 3, 600.0).await;
+    row("2025-09-10", &f.p3, 17_277, 85_800.0).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "paddock"), [json!("P1"), json!("P2"), json!("P3"), json!("P1"), json!("P2")]);
+    assert_eq!(column(ev, "collar_days"), [json!(0), json!(3), json!(0), json!(0), json!(0)]);
+}
+
+#[tokio::test]
+async fn a_herd_created_empty_and_filled_by_its_animals_goes_in_at_their_head() {
+    // The usual start: a herd made with no head, its animals imported five
+    // seconds later. The event read Head 0 and AU 0 (the count for those five
+    // seconds), so its stocking density and the NRCS number were 0 too.
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Cows", 0, Some(&f.p2)).await;
+    register(&app, &h, 1, 20).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z", "2025-09-01T12:00:05.000Z"]).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(20)], vec![json!(20.0)]));
+    // 20 AU over the paddock (acres on this farm).
+    let ac = f.area * AC_PER_HA;
+    assert_eq!(column(ev, "density"), [json!(round(20.0 / ac, 1))]);
+    // Head-days from the moment they were on record: 20 x (29 d 17 h less 5 s).
+    let hd = 20.0 * (29.0 + 17.0 / 24.0 - 5.0 / 86_400.0);
+    assert_eq!(column(ev, "head_days"), [json!(round(hd, 1))]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "number"), column(rec, "aud")), (vec![json!(20)], vec![json!(round(hd, 1))]));
+}
+
+#[tokio::test]
+async fn an_empty_herd_left_in_a_paddock_is_not_a_grazing_event() {
+    // The Training herd, emptied back into Cows, sits in P2 from Sep 12 with
+    // no head. It read as an open P2 event of 0 head on the paddock and NRCS
+    // records, and it made P2 look grazed until now: Cows going back into P2
+    // on Sep 21 read "Rest before in" 0. P2 rested from Sep 11 12:00 (Cows
+    // left) to Sep 21 12:00: 10.0 days.
+    let app = App::new().await;
+    let (f, cows) = grazing(&app).await;
+    let training = herd(&app, "Training", 0, Some(&f.p2)).await;
+    app.date_history(&training, &["2025-09-12T12:00:00.000Z"]).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "herd"), vec![json!("Cows"); 5]);
+    // As without Training (P1 back on Sep 15 after 9 days, P2 on Sep 21 after 10).
+    assert_eq!(column(ev, "rest_days"), [Value::Null, Value::Null, Value::Null, json!(9.0), json!(10.0)]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!(column(rec, "number"), [json!(100), json!(100), json!(90), json!(90), json!(90)]);
+    // With head it grazes: 5 head from Sep 25 07:00 (not from Sep 12, when it
+    // had none), and emptied again on Sep 28 07:00 it leaves then, though the
+    // herd stays placed in P2: 3.0 days, 15 head-days.
+    patch_herd(&app, &training, json!({"count": 5})).await;
+    patch_herd(&app, &training, json!({"count": 0})).await;
+    app.date_history(&training, &["2025-09-12T12:00:00.000Z", "2025-09-25T12:00:00.000Z", "2025-09-28T12:00:00.000Z"]).await;
+    let ev = &app.report("paddock_record", &format!("{SEPT}&herd_id={training}")).await["sections"][0];
+    assert_eq!((column(ev, "in"), column(ev, "out")), (vec![json!("2025-09-25 07:00")], vec![json!("2025-09-28 07:00")]));
+    assert_eq!((column(ev, "days"), column(ev, "head"), column(ev, "head_days")), (vec![json!(3.0)], vec![json!(5)], vec![json!(15.0)]));
+    let ev = &app.report("paddock_record", &format!("{SEPT}&herd_id={cows}")).await["sections"][0];
+    assert_eq!(column(ev, "rest_days"), [Value::Null, Value::Null, Value::Null, json!(9.0), json!(10.0)]);
 }
 
 #[tokio::test]

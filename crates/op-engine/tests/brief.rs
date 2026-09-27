@@ -170,7 +170,7 @@ async fn a_waiting_move_asks_for_y_or_n_in_both_unit_systems() {
             "P2 has rested 34 days.".into(),
             "Rain is due Friday.".into(),
             "The herd held its boundary yesterday.".into(),
-            "2 of 2 collars silent for a day.".into(),
+            "2 of 2 collars not reported yet.".into(),
             "No field note in 7 days.".into(),
         ],
         "two to four reasons: the fifth is left out"
@@ -295,7 +295,7 @@ async fn running_failed_or_missing_say_so_in_one_line_and_give_the_rest() {
         order: 50,
         run: BriefLine::run_fn(|_c, _h, _n| async { Ok(vec!["Battery low: 031 14%.".to_owned()]) }),
     });
-    let rest = ["1 of 1 collars silent for a day.", "No field note in 7 days.", "Battery low: 031 14%."];
+    let rest = ["1 of 1 collars not reported yet.", "No field note in 7 days.", "Battery low: 031 14%."];
 
     let expect = |head: &str| std::iter::once(head.to_owned()).chain(rest.iter().map(|s| s.to_string())).collect::<Vec<_>>();
     assert_eq!(t.lines(&f).await, expect("Cows: no decision yet today."));
@@ -339,8 +339,17 @@ async fn registry_lines_come_last_in_their_order() {
 #[tokio::test]
 async fn stale_data_is_named() {
     let t = setup().await;
-    let f = farm(&t, "propose", 2).await;
+    let f = farm(&t, "propose", 3).await;
     report(&t, &f.keys[0], [-93.624, 42.0318], 3).await;
+    // The second last reported two days ago; the third, linked just now, never has.
+    report(&t, &f.keys[1], [-93.624, 42.0318], 3).await;
+    let two_days = time::to_db(&(time::now() - chrono::Duration::days(2)));
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM collars WHERE herd_id = ? AND last_seen IS NOT NULL ORDER BY id")
+        .bind(&f.herd.id)
+        .fetch_all(t.ctx.db())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE collars SET last_seen = ? WHERE id = ?").bind(&two_days).bind(&ids[1]).execute(t.ctx.db()).await.unwrap();
     // Imagery for P1, taken 20 days ago.
     let taken = (time::now() - chrono::Duration::days(20)).format("%Y-%m-%d").to_string();
     let report_json = json!({ "report_id": "lr_1", "paddock_id": id(&f.p1), "source": "alexandria", "as_of": time::to_db(&time::now()),
@@ -361,12 +370,43 @@ async fn stale_data_is_named() {
         [
             "Cows: STAY in P1.",
             "Workable.",
-            "1 of 2 collars silent for a day.",
+            "1 of 3 collars silent for a day.",
+            "1 of 3 collars not reported yet.",
             "Herd position from the farm record, not collars.",
             "Imagery for P1 is 20 days old.",
             "No field note in 7 days.",
         ]
     );
+}
+
+#[tokio::test]
+async fn a_call_the_farmer_changed_drops_the_proposals_reasons() {
+    let t = setup().await;
+    let f = farm(&t, "propose", 0).await;
+    // S's schedule STAY that the farmer answered N to: now a HOLD, applied.
+    let mut d = decision(&f, DecisionAction::Stay, "The schedule opens strip 3 of 3 at Mon 08:37.");
+    d.action = Some(DecisionAction::Hold);
+    d.status = DecisionStatus::Applied;
+    d.need = Some("Check the water in strip 3".into());
+    d.inputs["proposed_action"] = json!("STAY");
+    d.inputs["farmer_response"] = json!({ "action": "reject", "by": { "via": "text", "name": "Mia" } });
+    db::insert(&t.ctx, &d).await.unwrap();
+    let lines = t.lines(&f).await;
+    assert_eq!(lines[0], "Cows: HOLD today's strip.");
+    assert!(!lines.iter().any(|l| l.contains("Mon 08:37") || l.contains("water")), "the STAY's reasons and check are gone: {lines:?}");
+
+    // A brain MOVE the farmer redrew: its reasons were for its own boundary.
+    let mut m = decision(&f, DecisionAction::Move, "P2 has rested 34 days.");
+    m.status = DecisionStatus::Applied;
+    m.inputs["proposed_geometry"] = f.p2["geometry"].clone();
+    m.created_at = time::now() + chrono::Duration::seconds(1);
+    db::insert(&t.ctx, &m).await.unwrap();
+    assert!(!t.lines(&f).await.iter().any(|l| l.contains("rested 34 days")));
+    // As proposed, the reasons stay.
+    let mut p = decision(&f, DecisionAction::Move, "P2 has rested 34 days.");
+    p.created_at = time::now() + chrono::Duration::seconds(2);
+    record(&t, &f, p).await;
+    assert!(t.lines(&f).await.iter().any(|l| l == "P2 has rested 34 days."));
 }
 
 #[tokio::test]

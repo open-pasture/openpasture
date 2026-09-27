@@ -43,8 +43,8 @@ pub struct ReportsSettings {
     pub au: AuFactors,
 }
 
-/// What a cattle herd is made of. With `pairs`, each cow has a calf at side:
-/// the pair is one head (counted at the pair factor) and `calves` is ignored.
+/// What a cattle herd is made of. With `pairs`, each cow has a calf at side,
+/// the pair counted at the pair factor, and `calves` is ignored.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HerdMix {
@@ -54,9 +54,47 @@ pub struct HerdMix {
     pub pairs: bool,
 }
 
+/// How a herd's head count is kept, which says what a pair is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counted {
+    /// The farmer's own number: a pair is one head.
+    ByHand,
+    /// Its animal rows (K-animals): a calf at side may be registered as an
+    /// animal of its own, so a pair is one head or two.
+    ByAnimals,
+}
+
 impl HerdMix {
+    /// Head the mix names, a pair as one head.
     fn head(&self) -> u32 {
         self.cows + self.bulls + if self.pairs { 0 } else { self.calves }
+    }
+
+    /// The head count the mix's animal units stand at, for a herd of `count`
+    /// head. The mix's head, a pair as one head; but in a herd counted by its
+    /// animals, any count from the pairs as one head each (no calf
+    /// registered) to the pairs as two (every calf registered) is the mix
+    /// itself, since a calf at side is in its pair's factor: 100 pairs are
+    /// 130 AU at 100, 150 or 200 registered head, and tagging calves through
+    /// the calving season never moves the AU. A count outside that range
+    /// scales from its nearer end.
+    pub fn head_at(&self, count: u32, counted: Counted) -> u32 {
+        let one = self.head();
+        if self.pairs && counted == Counted::ByAnimals { count.clamp(one, one + self.cows) } else { one }
+    }
+
+    /// How much of the mix a herd of `count` head is.
+    fn share(&self, count: u32, counted: Counted) -> f64 {
+        count as f64 / self.head_at(count, counted).max(1) as f64
+    }
+
+    /// The mix's animal units.
+    pub fn animal_units(&self, f: &AuFactors) -> f64 {
+        if self.pairs {
+            self.cows as f64 * f.pair + self.bulls as f64 * f.bull
+        } else {
+            self.cows as f64 * f.cow + self.bulls as f64 * f.bull + self.calves as f64 * f.weaned_calf
+        }
     }
 }
 
@@ -102,26 +140,19 @@ impl Inputs {
         self.herds.get(herd_id).and_then(|h| h.mix).filter(|m| species == "cattle" && m.head() > 0)
     }
 
-    /// Animal units per head: from the herd's mix and the AU factors when
-    /// set, else the species factor of `calc::animal_units`.
-    pub fn au_per_head(&self, herd_id: &str, species: &str) -> f64 {
+    /// Animal units of the herd at `count` head: its mix's, by the AU
+    /// factors, when one is set ([`HerdMix::head_at`] says which count they
+    /// stand at), else the species factor of `calc::animal_units` per head.
+    pub fn animal_units(&self, herd_id: &str, species: &str, count: u32, counted: Counted) -> f64 {
         match self.mix(herd_id, species) {
-            Some(m) => {
-                let f = self.settings.au;
-                let au = if m.pairs {
-                    m.cows as f64 * f.pair + m.bulls as f64 * f.bull
-                } else {
-                    m.cows as f64 * f.cow + m.bulls as f64 * f.bull + m.calves as f64 * f.weaned_calf
-                };
-                au / m.head() as f64
-            }
-            None => op_engine::calc::animal_units(species, 1, None),
+            Some(m) => m.animal_units(&self.settings.au) * m.share(count, counted),
+            None => op_engine::calc::animal_units(species, 1, None) * count as f64,
         }
     }
 
-    /// The share of head that are cow-calf pairs, when the mix says so.
-    pub fn pair_share(&self, herd_id: &str, species: &str) -> Option<f64> {
-        self.mix(herd_id, species).filter(|m| m.pairs).map(|m| m.cows as f64 / m.head() as f64)
+    /// Cow-calf pairs in the herd at `count` head, when the mix says so.
+    pub fn pairs(&self, herd_id: &str, species: &str, count: u32, counted: Counted) -> Option<f64> {
+        self.mix(herd_id, species).filter(|m| m.pairs).map(|m| m.cows as f64 * m.share(count, counted))
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -198,4 +229,55 @@ async fn put_inputs(State(ctx): State<Ctx>, ApiJson(patch): ApiJson<Value>) -> A
 
 pub fn router() -> Router<Ctx> {
     Router::new().route("/api/reports/settings", get(get_inputs).put(put_inputs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Counted::{ByAnimals, ByHand};
+
+    fn au(m: HerdMix, count: u32, c: Counted) -> f64 {
+        (m.animal_units(&AuFactors::default()) * m.share(count, c) * 1000.0).round() / 1000.0
+    }
+
+    fn pairs(m: HerdMix, count: u32, c: Counted) -> f64 {
+        (m.cows as f64 * m.share(count, c) * 1000.0).round() / 1000.0
+    }
+
+    #[test]
+    fn a_pair_mix_holds_its_animal_units_while_calves_are_tagged() {
+        // 100 pairs at 1.3 AU, counted by their animal rows: 130 AU with no
+        // calf registered (100 head), all of them (200 head), or any number
+        // between, as calves are tagged through the calving season. Never a
+        // jump at one more calf.
+        let mix = HerdMix { cows: 100, pairs: true, ..Default::default() };
+        for count in [100, 120, 149, 150, 151, 180, 200] {
+            assert_eq!(au(mix, count, ByAnimals), 130.0, "{count} head");
+            assert_eq!(pairs(mix, count, ByAnimals), 100.0, "{count} head are 100 pairs");
+        }
+        // Fewer than the pairs: some pairs are gone (90 head, 90 × 1.3). More
+        // than pairs and calves: more pairs (220 head, 110 pairs, 143 AU).
+        assert_eq!((au(mix, 90, ByAnimals), pairs(mix, 90, ByAnimals)), (117.0, 90.0));
+        assert_eq!((au(mix, 220, ByAnimals), pairs(mix, 220, ByAnimals)), (143.0, 110.0));
+        assert_eq!(au(mix, 0, ByAnimals), 0.0);
+        // 90 pairs and 10 bulls: 90 × 1.3 + 10 × 1.35 = 130.5 AU from 100 to 190 head.
+        let bulls = HerdMix { cows: 90, bulls: 10, pairs: true, ..Default::default() };
+        assert_eq!((au(bulls, 100, ByAnimals), au(bulls, 145, ByAnimals), au(bulls, 190, ByAnimals)), (130.5, 130.5, 130.5));
+        assert_eq!((bulls.head_at(50, ByAnimals), bulls.head_at(145, ByAnimals), bulls.head_at(300, ByAnimals)), (100, 145, 190));
+    }
+
+    #[test]
+    fn a_count_kept_by_hand_is_a_pair_to_a_head() {
+        // The farmer's own count has no calves registered in it: 110 head of
+        // a 100-pair mix are 110 pairs, 143 AU.
+        let mix = HerdMix { cows: 100, pairs: true, ..Default::default() };
+        assert_eq!((au(mix, 100, ByHand), au(mix, 110, ByHand), pairs(mix, 110, ByHand)), (130.0, 143.0, 110.0));
+        assert_eq!(mix.head_at(200, ByHand), 100);
+        // Without pairs the mix's head is its head either way: 90 cows, 10
+        // bulls, 50 weaned calves are 90 + 13.5 + 25 = 128.5 AU at 150 head, half at 75.
+        let weaned = HerdMix { cows: 90, bulls: 10, calves: 50, pairs: false };
+        for c in [ByHand, ByAnimals] {
+            assert_eq!((au(weaned, 150, c), au(weaned, 75, c), weaned.head_at(200, c)), (128.5, 64.25, 150));
+        }
+    }
 }

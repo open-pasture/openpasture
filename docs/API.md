@@ -870,16 +870,25 @@ animal frees its tag.
 **Head count.** Once a herd has any animal rows, `herds.count` is its animals on the farm (not
 removed), kept by every create, delete, herd change, import, remove and swap; `PATCH` of another
 `count` on such a herd is 400 `Count follows the animals in this herd.`. Every such change publishes
-`animals_changed { herd_id }`.
+`animals_changed { herd_id }`. When the last animal moves out of a herd (or is deleted) its count
+goes to 0, and with no animal rows left the farmer can set it again. A removal dated earlier (`at`)
+takes the head off the herd's history from that date, so reports count it only until it left: each
+`herd_history` row from `at` on drops by one and a row at `at` starts the lower count (a date before
+the animal's record began counts from the record). The mark and the count are one write, so an
+animal added or moved in the herd at the same moment never takes a removal's backdate with it; a
+second remove of the same animal is 409.
 
 **Import.** The preview guesses the mapping from the header (Tag, Visual ID, Ear tag; EID, RFID,
 ISO; Name; Breed; Sex, Gender; DOB, Birth date, Born; Collar; Notes, Comments), returns the first 20
 rows as they are in the file and the rows the guessed mapping would skip (with `herd_id`, checked
-against that herd too). Previews live in memory for 30 minutes. A commit creates animals whose tag
+against that herd too). Previews live in memory for 30 minutes (the file itself, 64 MB for all of
+them together, oldest out first). A row filling more than 256 columns is 400 `Row N has more than
+256 columns.`; cells past a row's end read as empty. A commit creates animals whose tag
 isn't in the herd and updates those whose tag is; an empty cell leaves the field as it is, so
 committing the same file twice changes nothing. Sex reads F/female/cow/heifer, M/male/bull,
-steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (month first on a farm in a US time
-zone, day first elsewhere), `4/1/22`, `01.04.2022` (always day first). A `collar` column names a
+steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (one way for the whole file: the way its
+dates that read only one way show, like `13/4/2022`, else month first on a farm in a US time zone and
+day first elsewhere), `4/1/22`, `01.04.2022` (always day first). A `collar` column names a
 collar of the herd by name or id and puts it on the animal (a parked collar goes back on duty). A
 row with any error is skipped and listed; the rest go in, in one transaction.
 
@@ -956,7 +965,14 @@ Position history: CSV columns are guessed from the headers (tag, time, lat, lon,
 be changed with `mapping`; GPX tracks are labelled by their names (the animal's tag); GeoJSON Points
 take time and tag from properties. Times with an offset (RFC 3339, `…-05:00`, `Z`, ` UTC`) or unix
 seconds/milliseconds are exact; times without one are read in `zone` (default the farm's time zone),
-and `needs_zone` says so. A point at `0,0` or out of range is an error row. Each animal keeps one
+and `needs_zone` says so; in the hour the clocks go back through, each point is read from the same
+animal's point before it (the same local time again is the hour's second pass, else the nearer of
+the two instants, and on a tie the one the track is heading to), so both hours stay at any fix
+rate. Slash dates are read one way per file: day first when its dates show it (`13/06/2026`), month
+first when they show that, else by `zone` (month first in a US zone); a row the other way is an
+error row. Years are 2000 to 2099 (`06/14/26` is 2026). A CSV header wider than 256 columns is 400
+`The CSV has more than 256 columns.`; preview rows are as wide as the header. A point at `0,0` or out
+of range is an error row. Each animal keeps one
 point per instant (`duplicates` counts the rest; a file with nothing new is 409). Commit stores the points in `imported_fixes` and
 each animal's daily dwell per paddock in `imported_paddock_days` (today's paddocks, the rollup's
 30-minute gap rule), so pasture history's rest days and last grazed include it; the rollup never
@@ -1007,12 +1023,21 @@ shape, area and name. On upgrade both are backfilled once: occupancy from applie
 (the time the activity log says the move was applied, else the response or creation time; where a
 herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
 that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
-one paddock; head is the count on the day in and head-days follow every count change inside it.
+one paddock with head: a stretch at 0 head isn't grazing, so a herd made empty and filled by its
+animals a moment later goes in when they came, one emptied into another herd and left in place leaves
+when its last animal did, and one that never had any is no event (the paddock rests through it).
+Head is the count on the day in and head-days follow every count change inside it.
 Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
-exists. Animal units per head: the herd's mix with the `au` factors when a cattle herd has one
-(with `pairs` a cow and her calf are one head at the pair factor), else `cattle 1.0`, `sheep 0.2`,
-`goats 0.15`.
+exists: UTC days on which the paddock held at least 1/24 of the herd's tracked dwell (the pasture
+rule), so a few fixes across a fence don't make one. Animal units: the herd's mix with the `au` factors when a cattle herd has one, else
+`cattle 1.0`, `sheep 0.2`, `goats 0.15` per head. A mix's AU stand at its head count and scale with
+the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor and a
+pair is one head. In a herd whose count follows its animal rows, a calf at side may be registered as
+an animal of its own, so any count from cows + bulls to cows × 2 + bulls is the mix itself: 100 pairs
+are 130 AU at 100, 150 or 200 head (tagging calves through calving never moves the AU, and weaning
+them off doesn't either), never 260; a count outside that range scales from its nearer end. The
+method note gives the head counts the mix's AU stand at.
 
 - `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
   head-days, AU-days, stocking density, rest before in), then a line per paddock.
@@ -1045,7 +1070,7 @@ MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
 | POST | `/api/paddocks/:id/heights` | `{ height_cm, residual_cm?, at? }` (hand and up) | 201 `Height` |
 
 ```ts
-PaddockLayer { paddock_id, grazing?: true /* a herd is in it now */, rest_days?, last_grazed?,
+PaddockLayer { paddock_id, grazing?: true /* a herd with head is in it now */, rest_days?, last_grazed?,
                ndvi?, ndvi_at? /* YYYY-MM-DD of the imagery */,
                drought?: { category: "D0"|"D1"|"D2"|"D3"|"D4"|null /* null: not in drought */ },
                flood?: { in_floodplain: boolean, zone?, risk?: "medium"|"high" /* 3-day forecast */ } }
@@ -1053,14 +1078,23 @@ Height       { id /* hgt_… */, paddock_id, at, height_cm, residual_cm?, by: Ac
 ```
 
 A field is absent when nothing is known. Rest days count from when any herd last grazed the
-paddock (applied moves, collar fixes, rolled-up and imported history, `grazed_until`; a paddock
-with a herd in it now is 0). NDVI, drought and flood come from the newest cached land report:
+paddock (applied moves, collar days, rolled-up and imported history, `grazed_until`; a paddock
+with a herd in it now is 0). Collars graze a paddock on a UTC day when at least 1/24 of the
+herd's tracked day is in it (fixes for hot days, dwell for rolled-up and imported ones), the
+pasture history's rule; fixes across a fence from a herd next door, or one animal that wandered,
+don't count. NDVI, drought and flood come from the newest cached land report:
 they need the land provider key (open data has only weather), so without it they are absent.
 
 A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
 behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
 it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
-signals; older ones stay listed but no longer count.
+signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
+count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay with
+head on the farm record that ended after it, by a move or by the herd being emptied there, a later
+`grazed_until`, or a collar grazing day there, as for rest days): the grass it measured has been
+eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd with head is in now,
+`height_cm` is the grass ahead of it. A herd with no head (the Training herd once its animals went
+back) grazes nothing: its paddock isn't grazed now for rest days, the Rest layer or heights.
 
 Changes to existing shapes (all additive):
 - `Signals.paddocks[]` gains `grazing_days` (days this paddock's forage feeds the herd: 60 % of
@@ -1188,10 +1222,12 @@ time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`
 `Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
 once sent: collars not parked that applied its active boundary, and the sweep still left),
 the one thing to check when the decision asks for it, then up to four reasons as the record
-has them. When today's decision is still running, failed or missing, one line says so
-(`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars silent for a
-day.`, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20 days old.`,
-`No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
+has them (left out once the farmer changed the call: a HOLD made from a STAY, or their own
+boundary for the proposed one). When today's decision is still running, failed or missing, one
+line says so (`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars
+silent for a day.` for collars that reported before; `2 of 250 collars not reported yet.` for
+ones that never have, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20
+days old.`, `No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
 farm's units. `text` is the lines as one text: GSM-7 (curly quotes, dashes and accents made
 plain, emoji left out), at most 480 characters, giving up the fourth and third reason first,
 then stale-data lines, the second reason, other features' lines, the check and the first
@@ -1241,7 +1277,8 @@ cut with. The strips always cover the whole paddock; holes stay holes. More than
 400. `width_m` in the answer is the band width used (for `count`, depth ÷ count).
 
 `grazeable_ha` is the strip less the exclusions in effect now (farm-wide and the paddock's).
-`days` = forage × `grazeable_ha` ÷ (animal units × 11.8 kg DM a day), to 0.1 d, where forage is
+`days` = 60 % of forage × `grazeable_ha` ÷ (animal units × 11.8 kg DM a day), to 0.1 d (the rule
+the pre-send check and the grazing signals use too, so a strip and its check say the same days), where forage is
 the paddock's standing forage above the residual from its grazing signals (a cached land report,
 or a measured height when one is recorded; never fetched here). Without forage or animals there
 are no days, and sizing by `days` is 400. Head is `head`, else the herd's count; animal units
@@ -1295,9 +1332,9 @@ ring (at most 64 corners, no holes) that firmware 0.1 collars enforce, when the 
 Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage from the paddock
 holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
 or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
-= 60 % of it at 11.8 kg DM per animal unit a day; `rest_days` since that paddock was last grazed
-(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it, the
-newest collar fix in it and the days collars spent in it, any herd); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
+= 60 % of it at 11.8 kg DM per animal unit a day (as strip days); `rest_days` since that paddock was last grazed
+(0 while a herd with head is in it; else the latest of `grazed_until`, an applied move out of it and the
+last collar grazing day there, any herd, by the rest-days rule); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
 
 Findings, most severe first:
 
@@ -1440,8 +1477,10 @@ at?, starts_at?, back_fence?: boolean, next_index? }` (manager): makes one; stri
 layout or are cut across the herd's paddock. Neither is a decision-brain tool.
 
 **Reports.** `paddock_record` and `nrcs_528` gain "Planned days" (a schedule's `planned_end` less
-the stay's start) and "Residual at exit" (the measured height nearest the day out, within two
-days; `residual_cm`, else `height_cm`), each only when some row has a value.
+the stay's start) and "Residual at exit" (a `residual_cm` recorded within two days of the day out
+and not before the day in, or a plain `height_cm` measured in the two days after the herd left; the
+one nearest the day out), each only when some row has a value. A height taken before the herd left
+is the grass it was about to graze, not a residual.
 
 **Moves.** A sweep now waits only on its own staged first step (a farmer's target sent for
 later), not on a schedule's staged boundaries; `move_stalled`'s "waiting on a staged boundary"
@@ -1583,7 +1622,11 @@ HerdTraining   Training & { herd_id }
 - **Learning status**: trained after `trained_after` turned-back episodes in a row with no crossing
   (rest and boundary changes neither count nor break the run); learning once it has any episode;
   no status without episodes. `since`: the episode that made it trained; for learning, the crossing
-  that ended being trained, else its first episode. `trained_after` is its herd's.
+  that ended being trained, else its first episode. `trained_after` is its herd's. It is read as
+  each animal's settled episodes (begun more than six days ago) folded once and kept, plus the days
+  since, so a herd's status costs its recent episodes, not a season of them; an animal is folded
+  again when a settled episode of it is added or taken off (`welfare_late`, kept by a trigger) or
+  its herd's `trained_after` changes.
 - **Training mode** per herd: while `enabled`, a boundary sent for the herd without `warn_m` takes
   the training `warn_m` (op-ingest's `default_margins`); a send that names `warn_m` keeps it.
   Boundaries already sent keep theirs. `warn_m` 1–100 m, `trained_after` 1–50.
@@ -1657,7 +1700,9 @@ the data dir opens, in `paddocks` and in the geometry history reports use. Rows 
 right are left alone.
 
 **Rest days at 250 collars.** "Last grazed" for signals, the decision context and
-`GET /api/layers/paddocks` reads the newest fix per herd and paddock from `fix_paddock_last`
-(kept by a trigger as fixes land), not the herd's hot fixes; the herd's position over the last
+`GET /api/layers/paddocks` reads per-day summaries kept by triggers: `fix_paddock_days` (hot
+fixes per herd, UTC day and paddock) and `paddock_day_dwell` (rolled-up and imported dwell per
+herd, date, paddock), a few rows per paddock and day, not the herd's hot fixes or the collar days
+(`fix_paddock_last` is gone); the herd's position over the last
 day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
 holds more. No response shape changes.

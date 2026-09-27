@@ -14,7 +14,7 @@ use op_core::{Ctx, Paddock, Polygon};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::settings::Inputs;
+use crate::settings::{Counted, Inputs};
 use crate::{ReportDoc, ReportParams};
 
 pub use op_engine::calc::round;
@@ -60,10 +60,15 @@ pub struct Cut {
     pub open: bool,
     /// The window cut the stay short at either end (not counting `open`).
     pub cut: bool,
-    /// Head on the first day of the cut.
+    /// The stay went on past the window: `end` is the window's end (the
+    /// midnight after the report's last day), not a day the herd left.
+    pub cut_end: bool,
+    /// Head on the first day of the cut (a stay always has head: [`Farm::stays`]).
     pub head: u32,
     pub days: f64,
     pub head_days: f64,
+    /// (head, days) of each stretch at one count, in time order.
+    pub counts: Vec<(u32, f64)>,
     /// The head count changed inside the cut.
     pub recounted: bool,
 }
@@ -87,6 +92,8 @@ pub struct Farm {
     pub herds: BTreeMap<String, Vec<HerdState>>,
     /// Current herd names, for herds that still exist.
     current_herds: BTreeMap<String, String>,
+    /// Herds whose count follows their animal rows (K-animals).
+    by_animals: BTreeSet<String>,
     versions: BTreeMap<String, Vec<PaddockVersion>>,
 }
 
@@ -98,6 +105,7 @@ impl Farm {
         let inputs = Inputs::load(ctx).await?;
         let paddocks = ctx.store().list_paddocks().await?.into_iter().map(|p| (p.id.clone(), p)).collect();
         let current_herds = ctx.store().list_herds().await?.into_iter().map(|h| (h.id, h.name)).collect();
+        let by_animals = sqlx::query_scalar::<_, String>("SELECT DISTINCT herd_id FROM animals").fetch_all(ctx.db()).await?.into_iter().collect();
 
         let mut herds: BTreeMap<String, Vec<HerdState>> = BTreeMap::new();
         let rows =
@@ -127,7 +135,7 @@ impl Farm {
             versions.entry(r.get("paddock_id")).or_default().push(PaddockVersion { at: from_db(&at)?, area_ha, name: r.get("name") });
         }
 
-        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, versions })
+        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, by_animals, versions })
     }
 
     /// Farm-local midnight starting `day`, in UTC.
@@ -204,12 +212,19 @@ impl Farm {
         self.herds.get(herd_id).and_then(|s| s.last()).map(|s| s.species.clone()).unwrap_or_else(|| "cattle".into())
     }
 
-    pub fn au_per_head(&self, herd_id: &str) -> f64 {
-        self.inputs.au_per_head(herd_id, &self.species(herd_id))
+    /// How the herd's count is kept: by its animal rows once it has any.
+    pub fn counted(&self, herd_id: &str) -> Counted {
+        if self.by_animals.contains(herd_id) { Counted::ByAnimals } else { Counted::ByHand }
     }
 
-    pub fn pair_share(&self, herd_id: &str) -> Option<f64> {
-        self.inputs.pair_share(herd_id, &self.species(herd_id))
+    /// Animal units of the herd at `count` head.
+    pub fn animal_units(&self, herd_id: &str, count: u32) -> f64 {
+        self.inputs.animal_units(herd_id, &self.species(herd_id), count, self.counted(herd_id))
+    }
+
+    /// Cow-calf pairs in the herd at `count` head, when its mix says so.
+    pub fn pairs(&self, herd_id: &str, count: u32) -> Option<f64> {
+        self.inputs.pairs(herd_id, &self.species(herd_id), count, self.counted(herd_id))
     }
 
     /// Herds the report covers: the one asked for, else every herd with history.
@@ -226,7 +241,8 @@ impl Farm {
         self.herds.values().flatten().filter(|s| s.source == "install").map(|s| s.at).min()
     }
 
-    /// Every stay of every herd, in herd then time order.
+    /// Every stay of every herd, in herd then time order: its time in a
+    /// paddock with head ([`with_head`]).
     pub fn stays(&self) -> Vec<Stay> {
         let since = self.history_since();
         let mut out = Vec::new();
@@ -268,8 +284,7 @@ impl Farm {
                 out.push(c);
             }
         }
-        out.retain(|s| !s.parts.is_empty());
-        out
+        with_head(out)
     }
 
     /// Days since any herd last left `paddock_id` before `t`; None with no
@@ -284,9 +299,49 @@ impl Farm {
     }
 }
 
+/// Stays as a herd's time in a paddock with head. A stretch at 0 head isn't
+/// grazing: a herd made empty and filled by its animals a moment later goes
+/// in when they came, one emptied into another herd and left where it was
+/// (the Training herd after training) leaves when its last animal did, and
+/// one that never had any is no stay at all, so the paddock rests through it.
+fn with_head(stays: Vec<Stay>) -> Vec<Stay> {
+    let mut out = Vec::with_capacity(stays.len());
+    for s in stays {
+        let mut run: Vec<Part> = Vec::new();
+        for p in s.parts.iter().copied().chain([Part { start: DateTime::<Utc>::MAX_UTC, end: None, count: 0 }]) {
+            if p.count > 0 {
+                run.push(p);
+            } else if let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) {
+                out.push(Stay { start: first.start, end: last.end, parts: std::mem::take(&mut run), ..s.clone() });
+            }
+        }
+    }
+    out
+}
+
 /// A span in days.
 pub fn days(d: Duration) -> f64 {
     d.num_milliseconds().max(0) as f64 / 86_400_000.0
+}
+
+impl Cut {
+    /// The farm day the cut ends on: the day the herd left, or for a stay
+    /// that went on past the window, the window's last day.
+    pub fn last_day(&self, farm: &Farm) -> NaiveDate {
+        if self.cut_end { farm.local_date(self.end - Duration::milliseconds(1)) } else { farm.local_date(self.end) }
+    }
+}
+
+impl Cut {
+    /// Animal-unit days of `herd_id` in the cut, each stretch at its count's animal units.
+    pub fn au_days(&self, farm: &Farm, herd_id: &str) -> f64 {
+        self.counts.iter().map(|(c, d)| farm.animal_units(herd_id, *c) * d).sum()
+    }
+
+    /// Pair-days of `herd_id` in the cut, when its mix names pairs.
+    pub fn pair_days(&self, farm: &Farm, herd_id: &str) -> Option<f64> {
+        self.counts.iter().map(|(c, d)| farm.pairs(herd_id, *c).map(|p| p * d)).sum()
+    }
 }
 
 impl Stay {
@@ -299,25 +354,29 @@ impl Stay {
         }
         let mut head_days = 0.0;
         let mut head = None;
-        let mut counts = BTreeSet::new();
+        let mut counts = Vec::new();
         for p in &self.parts {
             let (a, b) = (p.start.max(start), p.end.unwrap_or(DateTime::<Utc>::MAX_UTC).min(stop));
             if b > a {
                 head.get_or_insert(p.count);
-                counts.insert(p.count);
+                counts.push((p.count, days(b - a)));
                 head_days += p.count as f64 * days(b - a);
             }
         }
+        let recounted = counts.iter().map(|(c, _)| *c).collect::<BTreeSet<_>>().len() > 1;
         let open = self.end.is_none() && w1 >= now;
+        let cut_end = stop < end && !open;
         Some(Cut {
             start,
             end: stop,
             open,
-            cut: start > self.start || (stop < end && !open),
+            cut: start > self.start || cut_end,
+            cut_end,
             head: head.unwrap_or(0),
             days: days(stop - start),
             head_days,
-            recounted: counts.len() > 1,
+            counts,
+            recounted,
         })
     }
 }
@@ -351,15 +410,24 @@ pub fn days_in_paddocks(farm: &Farm, stays: &[&Stay], w0: DateTime<Utc>, w1: Dat
     seen.len()
 }
 
-/// Days collars place each herd in each paddock, from daily dwell
-/// (`paddock_days`, UTC dates): (herd, paddock) → dates.
+/// Days collars place each herd in each paddock (UTC dates): (herd,
+/// paddock) → dates. A day counts when the paddock held a real share of the
+/// herd's tracked day ([`op_engine::signals::GRAZING_DAY_SHARE`], an hour's
+/// worth: op-analytics' pasture rule and the engine's last grazed), from the
+/// rolled-up and imported collar days (`paddock_day_dwell`). A few fixes
+/// across a fence from the paddock the herd is really in don't make one.
 pub async fn collar_days(ctx: &Ctx, w0: DateTime<Utc>, w1: DateTime<Utc>) -> anyhow::Result<BTreeMap<(String, String), BTreeSet<NaiveDate>>> {
     let rows = sqlx::query(
-        "SELECT herd_id, paddock_id, date FROM paddock_days WHERE date >= ? AND date <= ? AND paddock_id != '' AND herd_id != '' AND fixes > 0
-         GROUP BY herd_id, paddock_id, date",
+        "SELECT d.herd_id, d.paddock_id, d.date FROM (
+             SELECT herd_id, date, paddock_id, SUM(dwell_s) AS dwell FROM paddock_day_dwell
+             WHERE date >= ?1 AND date <= ?2 AND herd_id != '' GROUP BY herd_id, date, paddock_id) d
+         JOIN (SELECT herd_id, date, SUM(dwell_s) AS total FROM paddock_day_dwell
+               WHERE date >= ?1 AND date <= ?2 AND herd_id != '' GROUP BY herd_id, date) t ON t.herd_id = d.herd_id AND t.date = d.date
+         WHERE d.paddock_id != '' AND d.dwell > 0 AND d.dwell >= ?3 * t.total",
     )
     .bind(w0.date_naive().to_string())
     .bind(w1.date_naive().to_string())
+    .bind(op_engine::signals::GRAZING_DAY_SHARE)
     .fetch_all(ctx.db())
     .await?;
     let mut out: BTreeMap<(String, String), BTreeSet<NaiveDate>> = BTreeMap::new();
@@ -414,7 +482,16 @@ pub fn au_note(farm: &Farm, herd_ids: &[String]) -> Option<String> {
                 if m.calves > 0 && !m.pairs {
                     what.push(format!("{} weaned calves", m.calves));
                 }
-                mixed.push(format!("{} {}", farm.herd_name(h), what.join(", ")));
+                // The head counts the mix's animal units stand at (other counts scale them).
+                let counted = farm.counted(h);
+                let (low, high) = (m.head_at(0, counted), m.head_at(u32::MAX, counted));
+                let mut at = format!("{} AU at {low}", fmt_au(m.animal_units(&farm.inputs.settings.au)));
+                if high > low {
+                    at += &format!(" to {high} head, calves at side counted or not");
+                } else {
+                    at += " head";
+                }
+                mixed.push(format!("{} {}: {at}", farm.herd_name(h), what.join(", ")));
             }
             None => {
                 species.insert(sp);
@@ -436,6 +513,12 @@ pub fn au_note(farm: &Farm, herd_ids: &[String]) -> Option<String> {
         ));
     }
     Some(format!("Animal units per head: {}.", parts.join("; ")))
+}
+
+/// "130.5", "143" (one decimal, dropped when zero).
+fn fmt_au(v: f64) -> String {
+    let s = format!("{:.1}", round(v, 1));
+    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
 }
 
 fn fmt_factor(v: f64) -> String {

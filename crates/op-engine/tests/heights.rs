@@ -181,6 +181,79 @@ async fn a_measured_height_overrides_ndvi() {
 }
 
 #[tokio::test]
+async fn a_height_taken_before_the_paddock_was_grazed_stops_counting() {
+    let t = setup().await;
+    let (p1, p2, herd) = t.farm().await;
+    t.cache_report(&p2, json!({ "imagery": imagery(0.62) })).await; // 7 in
+    let ago = |days: i64| time::now() - Duration::days(days);
+    let forage = |v: &Value| (v["forage"]["source"].clone(), v["forage"]["height_inches"].clone(), v["forage"]["available_kg_dm_per_ha"].clone());
+
+    // P2 measured at 10 in ten days ago, not grazed since: (10 - 3) in × 336.
+    t.ok("POST", &format!("/api/paddocks/{p2}/heights"), Some(json!({ "height_cm": 25.4, "at": time::to_db(&ago(10)) }))).await;
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await), (json!("measured"), json!(10.0), json!(2352.0)));
+
+    // The herd grazed P2 from 6 to 3 days ago (on the farm record): the
+    // 10 in is eaten, so forage is imagery's again.
+    t.ok("PATCH", &format!("/api/herds/{herd}"), Some(json!({ "paddock_id": p2 }))).await;
+    t.ok("PATCH", &format!("/api/herds/{herd}"), Some(json!({ "paddock_id": p1 }))).await;
+    for (paddock, at) in [(&p2, ago(6)), (&p1, ago(3))] {
+        sqlx::query("UPDATE herd_history SET at = ? WHERE herd_id = ? AND paddock_id = ? AND source = 'changed'")
+            .bind(time::to_db(&at))
+            .bind(&herd)
+            .bind(paddock)
+            .execute(t.ctx.db())
+            .await
+            .unwrap();
+    }
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await), (json!("imagery"), json!(7.0), json!(1344.0)));
+    // Strips and the pre-send check read the same forage.
+    let pv = t.ok("POST", "/api/strips/preview", Some(json!({ "paddock_id": p2, "herd_id": herd, "orientation_deg": 0, "count": 2 }))).await;
+    assert_eq!((pv["forage_source"].clone(), pv["forage_kg_dm_per_ha"].clone()), (json!("imagery"), json!(1344.0)));
+
+    // The residual recorded as they left (8.89 cm = 3.5 in) is what stands: 0.5 in × 336.
+    t.ok("POST", &format!("/api/paddocks/{p2}/heights"), Some(json!({ "height_cm": 20.0, "residual_cm": 8.89, "at": time::to_db(&ago(3)) }))).await;
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await), (json!("measured"), json!(3.5), json!(168.0)));
+
+    // Yesterday from 12:00 UTC, the herd's collars in P1 (40 fixes): one
+    // lands across the fence in P2. That isn't grazing P2, the residual stands.
+    let noon = (time::now() - Duration::days(1)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc();
+    let fix = |i: i64, paddock: String| {
+        let (ctx, herd) = (t.ctx.clone(), herd.clone());
+        async move {
+            let at = noon + Duration::minutes(i);
+            sqlx::query(
+                "INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, sats, state, paddock_id) VALUES ('col_a', ?, ?, ?, -93.62, 42.03, 3.0, 9, 'inside', ?)",
+            )
+            .bind(&herd)
+            .bind(time::to_db(&at))
+            .bind(time::unix_ms(&at))
+            .bind(paddock)
+            .execute(ctx.db())
+            .await
+            .unwrap();
+        }
+    };
+    for i in 0..40 {
+        fix(i, if i == 20 { p2.clone() } else { p1.clone() }).await;
+    }
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("measured"));
+    // The herd in P2 for the afternoon (20 more fixes, a third of its day): grazed again, the residual is old.
+    for i in 40..60 {
+        fix(i, p2.clone()).await;
+    }
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("imagery"));
+    // So is a grazed_until after it.
+    sqlx::query("DELETE FROM fix_paddock_days").execute(t.ctx.db()).await.unwrap();
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("measured"));
+    t.ok("PATCH", &format!("/api/paddocks/{p2}"), Some(json!({ "grazed_until": time::to_db(&ago(2)) }))).await;
+    assert_eq!(forage(&t.paddock_signals(&herd, &p2).await).0, json!("imagery"));
+
+    // In the paddock the herd is in, a height taken as it went in is the grass ahead of it.
+    t.ok("POST", &format!("/api/paddocks/{p1}/heights"), Some(json!({ "height_cm": 15.24, "at": time::to_db(&ago(3)) }))).await;
+    assert_eq!(forage(&t.paddock_signals(&herd, &p1).await), (json!("measured"), json!(6.0), json!(1008.0)));
+}
+
+#[tokio::test]
 async fn a_measured_height_expires_after_21_days() {
     let t = setup().await;
     let (p1, p2, herd) = t.farm().await;

@@ -173,10 +173,180 @@ async fn the_head_count_follows_the_animals_once_there_are_any() {
     assert_eq!(animals::sync_herd_count(app.ctx.db(), &cows).await.unwrap(), None);
     let (s, _) = app.call("DELETE", &format!("/api/animals/{b}"), None).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    // Heifers has no animal rows left, so its count is the farmer's again (left where it was).
-    assert_eq!(app.count(&heifers).await, 1);
+    // Its last animal gone, Heifers has none: 0, and the count is the farmer's again.
+    assert_eq!(app.count(&heifers).await, 0);
     let (s, _) = app.call("PATCH", &format!("/api/herds/{heifers}"), Some(json!({"count": 12}))).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+/// (count, paddock) of the herd's history rows, oldest first.
+async fn history(app: &App, herd: &str) -> Vec<(i64, Option<String>)> {
+    sqlx::query_as("SELECT count, paddock_id FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(herd).fetch_all(app.ctx.db()).await.unwrap()
+}
+
+#[tokio::test]
+async fn moving_the_last_animal_out_leaves_the_herd_at_zero() {
+    // The training flow: new animals go into Training in P2, then all back to Cows.
+    let app = App::new().await;
+    let ring = json!([[[-93.62, 42.03], [-93.615, 42.03], [-93.615, 42.0336], [-93.62, 42.0336], [-93.62, 42.03]]]);
+    let (_, p2) = app.call("POST", "/api/paddocks", Some(json!({"name": "P2", "geometry": {"type": "Polygon", "coordinates": ring}}))).await;
+    let p2 = p2["id"].as_str().unwrap().to_owned();
+    let cows = app.herd("Cows", 219).await;
+    let (_, t) = app.call("POST", "/api/herds", Some(json!({"name": "Training", "species": "cattle", "count": 0, "paddock_id": p2}))).await;
+    let training = t["id"].as_str().unwrap().to_owned();
+    let mut ids = Vec::new();
+    for tag in ["301", "302", "303"] {
+        ids.push(app.animal(&training, tag).await);
+    }
+    assert_eq!(app.count(&training).await, 3);
+    for id in &ids {
+        let (s, v) = app.call("PATCH", &format!("/api/animals/{id}"), Some(json!({"herd_id": cows}))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    // Cows follows its 3 animal rows; Training has none left and no phantom head.
+    assert_eq!((app.count(&cows).await, app.count(&training).await), (3, 0));
+    let p2 = Some(p2);
+    assert_eq!(history(&app, &training).await, [(0, p2.clone()), (1, p2.clone()), (2, p2.clone()), (3, p2.clone()), (2, p2.clone()), (1, p2.clone()), (0, p2)]);
+    // Once empty, the farmer sets its count again.
+    let (s, _) = app.call("PATCH", &format!("/api/herds/{training}"), Some(json!({"count": 5}))).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_removal_dated_earlier_takes_the_head_off_the_history_from_then() {
+    let app = App::new().await;
+    let cows = app.herd("Cows", 0).await;
+    let (a, b) = (app.animal(&cows, "214").await, app.animal(&cows, "215").await);
+    app.animal(&cows, "216").await;
+    // Date the history: created Sep 1 with 0, the three animals Sep 1 (1, 2, 3 head).
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    assert_eq!(rows.len(), 4);
+    for (id, t) in rows.iter().zip(["2026-09-01T12:00:00.000Z", "2026-09-01T12:00:00.001Z", "2026-09-01T12:00:00.002Z", "2026-09-01T12:00:00.003Z"]) {
+        sqlx::query("UPDATE herd_history SET at = ? WHERE id = ?").bind(t).bind(id).execute(app.ctx.db()).await.unwrap();
+    }
+    sqlx::query("UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&cows).execute(app.ctx.db()).await.unwrap();
+    // A move on Sep 10 (3 head), recorded as it happens.
+    let ring = json!([[[-93.62, 42.03], [-93.615, 42.03], [-93.615, 42.0336], [-93.62, 42.0336], [-93.62, 42.03]]]);
+    let (_, p2) = app.call("POST", "/api/paddocks", Some(json!({"name": "P2", "geometry": {"type": "Polygon", "coordinates": ring}}))).await;
+    let p2 = p2["id"].as_str().unwrap().to_owned();
+    let (s, _) = app.call("PATCH", &format!("/api/herds/{cows}"), Some(json!({"paddock_id": p2}))).await;
+    assert_eq!(s, StatusCode::OK);
+    sqlx::query("UPDATE herd_history SET at = '2026-09-10T12:00:00.000Z' WHERE herd_id = ? AND paddock_id = ?")
+        .bind(&cows)
+        .bind(&p2)
+        .execute(app.ctx.db())
+        .await
+        .unwrap();
+
+    // 214 sold Sep 5, entered now; 215 died Sep 12, entered now.
+    let remove = |id: String, at: &'static str| {
+        let ctx = app.ctx.clone();
+        let cows = cows.clone();
+        async move {
+            let at = time::from_db(at).unwrap();
+            let row = ctx.store().get_animal(&id).await.unwrap().unwrap();
+            assert_eq!(row.herd_id, cows);
+            assert!(animals::remove_animal(&ctx, &Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap());
+        }
+    };
+    remove(a, "2026-09-05T17:00:00.000Z").await;
+    remove(b, "2026-09-12T17:00:00.000Z").await;
+    assert_eq!(app.count(&cows).await, 1);
+    let rows: Vec<(String, i64, Option<String>)> =
+        sqlx::query_as("SELECT at, count, paddock_id FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    let rows: Vec<(&str, i64, bool)> = rows.iter().map(|(t, c, p)| (t.get(..10).unwrap(), *c, p.as_deref() == Some(p2.as_str()))).collect();
+    let today = time::to_db(&time::now());
+    let today = today.get(..10).unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("2026-09-01", 0, false),
+            ("2026-09-01", 1, false),
+            ("2026-09-01", 2, false),
+            ("2026-09-01", 3, false),
+            // 214 left on Sep 5: 2 head from then, and at the Sep 10 move.
+            ("2026-09-05", 2, false),
+            ("2026-09-10", 2, true),
+            // 215 left on Sep 12: 1 head from then.
+            ("2026-09-12", 1, true),
+            // The rows the count changes wrote when each was entered.
+            (today, 1, true),
+            (today, 1, true),
+        ]
+    );
+    // 217 entered today and removed as of 2020: it never counted, so the
+    // rows from its record on drop back to 1 and nothing earlier changes.
+    // (Times are to the millisecond: a row written in the same one as the
+    // record began would read as from it.)
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    let c = app.animal(&cows, "217").await;
+    remove(c, "2020-01-01T00:00:00.000Z").await;
+    let counts: Vec<i64> =
+        sqlx::query_scalar("SELECT count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    assert_eq!(counts, [0, 1, 2, 3, 2, 2, 1, 1, 1, 1, 1]);
+}
+
+#[tokio::test]
+async fn a_removal_counts_from_its_date_while_another_animals_recount_is_still_to_run() {
+    // An animal added (or moved out) at the moment of a removal: its row is
+    // in, its own recount hasn't run. The removal used to read the count and
+    // the animals to tell whether it had been counted, took the pending one
+    // for its own, and skipped its backdate: the sold head kept counting until
+    // it was entered.
+    let app = App::new().await;
+    let cows = app.herd("Cows", 0).await;
+    let heifers = app.herd("Heifers", 0).await;
+    let (a, b) = (app.animal(&cows, "214").await, app.animal(&cows, "215").await);
+    app.animal(&cows, "216").await;
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    for (i, id) in rows.iter().enumerate() {
+        sqlx::query("UPDATE herd_history SET at = ? WHERE id = ?").bind(format!("2026-09-01T12:00:00.00{i}Z")).bind(id).execute(app.ctx.db()).await.unwrap();
+    }
+    sqlx::query("UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&cows).execute(app.ctx.db()).await.unwrap();
+    let history = || async {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+        let today = time::to_db(&time::now()).get(..10).unwrap().to_owned();
+        rows.into_iter().map(|(t, c)| (if t.starts_with(&today) { "today".to_owned() } else { t.get(..10).unwrap().to_owned() }, c)).collect::<Vec<_>>()
+    };
+    let removed = |id: &str, at: &str| {
+        let (ctx, id, at) = (app.ctx.clone(), id.to_owned(), time::from_db(at).unwrap());
+        async move {
+            let row = ctx.store().get_animal(&id).await.unwrap().unwrap();
+            animals::remove_animal(&ctx, &Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap()
+        }
+    };
+
+    // 217 is in, not yet counted (3 head, 3 active after 214 is marked).
+    let new = Animal { id: id::new_id(id::ANIMAL), tag: "217".into(), herd_id: cows.clone(), ..Default::default() };
+    app.ctx.store().insert_animal(&new).await.unwrap();
+    assert!(removed(&a, "2026-09-05T17:00:00.000Z").await);
+    // 3 head from Sep 1, 2 from Sep 5 when 214 was sold, and today 214 off
+    // the count (2) with 217 on it (3). 217's own recount finds nothing to do.
+    let d = |s: &str, n: i64| (s.to_owned(), n);
+    let mut want = vec![d("2026-09-01", 0), d("2026-09-01", 1), d("2026-09-01", 2), d("2026-09-01", 3), d("2026-09-05", 2), d("today", 2), d("today", 3)];
+    assert_eq!(history().await, want);
+    assert_eq!(animals::sync_herd_count(app.ctx.db(), &cows).await.unwrap(), None);
+    assert_eq!(app.count(&cows).await, 3);
+
+    // 215 moved to Heifers, its recount not yet run (3 head, 1 active after 216 is marked).
+    let row = app.ctx.store().get_animal(&b).await.unwrap().unwrap();
+    app.ctx.store().update_animal(&Animal { herd_id: heifers.clone(), ..row }).await.unwrap();
+    let c = app.ctx.store().list_animals(Some(&cows)).await.unwrap().into_iter().find(|x| x.tag == "216").unwrap();
+    assert!(removed(&c.id, "2026-09-12T17:00:00.000Z").await);
+    // 216 sold Sep 12: one head fewer from then (the rows written today too),
+    // and today 216 off the count (2) and 215's move taken in (1, 217 left).
+    want.splice(5..5, [d("2026-09-12", 1)]);
+    want[6].1 = 1;
+    want[7].1 = 2;
+    want.extend([d("today", 2), d("today", 1)]);
+    assert_eq!(history().await, want);
+    assert_eq!(app.count(&cows).await, 1);
+    assert_eq!(animals::sync_after_leaving(app.ctx.db(), &cows).await.unwrap(), None);
+
+    // Removed already: nothing changes.
+    assert!(!removed(&a, "2026-09-05T17:00:00.000Z").await);
+    assert_eq!((history().await, app.count(&cows).await), (want, 1));
 }
 
 #[tokio::test]

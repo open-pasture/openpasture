@@ -1,6 +1,7 @@
 //! Rest days and herd position at 250 collars without walking the hot fixes:
-//! the newest fix per (herd, paddock) is kept by a trigger as fixes land, so
-//! "last grazed" is one row per paddock and matches a full scan; fixes that
+//! fixes per (herd, day, paddock) are counted by a trigger as fixes land, so
+//! "last grazed" reads a few rows per paddock and day, matches a full scan,
+//! and counts only days a real share of the herd was there; fixes that
 //! landed outside every paddock count for a paddock drawn over them later; a
 //! window larger than the sample is read by index seeks per collar and bucket.
 
@@ -95,53 +96,130 @@ fn ms(t: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 #[tokio::test]
-async fn rest_days_read_the_newest_fix_per_paddock_and_match_a_full_scan() {
+async fn rest_days_count_the_days_a_real_share_of_the_herd_was_there() {
     let t = setup().await;
     let (p1, p2, p3) = (t.id_of("P1").await, t.id_of("P2").await, t.id_of("P3").await);
     let now = ms(time::now());
-    t.fix("col_a", now - Duration::hours(5), IN_P1, Some(&p1)).await;
-    t.fix("col_a", now - Duration::hours(4), IN_P1, Some(&p1)).await;
-    t.fix("col_b", now - Duration::hours(3), IN_P2, Some(&p2)).await;
-    // A late fix, older than what P1 and P2 have: nothing moves back.
-    t.fix("col_a", now - Duration::hours(6), IN_P2, Some(&p2)).await;
+    let noon = (now - Duration::days(1)).date_naive().and_hms_opt(12, 0, 0).unwrap().and_utc();
+    let min = |m: i64| noon + Duration::minutes(m);
+    // Yesterday from noon, a fix every 5 minutes. col_a in P1 for 40 fixes,
+    // two of them across the fence in P3; col_b in P1 for 36, then P2 for 12.
+    for j in 0..40 {
+        let (point, paddock) = if j == 10 || j == 30 { (IN_P3, &p3) } else { (IN_P1, &p1) };
+        t.fix("col_a", min(5 * j), point, Some(paddock)).await;
+    }
+    for j in 0..48 {
+        let (point, paddock) = if j < 36 { (IN_P1, &p1) } else { (IN_P2, &p2) };
+        t.fix("col_b", min(5 * j), point, Some(paddock)).await;
+    }
+    // A late fix, older than the rest: it counts, and moves nothing back.
+    t.fix("col_a", min(-60), IN_P2, Some(&p2)).await;
     // In the lane, outside every paddock.
-    t.fix("col_b", now - Duration::hours(1), LANE, None).await;
+    t.fix("col_b", min(240), LANE, None).await;
     // Far older than the lookback: not grazing.
     t.fix("col_c", now - Duration::days(200), IN_P3, Some(&p3)).await;
 
-    let kept: Vec<(String, i64)> = sqlx::query_as("SELECT paddock_id, last_t FROM fix_paddock_last WHERE herd_id = ? ORDER BY paddock_id")
-        .bind(&t.herd.id)
-        .fetch_all(t.ctx.db())
-        .await
-        .unwrap();
-    let mut want = vec![
-        (String::new(), time::unix_ms(&(now - Duration::hours(1)))),
-        (p1.clone(), time::unix_ms(&(now - Duration::hours(4)))),
-        (p2.clone(), time::unix_ms(&(now - Duration::hours(3)))),
-        (p3.clone(), time::unix_ms(&(now - Duration::days(200)))),
-    ];
-    want.sort();
-    assert_eq!(kept, want);
+    // The per-day counts are exactly the fixes, per herd, UTC day and paddock.
+    let kept: Vec<(i64, String, i64, i64)> =
+        sqlx::query_as("SELECT day, paddock_id, fixes, last_t FROM fix_paddock_days WHERE herd_id = ? ORDER BY day, paddock_id")
+            .bind(&t.herd.id)
+            .fetch_all(t.ctx.db())
+            .await
+            .unwrap();
+    let scan: Vec<(i64, String, i64, i64)> =
+        sqlx::query_as("SELECT t / 86400000, COALESCE(paddock_id, ''), COUNT(*), MAX(t) FROM fixes WHERE herd_id = ? GROUP BY 1, 2 ORDER BY 1, 2")
+            .bind(&t.herd.id)
+            .fetch_all(t.ctx.db())
+            .await
+            .unwrap();
+    assert_eq!(kept, scan);
 
+    // 90 fixes that day: P1 74, P2 13 (14 %), P3 2 (2 %), the lane 1.
     let last = t.last_grazed(now).await;
-    assert_eq!(last[&p1], Some(now - Duration::hours(4)));
-    assert_eq!(last[&p2], Some(now - Duration::hours(3)));
-    assert_eq!(last[&p3], None, "200 days back is outside the lookback");
+    assert_eq!(last[&p1], Some(min(195)), "col_a's last in P1");
+    assert_eq!(last[&p2], Some(min(235)));
+    assert_eq!(last[&p3], None, "2 % of the day across a fence isn't grazing, and 200 days back is outside the lookback");
+    let rest = signals::collar_grazed(&t.ctx, signals::Grazer::Paddock(&p3), now - Duration::days(365), None).await.unwrap();
+    assert_eq!(rest.get(&p3), Some(&ms(now - Duration::days(200))), "a year back, the day it was all the herd's fixes");
 
-    // The same as reading every fix.
-    let scan = sqlx::query("SELECT paddock_id, MAX(t) FROM fixes WHERE herd_id = ? AND paddock_id IS NOT NULL AND t >= ? GROUP BY paddock_id")
-        .bind(&t.herd.id)
-        .bind(time::unix_ms(&(now - Duration::days(120))))
-        .fetch_all(t.ctx.db())
-        .await
-        .unwrap();
-    for r in scan {
-        assert_eq!(last[&r.get::<String, _>(0)], Some(time::from_unix_ms(r.get::<i64, _>(1))));
-    }
-
-    // A collar clock running ahead: grazing now, not in the future.
+    // A collar clock running ahead: grazing now, not in the future (today, its only fix).
     t.fix("col_c", now + Duration::seconds(3), IN_P3, Some(&p3)).await;
     assert_eq!(t.last_grazed(now).await[&p3], Some(now));
+}
+
+#[tokio::test]
+async fn rolled_and_imported_days_count_by_dwell_and_leave_when_undone() {
+    let t = setup().await;
+    let (p1, p2, p3) = (t.id_of("P1").await, t.id_of("P2").await, t.id_of("P3").await);
+    let now = ms(time::now());
+    let date = (now - Duration::days(10)).date_naive();
+    let d0 = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let h = |n: i64| time::unix_ms(&(d0 + Duration::hours(n)));
+    // A day the rollup summed: col_a in P1 (80,000 s) with 600 s across the
+    // fence in P3; col_b in P1 (70,000 s) and P2 (10,000 s).
+    let rows = [("col_a", &p1, 80_000.0, h(22)), ("col_a", &p3, 600.0, h(23)), ("col_b", &p1, 70_000.0, h(20)), ("col_b", &p2, 10_000.0, h(21))];
+    let insert = |rows: Vec<(&'static str, String, f64, i64)>| {
+        let (ctx, herd, d) = (t.ctx.clone(), t.herd.id.clone(), date.to_string());
+        async move {
+            for (collar, paddock, dwell, last) in rows {
+                sqlx::query("INSERT INTO analytics_paddock_days (date, herd_id, collar_id, paddock_id, fixes, dwell_s, last_t) VALUES (?, ?, ?, ?, 10, ?, ?)")
+                    .bind(&d)
+                    .bind(&herd)
+                    .bind(collar)
+                    .bind(paddock)
+                    .bind(dwell)
+                    .bind(last)
+                    .execute(ctx.db())
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    insert(rows.iter().map(|(c, p, d, l)| (*c, (*p).clone(), *d, *l)).collect()).await;
+    let summary = || async {
+        sqlx::query_as::<_, (String, String, f64, i64)>(
+            "SELECT paddock_id, source, dwell_s, last_t FROM paddock_day_dwell WHERE herd_id = ? ORDER BY paddock_id, source",
+        )
+        .bind(&t.herd.id)
+        .fetch_all(t.ctx.db())
+        .await
+        .unwrap()
+    };
+    let mut want = vec![
+        (p1.clone(), "rolled".to_owned(), 150_000.0, h(22)),
+        (p2.clone(), "rolled".to_owned(), 10_000.0, h(21)),
+        (p3.clone(), "rolled".to_owned(), 600.0, h(23)),
+    ];
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(summary().await, want);
+    // 160,600 s tracked: P1 93 %, P2 6.2 % (grazing), P3 0.4 % (the fence).
+    let last = t.last_grazed(now).await;
+    assert_eq!((last[&p1], last[&p2], last[&p3]), (Some(time::from_unix_ms(h(22))), Some(time::from_unix_ms(h(21))), None));
+
+    // The rollup redoes the day with a late fix: the day's rows go and come back.
+    sqlx::query("DELETE FROM analytics_paddock_days WHERE date = ?").bind(date.to_string()).execute(t.ctx.db()).await.unwrap();
+    assert!(summary().await.is_empty());
+    let mut again: Vec<(&'static str, String, f64, i64)> = rows.iter().map(|(c, p, d, l)| (*c, (*p).clone(), *d, *l)).collect();
+    again.push(("col_c", p3.clone(), 9_000.0, h(23)));
+    insert(again).await;
+    // P3 now 9,600 of 169,600 s, 5.7 %: grazed.
+    assert_eq!(t.last_grazed(now).await[&p3], Some(time::from_unix_ms(h(23))));
+
+    // An import of another day, all its dwell in P2; undone, it leaves.
+    let e = (now - Duration::days(5)).date_naive();
+    let e10 = time::unix_ms(&(e.and_hms_opt(10, 0, 0).unwrap().and_utc()));
+    sqlx::query("INSERT INTO imported_paddock_days (date, herd_id, collar_id, paddock_id, fixes, dwell_s, last_t, import_id) VALUES (?, ?, 'ani_1', ?, 40, 20000, ?, 'imp_1')")
+        .bind(e.to_string())
+        .bind(&t.herd.id)
+        .bind(&p2)
+        .bind(e10)
+        .execute(t.ctx.db())
+        .await
+        .unwrap();
+    assert_eq!(t.last_grazed(now).await[&p2], Some(time::from_unix_ms(e10)));
+    sqlx::query("DELETE FROM imported_paddock_days WHERE import_id = 'imp_1'").execute(t.ctx.db()).await.unwrap();
+    assert_eq!(t.last_grazed(now).await[&p2], Some(time::from_unix_ms(h(21))));
+    assert!(summary().await.iter().all(|r| r.1 == "rolled"));
 }
 
 #[tokio::test]
@@ -238,6 +316,10 @@ async fn signals_read_fixes_by_index_seeks_only() {
     assert!(p.contains("fixes_herd_t") && !p.contains("SCAN fixes"), "{p}");
     let p = plan(&t.ctx, "SELECT MIN(t) FROM fixes WHERE herd_id = ?").await;
     assert!(p.contains("fixes_herd_t") && !p.contains("SCAN fixes"), "{p}");
-    let p = plan(&t.ctx, "SELECT paddock_id, last_t FROM fix_paddock_last WHERE herd_id = ?").await;
-    assert!(p.contains("PRIMARY KEY") && !p.contains("SCAN"), "{p}");
+    // Last grazed reads the per-day summaries by key, never a table scan.
+    for sql in [signals::HOT_GRAZED_SQL, signals::HOT_GRAZED_PADDOCK_SQL, signals::DAYS_GRAZED_SQL, signals::DAYS_GRAZED_PADDOCK_SQL, signals::OUTSIDE_SQL] {
+        let p = plan(&t.ctx, sql).await;
+        assert!(!p.contains("SCAN fix_paddock_days") && !p.contains("SCAN paddock_day_dwell") && !p.contains("SCAN fixes"), "{sql}: {p}");
+        assert!(p.contains("PRIMARY KEY") || p.contains("_paddock"), "{sql}: {p}");
+    }
 }

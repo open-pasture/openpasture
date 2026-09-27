@@ -66,7 +66,7 @@ pub struct StripFacts {
     pub area_ha: f64,
     /// The strip less the exclusions in effect now.
     pub grazeable_ha: f64,
-    /// Days of grazing for the herd: forage × grazeable ÷ (AU × 11.8 kg DM/day). Absent without a forage estimate or animals.
+    /// Days of grazing for the herd ([`calc::grazing_days`] of forage × grazeable). Absent without a forage estimate or animals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub days: Option<f64>,
 }
@@ -120,10 +120,13 @@ pub async fn exclusions(ctx: &Ctx, p: &Paddock) -> anyhow::Result<Vec<Polygon>> 
     Ok(found.into_iter().filter(|f| f.kind == FeatureKind::Exclusion).filter_map(|f| f.geometry.polygon()).collect())
 }
 
-/// Days a strip feeds `animal_units`: forage × grazeable ÷ (AU × 11.8 kg DM/day), to 0.1 d.
+/// Days a strip feeds `animal_units`: [`calc::grazing_days`] of forage ×
+/// grazeable, the same rule as the pre-send check and the grazing signals.
 pub fn strip_days(kg_dm_per_ha: f64, grazeable_ha: f64, animal_units: f64) -> Option<f64> {
-    let demand = animal_units * calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY;
-    (demand > 0.0 && kg_dm_per_ha.is_finite()).then(|| calc::round((kg_dm_per_ha.max(0.0) * grazeable_ha.max(0.0) / demand).min(3650.0), 1))
+    if !kg_dm_per_ha.is_finite() {
+        return None;
+    }
+    calc::grazing_days(kg_dm_per_ha.max(0.0) * grazeable_ha.max(0.0), animal_units)
 }
 
 /// Who is being fed: head (asked, else the herd's count) and their animal units.
@@ -184,7 +187,7 @@ pub async fn preview_with(ctx: &Ctx, paddock: &Paddock, herd: Option<&Herd>, par
             if au <= 0.0 {
                 return Err(ApiError::bad_request("Strips sized by days need a head count."));
             }
-            let per_strip_ha = days * au * calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY / f.kg_dm_per_ha;
+            let per_strip_ha = calc::forage_for_days(days, au) / f.kg_dm_per_ha;
             let grazeable = strip::area_outside_ha(&paddock.geometry, &excl);
             if grazeable <= 0.0 || depth <= 0.0 {
                 return Err(ApiError::bad_request("This paddock has no ground left to graze."));

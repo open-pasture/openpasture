@@ -467,16 +467,99 @@ async fn the_record_reads_one_animal_or_herd_through_indexes() {
         ("SELECT id, t FROM cues WHERE t >= 0 AND t < 9 AND herd_id = 'h'", "cues_herd_t"),
         ("SELECT id FROM episodes WHERE start_t < 9 AND end_t >= 0 AND animal_id = 'a'", "episodes_animal"),
         (
-            "SELECT animal_id, start_t, end_t, outcome, derived FROM episodes WHERE animal_id IN ('a', 'b') ORDER BY animal_id, start_t",
+            "SELECT animal_id, start_t, end_t, outcome, derived FROM episodes WHERE animal_id IN ('a', 'b') AND start_t >= 0 AND start_t < 9 ORDER BY animal_id, start_t, end_t, outcome, derived",
             "COVERING INDEX episodes_animal",
         ),
+        ("SELECT animal_id, changes FROM welfare_late WHERE animal_id IN ('a', 'b')", "PRIMARY KEY"),
         ("SELECT t, state, margin_m, boundary_version FROM fixes WHERE collar_id = 'c' AND t >= 0 ORDER BY t", "fixes_collar_t"),
         ("SELECT MIN(start_t) FROM episodes WHERE collar_id = 'c' AND derived = 1 AND end_t >= 0", "episodes_collar_start"),
     ] {
         let p = plan(sql).await;
         assert!(p.contains(index), "{sql}\n{p}");
-        assert!(!p.contains("SCAN cues") && !p.contains("SCAN episodes") && !p.contains("SCAN fixes"), "{sql}\n{p}");
+        assert!(!p.contains("SCAN cues") && !p.contains("SCAN episodes") && !p.contains("SCAN fixes") && !p.contains("TEMP B-TREE"), "{sql}\n{p}");
     }
+}
+
+/// The herd's animals as `GET /api/welfare/animals` has them, and as
+/// [`welfare::learning`] gives them from every episode each has.
+async fn read_and_whole(app: &App) -> (Vec<Value>, Vec<Value>) {
+    let v = app.get("/api/welfare/animals?herd_id=herd_1").await;
+    let rows: Vec<Value> = v["animals"].as_array().unwrap().clone();
+    let n = v["training"]["trained_after"].as_u64().unwrap() as u32;
+    let ids: Vec<String> = rows.iter().map(|r| r["animal_id"].as_str().unwrap().to_owned()).collect();
+    let hist = welfare::history(&app.ctx, &ids).await.unwrap();
+    let whole = rows
+        .iter()
+        .map(|r| {
+            let id = r["animal_id"].as_str().unwrap();
+            let mut w = r.clone();
+            let l = serde_json::to_value(welfare::learning(hist.get(id).map(Vec::as_slice).unwrap_or_default(), n, None)).unwrap();
+            for k in ["status", "since", "streak", "outcomes", "last_episode_at", "derived"] {
+                match l.get(k) {
+                    Some(x) => w[k] = x.clone(),
+                    None => {
+                        w.as_object_mut().unwrap().remove(k);
+                    }
+                }
+            }
+            w
+        })
+        .collect();
+    (rows, whole)
+}
+
+#[tokio::test]
+async fn learning_status_kept_between_reads_is_always_the_whole_historys() {
+    let app = App::new(3).await;
+    let now = time::now().timestamp_millis();
+    // 101: six turned back 30 days ago (trained). 102: four turned back 20
+    // days ago, crossed 10 days ago. 103: nothing yet.
+    for i in 0..6 {
+        episode(&app, "col_1", "ani_1", now - 30 * DAY + i * MIN, "turned_back", false).await;
+    }
+    for i in 0..4 {
+        episode(&app, "col_2", "ani_2", now - 20 * DAY + i * MIN, "turned_back", false).await;
+    }
+    episode(&app, "col_2", "ani_2", now - 10 * DAY, "crossed", false).await;
+    let check = |what: &'static str| {
+        let app = &app;
+        async move {
+            let (read, whole) = read_and_whole(app).await;
+            assert_eq!(read, whole, "{what}");
+            read
+        }
+    };
+    let r = check("first read").await;
+    assert_eq!((r[0]["status"].as_str(), r[1]["status"].as_str()), (Some("trained"), Some("learning")));
+    check("read again").await;
+
+    // New episodes this morning.
+    for i in 0..2 {
+        episode(&app, "col_3", "ani_3", now - HOUR + i * MIN, "turned_back", false).await;
+    }
+    episode(&app, "col_1", "ani_1", now - 2 * HOUR, "rest", true).await;
+    let r = check("this morning's").await;
+    assert_eq!((r[2]["status"].as_str(), r[2]["streak"].as_u64()), (Some("learning"), Some(2)));
+
+    // 101's collar uploads a crossing from 15 days ago, late: learning since then.
+    episode(&app, "col_1", "ani_1", now - 15 * DAY, "crossed", false).await;
+    let r = check("a late crossing").await;
+    assert_eq!((r[0]["status"].as_str(), ms(&r[0]["since"])), (Some("learning"), now - 15 * DAY));
+
+    // An old episode taken off the record: 102's crossing. Four turned back, learning.
+    sqlx::query("DELETE FROM episodes WHERE animal_id = 'ani_2' AND outcome = 'crossed'").execute(app.ctx.db()).await.unwrap();
+    let r = check("an old one gone").await;
+    assert_eq!((r[1]["streak"].as_u64(), r[1]["outcomes"]["crossed"].as_u64()), (Some(4), Some(0)));
+
+    // Trained after three: 102's four in a row make it trained.
+    let (s, _) = app.call("PUT", "/api/welfare/training/herd_1", Some(json!({ "trained_after": 3 }))).await;
+    assert_eq!(s, 200);
+    let r = check("trained after three").await;
+    assert_eq!(r[1]["status"], "trained");
+
+    // One animal's record reads the same.
+    let a = app.get(&format!("/api/welfare/animals/ani_1/cues?{}", range(now - 40 * DAY))).await;
+    assert_eq!((a["learning"]["status"].as_str(), ms(&a["learning"]["since"])), (Some("learning"), now - 15 * DAY));
 }
 
 #[tokio::test]
@@ -501,4 +584,19 @@ async fn a_herd_of_250_with_a_season_of_episodes_reads_fast() {
     assert_eq!(v["trained"].as_u64().unwrap() + v["learning"].as_u64().unwrap(), 250);
     assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     eprintln!("250 animals, 50,000 episodes: {took:?}");
+    // Read again (the herd panel does every 15 s while cues land): the
+    // settled episodes are kept folded and only the last days are read.
+    // Episodes are only ever added or taken off; changed behind the record's
+    // back, the settled ones aren't read again.
+    sqlx::query("UPDATE episodes SET outcome = 'crossed'").execute(app.ctx.db()).await.unwrap();
+    let started = std::time::Instant::now();
+    let again = app.get("/api/welfare/animals?herd_id=herd_1").await;
+    eprintln!("read again: {:?}", started.elapsed());
+    assert_eq!(again, v);
+    // A settled episode added late is: 101 crossed a week ago.
+    let t = time::now().timestamp_millis() - 7 * DAY;
+    episode(&app, "col_1", "ani_1", t, "crossed", false).await;
+    let v = app.get("/api/welfare/animals?herd_id=herd_1").await;
+    let row = v["animals"].as_array().unwrap().iter().find(|r| r["tag"] == "101").cloned().unwrap();
+    assert_eq!((row["status"].as_str(), row["streak"].as_u64()), (Some("learning"), Some(0)), "{row}");
 }

@@ -8,7 +8,7 @@
 //!   enforces, when the herd has one.
 //! - facts: area, head, area per head, forage and grazing days from the
 //!   containing paddock's forage (a measured height, else imagery;
-//!   `feed_budget_days(forage × area, AU, 11.8, 0.6, 0)`), rest days, corners,
+//!   [`calc::grazing_days`] of forage × area, as strips), rest days, corners,
 //!   holes, and the sweep's minutes.
 //! - findings: [`op_ingest::prepare`]'s (map features, collars, slots) plus
 //!   `forage_short`, `area_per_head_low`, `rested_short` and `weak_coverage`
@@ -149,7 +149,8 @@ pub async fn check(ctx: &Ctx, herd_id: &str, req: &CheckRequest) -> ApiResult<Ch
         None => None,
     };
     let forage_kg_dm = forage.as_ref().map(|f| calc::round(f.kg_dm_per_ha * area_ha, 0));
-    let grazing_days = forage_kg_dm.and_then(|kg| calc::feed_budget_days(kg, au, calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY, calc::DEFAULT_UTILIZATION, 0.0));
+    // The rule strip days use, so a strip and its check say the same days.
+    let grazing_days = forage_kg_dm.and_then(|kg| calc::grazing_days(kg, au));
     let forage_source = forage.and_then(|f| f.source).map(|s| if s == "imagery" { "ndvi".to_owned() } else { s });
     let rest_days = match &paddock {
         Some(p) => rest_days(ctx, p, now).await?,
@@ -206,25 +207,26 @@ fn finding(code: &str, severity: Severity, text: String, geometry: Option<Value>
     Finding { code: code.into(), severity, text, geometry, targets }
 }
 
-/// Days since the paddock was last grazed, from the record: 0 while a herd is
-/// in it, else the latest of its `grazed_until`, an applied move out of it,
-/// the newest collar fix in it (X1's per-paddock `fix_paddock_last`) and the
-/// last day collars grazed it (rolled-up and imported history). Any herd
-/// counts. A few small reads, never a walk of the fixes, so it answers while
-/// the farmer draws.
+/// Days since the paddock was last grazed, from the record: 0 while a herd with
+/// head is in it, else the latest of its `grazed_until`, an applied move out of it,
+/// and the last day collars grazed it ([`signals::collar_grazed`]: a real
+/// share of a herd's tracked day there, from hot fixes, rolled-up days and
+/// imported history, so fixes across a fence from the herd next door don't
+/// count). Any herd counts. A few small reads, never a walk of the fixes, so
+/// it answers while the farmer draws.
 pub async fn rest_days(ctx: &Ctx, p: &Paddock, now: DateTime<Utc>) -> anyhow::Result<Option<f64>> {
     let herds = ctx.store().list_herds().await?;
-    if herds.iter().any(|h| h.paddock_id.as_deref() == Some(p.id.as_str())) {
+    // A herd with head in it grazes it now. An empty one (the Training herd
+    // once its animals went back) isn't grazing anything.
+    if herds.iter().any(|h| h.count > 0 && h.paddock_id.as_deref() == Some(p.id.as_str())) {
         return Ok(Some(0.0));
     }
     let history = db::list(ctx, None, 100).await?;
     let mut last = signals::last_grazed(ctx, None, std::slice::from_ref(p), None, &history, now).await?.remove(&p.id).flatten();
-    for sql in ["SELECT MAX(last_t) FROM fix_paddock_last WHERE paddock_id = ?", "SELECT MAX(last_t) FROM paddock_days WHERE paddock_id = ? AND fixes > 0"] {
-        let t: Option<i64> = sqlx::query(sql).bind(&p.id).fetch_one(ctx.db()).await?.try_get(0)?;
-        // A collar clock running ahead counts as now.
-        if let Some(at) = t.map(|t| time::from_unix_ms(t).min(now)) {
-            last = last.max(Some(at));
-        }
+    let since = now - Duration::days(signals::REST_LOOKBACK_DAYS);
+    // A collar clock running ahead counts as now.
+    for at in signals::collar_grazed(ctx, signals::Grazer::Paddock(&p.id), since, None).await?.into_values() {
+        last = last.max(Some(at.min(now)));
     }
     Ok(last.map(|at| calc::round((now - at).num_milliseconds().max(0) as f64 / 86_400_000.0, 1)))
 }

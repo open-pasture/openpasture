@@ -32,8 +32,11 @@ pub const MAX_BYTES: usize = 5 * 1024 * 1024;
 /// Import ids (shared with K-files' imports).
 pub const IMPORT: &str = "imp";
 const TTL: Duration = Duration::from_secs(30 * 60);
-/// Previews kept at once; the oldest goes first.
-const KEEP: usize = 16;
+/// Most bytes the waiting previews hold together (a dozen files at the size
+/// limit); the oldest goes first.
+const KEEP_BYTES: usize = 64 * 1024 * 1024;
+/// What one waiting preview costs besides its file.
+const ENTRY_BYTES: usize = 1024;
 const PREVIEW_ROWS: usize = 20;
 
 pub fn router() -> Router<Ctx> {
@@ -42,29 +45,45 @@ pub fn router() -> Router<Ctx> {
         .route("/api/animals/import/{import_id}/commit", post(commit))
 }
 
-struct Stored {
-    at: Instant,
-    table: Arc<Table>,
+/// Previews waiting for their commit: the uploaded file itself (at most
+/// [`MAX_BYTES`]), read again when committed, so what one costs is bounded by
+/// its size, never by the table it spreads into.
+struct Previews {
+    budget: usize,
+    map: Mutex<HashMap<String, (Instant, Bytes)>>,
 }
 
-static PREVIEWS: LazyLock<Mutex<HashMap<String, Stored>>> = LazyLock::new(Default::default);
-
-fn keep(table: Table) -> String {
-    let id = id::new_id(IMPORT);
-    let mut m = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, s| s.at.elapsed() < TTL);
-    while m.len() >= KEEP {
-        let Some(oldest) = m.iter().min_by_key(|(_, s)| s.at).map(|(k, _)| k.clone()) else { break };
-        m.remove(&oldest);
+impl Previews {
+    fn new(budget: usize) -> Self {
+        Self { budget, map: Mutex::new(HashMap::new()) }
     }
-    m.insert(id.clone(), Stored { at: Instant::now(), table: Arc::new(table) });
-    id
+
+    fn keep(&self, id: String, bytes: Bytes) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        m.retain(|_, (at, _)| now.duration_since(*at) < TTL);
+        m.insert(id, (now, bytes));
+        let mut total: usize = m.values().map(|(_, b)| b.len() + ENTRY_BYTES).sum();
+        while total > self.budget && m.len() > 1 {
+            let Some(oldest) = m.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else { break };
+            if let Some((_, b)) = m.remove(&oldest) {
+                total -= b.len() + ENTRY_BYTES;
+            }
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<Bytes> {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, (at, _)| at.elapsed() < TTL);
+        m.get(id).map(|(_, b)| b.clone())
+    }
 }
 
-fn stored(id: &str) -> Option<Arc<Table>> {
-    let mut m = PREVIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, s| s.at.elapsed() < TTL);
-    m.get(id).map(|s| s.table.clone())
+static PREVIEWS: LazyLock<Previews> = LazyLock::new(|| Previews::new(KEEP_BYTES));
+
+/// Read the file off the async workers: a table can take a while to build.
+async fn read_table(bytes: Bytes) -> ApiResult<Arc<Table>> {
+    tokio::task::spawn_blocking(move || table::read(&bytes)).await.map_err(anyhow::Error::from)?.map(Arc::new).map_err(ApiError::bad_request)
 }
 
 /// A row that can't go in, by spreadsheet row number (header = 1).
@@ -93,7 +112,7 @@ struct PreviewQuery {
 }
 
 async fn preview(State(ctx): State<Ctx>, Query(q): Query<PreviewQuery>, body: Bytes) -> ApiResult<Json<Preview>> {
-    let table = table::read(&body).map_err(ApiError::bad_request)?;
+    let table = read_table(body.clone()).await?;
     let mapping = mapping::guess(&table.columns);
     let herd = match q.herd_id.filter(|h| !h.is_empty()) {
         Some(h) if ctx.store().get_herd(&h).await?.is_some() => Some(h),
@@ -106,9 +125,10 @@ async fn preview(State(ctx): State<Ctx>, Query(q): Query<PreviewQuery>, body: By
     } else {
         Vec::new()
     };
-    let rows = table.rows.iter().take(PREVIEW_ROWS).cloned().collect();
+    let rows = table.rows.iter().take(PREVIEW_ROWS).map(|r| table.padded(r)).collect();
     let (columns, total) = (table.columns.clone(), table.rows.len());
-    let import_id = keep(table);
+    let import_id = id::new_id(IMPORT);
+    PREVIEWS.keep(import_id.clone(), body);
     Ok(Json(Preview { import_id, columns, mapping, rows, total, errors }))
 }
 
@@ -128,7 +148,8 @@ pub struct Committed {
 }
 
 async fn commit(State(ctx): State<Ctx>, identity: Identity, Path(import_id): Path<String>, ApiJson(body): ApiJson<CommitBody>) -> ApiResult<Json<Committed>> {
-    let table = stored(&import_id).ok_or_else(|| ApiError::not_found("This preview has expired. Choose the file again."))?;
+    let bytes = PREVIEWS.get(&import_id).ok_or_else(|| ApiError::not_found("This preview has expired. Choose the file again."))?;
+    let table = read_table(bytes).await?;
     let herd = ctx.store().get_herd(&body.herd_id).await?.ok_or_else(|| ApiError::bad_request("No such herd."))?;
     let month_first = month_first(&ctx).await?;
     let started = Instant::now();
@@ -222,6 +243,11 @@ async fn plan(conn: &mut SqliteConnection, t: &Table, m: &Mapping, herd_id: Opti
     if !idx.contains_key("tag") {
         return Err(ApiError::bad_request("Choose the column with the tags."));
     }
+    // One way for the whole file's birth dates, from the file itself.
+    let month_first = match idx.get("born") {
+        Some(&i) => rules::month_first_in(t.rows.iter().map(|r| table::cell(r, i)), month_first),
+        None => month_first,
+    };
 
     let herd_animals: Vec<Animal> = match herd_id {
         Some(h) => sqlx::query("SELECT * FROM animals WHERE herd_id = ?")
@@ -247,7 +273,7 @@ async fn plan(conn: &mut SqliteConnection, t: &Table, m: &Mapping, herd_id: Opti
         Vec::new()
     };
 
-    let cell = |r: &[String], f: &str| idx.get(f).map(|&i| r[i].trim()).filter(|s| !s.is_empty()).map(str::to_owned);
+    let cell = |r: &[String], f: &str| idx.get(f).map(|&i| table::cell(r, i).trim()).filter(|s| !s.is_empty()).map(str::to_owned);
     let mut seen_tags: HashMap<String, usize> = HashMap::new();
     let mut seen_eids: HashMap<String, usize> = HashMap::new();
     let mut seen_collars: HashMap<String, usize> = HashMap::new();
@@ -388,4 +414,35 @@ async fn update(tx: &mut SqliteConnection, a: &Animal) -> ApiResult<()> {
         .await
         .map_err(conflict)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previews_are_kept_by_bytes_and_the_oldest_goes_first() {
+        // Room for two 1 MB files and their entries, not three.
+        let p = Previews::new(2 * (1024 * 1024 + ENTRY_BYTES));
+        let mb = Bytes::from(vec![b'x'; 1024 * 1024]);
+        p.keep("a".into(), mb.clone());
+        std::thread::sleep(Duration::from_millis(2));
+        p.keep("b".into(), mb.clone());
+        assert!(p.get("a").is_some() && p.get("b").is_some());
+        std::thread::sleep(Duration::from_millis(2));
+        p.keep("c".into(), mb.clone());
+        assert!(p.get("a").is_none(), "the oldest made room");
+        assert_eq!(p.get("b").map(|b| b.len()), Some(1024 * 1024));
+        assert!(p.get("c").is_some());
+        // Small files: hundreds fit where a count cap of 16 used to evict.
+        let p = Previews::new(KEEP_BYTES);
+        for i in 0..500 {
+            p.keep(format!("imp_{i}"), Bytes::from_static(b"Tag\n214\n"));
+        }
+        assert!(p.get("imp_0").is_some() && p.get("imp_499").is_some());
+        // One file bigger than the whole budget is still kept (it's the newest).
+        let p = Previews::new(1000);
+        p.keep("big".into(), mb);
+        assert!(p.get("big").is_some());
+    }
 }

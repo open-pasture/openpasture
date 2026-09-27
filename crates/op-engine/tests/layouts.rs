@@ -150,12 +150,13 @@ async fn applying_a_layout_gives_its_strips_with_todays_days() {
     assert_eq!(a["layout"]["strips"], l["strips"]);
     assert_eq!(a["forage_kg_dm_per_ha"], 672.0);
     for s in a["strips"].as_array().unwrap() {
-        assert_eq!(s["days"].as_f64().unwrap(), op_engine::calc::round(672.0 * s["grazeable_ha"].as_f64().unwrap() / 2950.0, 1));
+        // 60 % of the strip's forage at 11.8 kg DM per AU a day, as every grazing-days figure.
+        assert_eq!(s["days"].as_f64().unwrap(), op_engine::calc::round(672.0 * s["grazeable_ha"].as_f64().unwrap() * 0.6 / 2950.0, 1));
     }
-    // For fewer head.
+    // For fewer head: a quarter of 16.556 ha at 672 kg, 60 % eaten by 25 head (295 kg a day), is 5.7 days.
     let a = t.ok("POST", &format!("/api/layouts/{id}/apply"), Some(json!({ "herd_id": herd, "head": 25 }))).await;
     assert_eq!(a["head"], 25);
-    assert!(a["strips"][0]["days"].as_f64().unwrap() > 9.0);
+    assert!((a["strips"][0]["days"].as_f64().unwrap() - 5.7).abs() < 0.15, "{}", a["strips"][0]);
     let (s, _) = t.req("POST", "/api/layouts/lay_nope/apply", Some(json!({}))).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
@@ -187,8 +188,9 @@ async fn a_layout_sized_by_days_keeps_its_width_when_forage_changes() {
     let (pad, herd) = farm(&t).await;
     ndvi_report(&t.ctx, &pad, 0.5, 0).await;
     let l = t.ok("POST", "/api/layouts", Some(json!({ "paddock_id": pad, "herd_id": herd, "orientation_deg": 0, "days": 0.5 }))).await;
+    // Half a day of 250 head eats 1,475 kg DM, 60 % of 2,458 kg standing: 3.658 ha of 672 kg, 88 m of the 400 m.
     let width = l["params"]["width_m"].as_f64().unwrap();
-    assert!((width - 53.07).abs() < 0.1, "{width}");
+    assert!((width - 88.45).abs() < 0.1, "{width}");
     assert_eq!(l["params"]["days"], 0.5);
     // The grass grew: the same strips, more days each.
     ndvi_report(&t.ctx, &pad, 0.8, 1).await;
