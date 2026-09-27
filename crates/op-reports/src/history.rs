@@ -63,8 +63,7 @@ pub struct Cut {
     /// The stay went on past the window: `end` is the window's end (the
     /// midnight after the report's last day), not a day the herd left.
     pub cut_end: bool,
-    /// Head on the first day of the cut: the first count above 0 in it (0
-    /// only when it never had any).
+    /// Head on the first day of the cut (a stay always has head: [`Farm::stays`]).
     pub head: u32,
     pub days: f64,
     pub head_days: f64,
@@ -242,7 +241,8 @@ impl Farm {
         self.herds.values().flatten().filter(|s| s.source == "install").map(|s| s.at).min()
     }
 
-    /// Every stay of every herd, in herd then time order.
+    /// Every stay of every herd, in herd then time order: its time in a
+    /// paddock with head ([`with_head`]).
     pub fn stays(&self) -> Vec<Stay> {
         let since = self.history_since();
         let mut out = Vec::new();
@@ -284,8 +284,7 @@ impl Farm {
                 out.push(c);
             }
         }
-        out.retain(|s| !s.parts.is_empty());
-        out
+        with_head(out)
     }
 
     /// Days since any herd last left `paddock_id` before `t`; None with no
@@ -298,6 +297,26 @@ impl Farm {
         }
         last.map(|l| days(t - l))
     }
+}
+
+/// Stays as a herd's time in a paddock with head. A stretch at 0 head isn't
+/// grazing: a herd made empty and filled by its animals a moment later goes
+/// in when they came, one emptied into another herd and left where it was
+/// (the Training herd after training) leaves when its last animal did, and
+/// one that never had any is no stay at all, so the paddock rests through it.
+fn with_head(stays: Vec<Stay>) -> Vec<Stay> {
+    let mut out = Vec::with_capacity(stays.len());
+    for s in stays {
+        let mut run: Vec<Part> = Vec::new();
+        for p in s.parts.iter().copied().chain([Part { start: DateTime::<Utc>::MAX_UTC, end: None, count: 0 }]) {
+            if p.count > 0 {
+                run.push(p);
+            } else if let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) {
+                out.push(Stay { start: first.start, end: last.end, parts: std::mem::take(&mut run), ..s.clone() });
+            }
+        }
+    }
+    out
 }
 
 /// A span in days.
@@ -339,11 +358,7 @@ impl Stay {
         for p in &self.parts {
             let (a, b) = (p.start.max(start), p.end.unwrap_or(DateTime::<Utc>::MAX_UTC).min(stop));
             if b > a {
-                // The head that went in: a herd made with no head and filled by
-                // its animals a moment later goes in at their count, not at 0.
-                if p.count > 0 {
-                    head.get_or_insert(p.count);
-                }
+                head.get_or_insert(p.count);
                 counts.push((p.count, days(b - a)));
                 head_days += p.count as f64 * days(b - a);
             }

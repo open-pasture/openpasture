@@ -344,6 +344,72 @@ async fn short_rest_is_found_for_ground_the_herd_isnt_on() {
 }
 
 #[tokio::test]
+async fn an_empty_herd_left_in_a_paddock_is_not_grazing_it() {
+    // The training flow ends with every animal moved back to Cows and the
+    // Training herd at 0 head, still placed in P2. P2 rested 40 days; it read
+    // grazed now (rest 0, "P2 grazed in the last day" under a boundary drawn
+    // there, the Rest layer at 0) and a height measured there stood as the
+    // grass ahead of a herd.
+    let t = T::new().await;
+    t.ok("PATCH", &format!("/api/paddocks/{}", t.p2), json!({ "grazed_until": ts(Utc::now() - Duration::days(40)) })).await;
+    let training = t.ok("POST", "/api/herds", json!({ "name": "Training", "species": "cattle", "count": 0, "paddock_id": t.p2 })).await;
+    let c = t.check(json!({ "geometry": p2() })).await;
+    assert_eq!(c["facts"]["rest_days"], 40.0, "{}", c["facts"]);
+    assert!(!codes(&c).contains(&"rested_short"), "{:?}", codes(&c));
+    let layer = || async {
+        let l = t.ok("GET", "/api/layers/paddocks", json!(null)).await;
+        l["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap()["rest_days"].clone()
+    };
+    assert_eq!(layer().await, 40.0);
+    // A height taken 10 days ago, grazed down since (grazed_until 2 days ago):
+    // no herd with head is there now, so it no longer counts.
+    t.ok("POST", &format!("/api/paddocks/{}/heights", t.p2), json!({ "height_cm": 25.4, "at": ts(Utc::now() - Duration::days(10)) })).await;
+    t.ok("PATCH", &format!("/api/paddocks/{}", t.p2), json!({ "grazed_until": ts(Utc::now() - Duration::days(2)) })).await;
+    let p2_forage = || async {
+        let s = t.ok("GET", &format!("/api/signals?herd_id={}", t.herd), json!(null)).await;
+        s["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap()["forage"].clone()
+    };
+    let f = p2_forage().await;
+    assert!(f.is_object() && f["source"] != "measured", "{f}");
+    // Three head back in Training: P2 is being grazed now.
+    t.ok("PATCH", &format!("/api/herds/{}", training["id"].as_str().unwrap()), json!({ "count": 3 })).await;
+    assert_eq!(t.check(json!({ "geometry": p2() })).await["facts"]["rest_days"], 0.0);
+    assert_eq!(layer().await, 0.0);
+    let f = p2_forage().await;
+    assert_eq!((f["source"].as_str(), f["height_cm"].as_f64()), (Some("measured"), Some(25.4)), "{f}");
+}
+
+#[tokio::test]
+async fn a_herd_emptied_where_it_grazed_has_grazed_the_height_down() {
+    // Training grazed P2 with 5 head from 20 days ago and was emptied back into
+    // Cows 2 days ago, left placed in P2. A height taken 10 days ago, in the
+    // middle of that, is grass since eaten: it stops counting.
+    let t = T::new().await;
+    let training = t.ok("POST", "/api/herds", json!({ "name": "Training", "species": "cattle", "count": 5, "paddock_id": t.p2 })).await;
+    let id = training["id"].as_str().unwrap().to_owned();
+    t.ok("PATCH", &format!("/api/herds/{id}"), json!({ "count": 0 })).await;
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&id).fetch_all(t.ctx.db()).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    for (row, ago) in rows.iter().zip([20, 2]) {
+        sqlx::query("UPDATE herd_history SET at = ? WHERE id = ?")
+            .bind(time::to_db(&(Utc::now() - Duration::days(ago))))
+            .bind(row)
+            .execute(t.ctx.db())
+            .await
+            .unwrap();
+    }
+    t.ok("POST", &format!("/api/paddocks/{}/heights", t.p2), json!({ "height_cm": 25.4, "at": ts(Utc::now() - Duration::days(10)) })).await;
+    let s = t.ok("GET", &format!("/api/signals?herd_id={}", t.herd), json!(null)).await;
+    let f = s["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap()["forage"].clone();
+    assert!(f.is_object() && f["source"] != "measured", "{f}");
+    // Measured after they were emptied out: it stands.
+    t.ok("POST", &format!("/api/paddocks/{}/heights", t.p2), json!({ "height_cm": 9.0, "at": ts(Utc::now() - Duration::days(1)) })).await;
+    let s = t.ok("GET", &format!("/api/signals?herd_id={}", t.herd), json!(null)).await;
+    let f = s["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap()["forage"].clone();
+    assert_eq!((f["source"].as_str(), f["height_cm"].as_f64()), (Some("measured"), Some(9.0)), "{f}");
+}
+
+#[tokio::test]
 async fn fixes_across_the_fence_are_not_grazing() {
     let t = T::new().await;
     let rested = Utc::now() - Duration::days(40);

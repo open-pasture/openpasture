@@ -207,8 +207,8 @@ fn finding(code: &str, severity: Severity, text: String, geometry: Option<Value>
     Finding { code: code.into(), severity, text, geometry, targets }
 }
 
-/// Days since the paddock was last grazed, from the record: 0 while a herd is
-/// in it, else the latest of its `grazed_until`, an applied move out of it,
+/// Days since the paddock was last grazed, from the record: 0 while a herd with
+/// head is in it, else the latest of its `grazed_until`, an applied move out of it,
 /// and the last day collars grazed it ([`signals::collar_grazed`]: a real
 /// share of a herd's tracked day there, from hot fixes, rolled-up days and
 /// imported history, so fixes across a fence from the herd next door don't
@@ -216,7 +216,9 @@ fn finding(code: &str, severity: Severity, text: String, geometry: Option<Value>
 /// it answers while the farmer draws.
 pub async fn rest_days(ctx: &Ctx, p: &Paddock, now: DateTime<Utc>) -> anyhow::Result<Option<f64>> {
     let herds = ctx.store().list_herds().await?;
-    if herds.iter().any(|h| h.paddock_id.as_deref() == Some(p.id.as_str())) {
+    // A herd with head in it grazes it now. An empty one (the Training herd
+    // once its animals went back) isn't grazing anything.
+    if herds.iter().any(|h| h.count > 0 && h.paddock_id.as_deref() == Some(p.id.as_str())) {
         return Ok(Some(0.0));
     }
     let history = db::list(ctx, None, 100).await?;

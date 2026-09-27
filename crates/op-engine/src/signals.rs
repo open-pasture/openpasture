@@ -243,7 +243,7 @@ pub fn from_paddock(d: &Decision) -> Option<String> {
 /// When each paddock was last grazed: applied moves out of it, the collar
 /// days the herd grazed it ([`collar_grazed`]: a real share of its tracked
 /// day there, from hot fixes, rolled-up days and imported history), the
-/// farmer's `grazed_until`, and now for the current paddock.
+/// farmer's `grazed_until`, and now for the current paddock (a herd with head).
 ///
 /// Hot fixes are read as `fix_paddock_days` (a trigger counts them per herd,
 /// day and paddock as they land), never a walk of the herd's fixes. Fixes that
@@ -291,7 +291,10 @@ pub async fn last_grazed(
             }
         }
     }
+    // The herd's paddock is grazed now, when it has head: an empty herd left
+    // in a paddock (the Training herd once its animals went back) isn't.
     if let Some(c) = current
+        && herd.is_none_or(|h| h.count > 0)
         && last.contains_key(c)
     {
         last.insert(c.to_owned(), Some(now));
@@ -422,8 +425,8 @@ const GRAZED_AFTER: Duration = Duration::hours(1);
 /// newest of the last 21 days ([`heights::current`]), unless a herd grazed
 /// the paddock after it was taken. Grazing is any herd's: a stay on the farm
 /// record (`herd_history`) that ended after it, the farmer's `grazed_until`,
-/// or collar fixes there (hot, rolled-up or imported). In a paddock a herd is
-/// in now, the height stands for the grass ahead of it (`height_cm`);
+/// or collar fixes there (hot, rolled-up or imported). In a paddock a herd with
+/// head is in now, the height stands for the grass ahead of it (`height_cm`);
 /// elsewhere a `residual_cm` is what the last grazing left, and stands instead.
 /// A few indexed reads per measured paddock, never a walk of the fixes.
 pub async fn measured(ctx: &Ctx, paddocks: &[Paddock], now: DateTime<Utc>) -> anyhow::Result<HashMap<String, Measured>> {
@@ -431,7 +434,8 @@ pub async fn measured(ctx: &Ctx, paddocks: &[Paddock], now: DateTime<Utc>) -> an
     if heights.is_empty() {
         return Ok(HashMap::new());
     }
-    let occupied: Vec<String> = ctx.store().list_herds().await?.into_iter().filter_map(|h| h.paddock_id).collect();
+    // Paddocks a herd with head is in (an empty herd grazes nothing).
+    let occupied: Vec<String> = ctx.store().list_herds().await?.into_iter().filter(|h| h.count > 0).filter_map(|h| h.paddock_id).collect();
     let mut out = HashMap::new();
     for p in paddocks {
         let Some(h) = heights.get(&p.id) else { continue };
@@ -449,7 +453,8 @@ pub async fn measured(ctx: &Ctx, paddocks: &[Paddock], now: DateTime<Utc>) -> an
 
 /// Whether any herd grazed the paddock after `t` (up to `now`): the
 /// farmer's `grazed_until`, collar days with a real share of a herd's day
-/// there ([`collar_grazed`]), or a stay on the farm record.
+/// there ([`collar_grazed`]), or a stay with head on the farm record that
+/// ended after it (the herd moved on, or was emptied where it stood).
 async fn grazed_after(ctx: &Ctx, p: &Paddock, t: DateTime<Utc>, now: DateTime<Utc>) -> anyhow::Result<bool> {
     if p.grazed_until.is_some_and(|g| g > t && g <= now) {
         return Ok(true);
@@ -457,11 +462,12 @@ async fn grazed_after(ctx: &Ctx, p: &Paddock, t: DateTime<Utc>, now: DateTime<Ut
     if collar_grazed(ctx, Grazer::Paddock(&p.id), t, Some(t.date_naive())).await?.values().any(|at| *at > t) {
         return Ok(true);
     }
-    // A herd on record in the paddock that left it after `t`.
+    // A herd on record in the paddock with head that left it, or was emptied
+    // there (its animals moved to another herd), after `t`.
     let left: Option<String> = sqlx::query_scalar(
         "SELECT MAX(n.at) FROM herd_history h JOIN herd_history n ON n.id = (
              SELECT x.id FROM herd_history x WHERE x.herd_id = h.herd_id AND (x.at > h.at OR (x.at = h.at AND x.id > h.id)) ORDER BY x.at, x.id LIMIT 1)
-         WHERE h.paddock_id = ?1 AND (n.paddock_id IS NULL OR n.paddock_id != ?1) AND n.at > ?2",
+         WHERE h.paddock_id = ?1 AND h.count > 0 AND (n.paddock_id IS NULL OR n.paddock_id != ?1 OR n.count = 0) AND n.at > ?2",
     )
     .bind(&p.id)
     .bind(time::to_db(&t))

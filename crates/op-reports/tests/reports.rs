@@ -778,6 +778,37 @@ async fn a_herd_created_empty_and_filled_by_its_animals_goes_in_at_their_head() 
 }
 
 #[tokio::test]
+async fn an_empty_herd_left_in_a_paddock_is_not_a_grazing_event() {
+    // The Training herd, emptied back into Cows, sits in P2 from Sep 12 with
+    // no head. It read as an open P2 event of 0 head on the paddock and NRCS
+    // records, and it made P2 look grazed until now: Cows going back into P2
+    // on Sep 21 read "Rest before in" 0. P2 rested from Sep 11 12:00 (Cows
+    // left) to Sep 21 12:00: 10.0 days.
+    let app = App::new().await;
+    let (f, cows) = grazing(&app).await;
+    let training = herd(&app, "Training", 0, Some(&f.p2)).await;
+    app.date_history(&training, &["2025-09-12T12:00:00.000Z"]).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "herd"), vec![json!("Cows"); 5]);
+    // As without Training (P1 back on Sep 15 after 9 days, P2 on Sep 21 after 10).
+    assert_eq!(column(ev, "rest_days"), [Value::Null, Value::Null, Value::Null, json!(9.0), json!(10.0)]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!(column(rec, "number"), [json!(100), json!(100), json!(90), json!(90), json!(90)]);
+    // With head it grazes: 5 head from Sep 25 07:00 (not from Sep 12, when it
+    // had none), and emptied again on Sep 28 07:00 it leaves then, though the
+    // herd stays placed in P2: 3.0 days, 15 head-days.
+    patch_herd(&app, &training, json!({"count": 5})).await;
+    patch_herd(&app, &training, json!({"count": 0})).await;
+    app.date_history(&training, &["2025-09-12T12:00:00.000Z", "2025-09-25T12:00:00.000Z", "2025-09-28T12:00:00.000Z"]).await;
+    let ev = &app.report("paddock_record", &format!("{SEPT}&herd_id={training}")).await["sections"][0];
+    assert_eq!((column(ev, "in"), column(ev, "out")), (vec![json!("2025-09-25 07:00")], vec![json!("2025-09-28 07:00")]));
+    assert_eq!((column(ev, "days"), column(ev, "head"), column(ev, "head_days")), (vec![json!(3.0)], vec![json!(5)], vec![json!(15.0)]));
+    let ev = &app.report("paddock_record", &format!("{SEPT}&herd_id={cows}")).await["sections"][0];
+    assert_eq!(column(ev, "rest_days"), [Value::Null, Value::Null, Value::Null, json!(9.0), json!(10.0)]);
+}
+
+#[tokio::test]
 async fn csv_is_one_file_that_parses_back() {
     let app = App::new().await;
     grazing(&app).await;

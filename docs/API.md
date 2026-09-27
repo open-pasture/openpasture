@@ -991,8 +991,10 @@ shape, area and name. On upgrade both are backfilled once: occupancy from applie
 (the time the activity log says the move was applied, else the response or creation time; where a
 herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
 that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
-one paddock; head is the count on the day in (the first above 0, so a herd made empty and filled by its
-animals a moment later goes in at their count) and head-days follow every count change inside it.
+one paddock with head: a stretch at 0 head isn't grazing, so a herd made empty and filled by its
+animals a moment later goes in when they came, one emptied into another herd and left in place leaves
+when its last animal did, and one that never had any is no event (the paddock rests through it).
+Head is the count on the day in and head-days follow every count change inside it.
 Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
 exists: UTC days on which the paddock held at least 1/24 of the herd's tracked dwell (the pasture
@@ -1055,10 +1057,12 @@ A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` i
 behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
 it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
 signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
-count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay on
-the farm record that ended after it, a later `grazed_until`, or a collar grazing day there, as for
-rest days): the grass it measured has been eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd
-is in now, `height_cm` is the grass ahead of it.
+count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay with
+head on the farm record that ended after it, by a move or by the herd being emptied there, a later
+`grazed_until`, or a collar grazing day there, as for rest days): the grass it measured has been
+eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd with head is in now,
+`height_cm` is the grass ahead of it. A herd with no head (the Training herd once its animals went
+back) grazes nothing: its paddock isn't grazed now for rest days, the Rest layer or heights.
 
 Changes to existing shapes (all additive):
 - `Signals.paddocks[]` gains `grazing_days` (days this paddock's forage feeds the herd: 60 % of
@@ -1297,7 +1301,7 @@ Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage 
 holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
 or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
 = 60 % of it at 11.8 kg DM per animal unit a day (as strip days); `rest_days` since that paddock was last grazed
-(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it and the
+(0 while a herd with head is in it; else the latest of `grazed_until`, an applied move out of it and the
 last collar grazing day there, any herd, by the rest-days rule); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
 
 Findings, most severe first:
