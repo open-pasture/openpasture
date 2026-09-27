@@ -14,7 +14,7 @@ use op_core::{Ctx, Paddock, Polygon};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::settings::Inputs;
+use crate::settings::{Counted, Inputs};
 use crate::{ReportDoc, ReportParams};
 
 pub use op_engine::calc::round;
@@ -92,6 +92,8 @@ pub struct Farm {
     pub herds: BTreeMap<String, Vec<HerdState>>,
     /// Current herd names, for herds that still exist.
     current_herds: BTreeMap<String, String>,
+    /// Herds whose count follows their animal rows (K-animals).
+    by_animals: BTreeSet<String>,
     versions: BTreeMap<String, Vec<PaddockVersion>>,
 }
 
@@ -103,6 +105,7 @@ impl Farm {
         let inputs = Inputs::load(ctx).await?;
         let paddocks = ctx.store().list_paddocks().await?.into_iter().map(|p| (p.id.clone(), p)).collect();
         let current_herds = ctx.store().list_herds().await?.into_iter().map(|h| (h.id, h.name)).collect();
+        let by_animals = sqlx::query_scalar::<_, String>("SELECT DISTINCT herd_id FROM animals").fetch_all(ctx.db()).await?.into_iter().collect();
 
         let mut herds: BTreeMap<String, Vec<HerdState>> = BTreeMap::new();
         let rows =
@@ -132,7 +135,7 @@ impl Farm {
             versions.entry(r.get("paddock_id")).or_default().push(PaddockVersion { at: from_db(&at)?, area_ha, name: r.get("name") });
         }
 
-        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, versions })
+        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, by_animals, versions })
     }
 
     /// Farm-local midnight starting `day`, in UTC.
@@ -209,14 +212,19 @@ impl Farm {
         self.herds.get(herd_id).and_then(|s| s.last()).map(|s| s.species.clone()).unwrap_or_else(|| "cattle".into())
     }
 
+    /// How the herd's count is kept: by its animal rows once it has any.
+    pub fn counted(&self, herd_id: &str) -> Counted {
+        if self.by_animals.contains(herd_id) { Counted::ByAnimals } else { Counted::ByHand }
+    }
+
     /// Animal units of the herd at `count` head.
     pub fn animal_units(&self, herd_id: &str, count: u32) -> f64 {
-        self.inputs.animal_units(herd_id, &self.species(herd_id), count)
+        self.inputs.animal_units(herd_id, &self.species(herd_id), count, self.counted(herd_id))
     }
 
     /// Cow-calf pairs in the herd at `count` head, when its mix says so.
     pub fn pairs(&self, herd_id: &str, count: u32) -> Option<f64> {
-        self.inputs.pairs(herd_id, &self.species(herd_id), count)
+        self.inputs.pairs(herd_id, &self.species(herd_id), count, self.counted(herd_id))
     }
 
     /// Herds the report covers: the one asked for, else every herd with history.
@@ -445,10 +453,14 @@ pub fn au_note(farm: &Farm, herd_ids: &[String]) -> Option<String> {
                 if m.calves > 0 && !m.pairs {
                     what.push(format!("{} weaned calves", m.calves));
                 }
-                // The head count the mix's animal units stand at (other counts scale them).
-                let mut at = format!("{} AU at {} head", fmt_au(m.animal_units(&farm.inputs.settings.au)), m.head_at(0));
-                if m.pairs && m.cows > 0 {
-                    at += &format!(", or at {} head counting calves at side", m.head_at(u32::MAX));
+                // The head counts the mix's animal units stand at (other counts scale them).
+                let counted = farm.counted(h);
+                let (low, high) = (m.head_at(0, counted), m.head_at(u32::MAX, counted));
+                let mut at = format!("{} AU at {low}", fmt_au(m.animal_units(&farm.inputs.settings.au)));
+                if high > low {
+                    at += &format!(" to {high} head, calves at side counted or not");
+                } else {
+                    at += " head";
                 }
                 mixed.push(format!("{} {}: {at}", farm.herd_name(h), what.join(", ")));
             }

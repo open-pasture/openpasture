@@ -990,10 +990,12 @@ Stocking density is AU on the day in over the paddock's area then. Rest before i
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
 exists. Animal units: the herd's mix with the `au` factors when a cattle herd has one, else
 `cattle 1.0`, `sheep 0.2`, `goats 0.15` per head. A mix's AU stand at its head count and scale with
-the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor, and a
-count nearer cows × 2 + bulls than cows + bulls counts each calf at side as a head (calves registered
-as animals): 100 pairs are 130 AU at 100 head or at 200, never 260. The method note gives both
-counts.
+the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor and a
+pair is one head. In a herd whose count follows its animal rows, a calf at side may be registered as
+an animal of its own, so any count from cows + bulls to cows × 2 + bulls is the mix itself: 100 pairs
+are 130 AU at 100, 150 or 200 head (tagging calves through calving never moves the AU, and weaning
+them off doesn't either), never 260; a count outside that range scales from its nearer end. The
+method note gives the head counts the mix's AU stand at.
 
 - `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
   head-days, AU-days, stocking density, rest before in), then a line per paddock.
