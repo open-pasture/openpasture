@@ -45,6 +45,18 @@ export function cellText(metric: CoverageMetric, v: number, f: Fmt): string {
 
 export const percent = (b: number) => `${Math.round(b * 100)}%`;
 
+// The y range for a battery sparkline: the days' own range, never under 20 points so a few
+// points of noise stay flat and a week's drain reads as a slope, kept inside 0-100 %.
+export function sparkDomain(values: (number | null)[], span = 0.2): [number, number] {
+  const v = values.filter((x): x is number => x !== null && Number.isFinite(x));
+  if (!v.length) return [0, 1];
+  const [lo, hi] = [Math.min(...v), Math.max(...v)];
+  const w = Math.min(1, Math.max(hi - lo, span));
+  let a = (lo + hi) / 2 - w / 2;
+  a = Math.min(Math.max(a, 0), 1 - w);
+  return [a, a + w];
+}
+
 // Percentage points a day, one decimal: "-2.1%/d".
 export const trendText = (pct: number) => `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%/d`;
 

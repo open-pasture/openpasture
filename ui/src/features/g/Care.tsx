@@ -9,7 +9,7 @@ import { useCan } from "../../store/me";
 import { Button } from "../../ui";
 import { Spark } from "../../ui/Spark";
 import { useNow } from "../../util";
-import { daysText, dueText, percent, shortDay, trendText } from "./model";
+import { daysText, dueText, percent, shortDay, sparkDomain, trendText } from "./model";
 
 // Herd table: the last two weeks of battery, and days left while it falls.
 export function TrendCell({ row }: { row: HerdRow }) {
@@ -17,7 +17,7 @@ export function TrendCell({ row }: { row: HerdRow }) {
   if (!r) return null;
   return (
     <span className="gtrend">
-      <Spark values={r.daily} domain={[0, 1]} width={48} height={14} label="Battery by day" />
+      <Spark values={r.daily} domain={sparkDomain(r.daily)} width={56} height={14} label="Battery by day" />
       {r.days_left !== undefined && <span className="mono dim">{daysText(r.days_left)}</span>}
     </span>
   );
@@ -61,7 +61,7 @@ export function Care({ collar }: { animal?: Animal; collar?: Collar }) {
           <li>
             <span>battery</span>
             <b className="gline">
-              <Spark values={r.daily} domain={[0, 1]} width={64} height={16} label="Battery by day" />
+              <Spark values={r.daily} domain={sparkDomain(r.daily)} width={64} height={16} label="Battery by day" />
               {[r.battery !== undefined && percent(r.battery), r.trend_pct_day !== undefined && trendText(r.trend_pct_day), r.days_left !== undefined && `${daysText(r.days_left)} left`]
                 .filter(Boolean)
                 .join("  ")}

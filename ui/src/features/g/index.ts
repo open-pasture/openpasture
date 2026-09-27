@@ -43,7 +43,7 @@ layers.register({
 });
 watchCoverage(() => layers.changed());
 
-herdColumns.register({ id: "g-trend", label: "trend", order: 85, width: 110, sort: (a, b) => byDaysLeft(fleet.get().rows)(a, b), Cell: TrendCell });
+herdColumns.register({ id: "g-trend", label: "trend", order: 85, width: 132, sort: (a, b) => byDaysLeft(fleet.get().rows)(a, b), Cell: TrendCell });
 herdColumns.register({ id: "g-fit", label: "fit check", order: 95, width: 100, sort: (a, b) => byFitDue(fleet.get().rows)(a, b), Cell: FitCell });
 herdBulk.register({ id: "g-fit", label: "Checked fit", order: 50, minRole: "hand", run: checkedFit });
 animalPage.register({ id: "g-care", order: 30, when: (p) => !!p.collar, Section: Care });

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Coverage, FleetRow } from "../../api/g";
 import type { HerdRow } from "../../registry";
 import { fmt } from "../../units";
-import { byDaysLeft, byFitDue, cellText, collarIds, daysText, dueText, squares, tone, trendText } from "./model";
+import { byDaysLeft, byFitDue, cellText, collarIds, daysText, dueText, sparkDomain, squares, tone, trendText } from "./model";
 
 describe("coverage squares", () => {
   const c: Coverage = {
@@ -46,6 +46,17 @@ describe("fleet words", () => {
     expect(dueText(new Date(2026, 8, 27, 23, 0).toISOString(), now)).toEqual({ text: "today", late: false });
     expect(dueText(new Date(2026, 8, 27, 1, 0).toISOString(), now)).toEqual({ text: "today", late: false });
     expect(dueText(new Date(now - 3 * DAY).toISOString(), now)).toEqual({ text: "3 d late", late: true });
+  });
+
+  test("a sparkline spans at least 20 points, inside 0-100 %", () => {
+    const [lo, hi] = sparkDomain([null, 0.9, 0.87, 0.84, 0.81]);
+    expect(lo).toBeCloseTo(0.755, 9);
+    expect(hi).toBeCloseTo(0.955, 9);
+    const near = (got: [number, number], want: [number, number]) => got.forEach((v, i) => expect(v).toBeCloseTo(want[i], 9));
+    near(sparkDomain([0.2, 0.9]), [0.2, 0.9]);
+    near(sparkDomain([0.99, 0.98]), [0.8, 1]);
+    near(sparkDomain([0.01]), [0, 0.2]);
+    expect(sparkDomain([null, null])).toEqual([0, 1]);
   });
 
   test("trend and days left", () => {
