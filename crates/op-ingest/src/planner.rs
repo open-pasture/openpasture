@@ -10,10 +10,17 @@
 //!
 //! The back line sits `0.6 × warn_m` behind the rearmost animal, so that
 //! animal is in the warning band and every other animal is clear of it.
+//!
+//! Steps fit the herd's collars (`limits`): the outer ring is cut down to
+//! what they hold, leaving room for holes. The target's holes are in every
+//! step (the step contains the target), and so is each hole of the previous
+//! boundary that still lies whole inside the step with the gap a collar
+//! needs; the step is checked with the collars' shape rules.
 
 use geo::{BooleanOps, ConvexHull, Coord, InteriorPoint, LineString, MultiPoint, MultiPolygon, Point};
 use op_geo::ring::{clean_ring, distance_to_segment, point_in_ring, ring_is_simple, signed_area, validate_ring};
-use op_geo::{LonLat, MAX_COLLAR_VERTICES, Polygon, Projection};
+use op_geo::shape::{self, SERVER_SLACK_M};
+use op_geo::{CollarLimits, LonLat, Polygon, Projection};
 use serde::{Deserialize, Serialize};
 
 type P = [f64; 2];
@@ -52,6 +59,8 @@ pub struct PlanInput<'a> {
     /// The move's frame once chosen; `None` picks one (herd centroid →
     /// target centroid).
     pub frame: Option<Frame>,
+    /// What the herd's collars hold.
+    pub limits: CollarLimits,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +188,17 @@ pub fn plan(input: &PlanInput) -> Plan {
     }
     let hull = MultiPoint(hull_pts).convex_hull();
 
+    // Holes: the target's always; the previous boundary's where they still fit.
+    let limits = input.limits;
+    let hole_rings = |p: &Polygon| -> Vec<Vec<LonLat>> { p.holes().filter(|h| h.len() >= 3).collect() };
+    let target_holes = if limits.holes > 0 { hole_rings(input.target) } else { vec![] };
+    let prev_holes = match input.previous {
+        Some(prev) if limits.holes > 0 => hole_rings(prev),
+        _ => vec![],
+    };
+    let reserved: usize = target_holes.iter().map(Vec::len).sum();
+    let max_outer = limits.outer.min(limits.total.saturating_sub(reserved)).max(3);
+
     let Some(inner) = target.interior_point() else { return Plan::Hold("The target has no area.".into()) };
     // The hull keeps the sides close. In a non-convex area it can cut the
     // herd off from the target (an L-shaped paddock); then the area itself
@@ -218,19 +238,48 @@ pub fn plan(input: &PlanInput) -> Plan {
         if use_hull && cut_off {
             continue;
         }
-        if !reduce(&mut ring, MAX_COLLAR_VERTICES, &pts, &need, &space.target) {
+        if !reduce(&mut ring, max_outer, &pts, &need, &space.target) {
             outcome = Plan::Hold("The step needs more corners than a collar holds.".into());
             continue;
         }
-        let left_out: Vec<usize> = need.iter().enumerate().filter(|(_, n)| n.is_none()).map(|(i, _)| i).collect();
         let lonlat = space.proj.inverse_ring(&ring);
-        let Ok(valid) = validate_ring(&lonlat, Some(MAX_COLLAR_VERTICES)) else {
+        let Ok(valid) = validate_ring(&lonlat, Some(max_outer)) else {
             outcome = Plan::Hold("The step is not a valid collar boundary.".into());
             continue;
         };
-        return Plan::Step(Step { polygon: Polygon::from_ring(valid), frame, level, remaining_m, left_out, corridor });
+        let Some(polygon) = with_holes(valid, &target_holes, &prev_holes, &limits, w) else {
+            outcome = Plan::Hold("The step is not a valid collar boundary.".into());
+            continue;
+        };
+        // An animal in a hole is outside the step, like one the step doesn't reach.
+        let in_hole = |a: &LonLat| polygon.holes().any(|h| point_in_ring(*a, &h));
+        let left_out: Vec<usize> = need.iter().zip(input.animals).enumerate().filter(|(_, (n, a))| n.is_none() || in_hole(a)).map(|(i, _)| i).collect();
+        return Plan::Step(Step { polygon, frame, level, remaining_m, left_out, corridor });
     }
     outcome
+}
+
+/// The step ring with the target's holes, plus each of the previous
+/// boundary's holes that still passes the collars' shape rules with it
+/// (whole inside the step, the gap from every other ring, within the vertex
+/// budget). `None` when even the target's holes don't pass.
+fn with_holes(outer: Vec<LonLat>, target_holes: &[Vec<LonLat>], prev_holes: &[Vec<LonLat>], limits: &CollarLimits, warn_m: f64) -> Option<Polygon> {
+    let ok = |p: &Polygon| shape::check(p, limits, warn_m, 0.0, SERVER_SLACK_M).is_ok();
+    let mut polygon = Polygon::from_rings(outer, target_holes.iter().cloned());
+    if !ok(&polygon) {
+        return None;
+    }
+    for h in prev_holes {
+        if target_holes.contains(h) {
+            continue;
+        }
+        let mut next = polygon.clone();
+        next.coordinates.push(Polygon::from_ring(h.clone()).coordinates.remove(0));
+        if ok(&next) {
+            polygon = next;
+        }
+    }
+    Some(polygon)
 }
 
 /// Axis from the herd's centroid toward the target's centroid (the local
@@ -414,7 +463,8 @@ mod tests {
     /// The invariants every step keeps.
     fn check_step(input: &PlanInput, step: &Step) {
         let ring = local(&step.polygon);
-        assert!(ring.len() >= 3 && ring.len() <= MAX_COLLAR_VERTICES, "{} corners", ring.len());
+        assert!(ring.len() >= 3 && ring.len() <= input.limits.outer, "{} corners", ring.len());
+        shape::check(&step.polygon, &input.limits, W, 1.0, SERVER_SLACK_M).unwrap();
         assert!(ring_is_simple(&ring), "not simple");
         assert!(step.polygon.is_valid());
         let target = local(input.target);
@@ -459,7 +509,7 @@ mod tests {
         let target = rect(0.0, 0.0, 100.0, 100.0);
         let paddock = rect(-50.0, -50.0, 200.0, 200.0);
         let herd = animals(&scatter(12, 20.0, 20.0, 80.0, 80.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         assert_eq!(plan(&input), Plan::Target);
         // No animals: nothing to sweep.
         let input = PlanInput { animals: &[], ..input };
@@ -471,7 +521,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 300.0, 200.0);
         let target = rect(250.0, 150.0, 300.0, 200.0);
         let herd = animals(&scatter(12, 10.0, 10.0, 240.0, 190.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         let Frame::Axis { axis } = s.frame else { panic!("expected an axis, got {:?}", s.frame) };
         assert!(axis[0] > 0.3 && axis[1] > 0.1, "toward the NE corner: {axis:?}");
@@ -498,7 +548,7 @@ mod tests {
         let mut last_level = f64::NEG_INFINITY;
         for step in 0..60 {
             let herd = animals(&pts);
-            let input = PlanInput { target: &target, previous: Some(&prev), paddock: None, animals: &herd, warn_m: W, frame };
+            let input = PlanInput { target: &target, previous: Some(&prev), paddock: None, animals: &herd, warn_m: W, frame, limits: CollarLimits::V0 };
             match plan(&input) {
                 Plan::Target => {
                     assert!(step > 3, "finished too soon");
@@ -542,7 +592,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 400.0, 120.0);
         let target = rect(340.0, 10.0, 395.0, 110.0);
         let herd = animals(&scatter(10, 5.0, 5.0, 80.0, 115.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         let Frame::Axis { axis } = s.frame else { panic!() };
         assert!(axis[0] > 0.95, "{axis:?}");
@@ -555,7 +605,7 @@ mod tests {
         let paddock = poly(&[[0.0, 0.0], [300.0, 0.0], [300.0, 80.0], [80.0, 80.0], [80.0, 300.0], [0.0, 300.0]]);
         let target = rect(5.0, 250.0, 75.0, 295.0);
         let herd = animals(&scatter(12, 150.0, 10.0, 290.0, 70.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert!(s.left_out.is_empty(), "{:?}", s.left_out);
         assert!(!s.corridor);
@@ -570,7 +620,7 @@ mod tests {
         let herd_pts = scatter(10, 120.0, 60.0, 240.0, 190.0);
         let straggler = at(15.0, 15.0);
         let herd = animals(&herd_pts);
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert!(!s.polygon.contains(straggler), "the straggler is behind the back line");
         let mut with = herd.clone();
@@ -585,7 +635,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 200.0, 200.0);
         let target = rect(150.0, 150.0, 200.0, 200.0);
         let herd = animals(&[[30.0, 40.0]]);
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert!(matches!(s.frame, Frame::Axis { .. }));
     }
@@ -595,7 +645,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 200.0, 200.0);
         let target = rect(150.0, 150.0, 200.0, 200.0);
         let herd = animals(&(0..8).map(|i| [20.0 + 10.0 * i as f64, 30.0]).collect::<Vec<_>>());
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         step_of(&input);
         // Collinear along the axis too.
         let herd = animals(&(0..8).map(|i| [20.0 + 10.0 * i as f64, 20.0 + 10.0 * i as f64]).collect::<Vec<_>>());
@@ -608,7 +658,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 300.0, 300.0);
         let target = rect(130.0, 130.0, 170.0, 170.0);
         let herd = animals(&[[40.0, 40.0], [260.0, 40.0], [260.0, 260.0], [40.0, 260.0], [150.0, 150.0], [100.0, 200.0]]);
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert_eq!(s.frame, Frame::Gather);
         // The corner animals are in their warning band, not outside.
@@ -624,7 +674,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 300.0, 200.0);
         let target = rect(250.0, 150.0, 300.0, 200.0);
         let herd = animals(&scatter(8, 10.0, 10.0, 200.0, 190.0));
-        let input = PlanInput { target: &target, previous: None, paddock: Some(&paddock), animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: None, paddock: Some(&paddock), animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         step_of(&input);
         // Herd outside the paddock: a box around target and herd.
         let herd = animals(&scatter(8, -200.0, -100.0, -100.0, -20.0));
@@ -643,7 +693,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 300.0, 200.0);
         let target = rect(250.0, 150.0, 300.0, 200.0);
         let herd = animals(&[[50.0, 50.0], [100.0, 80.0], [-20.0, 60.0]]);
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert_eq!(s.left_out, vec![2]);
     }
@@ -664,9 +714,36 @@ mod tests {
         let paddock = circle(0.0, 0.0, 200.0, 60);
         let target = circle(140.0, 0.0, 40.0, 40);
         let herd = animals(&scatter(30, -150.0, -100.0, 0.0, 100.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
-        assert!(s.polygon.outer_ring().len() <= MAX_COLLAR_VERTICES);
+        assert!(s.polygon.outer_ring().len() <= CollarLimits::V0.outer);
+        // Collars that hold fewer corners get fewer.
+        let input = PlanInput { limits: CollarLimits { outer: 24, ..CollarLimits::V0 }, ..input };
+        let s = step_of(&input);
+        assert!(s.polygon.outer_ring().len() <= 24);
+    }
+
+    #[test]
+    fn the_targets_holes_are_in_every_step() {
+        let paddock = rect(0.0, 0.0, 300.0, 200.0);
+        // The target's hole (a pond), and a hole in the paddock the herd is leaving.
+        let pond = poly(&[[260.0, 160.0], [280.0, 160.0], [280.0, 180.0], [260.0, 180.0]]).coordinates.remove(0);
+        let target = Polygon::from_rings(rect(230.0, 130.0, 300.0, 200.0).coordinates.remove(0), [pond.clone()]);
+        let barn = poly(&[[150.0, 100.0], [170.0, 100.0], [170.0, 120.0], [150.0, 120.0]]).coordinates.remove(0);
+        let previous = Polygon::from_rings(paddock.coordinates[0].clone(), [barn.clone()]);
+        let herd = animals(&scatter(10, 10.0, 10.0, 120.0, 90.0));
+        let input = PlanInput { target: &target, previous: Some(&previous), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        let s = step_of(&input);
+        let holes: Vec<Vec<LonLat>> = s.polygon.holes().collect();
+        assert!(holes.contains(&clean_ring(&pond)), "the target's hole");
+        assert!(holes.contains(&clean_ring(&barn)), "the barn is still inside the step");
+        assert!(!s.polygon.contains(at(270.0, 170.0)) && !s.polygon.contains(at(160.0, 110.0)));
+        // Legacy-only limits carry no holes (the collar can't hold them).
+        let input = PlanInput { limits: CollarLimits::LEGACY, ..input };
+        match plan(&input) {
+            Plan::Step(s) => assert_eq!(s.polygon.coordinates.len(), 1),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -674,7 +751,7 @@ mod tests {
         let paddock = rect(0.0, 0.0, 100.0, 100.0);
         let target = rect(103.0, 0.0, 200.0, 100.0);
         let herd = animals(&scatter(6, 10.0, 10.0, 90.0, 90.0));
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None };
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
         let s = step_of(&input);
         assert!(s.corridor);
         assert!(s.left_out.is_empty());
@@ -686,7 +763,8 @@ mod tests {
         let target = rect(250.0, 150.0, 300.0, 200.0);
         let herd = animals(&scatter(8, 10.0, 10.0, 200.0, 190.0));
         let frame = Frame::Axis { axis: [1.0, 0.0] };
-        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: Some(frame) };
+        let input =
+            PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: Some(frame), limits: CollarLimits::V0 };
         assert_eq!(step_of(&input).frame, frame);
     }
 }

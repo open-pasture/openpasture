@@ -244,6 +244,9 @@ pub struct BoundaryAck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub at: DateTime<Utc>,
+    /// Why it was rejected (protocol v1 reject code, e.g. `hole_too_close`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

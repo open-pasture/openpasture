@@ -199,18 +199,15 @@ fn describe(d: &Decision) -> String {
     }
 }
 
-/// Validate a boundary the way a collar will: 3-64 vertices, sane ranges, no
-/// crossings, no holes.
+/// Validate a boundary the way a v1 collar will, within V0 limits (an outer
+/// ring of 3-128 corners, up to 16 holes, op-geo's shape rules with the
+/// server's slack). A shape with more corners than that is simplified to fit
+/// first (only ever smaller), as sending would do anyway.
 pub fn check_geometry(g: &Polygon) -> ApiResult<Polygon> {
-    let g = g.validated()?;
-    let ring = g.outer_ring();
-    let n = if ring.first() == ring.last() { ring.len().saturating_sub(1) } else { ring.len() };
-    if !(3..=64).contains(&n) {
-        return Err(ApiError::bad_request("A boundary needs 3 to 64 corners."));
-    }
-    if g.holes().next().is_some() {
-        return Err(ApiError::bad_request("A boundary can't have holes."));
-    }
+    use op_geo::shape::{self, DEFAULT_WARN_M, SERVER_SLACK_M};
+    let limits = op_geo::CollarLimits::V0;
+    let g = shape::fit(&g.validated()?, &limits);
+    shape::check(&g, &limits, DEFAULT_WARN_M, 1.0, SERVER_SLACK_M).map_err(|c| ApiError::bad_request(c.message()))?;
     Ok(g)
 }
 

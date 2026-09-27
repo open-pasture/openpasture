@@ -226,7 +226,7 @@
           },
           "geometry": {
             "type": "object",
-            "description": "GeoJSON Polygon, [longitude, latitude], 3-64 corners."
+            "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners."
           },
           "reasoning": {
             "type": "string",
