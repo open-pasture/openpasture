@@ -162,3 +162,152 @@ fn to_positions(collars: Vec<Collar>) -> Vec<Position> {
 pub async fn latest_positions(ctx: &Ctx, herd_id: &str) -> anyhow::Result<Vec<Position>> {
     Ok(to_positions(db::list_collars(ctx.db(), Some(herd_id)).await?))
 }
+
+// K-animals: collars on animals, keys and parking. The park and unpark routes
+// live here; op-import calls the rest (bulk linking, swap, remove, rekey).
+
+/// `POST /api/collars/{id}/park` and `/unpark`.
+pub fn lifecycle_router() -> Router<Ctx> {
+    Router::new().route("/api/collars/{id}/park", axum::routing::post(post_park)).route("/api/collars/{id}/unpark", axum::routing::post(post_unpark))
+}
+
+#[derive(Deserialize)]
+struct ParkBody {
+    reason: op_core::ParkReason,
+}
+
+async fn post_park(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<ParkBody>) -> ApiResult<Json<Collar>> {
+    Ok(Json(park_collar(&ctx, &id, body.reason).await?))
+}
+
+async fn post_unpark(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<Collar>> {
+    Ok(Json(unpark_collar(&ctx, &id).await?))
+}
+
+/// Where collars talk to this server: `{base_url}/collar/v1`.
+pub fn collar_endpoint(ctx: &Ctx) -> String {
+    endpoint(ctx)
+}
+
+/// Take a collar off duty: charging, on the shelf, in repair. It raises no
+/// alerts, isn't drawn or counted, and its reports keep only battery and
+/// health, so its fence state is forgotten and an open escape for it stops.
+/// Parking a parked collar changes only the reason.
+pub async fn park_collar(ctx: &Ctx, id: &str, reason: op_core::ParkReason) -> ApiResult<Collar> {
+    find(ctx, id).await?;
+    match crate::escapes::stop_escape(ctx, id).await {
+        Ok(_) => {}
+        Err(e) if e.status == StatusCode::CONFLICT => {}
+        Err(e) => return Err(e),
+    }
+    sqlx::query("UPDATE collars SET parked_at = COALESCE(parked_at, ?), parked_reason = ?, state = ?, outside_since = NULL WHERE id = ?")
+        .bind(op_core::time::to_db(&op_core::time::now()))
+        .bind(op_core::DbEnum::as_db(&reason))
+        .bind(FenceState::Unknown.as_str())
+        .bind(id)
+        .execute(ctx.db())
+        .await?;
+    let c = find(ctx, id).await?;
+    tracing::info!(collar = %id, reason = ?reason, "collar parked");
+    ctx.publish(Event::Collar { collar: c.clone() });
+    Ok(c)
+}
+
+/// Back on duty: its next report counts again.
+pub async fn unpark_collar(ctx: &Ctx, id: &str) -> ApiResult<Collar> {
+    find(ctx, id).await?;
+    sqlx::query("UPDATE collars SET parked_at = NULL, parked_reason = NULL WHERE id = ?").bind(id).execute(ctx.db()).await?;
+    let c = find(ctx, id).await?;
+    ctx.publish(Event::Collar { collar: c.clone() });
+    Ok(c)
+}
+
+/// Put a collar on an animal of its own herd, or take it off with `None`.
+/// `animals.collar_id` and `collars.animal_id` stay in step, and a parked
+/// collar put on an animal is back on duty.
+pub async fn link_collar(ctx: &Ctx, collar_id: &str, animal_id: Option<&str>) -> ApiResult<Collar> {
+    let collar = find(ctx, collar_id).await?;
+    if let Some(aid) = animal_id {
+        let a = ctx.store().get_animal(aid).await?.ok_or_else(|| ApiError::bad_request("No such animal."))?;
+        if a.herd_id != collar.herd_id {
+            return Err(ApiError::bad_request(format!("{} is in another herd.", collar.name)));
+        }
+        if a.removed_at.is_some() {
+            return Err(ApiError::bad_request(format!("{} is no longer on the farm.", a.tag)));
+        }
+    }
+    link_animal(ctx, &collar, animal_id).await?;
+    if animal_id.is_some() && collar.parked_at.is_some() {
+        return unpark_collar(ctx, collar_id).await;
+    }
+    let c = find(ctx, collar_id).await?;
+    ctx.publish(Event::Collar { collar: c.clone() });
+    Ok(c)
+}
+
+/// A new key for the collar, returned once. The old key stops working at once,
+/// so the collar reports again only after it is set up with the new one.
+pub async fn rekey_collar(ctx: &Ctx, id: &str) -> ApiResult<(Collar, String)> {
+    find(ctx, id).await?;
+    let key = keys::new_collar_key();
+    sqlx::query("UPDATE collars SET key_hash = ? WHERE id = ?").bind(keys::hash_key(&key)).bind(id).execute(ctx.db()).await?;
+    tracing::info!(collar = %id, "collar rekeyed");
+    Ok((find(ctx, id).await?, key))
+}
+
+/// Whether `key` is the collar's current key.
+pub async fn collar_key_matches(ctx: &Ctx, id: &str, key: &str) -> anyhow::Result<bool> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT key_hash FROM collars WHERE id = ?").bind(id).fetch_optional(ctx.db()).await?;
+    Ok(matches!(row, Some((Some(h),)) if h == keys::hash_key(key)))
+}
+
+/// One collar to create by [`create_linked_collars`].
+pub struct NewLinked {
+    pub name: String,
+    /// An active animal of the herd with no collar yet.
+    pub animal_id: Option<String>,
+}
+
+/// New collars in a herd, each with a fresh key (returned once, in order) and
+/// put on its animal when one is named. All or none: one write transaction.
+pub async fn create_linked_collars(ctx: &Ctx, herd_id: &str, items: &[NewLinked]) -> ApiResult<Vec<(Collar, String)>> {
+    require_herd(ctx, herd_id).await?;
+    let mut made = Vec::with_capacity(items.len());
+    for it in items {
+        made.push((id::new_id(id::COLLAR), clean_name(&it.name)?, keys::new_collar_key(), it.animal_id.clone()));
+    }
+    let at = op_core::time::to_db(&op_core::time::now());
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    for (cid, name, key, animal) in &made {
+        sqlx::query("INSERT INTO collars (id, name, herd_id, key_hash, state, created_at, animal_id) VALUES (?, ?, ?, ?, 'unknown', ?, ?)")
+            .bind(cid)
+            .bind(name)
+            .bind(herd_id)
+            .bind(keys::hash_key(key))
+            .bind(&at)
+            .bind(animal)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(aid) = animal {
+            let n = sqlx::query("UPDATE animals SET collar_id = ? WHERE id = ? AND herd_id = ? AND collar_id IS NULL AND removed_at IS NULL")
+                .bind(cid)
+                .bind(aid)
+                .bind(herd_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if n != 1 {
+                return Err(ApiError::conflict("An animal in the list already wears a collar or left the herd. Nothing was linked."));
+            }
+        }
+    }
+    tx.commit().await?;
+    let mut out = Vec::with_capacity(made.len());
+    for (cid, _, key, _) in made {
+        let c = find(ctx, &cid).await?;
+        ctx.publish(Event::Collar { collar: c.clone() });
+        out.push((c, key));
+    }
+    tracing::info!(herd = %herd_id, count = out.len(), "collars linked in bulk");
+    Ok(out)
+}

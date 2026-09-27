@@ -38,6 +38,7 @@ pub mod people;
 // @D
 pub mod features_api;
 // @K-animals
+pub mod animals;
 // @K-files
 // @I
 // @B
@@ -117,6 +118,7 @@ fn tool_specs() -> Vec<tools::ToolSpec> {
         // @D
         features_api::tool(),
         // @K-animals
+        animals::tool(),
         // @K-files
         // @I
         // @B

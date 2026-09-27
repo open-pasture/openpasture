@@ -11,6 +11,7 @@
 // @A-notify
 // @D
 // @K-animals
+pub mod animals;
 // @K-files
 // @I
 // @B
@@ -43,6 +44,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @A-notify
         // @D
         // @K-animals
+        animals::router(),
         // @K-files
         // @I
         // @B

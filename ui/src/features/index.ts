@@ -13,6 +13,7 @@ import "./j";
 // @D
 import "./d";
 // @K-animals
+import "./k-animals";
 // @K-files
 // @I
 // @B
