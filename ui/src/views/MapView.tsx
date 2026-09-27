@@ -17,7 +17,7 @@ import { LayersMenu } from "../map/LayersMenu";
 import { interleave, PADDOCK_SHEET, paddockSheet, sectionNodes, useSections, views } from "../registry";
 import { Button, Input, Menu, Sheet } from "../ui";
 import { useUnits } from "../units";
-import { typing, useKey } from "../util";
+import { attempt, typing, useKey } from "../util";
 import { pageHash, pageKeys } from "../features/k-animals/herd";
 import { HerdPanel } from "./HerdPanel";
 
@@ -373,24 +373,29 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
   const u = useUnits();
   const [name, setName] = useState(p.name);
   const [notes, setNotes] = useState(p.notes ?? "");
+  // A refused edit says why under the actions.
+  const [err, setErr] = useState<string>();
+  const run = (f: () => Promise<unknown>) => attempt(f, { failed: setErr });
   const save = async () => {
-    if (name.trim() && name !== p.name) {
+    if (name.trim() && name !== p.name) await run(async () => {
       await api.updatePaddock(p.id, { name: name.trim() });
       await store.refresh();
-    }
+    });
   };
   // Standing notes go into every decision's context.
   const saveNotes = async () => {
     const v = notes.trim();
     if (v === (p.notes ?? "")) return;
-    await api.updatePaddock(p.id, { notes: (v || null) as string | undefined });
-    await store.refresh();
+    await run(async () => {
+      await api.updatePaddock(p.id, { notes: (v || null) as string | undefined });
+      await store.refresh();
+    });
   };
-  const remove = async () => {
+  const remove = () => run(async () => {
     await api.deletePaddock(p.id);
     onClose();
     await store.refresh();
-  };
+  });
   return interleave([
     { key: "name", order: PADDOCK_SHEET.name, node: (
       <form onSubmit={(e) => { e.preventDefault(); void save(); }}>
@@ -402,7 +407,8 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
     { key: "actions", order: PADDOCK_SHEET.actions, node: manage && (
       <div className="acts">
         <Button small onClick={onReshape}>Reshape</Button>
-        <Button small kind="plain" className="danger" onClick={remove}>Delete</Button>
+        <Button small kind="plain" className="danger" onClick={() => void remove()}>Delete</Button>
+        {err && <span className="mono err">{err}</span>}
       </div>
     ) },
   ], added);

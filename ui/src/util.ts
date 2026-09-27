@@ -63,6 +63,23 @@ export function useHash(): [string, string, (h: string) => void] {
   return [view, rest, (v) => (location.hash = "/" + v)];
 }
 
+// A form's request: busy while it runs, and when it fails its message (the server's sentence)
+// goes to `failed` for the form to show, instead of an unhandled rejection and no word. True
+// when it went through.
+export async function attempt(f: () => Promise<unknown>, on: { busy?: (b: boolean) => void; failed: (message: string | undefined) => void }): Promise<boolean> {
+  on.busy?.(true);
+  on.failed(undefined);
+  try {
+    await f();
+    return true;
+  } catch (e) {
+    on.failed(e instanceof Error ? e.message : String(e));
+    return false;
+  } finally {
+    on.busy?.(false);
+  }
+}
+
 // One pending timer per key (a herd): a new call replaces that key's timer only.
 export function perKey<K>() {
   const timers = new Map<K, ReturnType<typeof setTimeout>>();

@@ -1,27 +1,28 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type Paddock } from "../../api";
 import { store } from "../../store";
 import { Button, Input } from "../../ui";
+import { attempt } from "../../util";
 import { current } from "../drawn";
 import { useDrawing, type ToolProps } from "../tools";
 
-// Draw a paddock, name it, save it.
+// Draw a paddock, name it, save it. A refused save says why beside Save.
 export function PaddockTool({ draw, done }: ToolProps) {
-  const { drawn } = useDrawing(draw, "paddock");
+  const { drawn, geometry } = useDrawing(draw, "paddock");
   const [name, setName] = useState(() => nextName(store.get().state?.paddocks ?? []));
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string>();
+  // Reshaping answers the last refusal.
+  useEffect(() => setErr(undefined), [geometry]);
 
-  const save = async () => {
+  const save = () => {
     const g = current(draw);
     if (!g) return;
-    setBusy(true);
-    try {
+    return attempt(async () => {
       await api.createPaddock({ name: name.trim() || nextName(store.get().state?.paddocks ?? []), geometry: g });
       done();
       await store.refresh();
-    } finally {
-      setBusy(false);
-    }
+    }, { busy: setBusy, failed: setErr });
   };
 
   if (!drawn)
@@ -36,6 +37,7 @@ export function PaddockTool({ draw, done }: ToolProps) {
       <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} aria-label="Name" className="sm" />
       <Button small kind="plain" onClick={done}>Cancel</Button>
       <Button small kind="primary" type="submit" disabled={busy}>Save</Button>
+      {err && <span className="mono err ferr">{err}</span>}
     </form>
   );
 }

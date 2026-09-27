@@ -5,12 +5,14 @@ import { cState } from "../../store/c";
 import { store, useStore } from "../../store";
 import { Button, Input } from "../../ui";
 import { toXY } from "../../geo";
+import { attempt } from "../../util";
 import { startTool } from "./freehand";
 
 // Saved strip layouts of this paddock: Apply opens the strip tool on it; the name renames in place.
 export function PaddockLayouts({ paddock, herdId }: { paddock: Paddock; herdId?: string }) {
   const [list, setList] = useState<Layout[]>([]);
   const [editing, setEditing] = useState<string>();
+  const [err, setErr] = useState<string>();
   // Apply needs the strip tool, which shows while the selected herd is in a paddock.
   const canApply = useStore((s) => !!herdId && !!s.state?.herds.find((h) => h.id === herdId)?.paddock_id);
 
@@ -26,13 +28,15 @@ export function PaddockLayouts({ paddock, herdId }: { paddock: Paddock; herdId?:
   const rename = async (l: Layout, name: string) => {
     setEditing(undefined);
     if (!name.trim() || name.trim() === l.name) return;
-    const next = await cApi.renameLayout(l.id, name.trim());
-    setList((xs) => xs.map((x) => (x.id === l.id ? next : x)));
+    await attempt(async () => {
+      const next = await cApi.renameLayout(l.id, name.trim());
+      setList((xs) => xs.map((x) => (x.id === l.id ? next : x)));
+    }, { failed: setErr });
   };
-  const remove = async (l: Layout) => {
+  const remove = (l: Layout) => attempt(async () => {
     await cApi.deleteLayout(l.id);
     setList((xs) => xs.filter((x) => x.id !== l.id));
-  };
+  }, { failed: setErr });
   const apply = (l: Layout) => {
     cState.patch({ open: { paddockId: paddock.id, layoutId: l.id, at: Date.now() } });
     startTool("t");
@@ -54,6 +58,7 @@ export function PaddockLayouts({ paddock, herdId }: { paddock: Paddock; herdId?:
           <Button small kind="plain" onClick={() => void remove(l)}>Delete</Button>
         </li>
       ))}
+      {err && <li><span className="mono err">{err}</span></li>}
     </ul>
   );
 }
@@ -62,18 +67,15 @@ export function PaddockLayouts({ paddock, herdId }: { paddock: Paddock; herdId?:
 // names show, to reshape into what's needed.
 export function PaddockCopy({ paddock }: { paddock: Paddock }) {
   const [busy, setBusy] = useState(false);
-  const copy = async () => {
-    setBusy(true);
-    try {
-      await cApi.copyPaddock(paddock.id, { offset_m: [0, -nudgeM(paddock)] });
-      await store.refresh();
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [err, setErr] = useState<string>();
+  const copy = () => attempt(async () => {
+    await cApi.copyPaddock(paddock.id, { offset_m: [0, -nudgeM(paddock)] });
+    await store.refresh();
+  }, { busy: setBusy, failed: setErr });
   return (
     <div className="acts ccopy">
       <Button small onClick={() => void copy()} disabled={busy}>Copy</Button>
+      {err && <span className="mono err">{err}</span>}
     </div>
   );
 }
