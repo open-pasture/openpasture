@@ -431,7 +431,7 @@ mod tests {
         let area = Area::new(&rect(0.0, 0.0, 100.0, 100.0)).unwrap();
         let p = Projection::new(O);
         let mut a = Animal::new(p.offset(50.0, 3.0), false, &mut rng);
-        let beep = CueCommand { active: true, freq_hz: 2730, volume: 3, duration_ms: 300 };
+        let beep = CueCommand { active: true, freq_hz: 2730, volume: 3, duration_ms: 300, ..Default::default() };
         a.step(1.0, Some(&area), None, None, Some(beep), &mut rng);
         a.step(1.0, Some(&area), None, None, Some(beep), &mut rng);
         assert_eq!(a.mode, Mode::Fleeing);
