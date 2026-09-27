@@ -88,6 +88,30 @@ impl Relay {
     pub async fn verify_recipient(&self, channel: &str, to: &str, code: &str) -> Result<Result<Value, Refusal>, ChannelError> {
         self.call(reqwest::Method::POST, "/v1/notify/recipients/verify", Some(json!({ "channel": channel, "to": to, "code": code }))).await
     }
+
+    // @A3
+    /// `GET /v1/notify/inbox?since=&wait=`: texts to the relay's number meant
+    /// for this server, the relay holding the request up to `wait_s` seconds
+    /// while there are none.
+    pub async fn inbox(&self, since: Option<&str>, wait_s: u64) -> Result<crate::hosting::inbox::Inbox, ChannelError> {
+        let wait = wait_s.to_string();
+        let res = http()
+            .get(format!("{}/v1/notify/inbox", self.url))
+            .bearer_auth(&self.key)
+            .query(&[("since", since.unwrap_or("")), ("wait", wait.as_str())])
+            .timeout(std::time::Duration::from_secs(wait_s + 20))
+            .send()
+            .await
+            .map_err(|e| net_error("The relay", &e))?;
+        let status = res.status().as_u16();
+        let body = res.bytes().await.map_err(|e| net_error("The relay", &e))?;
+        if !(200..300).contains(&status) {
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let message = v.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("The relay answered {status}."));
+            return Err(refused(Refusal { status, message }));
+        }
+        serde_json::from_slice(&body).map_err(|_| ChannelError::Fail("The relay sent an inbox that can't be read.".into()))
+    }
 }
 
 /// 401, 403 and 409 need a person; 429 and 5xx pass.

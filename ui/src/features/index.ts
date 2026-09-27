@@ -33,6 +33,7 @@ import "./c";
 // @F
 // @S
 // @A3
+import "./a3";
 // @H
 // @L
 // @M

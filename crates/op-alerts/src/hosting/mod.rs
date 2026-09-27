@@ -17,6 +17,7 @@
 pub mod outbound;
 pub mod recipients;
 // @A3
+pub mod inbox;
 // @M
 
 use axum::extract::State;
@@ -68,6 +69,7 @@ pub fn router() -> Router<Ctx> {
             .route("/v1/notify/recipients/verify", post(recipients::verify))
             .route("/api/notify/hosting", get(get_hosting).put(put_hosting)),
         // @A3
+        inbox::router(),
         // @M
     ] {
         app = app.merge(part);
