@@ -45,7 +45,9 @@ function useGroups(): { group: string; order: number; node: ReactNode }[] {
   return [...byGroup].map(([group, list]) => ({
     group,
     order: list[0].order,
-    node: <div className="sgroup">{list.map((s) => <div key={s.id} aria-label={s.label}>{guarded(s.id, <s.Section />)}</div>)}</div>,
+    // Sections render straight into the group, so one with nothing to show leaves no trace and a
+    // group with nothing at all hides its row (CSS).
+    node: <div className="sgroup">{list.map((s) => guarded(s.id, <s.Section />))}</div>,
   }));
 }
 

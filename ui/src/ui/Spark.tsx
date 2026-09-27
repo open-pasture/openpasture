@@ -10,7 +10,7 @@ export function Spark({ values, width = 64, height = 16, domain, label }: {
   if (nums.length < 2) return null;
   let [lo, hi] = domain ?? [Math.min(...nums), Math.max(...nums)];
   if (hi - lo < 1e-9) (lo -= 1), (hi += 1);
-  const x = (i: number) => (values.length === 1 ? width : (i / (values.length - 1)) * (width - 2) + 1);
+  const x = (i: number) => (i / (values.length - 1)) * (width - 2) + 1;
   const y = (v: number) => height - 1.5 - ((v - lo) / (hi - lo)) * (height - 3);
   let d = "";
   let pen = false;

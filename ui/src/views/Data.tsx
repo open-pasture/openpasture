@@ -25,7 +25,8 @@ export function DataView() {
   }, [range]);
   const added = dataSections.use().map((d) => ({
     key: `section:${d.id}`, order: d.order,
-    node: <section className="dsec" aria-label={d.label}><h2>{d.label}</h2>{guarded(d.id, <d.Section herdId={herdId} from={from} to={to} />)}</section>,
+    // A section with nothing to show renders nothing, and its label goes with it (CSS).
+    node: <section className="dsec" aria-label={d.label}><h2>{d.label}</h2><div className="dsec-body">{guarded(d.id, <d.Section herdId={herdId} from={from} to={to} />)}</div></section>,
   }));
 
   return (
