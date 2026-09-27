@@ -58,6 +58,30 @@ export function spareCollars(collars: Collar[], animals: Animal[], herdId: strin
   return collars.filter((c) => c.herd_id === herdId && !c.animal_id && !worn.has(c.id)).sort((a, b) => compareValues(a.name, b.name));
 }
 
+// #/herd?select=<collar ids>: a selection handed over from elsewhere (the map's lasso). The
+// ids, the herd most of them are in (the table shows one herd), and that herd's rows they pick.
+export function selectionOf(rest: string): string[] {
+  if (!rest.startsWith("?")) return [];
+  const v = new URLSearchParams(rest.slice(1)).get("select") ?? "";
+  return [...new Set(v.split(",").map((s) => s.trim()).filter(Boolean))];
+}
+export const selectUrl = (collarIds: string[]) => `/herd?select=${collarIds.map(encodeURIComponent).join(",")}`;
+
+export function herdOfMost(collars: Collar[], ids: string[]): string | undefined {
+  const want = new Set(ids);
+  const n = new Map<string, number>();
+  for (const c of collars) if (want.has(c.id)) n.set(c.herd_id, (n.get(c.herd_id) ?? 0) + 1);
+  return [...n].sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+
+export function pickRows(rows: HerdRow[], collarIds: string[]): Set<string> {
+  const want = new Set(collarIds);
+  return new Set(rows.filter((r) => r.collar && want.has(r.collar.id)).map((r) => r.id));
+}
+
+// The picked rows first (as the lasso caught them in the table's order), then the rest.
+export const pickedFirst = (rows: HerdRow[], picked: ReadonlySet<string>) => [...rows.filter((r) => picked.has(r.id)), ...rows.filter((r) => !picked.has(r.id))];
+
 // #/herd/<tag>: the animal with that tag (this herd first, animals on the farm before
 // removed ones), else a collar by id or name.
 export function resolve(rest: string, animals: Animal[], collars: Collar[], herdId?: string): { animal?: Animal; collar?: Collar } {

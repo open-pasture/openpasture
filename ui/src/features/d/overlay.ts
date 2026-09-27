@@ -6,9 +6,12 @@
 import { createElement } from "react";
 import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import type { OverlayCtx, OverlayHandle } from "../../map/overlays";
-import { features } from "../../store/d";
+import type { DrawGeometry } from "../../map/drawn";
+import { featuresApi } from "../../api/d";
+import type { FeatureGeometry, MapFeature } from "../../api";
+import { features, putFeature } from "../../store/d";
 import { hatchBitmap, iconBitmap, ICONS, PR, type IconKind } from "./icons";
-import { mapData, nextChange } from "./model";
+import { mapData, modeFor, nextChange } from "./model";
 import { FeatureSheet } from "./sheet";
 
 // map/base.ts C, inlined so this chunk doesn't load MapLibre's module for four colours.
@@ -91,10 +94,15 @@ export function mountFeatures(ctx: OverlayCtx): OverlayHandle {
     hits.sort((a, b) => CLICKABLE.indexOf(a.layer.id) - CLICKABLE.indexOf(b.layer.id));
     return hits[0]?.properties?.id as string | undefined;
   };
+  // The map's reshape mode edits it in place; Save sends the new shape (checked like a new one).
+  const reshape = (f: MapFeature) =>
+    ctx.reshape(f.geometry as unknown as DrawGeometry, modeFor(f.kind, f.geometry.type), async (g) => {
+      putFeature(await featuresApi.update(f.id, { geometry: g as unknown as FeatureGeometry }));
+    });
   const onClick = (e: MapMouseEvent) => {
     const id = hitAt(e);
     if (!id) return;
-    ctx.openSheet(createElement(FeatureSheet, { key: id, id, select, close: () => ctx.openSheet(null) }));
+    ctx.openSheet(createElement(FeatureSheet, { key: id, id, select, close: () => ctx.openSheet(null), reshape }));
   };
   let pointing = false;
   const onMove = (e: MapMouseEvent) => {

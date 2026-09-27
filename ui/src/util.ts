@@ -45,6 +45,9 @@ export function useKey(handler: (e: KeyboardEvent) => void, deps: unknown[]) {
 export function parseHash(hash: string): [string, string] {
   const path = hash.replace(/^#\/?/, "");
   const i = path.indexOf("/");
+  // A query right after the view is the view's: #/herd?select=… → ["herd", "?select=…"].
+  const q = path.indexOf("?");
+  if (q >= 0 && (i < 0 || q < i)) return [path.slice(0, q) || "map", path.slice(q)];
   const view = i < 0 ? path : path.slice(0, i);
   return [view || "map", i < 0 ? "" : path.slice(i + 1)];
 }

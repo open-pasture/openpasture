@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Map as MLMap } from "maplibre-gl";
 import { api, ApiError, downloadBlob, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
+import { get } from "../api/http";
 import { DATA, dataSections, guarded, interleave } from "../registry";
 import { useStore } from "../store";
 import { useCan } from "../store/me";
@@ -22,8 +23,11 @@ export function DataView() {
   // The console is a POST, which managers and owners make.
   const sqlRole = useCan("manager");
   useEffect(() => {
-    api.sql("select count(*) from herds").then(() => setSqlOk(true), (e) => setSqlOk(!(e instanceof ApiError && e.status === 404)));
-  }, []);
+    // Managers ask the console itself; everyone else may only read, so they ask a small read of
+    // the same crate (the fleet settings).
+    const probe = sqlRole ? api.sql("select count(*) from herds") : get("/api/fleet/settings");
+    probe.then(() => setSqlOk(true), (e) => setSqlOk(!(e instanceof ApiError && e.status === 404)));
+  }, [sqlRole]);
   const { from, to } = useMemo(() => {
     const t = Date.now();
     return { from: new Date(t - SPAN[range]).toISOString(), to: new Date(t).toISOString() };

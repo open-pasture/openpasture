@@ -1,5 +1,5 @@
-// The small sheet a clicked feature opens: its name, facts, scope and dates, notes, Delete.
-// Managers change it in place; everyone else reads it.
+// The small sheet a clicked feature opens: its name, facts, scope and dates, notes, Reshape and
+// Delete. Managers change it in place; everyone else reads it.
 
 import { useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
 import { featuresApi, type FeaturePatch, type MapFeature } from "../../api/d";
@@ -11,7 +11,7 @@ import { NumberField } from "../../ui/NumberField";
 import { useUnits } from "../../units";
 import { endOfDay, facts, isActive, lastDay, localDate, radiusOf, scopePaddock, spec } from "./model";
 
-export function FeatureSheet({ id, select, close }: { id: string; select: (id: string | null) => void; close: () => void }) {
+export function FeatureSheet({ id, select, close, reshape }: { id: string; select: (id: string | null) => void; close: () => void; reshape?: (f: MapFeature) => void }) {
   const f = features.use((list) => list.find((x) => x.id === id));
   const [, tick] = useState(0);
   const on = !!f && isActive(f, Date.now());
@@ -32,10 +32,10 @@ export function FeatureSheet({ id, select, close }: { id: string; select: (id: s
   }, [f?.active_until]);
 
   if (!f || !on) return null;
-  return <Body f={f} close={close} />;
+  return <Body f={f} close={close} reshape={reshape} />;
 }
 
-function Body({ f, close }: { f: MapFeature; close: () => void }) {
+function Body({ f, close, reshape }: { f: MapFeature; close: () => void; reshape?: (f: MapFeature) => void }) {
   const state = useStore((s) => s.state);
   const paddocks = state?.paddocks ?? [];
   const tz = state?.farm?.timezone ?? "UTC";
@@ -112,6 +112,7 @@ function Body({ f, close }: { f: MapFeature; close: () => void }) {
       {err && <p className="err dmsg">{err}</p>}
       {edit && (
         <div className="acts">
+          {reshape && <Button small onClick={() => reshape(f)} disabled={busy}>Reshape</Button>}
           <Button small kind="plain" className="danger" onClick={remove} disabled={busy}>Delete</Button>
         </div>
       )}

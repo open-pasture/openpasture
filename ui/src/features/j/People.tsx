@@ -39,7 +39,12 @@ export function People() {
         <ul>
           {list.map((p) => (
             <PersonRow key={p.id} p={p} open={open === p.id} link={links[p.id]}
-              onToggle={() => setOpen(open === p.id ? undefined : p.id)}
+              onToggle={() => {
+                // Opening a line reads everyone again, so what changed since (a phone verified in
+                // its row, a text, another tab) shows.
+                if (open !== p.id) people.list().then(setList, () => {});
+                setOpen(open === p.id ? undefined : p.id);
+              }}
               onLink={(url) => setLinks((l) => ({ ...l, [p.id]: url }))}
               onChanged={changed} onRemoved={() => removed(p.id)} />
           ))}

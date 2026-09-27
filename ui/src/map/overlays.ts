@@ -6,7 +6,10 @@ import type { ReactNode } from "react";
 import type { LonLat, PositionItem } from "../api";
 import { createRegistry } from "../registry";
 import { store } from "../store";
+import { undrawn } from "../store/live";
 import type { Slot } from "./layers";
+import type { DrawKind } from "./draw";
+import type { DrawGeometry } from "./drawn";
 import { ANIMAL_SIZE } from "./animals-model";
 
 export type { Slot } from "./layers";
@@ -27,6 +30,9 @@ export interface OverlayCtx {
   openSheet(node: ReactNode | null): void;
   // Id to pass as addLayer's beforeId to draw in a slot.
   beforeId(slot: Slot): string;
+  // Reshape a shape on the map with the map's own Cancel / Save (as a paddock's Reshape); Save
+  // hands the new shape to `save`, and its error shows beside Save.
+  reshape(geometry: DrawGeometry, kind: DrawKind, save: (g: DrawGeometry) => Promise<unknown>): void;
 }
 
 export interface OverlayHandle {
@@ -52,12 +58,15 @@ export const layers = createRegistry<LayerItem>("layers");
 type PosListener = (changed: string[]) => void;
 
 // Built from the collar list and moved by each positions batch, so overlays never scan the store.
+// Parked collars and removed animals' aren't on the map, so they aren't here either.
 class Positions {
   private map = new Map<string, PositionItem>();
   private listeners = new Set<PosListener>();
   private pending = new Set<string>();
   private queued = false;
   private collars = store.get().collars;
+  private animals = store.get().animals;
+  private hidden = new Set<string>();
   private started = false;
 
   private start() {
@@ -65,10 +74,12 @@ class Positions {
     this.started = true;
     this.rebuild();
     store.subscribe(() => {
-      if (store.get().collars !== this.collars) this.rebuild();
+      const s = store.get();
+      if (s.collars !== this.collars || s.animals !== this.animals) this.rebuild();
     });
     store.onPositions((items) => {
       for (const it of items) {
+        if (this.hidden.has(it.collar_id)) continue;
         const cur = this.map.get(it.collar_id);
         if (cur && Date.parse(cur.fix.at) > Date.parse(it.fix.at)) continue;
         this.map.set(it.collar_id, { ...cur, ...it, animal_id: it.animal_id ?? cur?.animal_id, last_seen: it.last_seen ?? it.fix.at });
@@ -79,9 +90,11 @@ class Positions {
 
   private rebuild() {
     this.collars = store.get().collars;
+    this.animals = store.get().animals;
+    this.hidden = undrawn(this.collars, this.animals);
     const next = new Map<string, PositionItem>();
     for (const c of this.collars) {
-      if (!c.last_fix) continue;
+      if (!c.last_fix || this.hidden.has(c.id)) continue;
       next.set(c.id, { collar_id: c.id, animal_id: c.animal_id, fix: c.last_fix, state: c.state, battery: c.battery, last_seen: c.last_seen });
     }
     for (const id of new Set([...this.map.keys(), ...next.keys()])) {
@@ -176,6 +189,7 @@ export interface MapHost {
   rings: Rings;
   herdId(): string | undefined;
   openSheet(node: ReactNode | null): void;
+  reshape: OverlayCtx["reshape"];
 }
 
 export function overlayCtx(host: MapHost, owner: string): OverlayCtx {
@@ -192,6 +206,7 @@ export function overlayCtx(host: MapHost, owner: string): OverlayCtx {
     },
     openSheet: host.openSheet,
     beforeId: (slot) => slot,
+    reshape: host.reshape,
   };
 }
 

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, type Herd, type ParkReason } from "../../api";
 import { kAnimals, type ImportPreview, type ImportResult, type Mapping, type RowError } from "../../api/k-animals";
 import { guarded, herdBulk, herdColumns, type HerdBulk, type HerdRow } from "../../registry";
@@ -11,21 +11,22 @@ import { MappingRow } from "../../ui/MappingRow";
 import { Table, type Column } from "../../ui/Table";
 import { age, useNow } from "../../util";
 import { Edit } from "./Edit";
-import { battery, by, cardsPossible, day, each, FIELDS, herdRows, keysCsv, mappedRows, reasonWord, rowText, sexWord, type Shown } from "./herd";
+import { battery, by, cardsPossible, day, each, FIELDS, herdOfMost, herdRows, keysCsv, mappedRows, pickedFirst, pickRows, reasonWord, rowText, selectionOf, sexWord, type Shown } from "./herd";
 
 const AnimalPage = lazy(() => import("./AnimalPage").then((m) => ({ default: m.AnimalPage })));
 
-// #/herd: the table. #/herd/<tag>: that animal's page.
+// #/herd: the table. #/herd?select=<collar ids>: the table with those selected (the map's lasso).
+// #/herd/<tag>: that animal's page.
 export function HerdView({ rest }: { rest: string }) {
-  if (rest) return <Suspense fallback={null}><AnimalPage rest={rest} /></Suspense>;
-  return <HerdTable />;
+  if (rest && !rest.startsWith("?")) return <Suspense fallback={null}><AnimalPage rest={rest} /></Suspense>;
+  return <HerdTable select={selectionOf(rest)} />;
 }
 
 const PARK: { value: ParkReason; label: string }[] = [{ value: "charging", label: "Charging" }, { value: "shelf", label: "Shelf" }, { value: "repair", label: "Repair" }];
 
 type Flow = { k: "import"; file: File } | { k: "link"; file: File };
 
-function HerdTable() {
+function HerdTable({ select }: { select: string[] }) {
   const state = useStore((s) => s.state)!;
   const herdId = useStore((s) => s.herdId);
   const animals = useStore((s) => s.animals);
@@ -52,6 +53,22 @@ function HerdTable() {
     setSel((s) => ([...s].every((id) => ids.has(id)) ? s : new Set([...s].filter((id) => ids.has(id)))));
   }, [rows]);
   useEffect(() => () => kAnimalsSlice.patch({ pending: undefined }), []);
+  // A selection handed over: show the herd most of it is in, select those rows and list them
+  // first (until a header sorts), then drop it from the address so a reload starts clean.
+  const handoff = useRef(select.length ? select : undefined);
+  const [first, setFirst] = useState<Set<string>>();
+  useEffect(() => {
+    const ids = handoff.current;
+    if (!ids || !collars.length) return;
+    const target = herdOfMost(collars, ids);
+    if (target && target !== herdId) return void store.setHerd(target);
+    handoff.current = undefined;
+    const picked = pickRows(rows, ids);
+    setSel(picked);
+    setFirst(picked);
+    history.replaceState(null, "", "#/herd");
+  }, [rows, collars, herdId]);
+  const listed = useMemo(() => (first?.size ? pickedFirst(rows, first) : rows), [rows, first]);
 
   const edit = (r: HerdRow, field: Parameters<typeof Edit>[0]["field"], placeholder?: string) =>
     r.animal ? <Edit a={r.animal} field={field} can={canEdit} onError={setMsg} placeholder={placeholder} /> : null;
@@ -175,9 +192,9 @@ function HerdTable() {
       {flow?.k === "link" && <LinkFlow key={flow.file.name + flow.file.lastModified} file={flow.file} herd={herd} onDone={() => setFlow(undefined)} />}
       {msg && <p className="mono err hmsg">{msg}</p>}
       <div className="htable">
-        <Table rows={rows} columns={columns} rowKey={(r) => r.id} text={rowText} query={q}
+        <Table rows={listed} columns={columns} rowKey={(r) => r.id} text={rowText} query={q}
           selected={canSelect && shown === "active" ? sel : undefined} onSelect={canSelect && shown === "active" ? setSel : undefined}
-          initialSort={{ col: "tag", dir: "asc" }} height="100%" />
+          initialSort={handoff.current ? undefined : { col: "tag", dir: "asc" }} height="100%" />
       </div>
     </div>
   );

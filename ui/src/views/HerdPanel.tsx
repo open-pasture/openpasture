@@ -4,7 +4,7 @@ import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
-import { summarize } from "../store/live";
+import { summarize, undrawn } from "../store/live";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { useUnits } from "../units";
 import { age, clock, useNow } from "../util";
@@ -48,7 +48,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   if (!herd) return <aside className="panel" />;
   const all = store.get().collars;
   const names = collarLabels(all, animals);
-  const collars = all.filter((c) => c.herd_id === herd.id)
+  // Parked collars and removed animals' are off duty: not on the map, not counted here.
+  const off = undrawn(all, animals);
+  const collars = all.filter((c) => c.herd_id === herd.id && !off.has(c.id))
     .map((c) => ({ ...c, label: names.get(c.id) ?? c.name }));
   const byId = new Map(collars.map((c) => [c.id, c] as const));
   const latest = decisions[0];
@@ -91,7 +93,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
 
   // The ack count for whatever went out last: pending if one is in flight, else active.
   const b = bstat?.pending ?? bstat?.active;
-  const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied").length : 0;
+  const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied" && byId.has(a.collar_id)).length : 0;
   const done = collars.length > 0 && applied >= collars.length;
   const item = menu.find((m) => m.id === openItem);
 
