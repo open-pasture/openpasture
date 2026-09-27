@@ -7,7 +7,7 @@ import { byDaysLeft, byFitDue, cellText, collarIds, daysText, dueText, squares, 
 describe("coverage squares", () => {
   const c: Coverage = {
     metric: "accuracy", cell_m: 10, unit: "m", size: [0.0002, 0.0001],
-    cells: [[-93.62, 42.03, 2.5, 720], [-93.6198, 42.03, 9.1, 12]],
+    cells: [[-93.62, 42.03, 2.5, 720], [-93.6198, 42.03, 12.1, 12]],
   };
 
   test("each cell is a square of its size around its centre, edge to edge with the next", () => {
@@ -26,7 +26,7 @@ describe("coverage squares", () => {
   });
 
   test("tones: lower accuracy is better, more fixes are better", () => {
-    expect([2.9, 3, 7.9, 8].map((v) => tone("accuracy", v))).toEqual(["good", "fair", "fair", "poor"]);
+    expect([4.9, 5, 9.9, 10].map((v) => tone("accuracy", v))).toEqual(["good", "fair", "fair", "poor"]);
     expect([1, 0.95, 0.94, 0.8, 0.79].map((v) => tone("fixes", v))).toEqual(["good", "good", "fair", "fair", "poor"]);
   });
 

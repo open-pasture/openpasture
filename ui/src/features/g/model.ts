@@ -7,8 +7,9 @@ import type { Fmt } from "../../units";
 
 export type Tone = "good" | "fair" | "poor";
 
-// Accuracy in metres (lower is better); share of fixes that came (higher is better).
-export const ACCURACY_M = { fair: 3, poor: 8 } as const;
+// Accuracy in metres (lower is better; open sky is 1-4 m, and past 10 m a fence margin is
+// guesswork); share of fixes that came (higher is better).
+export const ACCURACY_M = { fair: 5, poor: 10 } as const;
 export const FIXES = { fair: 0.95, poor: 0.8 } as const;
 
 export function tone(metric: CoverageMetric, v: number): Tone {
