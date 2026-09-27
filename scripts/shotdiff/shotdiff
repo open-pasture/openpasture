@@ -1,0 +1,6 @@
+#!/bin/sh
+# Screenshot diffs and frame times of the openpasture UI. Usage: scripts/shotdiff/shotdiff help
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+[ -d "$here/node_modules/playwright-core" ] || (cd "$here" && bun install --frozen-lockfile >/dev/null)
+exec bun "$here/shotdiff.ts" "$@"
