@@ -9,7 +9,8 @@
 //!    decision is still running, failed or missing, one line says so and the
 //!    brief goes on with the rest.
 //! 2. Where it stands: "Reply Y or N." (waiting), "Sends 07:40 unless you
-//!    reply N." (timer), "Sent, 248/250 collars confirmed." (sent).
+//!    reply N." (timer), "Sent, 248/250 collars confirmed." (sent),
+//!    "Stopped 610 ft short, 250/250 collars confirmed." (its move stopped).
 //! 3. The one thing to check, when the decision asks for it.
 //! 4. Up to four reasons from the record, as written there.
 //! 5. Stale or missing data: silent collars, old imagery, a position from the
@@ -218,6 +219,10 @@ async fn sent(ctx: &Ctx, d: &Decision, collars: &[Collar], fmt: &Fmt, tz: chrono
     if let Some(b) = status.active.as_ref().filter(|b| b.decision_id == d.id) {
         let confirmed =
             status.acks.iter().filter(|a| a.version == b.version && a.status == AckStatus::Applied && collars.iter().any(|c| c.id == a.collar_id)).count();
+        // Someone stopped this decision's move before the target: the collars hold where it stopped.
+        if let Some(short) = stopped_short(ctx, &d.id).await? {
+            return Ok(format!("Stopped {} short, {confirmed}/{} collars confirmed.", fmt.len(short), collars.len()));
+        }
         let to_go = status
             .r#move
             .as_ref()
@@ -230,6 +235,18 @@ async fn sent(ctx: &Ctx, d: &Decision, collars: &[Collar], fmt: &Fmt, tz: chrono
         return Ok(format!("Sent, opens {}.", clock(at, tz, now)));
     }
     Ok("Sent.".into())
+}
+
+/// How far short of its target the decision's move stopped (metres), when it was stopped.
+/// Read from the move itself: the boundary status shows an ended move only briefly.
+async fn stopped_short(ctx: &Ctx, decision_id: &str) -> anyhow::Result<Option<f64>> {
+    let left: Option<f64> =
+        sqlx::query_scalar("SELECT remaining_m FROM moves WHERE decision_id = ? AND status = 'stopped' ORDER BY started_at DESC, id DESC LIMIT 1")
+            .bind(decision_id)
+            .fetch_optional(ctx.db())
+            .await?;
+    // Stopped with nothing left to go is as good as there.
+    Ok(left.filter(|m| *m >= 1.0))
 }
 
 /// Stale or missing data behind today's call.
