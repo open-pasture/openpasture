@@ -67,6 +67,8 @@ pub struct Cut {
     pub head: u32,
     pub days: f64,
     pub head_days: f64,
+    /// (head, days) of each stretch at one count, in time order.
+    pub counts: Vec<(u32, f64)>,
     /// The head count changed inside the cut.
     pub recounted: bool,
 }
@@ -207,12 +209,14 @@ impl Farm {
         self.herds.get(herd_id).and_then(|s| s.last()).map(|s| s.species.clone()).unwrap_or_else(|| "cattle".into())
     }
 
-    pub fn au_per_head(&self, herd_id: &str) -> f64 {
-        self.inputs.au_per_head(herd_id, &self.species(herd_id))
+    /// Animal units of the herd at `count` head.
+    pub fn animal_units(&self, herd_id: &str, count: u32) -> f64 {
+        self.inputs.animal_units(herd_id, &self.species(herd_id), count)
     }
 
-    pub fn pair_share(&self, herd_id: &str) -> Option<f64> {
-        self.inputs.pair_share(herd_id, &self.species(herd_id))
+    /// Cow-calf pairs in the herd at `count` head, when its mix says so.
+    pub fn pairs(&self, herd_id: &str, count: u32) -> Option<f64> {
+        self.inputs.pairs(herd_id, &self.species(herd_id), count)
     }
 
     /// Herds the report covers: the one asked for, else every herd with history.
@@ -300,6 +304,18 @@ impl Cut {
     }
 }
 
+impl Cut {
+    /// Animal-unit days of `herd_id` in the cut, each stretch at its count's animal units.
+    pub fn au_days(&self, farm: &Farm, herd_id: &str) -> f64 {
+        self.counts.iter().map(|(c, d)| farm.animal_units(herd_id, *c) * d).sum()
+    }
+
+    /// Pair-days of `herd_id` in the cut, when its mix names pairs.
+    pub fn pair_days(&self, farm: &Farm, herd_id: &str) -> Option<f64> {
+        self.counts.iter().map(|(c, d)| farm.pairs(herd_id, *c).map(|p| p * d)).sum()
+    }
+}
+
 impl Stay {
     /// The part of the stay inside `[w0, w1)`; `now` tells an open stay.
     pub fn cut(&self, w0: DateTime<Utc>, w1: DateTime<Utc>, now: DateTime<Utc>) -> Option<Cut> {
@@ -310,15 +326,16 @@ impl Stay {
         }
         let mut head_days = 0.0;
         let mut head = None;
-        let mut counts = BTreeSet::new();
+        let mut counts = Vec::new();
         for p in &self.parts {
             let (a, b) = (p.start.max(start), p.end.unwrap_or(DateTime::<Utc>::MAX_UTC).min(stop));
             if b > a {
                 head.get_or_insert(p.count);
-                counts.insert(p.count);
+                counts.push((p.count, days(b - a)));
                 head_days += p.count as f64 * days(b - a);
             }
         }
+        let recounted = counts.iter().map(|(c, _)| *c).collect::<BTreeSet<_>>().len() > 1;
         let open = self.end.is_none() && w1 >= now;
         let cut_end = stop < end && !open;
         Some(Cut {
@@ -330,7 +347,8 @@ impl Stay {
             head: head.unwrap_or(0),
             days: days(stop - start),
             head_days,
-            recounted: counts.len() > 1,
+            counts,
+            recounted,
         })
     }
 }
@@ -427,7 +445,12 @@ pub fn au_note(farm: &Farm, herd_ids: &[String]) -> Option<String> {
                 if m.calves > 0 && !m.pairs {
                     what.push(format!("{} weaned calves", m.calves));
                 }
-                mixed.push(format!("{} {}", farm.herd_name(h), what.join(", ")));
+                // The head count the mix's animal units stand at (other counts scale them).
+                let mut at = format!("{} AU at {} head", fmt_au(m.animal_units(&farm.inputs.settings.au)), m.head_at(0));
+                if m.pairs && m.cows > 0 {
+                    at += &format!(", or at {} head counting calves at side", m.head_at(u32::MAX));
+                }
+                mixed.push(format!("{} {}: {at}", farm.herd_name(h), what.join(", ")));
             }
             None => {
                 species.insert(sp);
@@ -449,6 +472,12 @@ pub fn au_note(farm: &Farm, herd_ids: &[String]) -> Option<String> {
         ));
     }
     Some(format!("Animal units per head: {}.", parts.join("; ")))
+}
+
+/// "130.5", "143" (one decimal, dropped when zero).
+fn fmt_au(v: f64) -> String {
+    let s = format!("{:.1}", round(v, 1));
+    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
 }
 
 fn fmt_factor(v: f64) -> String {

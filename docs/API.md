@@ -984,9 +984,12 @@ that move marked `grazed_until`), head counts at the count on upgrade day, which
 one paddock; head is the count on the day in and head-days follow every count change inside it.
 Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
-exists. Animal units per head: the herd's mix with the `au` factors when a cattle herd has one
-(with `pairs` a cow and her calf are one head at the pair factor), else `cattle 1.0`, `sheep 0.2`,
-`goats 0.15`.
+exists. Animal units: the herd's mix with the `au` factors when a cattle herd has one, else
+`cattle 1.0`, `sheep 0.2`, `goats 0.15` per head. A mix's AU stand at its head count and scale with
+the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor, and a
+count nearer cows × 2 + bulls than cows + bulls counts each calf at side as a head (calves registered
+as animals): 100 pairs are 130 AU at 100 head or at 200, never 260. The method note gives both
+counts.
 
 - `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
   head-days, AU-days, stocking density, rest before in), then a line per paddock.

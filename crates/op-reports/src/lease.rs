@@ -66,9 +66,9 @@ pub fn usage(farm: &Farm, stays: &[history::Stay], l: &Lease, p: &ReportParams) 
     for s in stays.iter().filter(|s| s.paddock_id == l.paddock_id && p.herd_id.as_ref().is_none_or(|h| *h == s.herd_id)) {
         let Some(c) = s.cut(a, z, farm.now) else { continue };
         u.head_days += c.head_days;
-        u.au_days += c.head_days * farm.au_per_head(&s.herd_id);
-        u.pair_days = match (u.pair_days, farm.pair_share(&s.herd_id)) {
-            (Some(d), Some(share)) => Some(d + c.head_days * share),
+        u.au_days += c.au_days(farm, &s.herd_id);
+        u.pair_days = match (u.pair_days, c.pair_days(farm, &s.herd_id)) {
+            (Some(d), Some(pairs)) => Some(d + pairs),
             _ => None,
         };
     }

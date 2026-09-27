@@ -43,8 +43,8 @@ pub struct ReportsSettings {
     pub au: AuFactors,
 }
 
-/// What a cattle herd is made of. With `pairs`, each cow has a calf at side:
-/// the pair is one head (counted at the pair factor) and `calves` is ignored.
+/// What a cattle herd is made of. With `pairs`, each cow has a calf at side,
+/// the pair counted at the pair factor, and `calves` is ignored.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HerdMix {
@@ -55,8 +55,33 @@ pub struct HerdMix {
 }
 
 impl HerdMix {
+    /// Head the mix names, a pair as one head.
     fn head(&self) -> u32 {
         self.cows + self.bulls + if self.pairs { 0 } else { self.calves }
+    }
+
+    /// The head count the mix's animal units stand at, for a herd of `count`
+    /// head: a pair as one head, or, when `count` is nearer that, a pair as
+    /// two (its calf registered as an animal of its own). A calf at side is
+    /// in its pair's factor either way, so counting calves never adds AU.
+    pub fn head_at(&self, count: u32) -> u32 {
+        let one = self.head();
+        let two = one + self.cows;
+        if self.pairs && count.abs_diff(two) < count.abs_diff(one) { two } else { one }
+    }
+
+    /// How much of the mix a herd of `count` head is.
+    fn share(&self, count: u32) -> f64 {
+        count as f64 / self.head_at(count).max(1) as f64
+    }
+
+    /// The mix's animal units.
+    pub fn animal_units(&self, f: &AuFactors) -> f64 {
+        if self.pairs {
+            self.cows as f64 * f.pair + self.bulls as f64 * f.bull
+        } else {
+            self.cows as f64 * f.cow + self.bulls as f64 * f.bull + self.calves as f64 * f.weaned_calf
+        }
     }
 }
 
@@ -102,26 +127,19 @@ impl Inputs {
         self.herds.get(herd_id).and_then(|h| h.mix).filter(|m| species == "cattle" && m.head() > 0)
     }
 
-    /// Animal units per head: from the herd's mix and the AU factors when
-    /// set, else the species factor of `calc::animal_units`.
-    pub fn au_per_head(&self, herd_id: &str, species: &str) -> f64 {
+    /// Animal units of the herd at `count` head: its mix's, by the AU
+    /// factors, when one is set ([`HerdMix::share`] of them), else the species
+    /// factor of `calc::animal_units` per head.
+    pub fn animal_units(&self, herd_id: &str, species: &str, count: u32) -> f64 {
         match self.mix(herd_id, species) {
-            Some(m) => {
-                let f = self.settings.au;
-                let au = if m.pairs {
-                    m.cows as f64 * f.pair + m.bulls as f64 * f.bull
-                } else {
-                    m.cows as f64 * f.cow + m.bulls as f64 * f.bull + m.calves as f64 * f.weaned_calf
-                };
-                au / m.head() as f64
-            }
-            None => op_engine::calc::animal_units(species, 1, None),
+            Some(m) => m.animal_units(&self.settings.au) * m.share(count),
+            None => op_engine::calc::animal_units(species, 1, None) * count as f64,
         }
     }
 
-    /// The share of head that are cow-calf pairs, when the mix says so.
-    pub fn pair_share(&self, herd_id: &str, species: &str) -> Option<f64> {
-        self.mix(herd_id, species).filter(|m| m.pairs).map(|m| m.cows as f64 / m.head() as f64)
+    /// Cow-calf pairs in the herd at `count` head, when the mix says so.
+    pub fn pairs(&self, herd_id: &str, species: &str, count: u32) -> Option<f64> {
+        self.mix(herd_id, species).filter(|m| m.pairs).map(|m| m.cows as f64 * m.share(count))
     }
 
     fn validate(&self) -> Result<(), String> {

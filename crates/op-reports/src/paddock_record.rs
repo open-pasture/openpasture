@@ -18,7 +18,10 @@ pub struct PaddockRecord;
 pub struct Event<'a> {
     pub stay: &'a Stay,
     pub cut: Cut,
-    pub au_per_head: f64,
+    /// Animal units on the first day.
+    pub au: f64,
+    /// Animal-unit days: each stretch of the cut at its count's animal units.
+    pub au_days: f64,
     /// AU on the first day, per hectare of the paddock then.
     pub au_per_ha: Option<f64>,
     pub area_ha: Option<f64>,
@@ -28,11 +31,11 @@ pub struct Event<'a> {
 
 impl Event<'_> {
     pub fn au(&self) -> f64 {
-        self.cut.head as f64 * self.au_per_head
+        self.au
     }
 
     pub fn au_days(&self) -> f64 {
-        self.cut.head_days * self.au_per_head
+        self.au_days
     }
 }
 
@@ -44,14 +47,15 @@ pub async fn events<'a>(ctx: &Ctx, farm: &Farm, stays: &'a [Stay], p: &ReportPar
     for s in stays.iter().filter(|s| p.herd_id.as_ref().is_none_or(|h| *h == s.herd_id)) {
         let Some(cut) = s.cut(w0, w1, farm.now) else { continue };
         let area_ha = farm.area_at(&s.paddock_id, cut.start);
-        let au_per_head = farm.au_per_head(&s.herd_id);
+        let au = farm.animal_units(&s.herd_id, cut.head);
         out.push(Event {
             stay: s,
-            au_per_ha: area_ha.filter(|a| *a > 0.0).map(|a| cut.head as f64 * au_per_head / a),
+            au_per_ha: area_ha.filter(|a| *a > 0.0).map(|a| au / a),
             area_ha,
             rest_days: farm.rest_before(stays, &s.paddock_id, s.start),
             collar_days: history::collar_days_in(dwell.get(&(s.herd_id.clone(), s.paddock_id.clone())), &cut),
-            au_per_head,
+            au,
+            au_days: cut.au_days(farm, &s.herd_id),
             cut,
         });
     }

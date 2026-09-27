@@ -364,8 +364,61 @@ async fn a_mix_sets_animal_units_and_a_stay_running_now_has_no_out() {
     assert_eq!(column(ev, "au"), [json!(130.5)]);
     assert_eq!(column(ev, "out"), [Value::Null]);
     let notes = doc["notes"].as_array().unwrap();
-    assert!(notes.contains(&json!("Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 90 pairs, 10 bulls).")), "{notes:?}");
+    let note = "Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 90 pairs, 10 bulls: 130.5 AU at 100 head, or at 190 head counting calves at side).";
+    assert!(notes.contains(&json!(note)), "{notes:?}");
     assert!(notes.contains(&json!("A blank out date means the herd is still there; its days run to now.")));
+}
+
+#[tokio::test]
+async fn a_pair_mix_reads_calves_registered_as_head_as_calves_at_side() {
+    // 100 cows and their 100 calves registered as animals: the herd counts 200.
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Pairs", 200, Some(&f.p2)).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z"]).await;
+    app.ok("PUT", "/api/reports/settings", json!({"herds": {h.clone(): {"mix": {"cows": 100, "pairs": true}}}})).await;
+    app.ok("PUT", &format!("/api/leases/{}", f.p2), json!({"landowner": "Jane Doe", "rate_per": "pair_month", "rate_amount": 30.0})).await;
+
+    // Sep 1 12:00 UTC to Oct 1 05:00 UTC: 29 days 17 hours at 200 head.
+    let hd = 200.0 * (29.0 + 17.0 / 24.0);
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    // 100 pairs × 1.3 = 130 AU over 200 head, not 200 × 1.3 = 260.
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(200)], vec![json!(130.0)]));
+    assert_eq!(column(ev, "head_days"), [json!(round(hd, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(round(hd * 0.65, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(3862.1)]);
+    let notes = doc["notes"].as_array().unwrap();
+    let note =
+        "Animal units per head: cow 1.0, bull 1.35, pair 1.3, weaned calf 0.5 (Pairs 100 pairs: 130 AU at 100 head, or at 200 head counting calves at side).";
+    assert!(notes.contains(&json!(note)), "{notes:?}");
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "au"), column(rec, "aud")), (vec![json!(130.0)], vec![json!(3862.1)]));
+
+    // 100 pairs a day: 5,941.7 head-days are 2,970.8 pair-days, 97.7 pair-months, $2,931.74.
+    let s = &app.report("lease_head_days", SEPT).await["sections"][0];
+    assert_eq!(column(s, "pair_months"), [json!(97.7)]);
+    assert_eq!(column(s, "amount"), [json!(round(hd / 2.0 / 30.4 * 30.0, 2))]);
+    assert_eq!(column(s, "amount"), [json!(2931.74)]);
+
+    // Weaned in October: the calves leave and the count drops to 100, a pair
+    // to a head. September still reads 200 head as 130 AU; October, 100 head
+    // at 1.3 AU each is the same 130.
+    patch_herd(&app, &h, json!({"count": 100})).await;
+    sqlx::query("UPDATE herd_history SET at = '2025-10-01T12:00:00.000Z' WHERE herd_id = ? AND count = 100").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let doc = app.report("paddock_record", "from=2025-09-01&to=2025-10-02").await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(200)], vec![json!(130.0)]));
+    // Sep 1 12:00 to Oct 1 12:00 UTC at 200 head (30 days), then to the end
+    // of Oct 2 (Oct 3 05:00 UTC) at 100 head (1 d 17 h): 130 AU all along.
+    let days = 30.0 + 1.0 + 17.0 / 24.0;
+    assert_eq!(column(ev, "au_days"), [json!(round(130.0 * days, 1))]);
+    assert_eq!(column(ev, "au_days"), [json!(4122.1)]);
+    // Sold down to 90 pairs, a pair to a head, on Oct 2: 90 × 1.3.
+    patch_herd(&app, &h, json!({"count": 90})).await;
+    sqlx::query("UPDATE herd_history SET at = '2025-10-02T12:00:00.000Z' WHERE herd_id = ? AND count = 90").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let doc = app.report("paddock_record", "from=2025-10-03&to=2025-10-03").await;
+    assert_eq!(column(&doc["sections"][0], "au"), [json!(117.0)]);
 }
 
 #[tokio::test]
