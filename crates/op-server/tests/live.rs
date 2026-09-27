@@ -96,8 +96,12 @@ async fn gather(ws: &mut Ws, wait: Duration) -> Vec<Value> {
     out
 }
 
+/// Messages of type `ty`, including those inside a `batch` of several herds' batches.
 fn of<'a>(msgs: &'a [Value], ty: &str) -> Vec<&'a Value> {
-    msgs.iter().filter(|m| m["type"] == ty).collect()
+    msgs.iter()
+        .flat_map(|m| if m["type"] == "batch" { m["events"].as_array().into_iter().flatten().collect() } else { vec![m] })
+        .filter(|m| m["type"] == ty)
+        .collect()
 }
 
 fn fix(i: usize) -> Fix {
@@ -137,11 +141,11 @@ async fn a_sweep_steps_acks_arrive_as_at_most_two_ack_batches() {
     // A sweep step as device.rs publishes it: each collar acks received, then
     // applied, each ack followed by the collar (whose boundary_version moves on applied).
     for c in &f.collars {
-        f.ctx.publish(Event::Ack { collar_id: c.id.clone(), herd_id: f.herd.clone(), version: 7, status: AckStatus::Received, reason: None });
+        f.ctx.publish(Event::Ack { collar_id: c.id.clone(), herd_id: f.herd.clone(), version: 7, status: AckStatus::Received, reason: None, code: None });
         f.ctx.publish(Event::Collar { collar: c.clone() });
     }
     for c in &f.collars {
-        f.ctx.publish(Event::Ack { collar_id: c.id.clone(), herd_id: f.herd.clone(), version: 7, status: AckStatus::Applied, reason: None });
+        f.ctx.publish(Event::Ack { collar_id: c.id.clone(), herd_id: f.herd.clone(), version: 7, status: AckStatus::Applied, reason: None, code: None });
         f.ctx.publish(Event::Collar { collar: Collar { boundary_version: Some(7), ..c.clone() } });
     }
     let msgs = gather(&mut ws, Duration::from_millis(1500)).await;
