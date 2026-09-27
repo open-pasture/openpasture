@@ -4,7 +4,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use op_core::Ctx;
+use op_core::{Ctx, Identity, Via};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -17,7 +17,9 @@ impl App {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::open(dir.path()).await.unwrap();
-        Self { router: op_core::router().with_state(ctx), _dir: dir }
+        // The owner on this machine, as op-server's guard would resolve it.
+        let router = op_core::with_identity(op_core::router().with_state(ctx), Identity::owner(Via::Local));
+        Self { router, _dir: dir }
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
