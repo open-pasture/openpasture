@@ -22,12 +22,13 @@ export const DEFAULT_WARN_M = 5;
 
 const browserTz = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-export function SendOptions({ opts, onChange }: { opts: Opts; onChange: (o: Opts) => void }) {
+export function SendOptions({ opts, onChange, defaultWarn = DEFAULT_WARN_M }: { opts: Opts; onChange: (o: Opts) => void; defaultWarn?: number }) {
   const u = useUnits();
   const tz = useStore((s) => s.state?.farm?.timezone) ?? browserTz();
   const [edit, setEdit] = useState<"warn" | "at">();
   const warnBox = useRef<HTMLSpanElement>(null);
-  const warn = opts.warn_m ?? DEFAULT_WARN_M;
+  // The herd's training warn while its training mode is on (H), else the collars' default.
+  const warn = opts.warn_m ?? defaultWarn;
   useEffect(() => {
     if (edit === "warn") warnBox.current?.querySelector("input")?.select();
   }, [edit]);

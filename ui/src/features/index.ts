@@ -34,6 +34,7 @@ import "./c";
 // @S
 // @A3
 // @H
+import "./h";
 // @L
 // @M
 // @Z
