@@ -356,11 +356,13 @@ async fn an_empty_herd_left_in_a_paddock_is_not_grazing_it() {
     let c = t.check(json!({ "geometry": p2() })).await;
     assert_eq!(c["facts"]["rest_days"], 40.0, "{}", c["facts"]);
     assert!(!codes(&c).contains(&"rested_short"), "{:?}", codes(&c));
+    // The Rest layer: rested 40 days, not drawn as grazed now.
     let layer = || async {
         let l = t.ok("GET", "/api/layers/paddocks", json!(null)).await;
-        l["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap()["rest_days"].clone()
+        let p = l["paddocks"].as_array().unwrap().iter().find(|p| p["paddock_id"] == t.p2.as_str()).unwrap().clone();
+        (p["rest_days"].clone(), p.get("grazing").cloned().unwrap_or(json!(false)))
     };
-    assert_eq!(layer().await, 40.0);
+    assert_eq!(layer().await, (json!(40.0), json!(false)));
     // A height taken 10 days ago, grazed down since (grazed_until 2 days ago):
     // no herd with head is there now, so it no longer counts.
     t.ok("POST", &format!("/api/paddocks/{}/heights", t.p2), json!({ "height_cm": 25.4, "at": ts(Utc::now() - Duration::days(10)) })).await;
@@ -374,7 +376,7 @@ async fn an_empty_herd_left_in_a_paddock_is_not_grazing_it() {
     // Three head back in Training: P2 is being grazed now.
     t.ok("PATCH", &format!("/api/herds/{}", training["id"].as_str().unwrap()), json!({ "count": 3 })).await;
     assert_eq!(t.check(json!({ "geometry": p2() })).await["facts"]["rest_days"], 0.0);
-    assert_eq!(layer().await, 0.0);
+    assert_eq!(layer().await, (json!(0.0), json!(true)));
     let f = p2_forage().await;
     assert_eq!((f["source"].as_str(), f["height_cm"].as_f64()), (Some("measured"), Some(25.4)), "{f}");
 }

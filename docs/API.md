@@ -1038,7 +1038,7 @@ MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
 | POST | `/api/paddocks/:id/heights` | `{ height_cm, residual_cm?, at? }` (hand and up) | 201 `Height` |
 
 ```ts
-PaddockLayer { paddock_id, grazing?: true /* a herd is in it now */, rest_days?, last_grazed?,
+PaddockLayer { paddock_id, grazing?: true /* a herd with head is in it now */, rest_days?, last_grazed?,
                ndvi?, ndvi_at? /* YYYY-MM-DD of the imagery */,
                drought?: { category: "D0"|"D1"|"D2"|"D3"|"D4"|null /* null: not in drought */ },
                flood?: { in_floodplain: boolean, zone?, risk?: "medium"|"high" /* 3-day forecast */ } }

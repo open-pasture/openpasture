@@ -94,7 +94,10 @@ pub async fn paddock_layers(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Lay
         let (current, _, _, _) = context::locate(ctx, h, &paddocks).await?;
         let history = db::list(ctx, Some(&h.id), 10).await?;
         merge(signals::last_grazed(ctx, Some(h), &paddocks, current.as_deref(), &history, now).await?);
-        grazing.extend(current);
+        // An empty herd left in a paddock isn't grazing it (signals::last_grazed).
+        if h.count > 0 {
+            grazing.extend(current);
+        }
     }
     let rest = calc::rest_days(&last, now);
 
