@@ -489,6 +489,12 @@ async fn settings_report_secrets_as_set_and_never_their_values() {
             assert_eq!(v["error"], words, "{body}");
         }
     }
+    // The view sent back as it came changes nothing.
+    let (_, view) = call(&a, "GET", "/api/notify/channels", None).await;
+    let (s, again) = call(&a, "PUT", "/api/notify/channels", Some(view.clone())).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert_eq!(again, view);
+
     // Refused requests change nothing.
     assert_eq!(call(&a, "GET", "/api/notify/channels", None).await.1["sms"]["from"], "+15155550100");
 }

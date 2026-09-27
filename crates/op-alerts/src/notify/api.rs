@@ -65,7 +65,8 @@ async fn get_channels(State(ctx): State<Ctx>) -> ApiResult<Json<ChannelsView>> {
 async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<ChannelsView>> {
     let Value::Object(mut body) = body else { return Err(ApiError::bad_request("Expected a JSON object.")) };
     let secrets = match body.remove("secrets") {
-        None | Some(Value::Null) => Map::new(),
+        // An array is the GET view's `[{name, set}]` sent back: nothing to change.
+        None | Some(Value::Null) | Some(Value::Array(_)) => Map::new(),
         Some(Value::Object(m)) => m,
         Some(_) => return Err(ApiError::bad_request("secrets is an object of names and values.")),
     };
