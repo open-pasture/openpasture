@@ -24,6 +24,7 @@ import "./k-files";
 // @P
 // @Q
 // @C
+import "./c";
 // @F
 // @S
 // @A3

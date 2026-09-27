@@ -11,6 +11,7 @@
 //! - [`shape`]: the shape rules a collar checks, and fitting a shape to a
 //!   collar's limits.
 //! - [`exclude`]: exclusions cut, holed, joined or dropped on a boundary.
+//! - [`strip`]: parallel strips across a paddock for strip grazing.
 //!
 //! Coordinates are `[longitude, latitude]`, WGS 84, as in GeoJSON.
 
@@ -23,6 +24,7 @@ pub mod polygon;
 pub mod projection;
 pub mod ring;
 pub mod shape;
+pub mod strip;
 
 pub use clip::{RingError, subtract_ring, union_rings};
 pub use cue::{Cue, CueCommand, CueConfig, CueKind, CueMode, Episode, EpisodeOutcome, EpisodeTracker};
