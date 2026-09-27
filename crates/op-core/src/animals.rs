@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{SqliteConnection, SqliteExecutor};
 
-use crate::domain::{Animal, Collar, Sex};
+use crate::domain::{Animal, Collar, DbEnum, Sex};
 use crate::error::{ApiError, ApiResult};
 use crate::identity::Role;
 use crate::tools::{ToolCall, ToolSpec};
@@ -225,31 +225,38 @@ pub async fn sync_after_leaving<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -
     Ok(row.map(|(n,)| n.max(0) as u32))
 }
 
-/// After an animal of `herd_id` was marked removed as of `at`: the count
-/// drops by it now, and a removal dated earlier takes the head off the
-/// herd's history from that date too ([`backdate_removal`]), so reports stop
-/// counting it then. One write transaction.
+/// Take an animal off the farm as `a` says (`removed_at`, `removed_reason`;
+/// its collar comes off) and off its herd's count: the count drops by it
+/// now, and a removal dated earlier takes the head off the herd's history
+/// from that date too ([`backdate_removal`]), so reports stop counting it
+/// then. `false` when the animal was already removed (or is gone): nothing
+/// changes then.
 ///
-/// The count still holds every animal marked removed since it was last
-/// counted, so it drops by this one only: two removals whose animals were
-/// both marked before either count ran each take their own head off from
-/// their own date. A count that holds no removed animal is left to
-/// [`sync_herd_count`].
-pub async fn count_removal(ctx: &Ctx, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+/// The mark, the collar coming off and the count are one write transaction,
+/// so the history counted the animal up to here and nothing else has
+/// counted its removal: its head comes off from its date, the count drops by
+/// one, and then follows the herd's active animals, taking in an animal
+/// added or moved at the same moment whose own recount hasn't run yet (its
+/// recount then finds nothing to change). No guess from the count and the
+/// animals, which such an animal throws off.
+pub async fn remove_animal(ctx: &Ctx, a: &Animal) -> anyhow::Result<bool> {
+    let at = a.removed_at.ok_or_else(|| anyhow::anyhow!("remove_animal needs removed_at"))?;
     let mut tx = store::begin_immediate(ctx.db()).await?;
-    let counts: Option<(i64, i64)> =
-        sqlx::query_as("SELECT count, (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL) FROM herds WHERE id = ?1")
-            .bind(herd_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if counts.is_some_and(|(count, active)| count > active) {
-        backdate_removal(&mut tx, herd_id, animal_id, at).await?;
-        sqlx::query("UPDATE herds SET count = count - 1 WHERE id = ?").bind(herd_id).execute(&mut *tx).await?;
-    } else {
-        sync_herd_count(&mut *tx, herd_id).await?;
+    let marked = sqlx::query("UPDATE animals SET removed_at = ?, removed_reason = ?, collar_id = NULL WHERE id = ? AND removed_at IS NULL")
+        .bind(time::to_db(&at))
+        .bind(a.removed_reason.map(|r| r.as_db()))
+        .bind(&a.id)
+        .execute(&mut *tx)
+        .await?;
+    if marked.rows_affected() == 0 {
+        return Ok(false);
     }
+    sqlx::query("UPDATE collars SET animal_id = NULL WHERE animal_id = ?").bind(&a.id).execute(&mut *tx).await?;
+    backdate_removal(&mut tx, &a.herd_id, &a.id, at).await?;
+    sqlx::query("UPDATE herds SET count = MAX(count - 1, 0) WHERE id = ?").bind(&a.herd_id).execute(&mut *tx).await?;
+    sync_herd_count(&mut *tx, &a.herd_id).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// An animal of `herd_id` left the farm at `at` but is only now taken off
@@ -258,17 +265,18 @@ pub async fn count_removal(ctx: &Ctx, herd_id: &str, animal_id: &str, at: DateTi
 /// herd was in then): head-days, AU-days and AUM run at the lower count from
 /// the day it left, not from the day it was entered. A date at or before the
 /// animal's record began means it never counted: the rows from its record on
-/// drop, and nothing before them changes. Call before the count itself
-/// changes (the trigger's row for that is right as it is). Nothing happens
-/// for a time that isn't in the past.
+/// drop, and nothing before them changes (even for a record begun this
+/// very millisecond). Call before the count itself changes (the trigger's
+/// row for that is right as it is). A removal dated now or later changes
+/// nothing here.
 pub async fn backdate_removal(conn: &mut SqliteConnection, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+    if at >= time::now() {
+        return Ok(());
+    }
     let created: Option<String> = sqlx::query_scalar("SELECT created_at FROM animals WHERE id = ?").bind(animal_id).fetch_optional(&mut *conn).await?;
     let created = created.as_deref().map(time::from_db).transpose()?;
     let from_record = created.is_some_and(|c| at <= c);
     let at = created.filter(|_| from_record).unwrap_or(at);
-    if at >= time::now() {
-        return Ok(());
-    }
     let at_db = time::to_db(&at);
     let exact: Option<i64> =
         sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? AND at = ? LIMIT 1").bind(herd_id).bind(&at_db).fetch_optional(&mut *conn).await?;

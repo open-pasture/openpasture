@@ -428,6 +428,57 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
     assert_eq!(events[0].payload["by"], "Cody");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removals_and_new_animals_at_once_each_count_from_their_own_date() {
+    // Five sold on Sep 20 are entered while five new ones are registered in
+    // the same herd. A new animal recounts the herd; landing between a
+    // removal's mark and its count, it used to take that removal's backdate
+    // with it, so the sold head kept counting until they were entered.
+    let app = App::new().await;
+    let csv: String = std::iter::once("Tag\n".to_owned()).chain((1..=20).map(|i| format!("{i}\n"))).collect();
+    let p = app.preview(csv.into_bytes()).await;
+    assert_eq!(app.commit(&p).await["created"], 20);
+    for sql in [
+        "UPDATE herd_history SET at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+        "UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+    ] {
+        sqlx::query(sql).bind(&app.herd).execute(app.ctx.db()).await.unwrap();
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 1..=5 {
+        let (router, removed, new) = (app.router.clone(), herd_animal_id(&app, &i.to_string()).await, format!("{}", 100 + i));
+        let herd = app.herd.clone();
+        tasks.spawn(async move {
+            let call = |path: String, body: Value| {
+                let router = router.clone();
+                async move {
+                    let req =
+                        Request::builder().method("POST").uri(path).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+                    router.oneshot(req).await.unwrap().status()
+                }
+            };
+            let (a, b) = tokio::join!(
+                call(format!("/api/animals/{removed}/remove"), json!({"reason": "sold", "at": "2026-09-20T15:00:00Z"})),
+                call("/api/animals".into(), json!({"tag": new, "herd_id": herd})),
+            );
+            assert_eq!((a, b), (StatusCode::OK, StatusCode::CREATED));
+        });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.unwrap();
+    }
+    assert_eq!(app.count().await, 20);
+    // 20 head from Sep 1, 15 from Sep 20 until the new ones came today.
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&app.herd).fetch_all(app.ctx.db()).await.unwrap();
+    let before_today: Vec<(&str, i64)> = rows.iter().filter(|(at, _)| at.as_str() < "2026-09-26").map(|(at, n)| (at.get(..10).unwrap(), *n)).collect();
+    assert_eq!(before_today.last(), Some(&("2026-09-20", 15)), "{rows:?}");
+    assert_eq!(before_today.iter().rev().find(|(at, _)| *at == "2026-09-01").map(|(_, n)| *n), Some(20), "{rows:?}");
+    assert_eq!(before_today.len(), 3, "{rows:?}");
+    // Today's rows run from 15 plus the new ones, back to 20 once all are in.
+    assert_eq!(rows.last().map(|(_, n)| *n), Some(20), "{rows:?}");
+}
+
 async fn herd_animal_id(app: &App, tag: &str) -> String {
     app.ctx.store().list_animals(Some(&app.herd)).await.unwrap().into_iter().find(|a| a.tag == tag).unwrap().id
 }

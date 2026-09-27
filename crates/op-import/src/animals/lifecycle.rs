@@ -54,11 +54,13 @@ async fn remove(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<Strin
     }
     let collar = a.collar_id.clone();
     let next = Animal { removed_at: Some(at), removed_reason: Some(b.reason), collar_id: None, ..a };
-    ctx.store().update_animal(&next).await?;
+    // Marked and counted together: the removal's date reaches the history.
+    if !op_core::animals::remove_animal(&ctx, &next).await? {
+        return Err(ApiError::conflict(format!("{} was already removed.", next.tag)));
+    }
     if let Some(c) = &collar {
         op_ingest::park_collar(&ctx, c, ParkReason::Shelf).await?;
     }
-    op_core::animals::count_removal(&ctx, &next.herd_id, &next.id, at).await?;
     ctx.publish(Event::AnimalsChanged { herd_id: Some(next.herd_id.clone()) });
     let mut payload = json!({ "animal_id": next.id, "reason": b.reason, "at": at });
     if let Some(c) = &collar {

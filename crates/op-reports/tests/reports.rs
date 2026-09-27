@@ -685,9 +685,9 @@ async fn sold_late(app: &App) -> (Farm, String) {
     let at = op_core::time::from_db("2025-09-11T12:00:00.000Z").unwrap();
     for id in &ids[..5] {
         let a = app.ctx.store().get_animal(id).await.unwrap().unwrap();
-        app.ctx.store().update_animal(&op_core::Animal { removed_at: Some(at), removed_reason: Some(op_core::RemovedReason::Sold), ..a }).await.unwrap();
         // What POST /api/animals/{id}/remove {at} does to the count and its history.
-        op_core::animals::count_removal(&app.ctx, &h, id, at).await.unwrap();
+        let sold = op_core::Animal { removed_at: Some(at), removed_reason: Some(op_core::RemovedReason::Sold), ..a };
+        assert!(op_core::animals::remove_animal(&app.ctx, &sold).await.unwrap());
     }
     assert_eq!(app.ctx.store().get_herd(&h).await.unwrap().unwrap().count, 15);
     (f, h)

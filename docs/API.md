@@ -842,7 +842,9 @@ removed), kept by every create, delete, herd change, import, remove and swap; `P
 goes to 0, and with no animal rows left the farmer can set it again. A removal dated earlier (`at`)
 takes the head off the herd's history from that date, so reports count it only until it left: each
 `herd_history` row from `at` on drops by one and a row at `at` starts the lower count (a date before
-the animal's record began counts from the record).
+the animal's record began counts from the record). The mark and the count are one write, so an
+animal added or moved in the herd at the same moment never takes a removal's backdate with it; a
+second remove of the same animal is 409.
 
 **Import.** The preview guesses the mapping from the header (Tag, Visual ID, Ear tag; EID, RFID,
 ISO; Name; Breed; Sex, Gender; DOB, Birth date, Born; Collar; Notes, Comments), returns the first 20

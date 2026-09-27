@@ -245,8 +245,8 @@ async fn a_removal_dated_earlier_takes_the_head_off_the_history_from_then() {
         async move {
             let at = time::from_db(at).unwrap();
             let row = ctx.store().get_animal(&id).await.unwrap().unwrap();
-            ctx.store().update_animal(&Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap();
-            animals::count_removal(&ctx, &cows, &id, at).await.unwrap();
+            assert_eq!(row.herd_id, cows);
+            assert!(animals::remove_animal(&ctx, &Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap());
         }
     };
     remove(a, "2026-09-05T17:00:00.000Z").await;
@@ -276,6 +276,9 @@ async fn a_removal_dated_earlier_takes_the_head_off_the_history_from_then() {
     );
     // 217 entered today and removed as of 2020: it never counted, so the
     // rows from its record on drop back to 1 and nothing earlier changes.
+    // (Times are to the millisecond: a row written in the same one as the
+    // record began would read as from it.)
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     let c = app.animal(&cows, "217").await;
     remove(c, "2020-01-01T00:00:00.000Z").await;
     let counts: Vec<i64> =
@@ -284,11 +287,15 @@ async fn a_removal_dated_earlier_takes_the_head_off_the_history_from_then() {
 }
 
 #[tokio::test]
-async fn two_removals_marked_before_either_is_counted_both_count_from_their_dates() {
-    // Two removals racing: both animals are marked removed before either
-    // one's count runs. Each still takes its head off the history from its date.
+async fn a_removal_counts_from_its_date_while_another_animals_recount_is_still_to_run() {
+    // An animal added (or moved out) at the moment of a removal: its row is
+    // in, its own recount hasn't run. The removal used to read the count and
+    // the animals to tell whether it had been counted, took the pending one
+    // for its own, and skipped its backdate: the sold head kept counting until
+    // it was entered.
     let app = App::new().await;
     let cows = app.herd("Cows", 0).await;
+    let heifers = app.herd("Heifers", 0).await;
     let (a, b) = (app.animal(&cows, "214").await, app.animal(&cows, "215").await);
     app.animal(&cows, "216").await;
     let rows: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
@@ -296,30 +303,50 @@ async fn two_removals_marked_before_either_is_counted_both_count_from_their_date
         sqlx::query("UPDATE herd_history SET at = ? WHERE id = ?").bind(format!("2026-09-01T12:00:00.00{i}Z")).bind(id).execute(app.ctx.db()).await.unwrap();
     }
     sqlx::query("UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&cows).execute(app.ctx.db()).await.unwrap();
+    let history = || async {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+        let today = time::to_db(&time::now()).get(..10).unwrap().to_owned();
+        rows.into_iter().map(|(t, c)| (if t.starts_with(&today) { "today".to_owned() } else { t.get(..10).unwrap().to_owned() }, c)).collect::<Vec<_>>()
+    };
+    let removed = |id: &str, at: &str| {
+        let (ctx, id, at) = (app.ctx.clone(), id.to_owned(), time::from_db(at).unwrap());
+        async move {
+            let row = ctx.store().get_animal(&id).await.unwrap().unwrap();
+            animals::remove_animal(&ctx, &Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap()
+        }
+    };
 
-    let (at_a, at_b) = (time::from_db("2026-09-05T17:00:00.000Z").unwrap(), time::from_db("2026-09-12T17:00:00.000Z").unwrap());
-    for (id, at) in [(&a, at_a), (&b, at_b)] {
-        let row = app.ctx.store().get_animal(id).await.unwrap().unwrap();
-        app.ctx.store().update_animal(&Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap();
-    }
-    animals::count_removal(&app.ctx, &cows, &a, at_a).await.unwrap();
-    animals::count_removal(&app.ctx, &cows, &b, at_b).await.unwrap();
+    // 217 is in, not yet counted (3 head, 3 active after 214 is marked).
+    let new = Animal { id: id::new_id(id::ANIMAL), tag: "217".into(), herd_id: cows.clone(), ..Default::default() };
+    app.ctx.store().insert_animal(&new).await.unwrap();
+    assert!(removed(&a, "2026-09-05T17:00:00.000Z").await);
+    // 3 head from Sep 1, 2 from Sep 5 when 214 was sold, and today 214 off
+    // the count (2) with 217 on it (3). 217's own recount finds nothing to do.
+    let d = |s: &str, n: i64| (s.to_owned(), n);
+    let mut want = vec![d("2026-09-01", 0), d("2026-09-01", 1), d("2026-09-01", 2), d("2026-09-01", 3), d("2026-09-05", 2), d("today", 2), d("today", 3)];
+    assert_eq!(history().await, want);
+    assert_eq!(animals::sync_herd_count(app.ctx.db(), &cows).await.unwrap(), None);
+    assert_eq!(app.count(&cows).await, 3);
+
+    // 215 moved to Heifers, its recount not yet run (3 head, 1 active after 216 is marked).
+    let row = app.ctx.store().get_animal(&b).await.unwrap().unwrap();
+    app.ctx.store().update_animal(&Animal { herd_id: heifers.clone(), ..row }).await.unwrap();
+    let c = app.ctx.store().list_animals(Some(&cows)).await.unwrap().into_iter().find(|x| x.tag == "216").unwrap();
+    assert!(removed(&c.id, "2026-09-12T17:00:00.000Z").await);
+    // 216 sold Sep 12: one head fewer from then (the rows written today too),
+    // and today 216 off the count (2) and 215's move taken in (1, 217 left).
+    want.splice(5..5, [d("2026-09-12", 1)]);
+    want[6].1 = 1;
+    want[7].1 = 2;
+    want.extend([d("today", 2), d("today", 1)]);
+    assert_eq!(history().await, want);
     assert_eq!(app.count(&cows).await, 1);
-    let rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
-    let rows: Vec<(&str, i64)> = rows.iter().map(|(t, c)| (t.get(..10).unwrap(), *c)).collect();
-    let today = time::to_db(&time::now());
-    let today = today.get(..10).unwrap();
-    // 3 head from Sep 1, 2 from Sep 5 (214 sold), 1 from Sep 12 (215 sold),
-    // and the two count changes as they were entered, both at 1 by now.
-    assert_eq!(
-        rows,
-        [("2026-09-01", 0), ("2026-09-01", 1), ("2026-09-01", 2), ("2026-09-01", 3), ("2026-09-05", 2), ("2026-09-12", 1), (today, 1), (today, 1)]
-    );
-    // A third count for an animal already taken off changes nothing.
-    animals::count_removal(&app.ctx, &cows, &b, at_b).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM herd_history WHERE herd_id = ?").bind(&cows).fetch_one(app.ctx.db()).await.unwrap();
-    assert_eq!((n, app.count(&cows).await), (8, 1));
+    assert_eq!(animals::sync_after_leaving(app.ctx.db(), &cows).await.unwrap(), None);
+
+    // Removed already: nothing changes.
+    assert!(!removed(&a, "2026-09-05T17:00:00.000Z").await);
+    assert_eq!((history().await, app.count(&cows).await), (want, 1));
 }
 
 #[tokio::test]
