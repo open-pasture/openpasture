@@ -33,6 +33,14 @@ export function applyPositions(collars: Collar[], index: ReadonlyMap<string, num
   return out ?? collars;
 }
 
+// A `collar` event carries the whole collar, so it replaces the row: a field the server left out
+// was cleared (unparked, unlinked). Only a newer fix the row already has from a positions batch
+// is kept, since the event can be older than the last batch.
+export function applyCollar(prev: Collar | undefined, next: Collar): Collar {
+  if (!prev?.last_fix || (next.last_fix && Date.parse(next.last_fix.at) >= Date.parse(prev.last_fix.at))) return next;
+  return { ...next, last_fix: prev.last_fix, state: prev.state };
+}
+
 // A herd's acks with each item replacing that collar's ack.
 export function applyAcks(acks: readonly Ack[], items: readonly AckItem[], at: string): Ack[] {
   const by = new Map(items.map((a) => [a.collar_id, a] as const));
