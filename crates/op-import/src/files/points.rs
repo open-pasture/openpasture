@@ -272,6 +272,10 @@ impl DateOrder {
         for t in times {
             let mut parts = t.trim().splitn(3, '/');
             let (Some(a), Some(b), Some(_)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            // Year first (2026/06/14) reads one way only and says nothing about the order.
+            if a.trim().len() > 2 {
+                continue;
+            }
             let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) else { continue };
             if a > 12 && b <= 12 {
                 day += 1;
@@ -605,6 +609,13 @@ mod tests {
             DateTime::<Utc>::from_timestamp_millis(p.points[0].t).unwrap().format("%m").to_string()
         };
         assert_eq!((month("America/Chicago"), month("Europe/London")), ("05".to_owned(), "06".to_owned()));
+
+        // Year-first slash dates read one way only and say nothing about the
+        // order: 06/05 on this US farm is still June 5.
+        let text = "tag,time,lat,lon\n214,2026/06/14 10:00,42.031,-93.622\n214,2026/06/15 10:00,42.031,-93.622\n214,06/05/2026 10:00,42.031,-93.622\n";
+        let p = parse("gps.csv", text.as_bytes(), None, "America/Chicago".parse().unwrap()).unwrap();
+        let days: Vec<String> = p.points.iter().map(|x| DateTime::<Utc>::from_timestamp_millis(x.t).unwrap().format("%m-%d").to_string()).collect();
+        assert_eq!((days, p.errors.clone()), (vec!["06-14".to_owned(), "06-15".to_owned(), "06-05".to_owned()], Vec::<String>::new()));
 
         // Rows that disagree: the more common order wins and the others are named.
         let text = "tag,time,lat,lon\n214,13/06/2026 10:00,42.031,-93.622\n214,14/06/2026 10:00,42.031,-93.622\n214,06/15/2026 10:00,42.031,-93.622\n";
