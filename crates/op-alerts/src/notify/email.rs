@@ -55,11 +55,18 @@ impl Email {
     }
 }
 
-/// Server said 4xx, or the connection dropped: try again. 5xx, TLS and
-/// login problems: fix the settings.
+/// Server said 4xx, or stopped answering: try again. 5xx, TLS and login
+/// problems: fix the settings. No connection at all (no network, no DNS,
+/// refused): wait for the network.
 fn smtp_error(e: &lettre::transport::smtp::Error) -> ChannelError {
     let text = format!("SMTP: {e}");
-    if e.is_permanent() || e.is_tls() || e.is_client() || e.is_response() { ChannelError::Fail(text) } else { ChannelError::Retry(text) }
+    if e.is_permanent() || e.is_tls() || e.is_client() || e.is_response() {
+        ChannelError::Fail(text)
+    } else if e.is_transient() || e.is_timeout() {
+        ChannelError::Retry(text)
+    } else {
+        ChannelError::Offline(text)
+    }
 }
 
 #[async_trait::async_trait]

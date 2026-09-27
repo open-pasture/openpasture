@@ -64,7 +64,7 @@ async fn texts_go_only_to_verified_phones_over_configured_channels() {
 }
 
 #[tokio::test]
-async fn the_relay_carries_sms_and_email_when_the_farm_has_neither() {
+async fn the_relay_carries_sms_but_never_email_it_cant_verify() {
     let f = Farm::new().await;
     f.ctx.store().set_setting_json(op_core::notify_config::CHANNELS_KEY, &json!({"relay": {"enabled": true}})).await.unwrap();
     f.ctx.secrets().set("hosted_api_key", "oph_test").unwrap();
@@ -74,9 +74,41 @@ async fn the_relay_carries_sms_and_email_when_the_farm_has_neither() {
     f.route(t0() + secs(10)).await;
     let m = f.messages_to(&a).await;
     let got: Vec<(&str, &str)> = m.iter().map(|x| (x.channel.as_str(), x.address.as_str())).collect();
-    assert_eq!(got, [("relay", "+15155550101"), ("relay", "cody@example.com")], "no WhatsApp without the farm's own");
+    // The relay texts only numbers proven to it, and a farm can't prove an email address to it.
+    assert_eq!(got, [("relay", "+15155550101")], "no email and no WhatsApp without the farm's own");
     assert_eq!(m[0].subject, None);
-    assert!(m[1].subject.is_some());
+    let (_, v) = f.owner("GET", "/api/alerts/rules", None).await;
+    assert_eq!(v["person_channels"], json!(["sms"]), "email isn't offered over the relay");
+    // A relay-only person who picked email gets nothing sent to be refused.
+    f.prefs(&a, json!({"channels": ["email"]})).await;
+    let p = op_alerts::routing::people(&f.ctx).await.unwrap().into_iter().find(|p| p.user.id == a).unwrap();
+    assert!(op_alerts::routing::deliveries(&p, &["relay"]).is_empty());
+}
+
+#[tokio::test]
+async fn whatsapp_alerts_are_offered_only_with_a_template() {
+    let f = Farm::new().await;
+    f.channels(json!({"whatsapp": {"from": "+15155550199"}})).await;
+    let a = f.person("Mia", Role::Manager, Some("+15155550101"), true, None).await;
+    f.prefs(&a, json!({"channels": ["whatsapp"]})).await;
+    assert!(op_core::notify_config::configured_channels(&f.ctx).await.unwrap().contains(&"whatsapp"), "replies can still go");
+    let (_, v) = f.owner("GET", "/api/alerts/rules", None).await;
+    assert_eq!(v["person_channels"], json!([]), "{v}");
+    escaped(&f).await;
+    f.route(t0() + secs(10)).await;
+    assert!(f.messages_to(&a).await.is_empty(), "a free-form WhatsApp alert would fail outside the 24 h window");
+
+    // With an approved template: offered and sent.
+    let f = Farm::new().await;
+    f.channels(json!({"whatsapp": {"from": "+15155550199", "template_sid": "HX0123456789abcdef0123456789abcdef"}})).await;
+    let a = f.person("Mia", Role::Manager, Some("+15155550101"), true, None).await;
+    f.prefs(&a, json!({"channels": ["whatsapp"]})).await;
+    let (_, v) = f.owner("GET", "/api/alerts/rules", None).await;
+    assert_eq!(v["person_channels"], json!(["whatsapp"]), "{v}");
+    escaped(&f).await;
+    f.route(t0() + secs(10)).await;
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.iter().map(|x| x.channel.as_str()).collect::<Vec<_>>(), ["whatsapp"]);
 }
 
 #[tokio::test]

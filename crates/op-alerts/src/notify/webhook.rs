@@ -1,7 +1,8 @@
 //! The farm's webhook: `POST url` with JSON `{ "type": "alert", "alert": Alert,
 //! "text" }` for a notified alert (else `{ "type": "message", "message":
 //! MessageLog }`), signed with
-//! `X-Openpasture-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`.
+//! `x-openpasture-signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`
+//! (the brand is lowercase; header names are case-insensitive).
 //! A receiver checks the signature over the raw body and refuses old `t`.
 //! 408, 429, 5xx and network errors are retried at 1 s, 5 s and 25 s.
 
@@ -14,7 +15,7 @@ use sqlx::{Column, Row, SqlitePool, TypeInfo, ValueRef};
 
 use super::{Channel, ChannelError, ChannelsConfig, Delivery, http, net_error, secret, set};
 
-pub const SIGNATURE_HEADER: &str = "X-Openpasture-Signature";
+pub const SIGNATURE_HEADER: &str = "x-openpasture-signature";
 
 pub struct Webhook {
     ctx: Ctx,
@@ -116,6 +117,12 @@ mod tests {
     use op_core::Severity;
     use op_core::alert::AlertStatus;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn the_signature_header_keeps_the_brand_lowercase() {
+        assert_eq!(SIGNATURE_HEADER, "x-openpasture-signature");
+        assert!(axum::http::HeaderName::from_static(SIGNATURE_HEADER).as_str() == SIGNATURE_HEADER);
+    }
 
     #[test]
     fn signature_is_hmac_sha256_over_time_dot_body() {

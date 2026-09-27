@@ -114,7 +114,7 @@ pub async fn rules_view(ctx: &Ctx) -> ApiResult<RulesView> {
             })
             .collect(),
         policy: config::policy(ctx).await?,
-        person_channels: routing::person_channels(&configured),
+        person_channels: routing::person_channels(&crate::notify::alert_channels(ctx).await?),
         configured,
     })
 }

@@ -13,7 +13,6 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use op_core::alert::MessageLog;
 use op_core::messages::{Outbound, enqueue};
-use op_core::notify_config::configured_channels;
 use op_core::time::now;
 use op_core::{Ctx, Herd};
 use sha2::Digest;
@@ -84,11 +83,11 @@ pub async fn run_once(ctx: &Ctx, at: DateTime<Utc>) -> anyhow::Result<Vec<Messag
 /// Queue the brief for every person who has it on (once per day, person,
 /// herd and address).
 async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<MessageLog>> {
-    let configured = configured_channels(ctx).await?;
+    let configured = crate::notify::alert_channels(ctx).await?;
     let herds: Vec<Herd> = ctx.store().list_herds().await?;
-    let mut briefs: Vec<(String, String)> = Vec::new();
+    let mut briefs: Vec<(String, String, Option<String>)> = Vec::new();
     for h in &herds {
-        briefs.push((h.id.clone(), op_engine::brief::brief(ctx, h, at).await?.text));
+        briefs.push((h.id.clone(), op_engine::brief::brief(ctx, h, at).await?.text, asks_about(ctx, h, at).await?));
     }
     let mut out = Vec::new();
     for p in routing::people(ctx).await? {
@@ -96,7 +95,7 @@ async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<Mes
             continue;
         }
         let ways = routing::deliveries(&p, &configured);
-        for (herd_id, text) in &briefs {
+        for (herd_id, text, decision_id) in &briefs {
             if p.prefs.herds.as_ref().is_some_and(|hs| !hs.contains(herd_id)) {
                 continue;
             }
@@ -116,7 +115,7 @@ async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<Mes
                             subject: email.then(|| format!("{herd}: morning brief")),
                             kind: "brief".into(),
                             alert_id: None,
-                            decision_id: None,
+                            decision_id: decision_id.clone(),
                             user_id: Some(p.user.id.clone()),
                         },
                     )
@@ -126,6 +125,24 @@ async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<Mes
         }
     }
     Ok(out)
+}
+
+/// The decision a herd's brief asks about ("Reply Y or N.", "Sends 07:40
+/// unless you reply N."), as op-engine's brief picks it: the herd's newest
+/// decision since the decision window began, not superseded, while it is a
+/// proposed MOVE or HOLD. A bare Y or N to the brief answers that one.
+async fn asks_about(ctx: &Ctx, herd: &Herd, at: DateTime<Utc>) -> anyhow::Result<Option<String>> {
+    let settings = ctx.settings().await?;
+    let tz: Tz = ctx.store().get_farm().await?.and_then(|f| f.timezone.parse().ok()).unwrap_or(Tz::UTC);
+    let since = op_engine::brief::window_start(at, tz, &settings.decision_time);
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, action FROM decisions WHERE herd_id = ? AND created_at >= ? AND status != 'superseded' ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&herd.id)
+    .bind(op_core::time::to_db(&since))
+    .fetch_optional(ctx.db())
+    .await?;
+    Ok(row.filter(|(_, status, action)| status == "proposed" && matches!(action.as_deref(), Some("MOVE" | "HOLD"))).map(|(id, ..)| id))
 }
 
 /// Check every 20 s.

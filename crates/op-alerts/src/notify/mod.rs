@@ -62,8 +62,12 @@ impl Delivery {
 /// Why a send didn't work, in words a farmer can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelError {
-    /// Worth another try later: a rate limit, a server error, no network.
+    /// Worth another try later: a rate limit, a server error, a timeout.
     Retry(String),
+    /// The provider couldn't be reached at all (no network, no DNS, the
+    /// connection refused), so it never saw the message: it waits for the
+    /// network to come back.
+    Offline(String),
     /// Won't work however often it is tried: a bad number, wrong credentials.
     Fail(String),
 }
@@ -71,7 +75,7 @@ pub enum ChannelError {
 impl ChannelError {
     pub fn message(&self) -> &str {
         match self {
-            Self::Retry(m) | Self::Fail(m) => m,
+            Self::Retry(m) | Self::Offline(m) | Self::Fail(m) => m,
         }
     }
 }
@@ -240,6 +244,19 @@ pub async fn channel(ctx: &Ctx, kind: &str) -> anyhow::Result<Option<Box<dyn Cha
     })
 }
 
+/// Channels an alert or a brief may go out on: every configured channel, but
+/// WhatsApp only with an approved template (`whatsapp.template_sid`). Twilio
+/// lets a business start a WhatsApp conversation only with one; without it
+/// WhatsApp alerts aren't offered, and replies inside the person's 24 h
+/// window still go as plain text on `configured_channels`' WhatsApp.
+pub async fn alert_channels(ctx: &Ctx) -> anyhow::Result<Vec<&'static str>> {
+    let mut out = configured_channels(ctx).await?;
+    if out.contains(&"whatsapp") && set(&load(ctx).await?.whatsapp.template_sid).is_none() {
+        out.retain(|c| *c != "whatsapp");
+    }
+    Ok(out)
+}
+
 // ---- messages sent on the spot ------------------------------------------------------
 
 /// A message that was sent (or failed) while someone waited, e.g. a test or
@@ -324,16 +341,15 @@ pub(crate) fn http() -> &'static reqwest::Client {
     })
 }
 
-/// A network failure in words, without the URL (it may carry a key).
+/// A network failure in words, without the URL (it may carry a key). Not
+/// getting a connection at all is [`ChannelError::Offline`]; a timeout or a
+/// dropped answer after connecting may have reached the provider, so it is a
+/// [`ChannelError::Retry`].
 pub(crate) fn net_error(what: &str, e: &reqwest::Error) -> ChannelError {
-    let why = if e.is_timeout() {
-        "timed out"
-    } else if e.is_connect() {
-        "can't be reached"
-    } else {
-        "didn't answer"
-    };
-    ChannelError::Retry(format!("{what} {why}."))
+    if e.is_connect() {
+        return ChannelError::Offline(format!("{what} can't be reached."));
+    }
+    ChannelError::Retry(format!("{what} {}.", if e.is_timeout() { "timed out" } else { "didn't answer" }))
 }
 
 /// A fresh 6-digit one-time code.

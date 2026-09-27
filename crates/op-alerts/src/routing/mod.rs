@@ -4,8 +4,10 @@
 //! - A person matches an alert when its severity is at least theirs, its herd
 //!   is one of theirs and its kind isn't muted, and they can be reached over a
 //!   configured channel: sms and whatsapp only to a verified phone that hasn't
-//!   texted STOP; sms and email go through the relay when the farm has no
-//!   Twilio or SMTP of its own.
+//!   texted STOP; sms goes through the relay when the farm has no Twilio of
+//!   its own; email only through the farm's own SMTP (the relay can't prove
+//!   an address is the person's); whatsapp only with an approved template
+//!   (`notify::alert_channels`).
 //! - When anyone matching is on duty, the first send goes only to them.
 //! - Warnings wait `group_window_s` and go out as one text for every alert of
 //!   that kind in that herd opened in the window; critical alerts wait only
@@ -54,14 +56,14 @@ pub async fn people(ctx: &Ctx) -> anyhow::Result<Vec<Person>> {
     Ok(out)
 }
 
-/// Channels a person may pick given what the farm has set up: sms and email
-/// also through the relay.
+/// Channels a person may pick given what the farm has set up
+/// (`notify::alert_channels`): sms also through the relay.
 pub fn person_channels(configured: &[&str]) -> Vec<&'static str> {
     let relay = configured.contains(&"relay");
     PERSON_CHANNELS
         .into_iter()
         .filter(|c| match *c {
-            "sms" | "email" => configured.contains(c) || relay,
+            "sms" => configured.contains(c) || relay,
             other => configured.contains(&other),
         })
         .collect()
@@ -76,7 +78,7 @@ pub fn deliveries(p: &Person, configured: &[&str]) -> Vec<(&'static str, String)
         let pick = match c.as_str() {
             "sms" => phone.clone().and_then(|ph| if configured.contains(&"sms") { Some(("sms", ph)) } else { relay.then_some(("relay", ph)) }),
             "whatsapp" => phone.clone().filter(|_| configured.contains(&"whatsapp")).map(|ph| ("whatsapp", ph)),
-            "email" => p.user.email.clone().and_then(|e| if configured.contains(&"email") { Some(("email", e)) } else { relay.then_some(("relay", e)) }),
+            "email" => p.user.email.clone().filter(|_| configured.contains(&"email")).map(|e| ("email", e)),
             _ => None,
         };
         if let Some(d) = pick
@@ -192,7 +194,7 @@ pub async fn route(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Report> {
 
 async fn farm(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Farm> {
     let tctx = TextCtx::of(ctx, now).await?;
-    let configured = op_core::notify_config::configured_channels(ctx).await?;
+    let configured = crate::notify::alert_channels(ctx).await?;
     let webhook_url = if configured.contains(&"webhook") {
         ctx.store()
             .get_setting_json(op_core::notify_config::CHANNELS_KEY)
