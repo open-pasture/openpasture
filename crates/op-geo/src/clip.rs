@@ -1,9 +1,11 @@
 //! Union and difference of simple rings, for turning boundary commands into
 //! single collar rings. Port of the agent kit's `collars/rings.py`.
 //!
-//! V0 collars hold one ring with no holes. Transitions merge the old paddock,
-//! a corridor and the new paddock; exclusions are cut out of the boundary.
-//! Greiner-Hormann clipping over rings projected to local metres.
+//! Transitions merge the old paddock, a corridor and the new paddock;
+//! exclusions that cross a boundary are cut out of it
+//! ([`crate::exclude::Placement::Cut`]), and exclusions inside it become holes
+//! ([`crate::exclude::Placement::Hole`]) instead. Greiner-Hormann clipping over
+//! rings projected to local metres.
 //!
 //! Paddocks often share fence lines, so edges overlap exactly. That is a
 //! degenerate case for the algorithm, so on a degenerate input the clip ring is
@@ -24,8 +26,9 @@ pub const RETRY_MARGINS_M: [f64; 2] = [0.5, 1.5];
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RingError {
-    /// The clip ring sits wholly inside the subject.
-    #[error("The exclusion sits entirely inside the boundary. V0 collars cannot enforce holes yet.")]
+    /// The clip ring sits wholly inside the subject: it is a hole, not a cut
+    /// (see [`crate::exclude::shape_target`]).
+    #[error("The exclusion sits entirely inside the boundary, so it is a hole, not a cut.")]
     Hole,
     #[error("{0}")]
     Degenerate(&'static str),
@@ -284,6 +287,13 @@ fn with_retries(subject: &[P], clip: &[P], op: Op) -> Result<Vec<Vec<P>>, RingEr
         }
     }
     Err(RingError::Failed(format!("Could not combine the shapes cleanly ({last_error}).")))
+}
+
+/// `subject` minus `clip`, both simple rings in local metres: every piece
+/// left (none when `clip` covers `subject`). Degenerate contact (shared
+/// edges, touching vertices) grows `clip` slightly, as [`subtract_ring`] does.
+pub(crate) fn subtract_pieces(subject: &[P], clip: &[P]) -> Result<Vec<Vec<P>>, RingError> {
+    with_retries(&clean_ring(subject), &clean_ring(clip), Op::Difference)
 }
 
 /// Merge lon/lat rings into one ring. Fails when they do not form one area.

@@ -227,6 +227,7 @@ pub fn gnss_fix<R: Rng + ?Sized>(truth: LonLat, at: DateTime<Utc>, rng: &mut R) 
         sats: Some(sats),
         cn0: Some(r(34.0 + sats as f64 * 0.6 + rng.gen_range(-2.0..2.0), 10.0)),
         ttf_s: Some(r(rng.gen_range(0.8..2.5), 10.0)),
+        ..Default::default()
     })
 }
 
@@ -281,7 +282,15 @@ impl Collar {
         if self.held_version() == Some(cmd.version) || self.staged.iter().any(|s| s.version == cmd.version) {
             return None;
         }
-        let ack = |status, reason: Option<String>| Ack { collar_id: None, command_id: cmd.command_id.clone(), version: cmd.version, status, reason, at: now };
+        let ack = |status, reason: Option<String>| Ack {
+            collar_id: None,
+            command_id: cmd.command_id.clone(),
+            version: cmd.version,
+            status,
+            reason,
+            at: now,
+            ..Default::default()
+        };
         if let Err(e) = cmd.validate(self.held_version()).and_then(|_| cmd.geofence(GeofenceConfig::default()).map(|_| ())) {
             return Some(ack(AckStatus::Rejected, Some(e.to_string())));
         }
@@ -315,7 +324,15 @@ impl Collar {
         let due: Vec<BoundaryCommand> = self.staged.iter().filter(|c| c.effective_at.is_none_or(|t| t <= now)).cloned().collect();
         due.into_iter()
             .map(|cmd| {
-                let a = Ack { collar_id: None, command_id: cmd.command_id.clone(), version: cmd.version, status: AckStatus::Applied, reason: None, at: now };
+                let a = Ack {
+                    collar_id: None,
+                    command_id: cmd.command_id.clone(),
+                    version: cmd.version,
+                    status: AckStatus::Applied,
+                    reason: None,
+                    at: now,
+                    ..Default::default()
+                };
                 self.apply(cmd);
                 a
             })
@@ -334,7 +351,7 @@ impl Collar {
             let r = h.fence.update(fix.point, fix.accuracy_m);
             let c = self.cue.update(&r, h.fence.config().warn_m, now.timestamp_millis());
             if c.active {
-                cue = Some(WireCue { at: now, level: c.volume, margin_m: (r.margin_m * 10.0).round() / 10.0, point: Some(fix.point) });
+                cue = Some(WireCue { at: now, level: c.volume, margin_m: (r.margin_m * 10.0).round() / 10.0, point: Some(fix.point), ..Default::default() });
                 self.last_cue = Some(c);
             }
         }
@@ -431,7 +448,7 @@ mod tests {
         let area = Area::new(&rect(0.0, 0.0, 100.0, 100.0)).unwrap();
         let p = Projection::new(O);
         let mut a = Animal::new(p.offset(50.0, 3.0), false, &mut rng);
-        let beep = CueCommand { active: true, freq_hz: 2730, volume: 3, duration_ms: 300 };
+        let beep = CueCommand { active: true, freq_hz: 2730, volume: 3, duration_ms: 300, ..Default::default() };
         a.step(1.0, Some(&area), None, None, Some(beep), &mut rng);
         a.step(1.0, Some(&area), None, None, Some(beep), &mut rng);
         assert_eq!(a.mode, Mode::Fleeing);

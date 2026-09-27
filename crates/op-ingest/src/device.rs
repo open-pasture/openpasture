@@ -211,7 +211,7 @@ async fn report(State(ctx): State<Ctx>, Device(mut collar): Device, ApiJson(mut 
     }
     ctx.publish(Event::Collar { collar });
     let latest_version = held.staged.last().or(held.active.as_ref()).map(|b| b.version);
-    Ok(Json(ReportResponse { latest_version }))
+    Ok(Json(ReportResponse { latest_version, ..Default::default() }))
 }
 
 #[derive(Deserialize)]
