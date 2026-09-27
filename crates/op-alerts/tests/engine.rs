@@ -265,7 +265,9 @@ async fn rules_and_policy_read_and_validate() {
             "move_stalled",
             "stragglers",
             "drop_off",
-            "gps_degraded"
+            "gps_degraded",
+            // @H
+            "fit_check_due"
         ]
     );
     let silent = v["rules"].as_array().unwrap().iter().find(|r| r["kind"] == "silent").unwrap();

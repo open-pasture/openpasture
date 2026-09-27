@@ -90,7 +90,7 @@ async fn coarser_cells_herds_ranges_and_bad_asks() {
     assert_eq!(app.get(&format!("/api/coverage?from={}&to={}", q(d + DAY), q(d + 2 * DAY))).await["cells"], json!([]));
     assert_eq!(app.get(&format!("/api/coverage?from={}&to={}", q(d - DAY), q(d + 2 * DAY))).await["cells"].as_array().unwrap().len(), 2);
 
-    for bad in ["cell_m=15", "cell_m=0", "cell_m=5", "cell_m=2000", "cell_m=x", "metric=cell", "from=-1h&to=-2h", "from=yesterday"] {
+    for bad in ["cell_m=15", "cell_m=0", "cell_m=5", "cell_m=2000", "cell_m=x", "metric=signal", "from=-1h&to=-2h", "from=yesterday"] {
         let (status, body) = app.call("GET", &format!("/api/coverage?{bad}"), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
         assert!(body["error"].is_string());

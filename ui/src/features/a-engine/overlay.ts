@@ -8,7 +8,7 @@ import type { Alert, LonLat } from "../../api";
 import type { Overlay, OverlayCtx } from "../../map/overlays";
 import { alerts } from "../../store/a-engine";
 import { attach, detach } from "./focus";
-import { circle, collarsOf, memberFacts, pulse } from "./model";
+import { circle, collarsOf, memberFacts, beat } from "./model";
 
 // C.red, C.fg3, C.bg (map/base.ts), inlined so the registries stay out of the map bundle.
 const RED = "#E5484D";
@@ -89,7 +89,7 @@ export const alertOverlay: Overlay = {
       if (!ringing) return;
       if (t - last >= 50) {
         last = t;
-        const { radius, opacity } = pulse(t);
+        const { radius, opacity } = beat(t);
         map.setPaintProperty("alert-rings", "circle-radius", radius);
         map.setPaintProperty("alert-rings", "circle-stroke-opacity", opacity);
       }

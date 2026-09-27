@@ -37,6 +37,7 @@ pub mod fleet;
 // @S
 // @A3
 // @H
+pub mod welfare;
 // @L
 // @M
 // @Z
@@ -78,6 +79,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @S
         // @A3
         // @H
+        welfare::router(),
         // @L
         // @M
         // @Z
@@ -113,6 +115,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @S
     // @A3
     // @H
+    welfare::spawn(ctx.clone());
     // @L
     // @M
     // @Z
@@ -149,6 +152,7 @@ fn tool_specs() -> Vec<op_core::tools::ToolSpec> {
         // @S
         // @A3
         // @H
+        welfare::tool(),
         // @L
         // @M
         // @Z

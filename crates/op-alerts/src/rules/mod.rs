@@ -17,11 +17,15 @@ mod collar_rules;
 mod fleet;
 mod herd_rules;
 mod telemetry;
+// @H
+mod fit_check;
 
 pub use collar_rules::{BoundaryNotApplied, Escaped, HerdSilent, LowBattery, Outside, Silent};
 pub use fleet::{Fleet, HerdInfo, Unit, fleet, silence};
 pub use herd_rules::{DecisionWaiting, MoveStalled, Stragglers};
 pub use telemetry::{DropOff, GpsDegraded};
+// @H
+pub use fit_check::FitCheckDue;
 
 /// How a rule behaves on this farm (`alerts.rules`, per kind). `after_min`
 /// and `threshold` mean what the rule's sentence says.
@@ -98,6 +102,7 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(GpsDegraded),
         // @S
         // @H
+        Box::new(FitCheckDue),
     ]
 }
 

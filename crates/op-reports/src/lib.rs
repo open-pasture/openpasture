@@ -33,6 +33,8 @@ pub use report::{Column, Report, ReportDoc, ReportParams, ReportSection};
 // @S
 // @A3
 // @H
+mod welfare;
+pub use welfare::AUDIO_ONLY_NOTE;
 // @L
 // @M
 // @Z
@@ -148,6 +150,7 @@ pub fn reports() -> Vec<Box<dyn Report>> {
         Box::new(organic::OrganicSeason),
         Box::new(lease::LeaseHeadDays),
         // @H
+        Box::new(welfare::WelfareRecord),
         // @S
     ]
 }

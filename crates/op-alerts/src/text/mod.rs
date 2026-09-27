@@ -247,6 +247,7 @@ pub fn rollup_title(kind: &str, n: usize, paddock: Option<&str>) -> String {
         "gps_degraded" => format!("{n} GPS weak"),
         // @S
         // @H
+        "fit_check_due" => format!("{n} fit checks due"),
         other => format!("{n} {}", other.replace('_', " ")),
     }
 }
@@ -470,6 +471,7 @@ pub fn group_text(alerts: &[Alert], place: Option<&str>, t: &TextCtx) -> String 
                 "decision_waiting" | "move_stalled" | "stragglers" | "herd_silent" => return alert_text(a, place, t),
                 // @S
                 // @H
+                "fit_check_due" => "fit check due".into(),
                 other => other.replace('_', " "),
             };
             list_text(&format!("{total} {phrase}:"), &labels)

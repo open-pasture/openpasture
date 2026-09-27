@@ -111,7 +111,8 @@ impl Farm {
             .bind(herd)
             .bind(to_db(&seen))
             .bind(fix.to_string())
-            .bind(to_db(&(seen - Duration::days(30))))
+            // Added a day ago, so its first fit check isn't due (H's fit_check_due).
+            .bind(to_db(&(seen - Duration::days(1))))
             .execute(self.ctx.db())
             .await
             .unwrap();

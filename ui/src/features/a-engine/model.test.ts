@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Alert } from "../../api";
-import { ageText, byUrgency, circle, collarsOf, herdRows, memberFacts, openCount, openFor, pulse, since, splitSentence, statusText, upsert } from "./model";
+import { ageText, byUrgency, circle, collarsOf, herdRows, memberFacts, openCount, openFor, beat, since, splitSentence, statusText, upsert } from "./model";
 import { drawn } from "./overlay";
 
 const T = "2026-09-27T12:00:00.000Z";
@@ -113,10 +113,10 @@ describe("the map", () => {
   });
 
   test("the ring grows and fades over its period", () => {
-    expect(pulse(0)).toEqual({ radius: 7, opacity: 0.7 });
-    const late = pulse(2300);
+    expect(beat(0)).toEqual({ radius: 7, opacity: 0.7 });
+    const late = beat(2300);
     expect(late.radius).toBeGreaterThan(20);
     expect(late.opacity).toBeLessThan(0.1);
-    expect(pulse(2400)).toEqual(pulse(0));
+    expect(beat(2400)).toEqual(beat(0));
   });
 });

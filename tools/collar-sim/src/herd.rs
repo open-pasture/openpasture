@@ -15,6 +15,7 @@ use op_protocol::{Ack, VerifyingKey, WireCue, WireEpisode, WireFix};
 use rand::Rng;
 
 use crate::firmware::Firmware;
+use crate::sensors::{Fall, Motion, fallen_read};
 
 /// Width of the warning zone the collars use.
 const WARN_M: f64 = 5.0;
@@ -267,6 +268,9 @@ pub struct Collar {
     /// Fix attempts and fixes got since the last report.
     pub fix_attempts: u32,
     pub fix_ok: u32,
+    /// The IMU (`--imu`), and when the collar comes off its animal (`--drop`).
+    pub motion: Option<Motion>,
+    pub fall: Option<Fall>,
 }
 
 /// Battery drain per hour.
@@ -289,7 +293,28 @@ impl Collar {
             episodes: Vec::new(),
             fix_attempts: 0,
             fix_ok: 0,
+            motion: None,
+            fall: None,
         }
+    }
+
+    /// Where the collar is: on the animal, or where it fell.
+    pub fn position(&self) -> LonLat {
+        self.fall.as_ref().and_then(|f| f.fell).map_or(self.animal.pos, |f| f.point)
+    }
+
+    /// Whether it lies where it fell.
+    pub fn fallen(&self) -> bool {
+        self.fall.as_ref().is_some_and(|f| f.fell.is_some())
+    }
+
+    /// `(still_s, tilt_deg)` from the IMU, when the collar has one.
+    pub fn imu(&self, now: DateTime<Utc>) -> Option<(u32, f64)> {
+        let m = self.motion.as_ref()?;
+        Some(match self.fall.as_ref().and_then(|f| f.fell) {
+            Some(f) => fallen_read(&f, now),
+            None => m.read(now),
+        })
     }
 
     /// The fence being enforced.
@@ -348,10 +373,20 @@ impl Collar {
     pub fn tick<R: Rng + ?Sized>(&mut self, now: DateTime<Utc>, dt: f64, herd: Option<Herd>, rng: &mut R) -> (Option<WireFix>, Option<WireCue>) {
         let fence = self.held.as_ref().map(|h| &h.area);
         let wall = if self.held.is_none() { self.paddock.as_ref() } else { None };
-        self.animal.step(dt, fence, wall, herd, self.last_cue.take(), rng);
+        // A collar on the ground plays to no animal.
+        let cue = self.last_cue.take().filter(|_| !self.fallen());
+        self.animal.step(dt, fence, wall, herd, cue, rng);
+        let pos = self.animal.pos;
+        if let Some(f) = self.fall.as_mut() {
+            f.check(now, pos, rng);
+        }
+        let (speed, mode) = (self.animal.vel[0].hypot(self.animal.vel[1]), self.animal.mode);
+        if let Some(m) = self.motion.as_mut() {
+            m.update(now, speed, mode, rng);
+        }
         self.battery = (self.battery - DRAIN_PER_HOUR * dt / 3600.0).max(0.0);
         self.fix_attempts += 1;
-        let Some(mut fix) = gnss_fix(self.animal.pos, now, rng) else { return (None, None) };
+        let Some(mut fix) = gnss_fix(self.position(), now, rng) else { return (None, None) };
         self.fix_ok += 1;
         if self.firmware.tick(fix.at).is_some() {
             self.follow(fix.at);

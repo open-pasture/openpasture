@@ -604,7 +604,9 @@ async fn rest_api_lists_builds_and_refuses_bad_input() {
             {"id": "paddock_record", "title": "Paddock grazing record"},
             {"id": "nrcs_528", "title": "NRCS 528 grazing record"},
             {"id": "organic_season", "title": "Organic grazing season"},
-            {"id": "lease_head_days", "title": "Lease head-days"}
+            {"id": "lease_head_days", "title": "Lease head-days"},
+            // @H
+            {"id": "welfare", "title": "Welfare record"}
         ])
     );
     for id in ["paddock_record", "nrcs_528", "organic_season", "lease_head_days"] {
