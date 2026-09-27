@@ -423,15 +423,26 @@ fn existing(path: PathBuf) -> Option<PathBuf> {
 
 // ---------------------------------------------------------------- SQLite
 
-/// Collars with rows in `table`, by a loose scan of its `(collar_id, t)`
-/// index: one seek per collar, whatever the table holds.
-async fn hot_collars(conn: &mut SqliteConnection, table: &str) -> anyhow::Result<Vec<String>> {
-    let sql = format!(
+// Per-collar reads of one day, each a range of a `(collar_id, t)` index
+// (tested with EXPLAIN QUERY PLAN), so a day costs its own rows, not the
+// table's.
+const DAY_FIXES: &str = "SELECT id, herd_id, t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? ORDER BY t";
+const PREV_FIX: &str = "SELECT t, lon, lat, herd_id FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? ORDER BY t DESC LIMIT 1";
+const NEXT_FIX: &str = "SELECT MIN(t) FROM fixes WHERE collar_id = ? AND t >= ? AND t < ?";
+const DAY_BATTERY: &str = "SELECT id, t, battery FROM health WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? AND battery IS NOT NULL ORDER BY t";
+
+fn collars_sql(table: &str) -> String {
+    format!(
         "WITH RECURSIVE c(id) AS (SELECT (SELECT MIN(collar_id) FROM {table}) \
          UNION ALL SELECT (SELECT MIN(collar_id) FROM {table} WHERE collar_id > c.id) FROM c WHERE c.id IS NOT NULL) \
          SELECT id FROM c WHERE id IS NOT NULL"
-    );
-    Ok(sqlx::query_scalar(&sql).fetch_all(conn).await?)
+    )
+}
+
+/// Collars with rows in `table`, by a loose scan of its `(collar_id, t)`
+/// index: one seek per collar, whatever the table holds.
+async fn hot_collars(conn: &mut SqliteConnection, table: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(&collars_sql(table)).fetch_all(conn).await?)
 }
 
 /// A read transaction whose snapshot is taken now (SQLite takes it at the
@@ -535,12 +546,7 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
         let mut fixes = cold.remove(collar).unwrap_or_default();
         // Rows a rollup has written to the day file but not yet deleted are
         // the file's; newer ones are late arrivals.
-        let mut rows = sqlx::query("SELECT id, herd_id, t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? ORDER BY t")
-            .bind(collar)
-            .bind(ds)
-            .bind(de)
-            .bind(cold_max)
-            .fetch(&mut *conn);
+        let mut rows = sqlx::query(DAY_FIXES).bind(collar).bind(ds).bind(de).bind(cold_max).fetch(&mut *conn);
         while let Some(r) = rows.try_next().await? {
             let id: i64 = r.try_get(0)?;
             max_id = max_id.max(id);
@@ -555,12 +561,7 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
         }
 
         let hot_prev: Option<(i64, f64, f64, Option<String>)> =
-            sqlx::query_as("SELECT t, lon, lat, herd_id FROM fixes WHERE collar_id = ? AND t >= ? AND t < ? ORDER BY t DESC LIMIT 1")
-                .bind(collar)
-                .bind(ds - MAX_GAP_MS)
-                .bind(ds)
-                .fetch_optional(&mut *conn)
-                .await?;
+            sqlx::query_as(PREV_FIX).bind(collar).bind(ds - MAX_GAP_MS).bind(ds).fetch_optional(&mut *conn).await?;
         let mut prev = cold_prev.get(collar).cloned();
         if let Some((t, lon, lat, herd)) = hot_prev {
             if prev.as_ref().is_none_or(|p| t > p.t) {
@@ -571,12 +572,7 @@ async fn coverage_read(ctx: &Ctx, conn: &mut SqliteConnection, grid: Grid, date:
             let (cx, cy) = grid.cell(e.point);
             Fx { t: e.t, cx: cx as i32, cy: cy as i32, acc: f32::NAN, herd: herds.get(e.herd.as_deref()) }
         });
-        let hot_next: Option<i64> = sqlx::query_scalar("SELECT MIN(t) FROM fixes WHERE collar_id = ? AND t >= ? AND t < ?")
-            .bind(collar)
-            .bind(de)
-            .bind(de + MAX_GAP_MS)
-            .fetch_one(&mut *conn)
-            .await?;
+        let hot_next: Option<i64> = sqlx::query_scalar(NEXT_FIX).bind(collar).bind(de).bind(de + MAX_GAP_MS).fetch_one(&mut *conn).await?;
         let next = match (hot_next, cold_next.get(collar).map(|e| e.t)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -661,14 +657,7 @@ async fn battery_read(ctx: &Ctx, conn: &mut SqliteConnection, date: NaiveDate, d
     let mut max_id = cold_max;
     for collar in collars {
         let mut readings = cold.remove(&collar).unwrap_or_default();
-        let hot: Vec<(i64, i64, f64)> =
-            sqlx::query_as("SELECT id, t, battery FROM health WHERE collar_id = ? AND t >= ? AND t < ? AND id > ? AND battery IS NOT NULL ORDER BY t")
-                .bind(&collar)
-                .bind(ds)
-                .bind(de)
-                .bind(cold_max)
-                .fetch_all(&mut *conn)
-                .await?;
+        let hot: Vec<(i64, i64, f64)> = sqlx::query_as(DAY_BATTERY).bind(&collar).bind(ds).bind(de).bind(cold_max).fetch_all(&mut *conn).await?;
         for (id, t, b) in hot {
             max_id = max_id.max(id);
             readings.push((t, b));
@@ -990,6 +979,32 @@ mod tests {
         // A block of 3 holds cells 0..3 of its row.
         assert_eq!(g.block_bbox(0, 0, 3)[2], g.block_bbox(2, 0, 1)[2]);
         assert_eq!(g.cells_in([b[0] + 1e-7, b[1] + 1e-7, b[2] - 1e-7, b[3] - 1e-7]), (2, -1, 2, -1));
+    }
+
+    #[tokio::test]
+    async fn day_reads_are_ranges_of_the_collar_time_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx::open(dir.path()).await.unwrap();
+        let plan = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(ctx.db()).await.unwrap();
+                rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join(" / ")
+            }
+        };
+        let bind = |sql: &str| sql.replacen("collar_id = ?", "collar_id = 'c'", 1).replace('?', "0");
+        for (sql, index) in [
+            (bind(DAY_FIXES), "fixes_collar_t (collar_id=? AND t>? AND t<?)"),
+            (bind(PREV_FIX), "fixes_collar_t (collar_id=? AND t>? AND t<?)"),
+            (bind(NEXT_FIX), "fixes_collar_t (collar_id=? AND t>? AND t<?)"),
+            (bind(DAY_BATTERY), "health_collar_t (collar_id=? AND t>? AND t<?)"),
+            (collars_sql("fixes"), "fixes_collar_t (collar_id>?)"),
+            (collars_sql("health"), "health_collar_t (collar_id>?)"),
+        ] {
+            let p = plan(sql.clone()).await;
+            assert!(p.contains(index), "{sql}\n{p}");
+            assert!(!p.contains("SCAN fixes") && !p.contains("SCAN health") && !p.contains("TEMP B-TREE"), "{sql}\n{p}");
+        }
     }
 
     #[test]
