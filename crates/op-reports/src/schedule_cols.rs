@@ -6,9 +6,12 @@
 //!   the stay planned it to end at the schedule's `planned_end` (the time its
 //!   last strip was done with, as made). Planned days = that end less the
 //!   stay's start. Stays without a schedule have none.
-//! - **Residual at exit**: the paddock's measured height (`paddock_heights`,
-//!   its `residual_cm`, else `height_cm`) nearest the stay's end within two
-//!   days either side. Stays still running have none.
+//! - **Residual at exit**: what the herd left, from `paddock_heights`: a
+//!   `residual_cm` recorded within two days of the stay's end (never before
+//!   the stay began), or a plain `height_cm` measured after the herd left,
+//!   within two days. The row nearest the end wins. A height taken before the
+//!   herd left (to size strips, say) is the grass it was about to eat, not a
+//!   residual. Stays still running have none.
 //!
 //! Each column shows only when some event in the report has a value.
 
@@ -56,14 +59,19 @@ pub async fn load(ctx: &Ctx, events: &[Event<'_>], now: DateTime<Utc>) -> anyhow
             Some(end) => {
                 let rows = sqlx::query("SELECT at, height_cm, residual_cm FROM paddock_heights WHERE paddock_id = ? AND at >= ? AND at <= ?")
                     .bind(&s.paddock_id)
-                    .bind(to_db(&(end - RESIDUAL_WINDOW)))
+                    .bind(to_db(&(end - RESIDUAL_WINDOW).max(s.start)))
                     .bind(to_db(&(end + RESIDUAL_WINDOW)))
                     .fetch_all(ctx.db())
                     .await?;
                 let mut best: Option<(i64, f64)> = None;
                 for r in &rows {
                     let at = from_db(&r.try_get::<String, _>("at")?)?;
-                    let cm = r.try_get::<Option<f64>, _>("residual_cm")?.unwrap_or(r.try_get::<f64, _>("height_cm")?);
+                    let cm = match r.try_get::<Option<f64>, _>("residual_cm")? {
+                        Some(residual) => residual,
+                        // A plain height is the residual only once the herd has left.
+                        None if at >= end => r.try_get::<f64, _>("height_cm")?,
+                        None => continue,
+                    };
                     let gap = (at - end).num_seconds().abs();
                     if best.is_none_or(|(g, _)| gap < g) {
                         best = Some((gap, cm));
@@ -114,7 +122,7 @@ pub fn notes((planned, residual): (bool, bool)) -> Vec<String> {
         n.push("Planned days: from the day in to the end of the strip schedule the herd ran there, as it was made.".into());
     }
     if residual {
-        n.push("Residual at exit: the measured height nearest the day out, within two days.".into());
+        n.push("Residual at exit: the residual recorded nearest the day out, or a height measured in the two days after it.".into());
     }
     n
 }

@@ -1414,8 +1414,10 @@ at?, starts_at?, back_fence?: boolean, next_index? }` (manager): makes one; stri
 layout or are cut across the herd's paddock. Neither is a decision-brain tool.
 
 **Reports.** `paddock_record` and `nrcs_528` gain "Planned days" (a schedule's `planned_end` less
-the stay's start) and "Residual at exit" (the measured height nearest the day out, within two
-days; `residual_cm`, else `height_cm`), each only when some row has a value.
+the stay's start) and "Residual at exit" (a `residual_cm` recorded within two days of the day out
+and not before the day in, or a plain `height_cm` measured in the two days after the herd left; the
+one nearest the day out), each only when some row has a value. A height taken before the herd left
+is the grass it was about to graze, not a residual.
 
 **Moves.** A sweep now waits only on its own staged first step (a farmer's target sent for
 later), not on a schedule's staged boundaries; `move_stalled`'s "waiting on a staged boundary"

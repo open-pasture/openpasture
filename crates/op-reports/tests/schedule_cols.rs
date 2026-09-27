@@ -148,3 +148,40 @@ async fn nothing_to_show_leaves_the_columns_out() {
         assert!(col(&s, "planned_days").is_none() && col(&s, "residual_exit").is_none(), "{report}");
     }
 }
+
+#[tokio::test]
+async fn a_height_taken_before_the_herd_left_is_not_the_residual() {
+    // Cows graze P1 for 36 hours: Sep 1 12:00 to Sep 3 00:00 UTC, then P2.
+    let app = App::new().await;
+    let (herd, p1) = farm(&app).await;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&herd).fetch_all(app.ctx.db()).await.unwrap();
+    sqlx::query("UPDATE herd_history SET at = '2026-09-03T00:00:00.000Z' WHERE id = ?").bind(ids[1]).execute(app.ctx.db()).await.unwrap();
+    let by = r#"{"via":"local"}"#;
+    // Measured to size strips the hour before they went in (10 in), and a
+    // residual left by the grazing before this one (Sep 1 06:00).
+    app.exec(
+        "INSERT INTO paddock_heights (id, paddock_id, at, height_cm, by, created_at) VALUES ('hgt_pre', ?, '2026-09-01T11:00:00.000Z', 25.4, ?, '2026-09-01T11:00:00.000Z')",
+        &[&p1, by],
+    )
+    .await;
+    app.exec(
+        "INSERT INTO paddock_heights (id, paddock_id, at, height_cm, residual_cm, by, created_at) VALUES ('hgt_old', ?, '2026-09-01T06:00:00.000Z', 20, 5, ?, '2026-09-01T06:00:00.000Z')",
+        &[&p1, by],
+    )
+    .await;
+    app.ctx.update_settings(&json!({"units": "imperial"})).await.unwrap();
+    for report in ["paddock_record", "nrcs_528"] {
+        assert!(col(&app.section(report).await, "residual_exit").is_none(), "{report}: neither is what the herd left");
+    }
+    // 3 in (7.62 cm) measured the morning after they left: the residual.
+    app.exec(
+        "INSERT INTO paddock_heights (id, paddock_id, at, height_cm, by, created_at) VALUES ('hgt_post', ?, '2026-09-03T14:00:00.000Z', 7.62, ?, '2026-09-03T14:00:00.000Z')",
+        &[&p1, by],
+    )
+    .await;
+    for report in ["paddock_record", "nrcs_528"] {
+        let s = app.section(report).await;
+        let r = col(&s, "residual_exit").unwrap();
+        assert_eq!((s["columns"][r]["unit"].as_str(), s["rows"][0][r].as_f64(), s["rows"][1][r].as_f64()), (Some("in"), Some(3.0), None), "{report}");
+    }
+}
