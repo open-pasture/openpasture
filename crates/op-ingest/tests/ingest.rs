@@ -879,7 +879,8 @@ async fn a_farmer_can_let_an_escaped_animal_go() {
     let now = chrono::Utc::now();
     app.fix(a_key, m_at(150.0, 230.0), now - chrono::Duration::seconds(90)).await;
     app.fix(a_key, m_at(150.0, 231.0), now).await;
-    op_ingest::escapes::scan(&app.ctx, now).await.unwrap();
+    // Out since its first new fix outside (the backfilled one doesn't start the clock).
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(60)).await.unwrap();
 
     let (s, e) = app.call("POST", &format!("/api/collars/{a}/escape/stop"), None).await;
     assert_eq!(s, StatusCode::OK, "{e}");

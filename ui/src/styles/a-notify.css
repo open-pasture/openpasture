@@ -1,0 +1,20 @@
+/* A-notify: Settings > Texting, Verify, Data > Messages. Tokens and patterns from app.css and base.css. */
+
+.texting{display:grid;gap:16px;justify-items:start}
+.texting>*{width:100%}
+.texting>.seg{width:auto}
+.texting .seg .dot{display:inline-block;margin-right:8px;vertical-align:1px}
+.tfields{display:grid;gap:12px}
+.tgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
+.tgrid .line{grid-column:1 / -1}
+.tgrid .input.port{width:96px}
+.tgrid select.input{justify-self:start;padding-right:32px}
+.tfields .line .input.to{width:200px;flex:none}
+.tfields .line span.mono,.verify span.mono{font-size:11.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.verify{display:flex;align-items:center;gap:8px}
+.verify .input.code{width:96px;letter-spacing:.2em;flex:none}
+
+.msgs{padding:0 16px 16px}
+.msgs .tbl td span.err{color:var(--red)}
+.msgs .tbl td span.ok{color:var(--live)}

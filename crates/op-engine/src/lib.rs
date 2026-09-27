@@ -24,10 +24,14 @@ pub mod tools;
 // @K-files
 // @I
 // @B
+pub mod heights;
+pub mod layers;
 // @G
 // @P
 // @Q
 // @C
+pub mod layouts;
+pub mod strips;
 // @F
 // @S
 // @A3
@@ -58,10 +62,14 @@ pub fn router() -> axum::Router<Ctx> {
         // @K-files
         // @I
         // @B
+        heights::router(),
+        layers::router(),
         // @G
         // @P
         // @Q
         // @C
+        strips::router(),
+        layouts::router(),
         // @F
         // @S
         // @A3

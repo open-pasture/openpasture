@@ -11,6 +11,11 @@
 //! herd's boundary with a new version, since it never goes back to an older
 //! one.
 //!
+//! Pens keep the herd boundary's holes. A collar out on an escape reports
+//! and polls fast (its config gets a fast window). When the escape ends, the
+//! herd boundaries staged at that moment are copied for that collar alone
+//! (`collar_id` + `copy_of`), so the rest of the herd downloads nothing.
+//!
 //! [`advance`] is pure. [`scan`] starts, steps and ends escapes; the driver
 //! runs it every 2 s.
 
@@ -28,9 +33,10 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::boundary::{NewBoundary, insert_boundary};
-use crate::db;
 use crate::moves::{FRESH_FIX, STEP_EVERY, stride};
 use crate::planner::{self, Frame, Plan, PlanInput};
+use crate::{config, db};
+use op_geo::CollarLimits;
 
 /// Outside the herd's boundary this long, with the collar's own cue spent
 /// (its outside tone stops after 10 s), and the animal gets a boundary of
@@ -79,6 +85,8 @@ pub struct EscapeState<'a> {
     /// The collar's own boundary now; `None` before the first.
     pub current: Option<&'a Polygon>,
     pub pen: &'a Pen,
+    /// What the herd's collars hold.
+    pub limits: CollarLimits,
 }
 
 /// Decide the escape's next action from the animal's position. The first
@@ -95,7 +103,7 @@ pub fn advance(e: &EscapeState, at: LonLat, now: DateTime<Utc>) -> (Next, Pen) {
         pen.level = None;
     }
     let plan_from = |previous: Option<&Polygon>, frame: Option<Frame>| {
-        planner::plan(&PlanInput { target: e.target, previous, paddock: None, animals: &[at], warn_m: e.warn_m, frame })
+        planner::plan(&PlanInput { target: e.target, previous, paddock: None, animals: &[at], warn_m: e.warn_m, frame, limits: e.limits })
     };
     let mut fresh = e.current.is_none();
     let mut plan = plan_from(e.current, pen.frame);
@@ -173,36 +181,27 @@ async fn open_row(db: &sqlx::SqlitePool, collar_id: &str) -> anyhow::Result<Opti
     row.map(|r| escape_from_row(&r)).transpose()
 }
 
-/// The boundaries a collar should hold, as the herd's are split: out on an
-/// escape, only its own; otherwise its herd's, where the copy it was handed
-/// back stands in for the herd boundary it copies.
+/// The boundaries a collar should hold, split like the herd's: out on an
+/// escape, only its pen; otherwise its herd's, together with the copies it
+/// was handed back after its last escape (each copy has a higher version
+/// than the herd boundary it copies and the same activation, so it stands
+/// in for it). Two index lookups for the herd, one for the copies.
 pub async fn collar_boundaries(db: &sqlx::SqlitePool, collar: &Collar, at: DateTime<Utc>) -> anyhow::Result<db::HerdBoundaries> {
-    let own = sqlx::query(
-        "SELECT b.*, EXISTS (SELECT 1 FROM escapes e WHERE e.boundary_id = b.id AND e.status = 'returning') AS open
-         FROM boundaries b WHERE b.collar_id = ? AND b.herd_id = ? ORDER BY b.version DESC LIMIT 1",
-    )
-    .bind(&collar.id)
-    .bind(&collar.herd_id)
-    .fetch_optional(db)
-    .await?;
-    let mut copy = None;
-    if let Some(r) = own {
-        let b = op_core::store::boundary_from_row(&r)?;
-        if r.try_get::<bool, _>("open")? {
-            return Ok(db::HerdBoundaries { active: Some(b), staged: vec![] });
-        }
-        // A pen left by an escape that ended without a hand-back counts for nothing.
-        if r.try_get::<Option<i64>, _>("copy_of")?.is_some() {
-            copy = Some(b);
-        }
+    let mut conn = db.acquire().await?;
+    let pen = sqlx::query(db::sql::OPEN_PEN).bind(&collar.id).bind(&collar.herd_id).fetch_optional(&mut *conn).await?;
+    if let Some(r) = pen {
+        return Ok(db::HerdBoundaries { active: Some(op_core::store::boundary_from_row(&r)?), staged: vec![] });
     }
-    let mut split = db::herd_boundaries(db, &collar.herd_id, at).await?;
-    if let Some(b) = copy
-        && split.active.as_ref().is_none_or(|a| b.version > a.version)
-    {
-        split.active = Some(b);
+    let herd = db::herd_boundaries_in(&mut conn, &collar.herd_id, at).await?;
+    let floor = herd.active.as_ref().map_or(0, |a| a.version);
+    let copies = sqlx::query(db::sql::OWN_COPIES).bind(&collar.herd_id).bind(&collar.id).bind(floor as i64).fetch_all(&mut *conn).await?;
+    if copies.is_empty() {
+        return Ok(herd);
     }
-    Ok(split)
+    let mut all = copies.iter().map(op_core::store::boundary_from_row).collect::<anyhow::Result<Vec<_>>>()?;
+    all.extend(herd.active);
+    all.extend(herd.staged);
+    Ok(db::split_boundaries(all, at))
 }
 
 /// Collars that are out on an escape, for the herd's sweep to leave alone.
@@ -221,19 +220,6 @@ async fn collar_lock(collar_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
 
 fn fresh_point(c: &Collar, at: DateTime<Utc>) -> Option<LonLat> {
     c.last_fix.as_ref().filter(|f| at - f.at <= FRESH_FIX).map(|f| f.point)
-}
-
-/// Since when the collar has been outside: its first fix after its last
-/// fix inside the herd's boundary.
-async fn outside_since(db: &sqlx::SqlitePool, collar_id: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
-    let (t,): (Option<i64>,) = sqlx::query_as(
-        "SELECT MIN(t) FROM fixes WHERE collar_id = ?1 AND t > COALESCE(
-             (SELECT MAX(t) FROM fixes WHERE collar_id = ?1 AND state IN ('inside', 'warning')), 0)",
-    )
-    .bind(collar_id)
-    .fetch_one(db)
-    .await?;
-    Ok(t.map(op_core::time::from_unix_ms))
 }
 
 /// One pass at time `at`: step or end every open escape, then start one for
@@ -266,7 +252,8 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
     if open_row(ctx.db(), collar_id).await?.is_some() {
         return Ok(None);
     }
-    let Some(since) = outside_since(ctx.db(), collar_id).await? else { return Ok(None) };
+    // Kept current by every report (its first fix outside after the last one in).
+    let Some(since) = collar.outside_since else { return Ok(None) };
     if at - since < ESCAPE_AFTER {
         return Ok(None);
     }
@@ -280,7 +267,8 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         return Ok(None);
     }
     let Some(active) = db::herd_boundaries(ctx.db(), &collar.herd_id, at).await?.active else { return Ok(None) };
-    let state = EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: None, pen: &Pen::default() };
+    let limits = crate::shape::herd_limits(ctx, &collar.herd_id).await?;
+    let state = EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: None, pen: &Pen::default(), limits };
     let (Next::Send { polygon, remaining_m }, pen) = advance(&state, point, at) else { return Ok(None) };
 
     let mut e = Escape {
@@ -297,7 +285,7 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         ended_at: None,
     };
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let b = insert_own(&mut tx, &collar, &active, &polygon, None, at).await?;
+    let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
     e.version = Some(b.version);
     sqlx::query(
         "INSERT INTO escapes (id, herd_id, collar_id, status, boundary_id, step, remaining_m, pen, started_at, updated_at)
@@ -318,16 +306,20 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
     tracing::info!(herd = %e.herd_id, collar = %e.collar_id, version = b.version, outside_s = (at - since).num_seconds(), "escape: own boundary sent");
     log_activity(ctx, &e, "escape.started", format!("{} got out; sent its own boundary", collar.name)).await;
     ctx.publish(Event::Escape { escape: e.clone() });
+    // It reports and polls fast while it is walked back.
+    config::refresh_quietly(ctx, config::Scope::Collar(collar_id)).await;
     Ok(Some(e))
 }
 
-/// A boundary for one collar under the decision its herd is on.
+/// A boundary for one collar under the decision its herd is on: a pen, or
+/// (`copy_of`) a copy of a herd boundary.
 async fn insert_own(
     tx: &mut sqlx::SqliteConnection,
     collar: &Collar,
     herd: &Boundary,
     geometry: &Polygon,
     copy_of: Option<u32>,
+    effective_at: Option<DateTime<Utc>>,
     at: DateTime<Utc>,
 ) -> anyhow::Result<Boundary> {
     let nb = NewBoundary {
@@ -335,7 +327,7 @@ async fn insert_own(
         geometry,
         warn_m: herd.warn_m,
         hysteresis_m: herd.hysteresis_m,
-        effective_at: None,
+        effective_at,
         decision_id: &herd.decision_id,
         created_at: at,
         collar_id: Some(&collar.id),
@@ -355,8 +347,15 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
     };
     let Some(active) = db::herd_boundaries(ctx.db(), &collar.herd_id, at).await?.active else { return Ok(()) };
     let Some(point) = fresh_point(&collar, at) else { return Ok(()) };
-    let state =
-        EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: row.e.geometry.as_ref(), pen: &row.pen };
+    let limits = crate::shape::herd_limits(ctx, &collar.herd_id).await?;
+    let state = EscapeState {
+        target: &active.geometry,
+        target_version: active.version,
+        warn_m: active.warn_m,
+        current: row.e.geometry.as_ref(),
+        pen: &row.pen,
+        limits,
+    };
     match advance(&state, point, at) {
         (Next::Wait, pen) => {
             if pen != row.pen {
@@ -372,7 +371,7 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
         (Next::Send { polygon, remaining_m }, pen) => {
             let mut e = row.e.clone();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-            let b = insert_own(&mut tx, &collar, &active, &polygon, None, at).await?;
+            let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
             e.step += 1;
             e.remaining_m = round_m(remaining_m);
             e.geometry = Some(polygon);
@@ -403,35 +402,21 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
 }
 
 /// End an escape. A collar still in the herd gets a copy of the herd's
-/// boundary. Boundaries the herd has staged are stored again above the
-/// copy's version, or the collar would never ask for them.
+/// boundary, and a copy of each boundary the herd has staged (same shape and
+/// `effective_at`, for this collar alone): the pen dropped its staged slots,
+/// and a staged herd version below the copy's would never be asked for.
 async fn end(ctx: &Ctx, row: EscapeRow, collar: Option<&Collar>, status: EscapeStatus, at: DateTime<Utc>) -> anyhow::Result<()> {
     let mut e = row.e;
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let mut copy = None;
-    let mut restaged = Vec::new();
     if let Some(c) = collar {
-        // Read under the write lock, so the copy is of the herd's newest boundary.
-        let rows =
-            sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version").bind(&c.herd_id).fetch_all(&mut *tx).await?;
-        let all = rows.iter().map(op_core::store::boundary_from_row).collect::<anyhow::Result<Vec<_>>>()?;
-        let split = db::split_boundaries(all, at);
+        // Read under the write lock, so the copies are of the herd's newest boundaries.
+        let split = db::herd_boundaries_in(&mut tx, &c.herd_id, at).await?;
         if let Some(active) = split.active {
-            copy = Some(insert_own(&mut tx, c, &active, &active.geometry, Some(active.version), at).await?);
+            copy = Some(insert_own(&mut tx, c, &active, &active.geometry, Some(active.version), None, at).await?);
         }
         for b in &split.staged {
-            let nb = NewBoundary {
-                herd_id: &c.herd_id,
-                geometry: &b.geometry,
-                warn_m: b.warn_m,
-                hysteresis_m: b.hysteresis_m,
-                effective_at: b.effective_at,
-                decision_id: &b.decision_id,
-                created_at: at,
-                collar_id: None,
-                copy_of: None,
-            };
-            restaged.push(insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?);
+            insert_own(&mut tx, c, b, &b.geometry, Some(b.version), b.effective_at, at).await?;
         }
     }
     e.status = status;
@@ -456,9 +441,6 @@ async fn end(ctx: &Ctx, row: EscapeRow, collar: Option<&Collar>, status: EscapeS
         return Ok(());
     }
     tx.commit().await?;
-    for b in &restaged {
-        crate::boundary::announce(ctx, b).await;
-    }
     let name = collar.map_or(e.collar_id.as_str(), |c| c.name.as_str()).to_owned();
     let (kind, title) = match status {
         EscapeStatus::Back => ("escape.back", format!("{name} is back with the herd")),
@@ -567,7 +549,14 @@ mod tests {
             Self { paddock: rect(0.0, 0.0, 100.0, 100.0), version: 1, current: None, pen: Pen::default() }
         }
         fn tick(&mut self, pt: LonLat, now: DateTime<Utc>) -> Next {
-            let st = EscapeState { target: &self.paddock, target_version: self.version, warn_m: W, current: self.current.as_ref(), pen: &self.pen };
+            let st = EscapeState {
+                target: &self.paddock,
+                target_version: self.version,
+                warn_m: W,
+                current: self.current.as_ref(),
+                pen: &self.pen,
+                limits: CollarLimits::V0,
+            };
             let (next, pen) = advance(&st, pt, now);
             self.pen = pen;
             if let Next::Send { polygon, .. } = &next {

@@ -12,6 +12,18 @@
 // @K-animals
 // @K-files
 // @I
+mod api;
+mod csv;
+mod feed_log;
+mod history;
+mod lease;
+mod leases_api;
+mod nrcs_528;
+mod organic;
+mod paddock_record;
+mod report;
+mod settings;
+pub use report::{Column, Report, ReportDoc, ReportParams, ReportSection};
 // @B
 // @G
 // @P
@@ -44,6 +56,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @K-animals
         // @K-files
         // @I
+        api::router(),
         // @B
         // @G
         // @P
@@ -110,6 +123,7 @@ fn tools() -> Vec<ToolSpec> {
         // @K-animals
         // @K-files
         // @I
+        api::get_report_tool(),
         // @B
         // @G
         // @P
@@ -123,4 +137,22 @@ fn tools() -> Vec<ToolSpec> {
         // @M
         // @Z
     ]
+}
+
+/// Every report, in the order `GET /api/reports` lists them.
+pub fn reports() -> Vec<Box<dyn Report>> {
+    vec![
+        // @I
+        Box::new(paddock_record::PaddockRecord),
+        Box::new(nrcs_528::Nrcs528),
+        Box::new(organic::OrganicSeason),
+        Box::new(lease::LeaseHeadDays),
+        // @H
+        // @S
+    ]
+}
+
+/// The report with this id.
+pub fn report(id: &str) -> Option<Box<dyn Report>> {
+    reports().into_iter().find(|r| r.id() == id)
 }

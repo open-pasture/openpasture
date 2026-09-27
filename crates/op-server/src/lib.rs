@@ -10,6 +10,7 @@ mod ui;
 // @E-lib
 // @E-srv
 // @J
+mod policy;
 // @A-engine
 // @A-notify
 // @D
@@ -242,7 +243,7 @@ pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
         .route("/api/live", get(live::handler))
         .fallback(ui::handler)
         .with_state(ctx.clone())
-        .layer(axum::middleware::from_fn_with_state(auth::AuthState { ctx, dev }, auth::guard));
+        .layer(axum::middleware::from_fn_with_state(auth::AuthState::new(ctx, dev), auth::guard));
     if dev {
         use axum::http::{HeaderValue, Method, header};
         let origins: Vec<HeaderValue> = auth::DEV_ORIGINS.iter().filter_map(|o| HeaderValue::from_str(o).ok()).collect();

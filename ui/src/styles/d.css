@@ -1,0 +1,15 @@
+/* Stream D: map features. Tool rows and the feature sheet, from the existing patterns. */
+
+/* the Point / Area switch beside a tool's name, and the exclusion form */
+.tools>.seg{background:rgba(11,12,9,.82);backdrop-filter:blur(6px);border-color:var(--line2)}
+.toolform .seg{border-color:var(--line2)}
+.toolform .dword{font-size:13px;line-height:20px;padding-left:4px}
+.toolform .input.ddate{width:auto}
+.toolform .dmsg{font-size:12px;line-height:16px;max-width:240px;padding-right:6px}
+input[type=date].input{color-scheme:dark}
+
+/* feature sheet */
+.dline{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px}
+.dline .input{width:auto}
+.dnotes{font-size:13px;line-height:20px;color:var(--fg2);white-space:pre-wrap;overflow-wrap:anywhere}
+.sheet .dmsg{font-size:12px;line-height:16px}
