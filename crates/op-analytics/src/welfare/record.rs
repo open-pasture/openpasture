@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use datafusion::arrow::array::timezone::Tz;
@@ -419,26 +419,41 @@ impl Ep {
     }
 }
 
-/// Every episode of these animals, in time order: what learning status is
-/// computed from (read from the `episodes_animal` index alone).
-pub async fn history(ctx: &Ctx, animals: &[String]) -> anyhow::Result<HashMap<String, Vec<Ep>>> {
+/// The columns and order learning status reads episodes in: time order, ties
+/// always broken the same way (the `episodes_animal` index's own order).
+const LEARN_COLS: &str = "animal_id, start_t, end_t, outcome, derived";
+const LEARN_ORDER: &str = "ORDER BY animal_id, start_t, end_t, outcome, derived";
+
+fn ep_of(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<(String, Ep)> {
+    let outcome: String = r.try_get(3)?;
+    Ok((r.try_get(0)?, Ep::new(r.try_get(1)?, r.try_get(2)?, &outcome, r.try_get::<i64, _>(4)? != 0)))
+}
+
+/// Episodes of `animals` with `start_t` in `[from, to)`, per animal in time
+/// order (read from the `episodes_animal` index alone).
+async fn episodes_between(ctx: &Ctx, animals: &[String], from: i64, to: i64) -> anyhow::Result<HashMap<String, Vec<Ep>>> {
     let mut out: HashMap<String, Vec<Ep>> = HashMap::new();
     for chunk in animals.chunks(400) {
         let sql = format!(
-            "SELECT animal_id, start_t, end_t, outcome, derived FROM episodes WHERE animal_id IN ({}) ORDER BY animal_id, start_t",
+            "SELECT {LEARN_COLS} FROM episodes WHERE animal_id IN ({}) AND start_t >= ? AND start_t < ? {LEARN_ORDER}",
             vec!["?"; chunk.len()].join(",")
         );
         let mut q = sqlx::query(&sql);
         for id in chunk {
             q = q.bind(id);
         }
-        for r in q.fetch_all(ctx.db()).await? {
-            let a: String = r.try_get(0)?;
-            let outcome: String = r.try_get(3)?;
-            out.entry(a).or_default().push(Ep::new(r.try_get(1)?, r.try_get(2)?, &outcome, r.try_get::<i64, _>(4)? != 0));
+        for r in q.bind(from).bind(to).fetch_all(ctx.db()).await? {
+            let (a, e) = ep_of(&r)?;
+            out.entry(a).or_default().push(e);
         }
     }
     Ok(out)
+}
+
+/// Every episode of these animals, in time order: what learning status is
+/// computed from (read from the `episodes_animal` index alone).
+pub async fn history(ctx: &Ctx, animals: &[String]) -> anyhow::Result<HashMap<String, Vec<Ep>>> {
+    episodes_between(ctx, animals, i64::MIN, i64::MAX).await
 }
 
 /// Where an animal stands: trained after `trained_after` turned-back
@@ -463,36 +478,165 @@ pub struct Learning {
     pub derived: bool,
 }
 
+/// Learning status taken one episode at a time, in time order: what
+/// [`learning`] does over a whole history, kept so it can go on from where it
+/// stopped ([`current`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Fold {
+    n: u32,
+    outcomes: Outcomes,
+    derived: bool,
+    learning_since: Option<i64>,
+    last_episode_at: Option<i64>,
+    /// Turned back in a row since the last crossing, and the end of the
+    /// `n`th of them.
+    run: u32,
+    nth_end: Option<i64>,
+}
+
+impl Fold {
+    pub fn new(trained_after: u32) -> Self {
+        Self { n: trained_after.max(1), ..Default::default() }
+    }
+
+    pub fn push(&mut self, e: &Ep) {
+        self.outcomes.add(e.outcome.as_str());
+        self.derived |= e.derived;
+        self.learning_since.get_or_insert(e.start);
+        self.last_episode_at = Some(e.end.max(e.start));
+        if e.crossed {
+            if self.run >= self.n {
+                self.learning_since = Some(e.start);
+            }
+            self.run = 0;
+            self.nth_end = None;
+        } else if e.turned_back {
+            self.run += 1;
+            if self.run == self.n {
+                self.nth_end = Some(e.end);
+            }
+        }
+    }
+
+    pub fn learning(&self) -> Learning {
+        let at = op_core::time::from_unix_ms;
+        let mut l =
+            Learning { streak: self.run, outcomes: self.outcomes, last_episode_at: self.last_episode_at.map(at), derived: self.derived, ..Default::default() };
+        if self.run >= self.n {
+            l.status = Some(Status::Trained);
+            l.since = self.nth_end.map(at);
+        } else if let Some(s) = self.learning_since {
+            l.status = Some(Status::Learning);
+            l.since = Some(at(s));
+        }
+        l
+    }
+}
+
 /// Learning status from episodes in time order, counting those that began
 /// before `until` (all of them when `None`).
 pub fn learning(eps: &[Ep], trained_after: u32, until: Option<i64>) -> Learning {
-    let n = trained_after.max(1) as usize;
-    let mut l = Learning::default();
-    let mut run: Vec<i64> = Vec::new();
-    let mut learning_since: Option<i64> = None;
+    let mut f = Fold::new(trained_after);
     for e in eps.iter().filter(|e| until.is_none_or(|u| e.start < u)) {
-        l.outcomes.add(e.outcome.as_str());
-        l.derived |= e.derived;
-        learning_since.get_or_insert(e.start);
-        l.last_episode_at = Some(op_core::time::from_unix_ms(e.end.max(e.start)));
-        if e.crossed {
-            if run.len() >= n {
-                learning_since = Some(e.start);
+        f.push(e);
+    }
+    f.learning()
+}
+
+/// Episodes that began this long ago are settled: the server rebuilds
+/// derived ones over the last five days only (derive's `LOOKBACK_MS`), and a
+/// settled one added or taken off later is counted in `welfare_late`
+/// (migration 0871, a trigger on `episodes` drawing the same line).
+pub const SETTLED_MS: i64 = 6 * 86_400_000;
+/// A kept fold goes on to the settled line once it is this far behind it.
+const CARRY_MS: i64 = 86_400_000;
+
+/// One animal's settled episodes, folded.
+#[derive(Debug, Clone)]
+struct Kept {
+    fold: Fold,
+    /// Episodes that began before this are in the fold.
+    upto: i64,
+    /// Its `welfare_late` count when folded.
+    late: i64,
+}
+
+/// Kept folds per data dir, then per animal.
+static KEPT: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, Kept>>>> = LazyLock::new(Default::default);
+
+/// Where each animal stands now (`(animal_id, trained_after)`): [`learning`]
+/// over all its episodes, read as a kept fold of its settled episodes plus
+/// the days since, so a herd's status costs its recent episodes, not its
+/// whole history. An animal is folded whole the first time, again when a
+/// settled episode of it changed (`welfare_late`) or its herd's
+/// `trained_after` did, and its fold goes on a day at a time.
+pub async fn current(ctx: &Ctx, animals: &[(String, u32)], now_ms: i64) -> anyhow::Result<HashMap<String, Learning>> {
+    let settled = now_ms - SETTLED_MS;
+    let ids: Vec<String> = animals.iter().map(|(a, _)| a.clone()).collect();
+    // Read before any episode, so a change landing meanwhile is seen next time.
+    let mut late: HashMap<String, i64> = HashMap::new();
+    for chunk in ids.chunks(400) {
+        let sql = format!("SELECT animal_id, changes FROM welfare_late WHERE animal_id IN ({})", vec!["?"; chunk.len()].join(","));
+        let mut q = sqlx::query_as::<_, (String, i64)>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        late.extend(q.fetch_all(ctx.db()).await?);
+    }
+    let late_of = |a: &str| late.get(a).copied().unwrap_or(0);
+    let dir = ctx.data_dir().to_path_buf();
+    let mut kept: HashMap<String, Kept> = {
+        let all = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = all.get(&dir);
+        animals
+            .iter()
+            .filter_map(|(a, n)| {
+                let k = mine?.get(a)?;
+                (k.fold.n == (*n).max(1) && k.late == late_of(a)).then(|| (a.clone(), k.clone()))
+            })
+            .collect()
+    };
+
+    // Animals without a fold: their settled episodes, whole.
+    let fresh: Vec<String> = ids.iter().filter(|a| !kept.contains_key(*a)).cloned().collect();
+    if !fresh.is_empty() {
+        let n_of: HashMap<&str, u32> = animals.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+        let mut eps = episodes_between(ctx, &fresh, i64::MIN, settled).await?;
+        for a in &fresh {
+            let mut fold = Fold::new(n_of[a.as_str()]);
+            for e in eps.remove(a).unwrap_or_default() {
+                fold.push(&e);
             }
-            run.clear();
-        } else if e.turned_back {
-            run.push(e.end);
+            kept.insert(a.clone(), Kept { fold, upto: settled, late: late_of(a) });
         }
     }
-    l.streak = run.len() as u32;
-    if run.len() >= n {
-        l.status = Some(Status::Trained);
-        l.since = Some(op_core::time::from_unix_ms(run[n - 1]));
-    } else if let Some(s) = learning_since {
-        l.status = Some(Status::Learning);
-        l.since = Some(op_core::time::from_unix_ms(s));
+    // Folds a day or more behind the settled line go on to it.
+    let behind: Vec<String> = kept.iter().filter(|(_, k)| k.upto + CARRY_MS <= settled).map(|(a, _)| a.clone()).collect();
+    if let Some(from) = behind.iter().filter_map(|a| kept.get(a)).map(|k| k.upto).min() {
+        let mut eps = episodes_between(ctx, &behind, from, settled).await?;
+        for a in &behind {
+            let k = kept.get_mut(a).expect("kept");
+            for e in eps.remove(a).unwrap_or_default().iter().filter(|e| e.start >= k.upto) {
+                k.fold.push(e);
+            }
+            k.upto = settled;
+        }
     }
-    l
+
+    // The days since, on top of each fold.
+    let mut out = HashMap::with_capacity(animals.len());
+    if let Some(from) = kept.values().map(|k| k.upto).min() {
+        let mut eps = episodes_between(ctx, &ids, from, i64::MAX).await?;
+        for (a, k) in &kept {
+            let mut fold = k.fold.clone();
+            for e in eps.remove(a).unwrap_or_default().iter().filter(|e| e.start >= k.upto) {
+                fold.push(e);
+            }
+            out.insert(a.clone(), fold.learning());
+        }
+    }
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).entry(dir).or_default().extend(kept);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- farm days

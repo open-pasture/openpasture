@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 
 pub use derive::{Derived, LEGACY_BEEP_MS, LegacyCue, Pass, Run, Step, StepCue, derive, episodes as track_episodes, steps};
 pub use record::{
-    Cue, Day, Ep, Episode, FitCheck, Learning, LedgerRow, Outcome, Outcomes, Status, StillSpell, TICK_M, Whose, by_collar, cues, days, episode_of, episodes,
-    farm_tz, fit_checks, history, learning, ledger, local_date, midnight, spells_for, still_spells, still_spells_all, ticks,
+    Cue, Day, Ep, Episode, FitCheck, Fold, Learning, LedgerRow, Outcome, Outcomes, SETTLED_MS, Status, StillSpell, TICK_M, Whose, by_collar, cues, current,
+    days, episode_of, episodes, farm_tz, fit_checks, history, learning, ledger, local_date, midnight, spells_for, still_spells, still_spells_all, ticks,
 };
 pub use training::{TRAINING_KEY, Training, TrainingPatch};
 
@@ -112,13 +112,13 @@ pub async fn herd(ctx: &Ctx, herd_id: Option<&str>) -> ApiResult<HerdWelfare> {
     }
     let animals: Vec<op_core::Animal> = ctx.store().list_animals(herd_id).await?.into_iter().filter(|a| a.removed_at.is_none()).collect();
     let trainings = training::all(ctx).await?;
-    let ids: Vec<String> = animals.iter().map(|a| a.id.clone()).collect();
-    let mut hist = history(ctx, &ids).await?;
+    let asked: Vec<(String, u32)> = animals.iter().map(|a| (a.id.clone(), trainings.get(&a.herd_id).copied().unwrap_or_default().trained_after)).collect();
+    // Kept folds of the settled episodes and the days since, not every episode ever.
+    let mut now = current(ctx, &asked, op_core::time::now().timestamp_millis()).await?;
     let mut rows = Vec::with_capacity(animals.len());
     let (mut trained, mut learning_n) = (0, 0);
     for a in animals {
-        let n = trainings.get(&a.herd_id).copied().unwrap_or_default().trained_after;
-        let l = learning(&hist.remove(&a.id).unwrap_or_default(), n, None);
+        let l = now.remove(&a.id).unwrap_or_default();
         match l.status {
             Some(Status::Trained) => trained += 1,
             Some(Status::Learning) => learning_n += 1,
@@ -181,8 +181,7 @@ pub async fn animal(ctx: &Ctx, animal_id: &str, range: TimeRange, max_cues: usiz
     let cue_rows = cues(ctx, Whose::Animal(animal_id), from, to).await?;
     let eps = episodes(ctx, Whose::Animal(animal_id), from, to).await?;
     let n = training::of(ctx, &a.herd_id).await?.trained_after;
-    let hist = history(ctx, std::slice::from_ref(&a.id)).await?;
-    let l = learning(hist.get(&a.id).map(Vec::as_slice).unwrap_or_default(), n, None);
+    let l = current(ctx, &[(a.id.clone(), n)], op_core::time::now().timestamp_millis()).await?.remove(&a.id).unwrap_or_default();
     let day_rows = days(&tz, from, to, &cue_rows, &eps);
     let mut collars: BTreeSet<String> = cue_rows.iter().map(|c| c.collar_id.clone()).chain(eps.iter().map(|e| e.collar_id.clone())).collect();
     collars.extend(a.collar_id.clone());

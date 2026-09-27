@@ -1567,7 +1567,11 @@ HerdTraining   Training & { herd_id }
 - **Learning status**: trained after `trained_after` turned-back episodes in a row with no crossing
   (rest and boundary changes neither count nor break the run); learning once it has any episode;
   no status without episodes. `since`: the episode that made it trained; for learning, the crossing
-  that ended being trained, else its first episode. `trained_after` is its herd's.
+  that ended being trained, else its first episode. `trained_after` is its herd's. It is read as
+  each animal's settled episodes (begun more than six days ago) folded once and kept, plus the days
+  since, so a herd's status costs its recent episodes, not a season of them; an animal is folded
+  again when a settled episode of it is added or taken off (`welfare_late`, kept by a trigger) or
+  its herd's `trained_after` changes.
 - **Training mode** per herd: while `enabled`, a boundary sent for the herd without `warn_m` takes
   the training `warn_m` (op-ingest's `default_margins`); a send that names `warn_m` keeps it.
   Boundaries already sent keep theirs. `warn_m` 1–100 m, `trained_after` 1–50.
