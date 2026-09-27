@@ -33,6 +33,7 @@
 .toolform{display:flex;align-items:center;gap:6px;padding:4px;border-radius:12px;border:1px solid var(--line2)}
 .toolform .btn.plain{background:none}
 .toolform .input{width:140px;background:var(--bg)}
+.toolform .ferr{font-size:12px;padding:0 8px;max-width:320px;white-space:normal}
 
 /* the herd panel, the website's .panel */
 .panel{border-left:1px solid var(--line);background:var(--bg);display:flex;flex-direction:column;min-height:0;overflow:hidden}

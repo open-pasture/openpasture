@@ -8,6 +8,8 @@ import { createRegistry } from "../registry";
 import { store } from "../store";
 import { undrawn } from "../store/live";
 import type { Slot } from "./layers";
+import type { DrawKind } from "./draw";
+import type { DrawGeometry } from "./drawn";
 import { ANIMAL_SIZE } from "./animals-model";
 
 export type { Slot } from "./layers";
@@ -28,6 +30,9 @@ export interface OverlayCtx {
   openSheet(node: ReactNode | null): void;
   // Id to pass as addLayer's beforeId to draw in a slot.
   beforeId(slot: Slot): string;
+  // Reshape a shape on the map with the map's own Cancel / Save (as a paddock's Reshape); Save
+  // hands the new shape to `save`, and its error shows beside Save.
+  reshape(geometry: DrawGeometry, kind: DrawKind, save: (g: DrawGeometry) => Promise<unknown>): void;
 }
 
 export interface OverlayHandle {
@@ -184,6 +189,7 @@ export interface MapHost {
   rings: Rings;
   herdId(): string | undefined;
   openSheet(node: ReactNode | null): void;
+  reshape: OverlayCtx["reshape"];
 }
 
 export function overlayCtx(host: MapHost, owner: string): OverlayCtx {
@@ -200,6 +206,7 @@ export function overlayCtx(host: MapHost, owner: string): OverlayCtx {
     },
     openSheet: host.openSheet,
     beforeId: (slot) => slot,
+    reshape: host.reshape,
   };
 }
 

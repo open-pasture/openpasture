@@ -4,9 +4,14 @@
 import type { FeatureKind, LonLat, MapFeature, Paddock, Polygon } from "../../api";
 import { areaHa, centroid, fromXY, inside, toXY } from "../../geo";
 import type { Fmt } from "../../units";
-import { spec } from "./kinds";
+import type { DrawKind } from "../../map/draw";
+import { spec, type Shape } from "./kinds";
 
 export { KINDS, spec, upsert, withPaddocks, type KindSpec, type Shape } from "./kinds";
+
+// Which terra-draw mode draws (and reshapes) each shape: exclusions in red, other areas in fg.
+export const modeFor = (kind: FeatureKind, shape: Shape): DrawKind =>
+  shape === "Point" ? "point" : shape === "LineString" ? "line" : kind === "exclusion" ? "exclusion" : "paddock";
 
 // A hazard point with no radius yet starts at this many metres.
 export const HAZARD_RADIUS_M = 10;

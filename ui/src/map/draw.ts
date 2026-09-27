@@ -14,6 +14,7 @@ import type { Polygon } from "../api";
 import { C } from "./base";
 
 export { current, currentGeometry, polygonOf, type DrawGeometry } from "./drawn";
+import type { DrawGeometry } from "./drawn";
 
 // Drawing modes. Polygons: "paddock" in fg, "boundary" in grass, "exclusion" in red,
 // "rect" a dragged rectangle. "point" and "line" for map features, "lasso" a freehand
@@ -93,6 +94,11 @@ export type Draw = ReturnType<typeof createDraw>;
 
 // Put an existing polygon into the draw store and select it for editing.
 export function editPolygon(draw: Draw, g: Polygon, kind: DrawKind) {
+  return editShape(draw, g, kind);
+}
+
+// The same for any shape a map feature has: a point drags whole, a line's vertices drag.
+export function editShape(draw: Draw, g: DrawGeometry, kind: DrawKind) {
   draw.clear();
   draw.setMode("edit");
   const [res] = draw.addFeatures([{ type: "Feature", geometry: g, properties: { mode: kind } } as GeoJSONStoreFeatures]);

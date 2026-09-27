@@ -4,7 +4,7 @@ import { offset, toXY } from "../../geo";
 import { fmt } from "../../units";
 import { hatchBitmap, HATCH, iconBitmap, ICONS, PR } from "./icons";
 import {
-  circle, endOfDay, facts, isActive, KINDS, lastDay, lineLength, localDate, mapData, nextChange, scopePaddock, spec, upsert, when,
+  circle, endOfDay, facts, isActive, KINDS, lastDay, lineLength, localDate, mapData, modeFor, nextChange, scopePaddock, spec, upsert, when,
   withPaddocks, zonedTime,
 } from "./model";
 
@@ -201,4 +201,14 @@ describe("pixel art", () => {
     expect(alpha(n - 1, 0)).toBe(0);
     expect(Array.from(b.data.slice(0, 3))).toEqual([0xe5, 0x48, 0x4d]);
   });
+});
+
+test("a feature is drawn and reshaped in its shape's mode: exclusions red, other areas fg, points and lines", () => {
+  expect(modeFor("exclusion", "Polygon")).toBe("exclusion");
+  expect(modeFor("water", "Polygon")).toBe("paddock");
+  expect(modeFor("farm_boundary", "Polygon")).toBe("paddock");
+  expect(modeFor("gate", "Point")).toBe("point");
+  expect(modeFor("hazard", "Point")).toBe("point");
+  expect(modeFor("road", "LineString")).toBe("line");
+  expect(modeFor("neighbour_line", "LineString")).toBe("line");
 });
