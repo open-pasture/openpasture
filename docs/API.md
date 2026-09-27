@@ -687,8 +687,9 @@ events; never on `fix` or `collar`.
 Notifications are queued as `messages` (kind `alert`, `alert_id`, `decision_id` for decisions) for the
 sender to deliver. A person gets an alert when its severity is at least theirs, its herd and kind are
 theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
-that hasn't texted STOP; with no Twilio or SMTP of the farm's own, sms and email go over the relay
-(channel `relay`, address the phone or the email). When anyone matching is on duty the first send goes
+that hasn't texted STOP; with no Twilio of the farm's own, sms goes over the relay (channel `relay`,
+address the phone); email only over the farm's own SMTP (the relay can't prove an address is the
+person's); WhatsApp only with an approved template. When anyone matching is on duty the first send goes
 only to them. Warnings wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214
 031 118"); critical waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet
 hours (the person's, else the farm's) hold warnings until they end and let critical through unless
@@ -773,7 +774,12 @@ through the farm's own SMS, else through the relay (which texts its own code). T
 the first text a number gets: `openpasture code 123456. Reply STOP to opt out.` Codes work for 10
 minutes and 5 tries, one new code per 30 s; they are stored hashed together with the phone they
 went to (a code sent to an old number never proves a new one) and the message log keeps the text
-with the code masked. Changing a phone clears its verification.
+with the code masked. Changing a phone clears its verification. The relay texts only phones proven
+to it for this server's key, so when the relay becomes how the farm texts (turned on, a new key or
+URL, or the farm's own Twilio removed) phones it hasn't proven lose their verification here and
+Verify (a relay code) shows beside them again; phones it has keep theirs, with the dead-man flag set
+by role. A phone the relay later refuses as not verified (403 "That recipient isn't verified.") is
+unverified the same way.
 
 Relay host side (a server with `notify.hosting.enabled`, texting for the `oph_` keys it issued from
 its own channels):
@@ -1472,7 +1478,7 @@ verification ("Phone verified. Reply STATUS any time.").
 
 | Text | Needs | Does |
 | --- | --- | --- |
-| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers a decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`). A bare Y or N answers the decision the newest text asking this number about one was about, while it still waits; when it was answered or replaced, or nothing asked, nothing is decided and the reply names what waits now, with its code ("Cows: move to P2 was replaced. Cows: move to P3? Reply Y or N"), which the next Y answers; several waiting → a numbered list, `Y 2` picks (a number with no list texted gets the list) |
+| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers a decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`). A bare Y or N answers the decision the newest text asking this number about one was about, while it still waits and no other text in the reply window asked about another that still waits (then the numbered list); when it was answered or replaced, or nothing asked, nothing is decided and the reply names what waits now, with its code ("Cows: move to P2 was replaced. Cows: move to P3? Reply Y or N"), which the next Y answers; several waiting → a numbered list, `Y 2` picks (a number with no list texted gets the list) |
 | `LATER` [code \| number] | manager | the approval prompt again in an hour (the decision's own timer is unchanged); not sent if by then the person texted STOP, was switched off, isn't a manager, or that number isn't their verified phone |
 | `OK` | hand | acks the alerts the last alert text to that person covered; a decision's own text is passed over (it takes Y or N) |
 | `STATUS` | anyone | each herd: head, paddock, a running move, open alerts, what waits for an answer |

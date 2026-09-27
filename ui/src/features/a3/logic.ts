@@ -35,14 +35,20 @@ export function repliesLine(t: Texting, configured: readonly string[]): RepliesL
   }
 }
 
+// Channels a brief can go out on (the server's alert_channels): WhatsApp only with an approved
+// template, since Twilio lets a business start a WhatsApp conversation only with one.
+export const briefChannels = (c: { configured: readonly string[]; whatsapp: { template_sid?: string } }) =>
+  c.configured.filter((k) => k !== "whatsapp" || !!c.whatsapp.template_sid);
+
 // The brief time beside Daily shows once something can carry it.
 export const canBrief = (configured: readonly string[]) => configured.some((c) => OUTBOUND.includes(c));
 
-// A person can get the brief: a verified phone over a text channel, or an email over email or the relay.
+// A person can get the brief: a verified phone over a text channel, or an email over the farm's
+// own email (the relay texts only phones proven to it).
 export function reachable(u: User, configured: readonly string[]): boolean {
   if (u.disabled_at) return false;
   const phone = !!u.phone && !!u.phone_verified_at && ["sms", "whatsapp", "relay"].some((c) => configured.includes(c));
-  const email = !!u.email && (configured.includes("email") || configured.includes("relay"));
+  const email = !!u.email && configured.includes("email");
   return phone || email;
 }
 

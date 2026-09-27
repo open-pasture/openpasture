@@ -254,3 +254,41 @@ async fn turning_the_relay_on_beside_the_farms_own_twilio_keeps_every_phone() {
     assert_eq!(s, StatusCode::OK);
     assert!(verified_at(&farm, &hank).await.is_none());
 }
+
+#[tokio::test]
+async fn a_phone_the_relay_says_it_doesnt_know_shows_verify_again() {
+    let host = Host::start().await;
+    let (_d, farm) = ctx().await;
+    let a = app(&farm);
+    let body = json!({ "secrets": { "hosted_url": host.url, "hosted_api_key": host.key }, "relay": { "enabled": true } });
+    let (s, v) = call(&a, "PUT", "/api/notify/channels", Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Hank's phone was verified another way (the farm's own Twilio before an
+    // upgrade, or the relay lost him): the relay refuses his texts.
+    let hank = person(&farm, Some(PHONE), Role::Manager).await;
+    users::set_phone_verified(&farm, &hank, chrono::Utc::now()).await.unwrap();
+    let mut o = out("alert:x:1", "relay", PHONE, "214 outside P3, 6m. Reply OK to ack");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    let got = message(&farm, &m.id).await;
+    assert_eq!((got.status.as_str(), got.error.as_deref()), ("failed", Some("That recipient isn't verified.")));
+    // So the phone isn't counted as reachable any more, and Verify (a relay code) works again.
+    assert!(verified_at(&farm, &hank).await.is_none());
+    let (s, v) = call(&a, "POST", "/api/notify/verify", Some(json!({ "user_id": hank }))).await;
+    assert_eq!((s, v.clone()), (StatusCode::OK, json!({ "via": "relay" })), "{v}");
+    let (s, v) = call(&a, "POST", "/api/notify/verify/confirm", Some(json!({ "user_id": hank, "code": last_code(&host.twilio) }))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut o = out("alert:x:2", "relay", PHONE, "214 outside P3, 9m. Reply OK to ack");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    assert_eq!(message(&farm, &m.id).await.status, "sent");
+    // A refusal for any other reason leaves the phone as it is.
+    let mut o = out("alert:x:3", "relay", "+15155550999", "214 outside P3");
+    o.user_id = Some(hank.clone());
+    let m = op_core::messages::enqueue(&farm, o).await.unwrap();
+    op_alerts::notify::sender::run_once(&farm, chrono::Utc::now()).await.unwrap();
+    assert_eq!(message(&farm, &m.id).await.status, "failed");
+    assert!(verified_at(&farm, &hank).await.is_some(), "a refusal for another number never touches Hank's");
+}

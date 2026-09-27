@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useChannels } from "../../store/a-notify";
 import { Check } from "../../ui/Check";
-import { canBrief, validTime } from "./logic";
+import { briefChannels, canBrief, validTime } from "./logic";
 import { saveTexting, useTexting } from "./state";
 
 export function BriefTime() {
@@ -12,7 +12,7 @@ export function BriefTime() {
   const [v, setV] = useState("");
   const [err, setErr] = useState<string>();
   useEffect(() => setV(t?.brief.time ?? ""), [t?.brief.time]);
-  if (!t || !c || !canBrief(c.configured)) return null;
+  if (!t || !c || !canBrief(briefChannels(c))) return null;
   const save = async (brief: { enabled?: boolean; time?: string }) => {
     setErr(undefined);
     try {

@@ -243,6 +243,26 @@ pub async fn relay_took_over(ctx: &Ctx, relay: &Relay, known: &[super::relay::Re
     Ok(unverified)
 }
 
+/// The relay refused a text to `phone`: it hasn't proven that number for
+/// this key (verified here some other way, e.g. on the farm's own Twilio
+/// before the relay took over, or the relay lost it). While the relay is how
+/// this server texts, the phone loses `phone_verified_at` so routing stops
+/// counting on it and Verify (a relay code) shows beside it again. Returns
+/// how many people that was.
+pub async fn relay_forgot(ctx: &Ctx, phone: &str) -> anyhow::Result<usize> {
+    let c = configured_channels(ctx).await?;
+    if !c.contains(&"relay") || c.contains(&"sms") {
+        return Ok(0);
+    }
+    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM users WHERE phone = ? AND phone_verified_at IS NOT NULL").bind(phone).fetch_all(ctx.db()).await?;
+    for (id,) in &ids {
+        sqlx::query("UPDATE users SET phone_verified_at = NULL WHERE id = ?").bind(id).execute(ctx.db()).await?;
+        sqlx::query("DELETE FROM phone_codes WHERE user_id = ?").bind(id).execute(ctx.db()).await?;
+        tracing::info!(user = %id, "the relay doesn't know this phone for this server; it needs verifying again");
+    }
+    Ok(ids.len())
+}
+
 async fn verified(ctx: &Ctx, user_id: &str) -> ApiResult<Verified> {
     let at = now();
     users::set_phone_verified(ctx, user_id, at).await?;

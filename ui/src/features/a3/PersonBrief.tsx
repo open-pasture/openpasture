@@ -6,14 +6,14 @@ import type { User } from "../../api";
 import { useChannels } from "../../store/a-notify";
 import { Check } from "../../ui/Check";
 import { textingApi } from "./api";
-import { personOf, reachable, withPerson } from "./logic";
+import { briefChannels, personOf, reachable, withPerson } from "./logic";
 import { texting, useTexting } from "./state";
 
 export function PersonBrief({ user }: { user: User }) {
   const t = useTexting();
   const c = useChannels();
   const [err, setErr] = useState<string>();
-  if (!t || !c || !reachable(user, c.configured)) return null;
+  if (!t || !c || !reachable(user, briefChannels(c))) return null;
   const p = personOf(t, user.id);
   const flip = async (on: boolean) => {
     setErr(undefined);

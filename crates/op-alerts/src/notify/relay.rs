@@ -147,7 +147,17 @@ impl Channel for Relay {
         }
         match self.call(reqwest::Method::POST, "/v1/notify", Some(body)).await? {
             Ok(v) => Ok(Delivery::sent(v.get("id").and_then(Value::as_str).map(str::to_owned))),
-            Err(r) => Err(refused(r)),
+            Err(r) => {
+                // The relay doesn't know this phone for our key: it needs proving to it.
+                if r.status == 403
+                    && r.message == crate::hosting::outbound::NOT_VERIFIED
+                    && channel == "sms"
+                    && let Err(e) = super::verify::relay_forgot(&self.ctx, to).await
+                {
+                    tracing::warn!(message = %msg.id, "unverifying a phone the relay doesn't know: {e:#}");
+                }
+                Err(refused(r))
+            }
         }
     }
 }

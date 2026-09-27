@@ -15,6 +15,10 @@ use super::{address, caller, can_send, key_prefix, take_quota};
 /// Kinds a relayed message may say it is (default `alert`).
 const KINDS: [&str; 5] = ["alert", "brief", "reply", "test", "verify"];
 
+/// The 403 for a recipient this key hasn't proven; a farm that gets it
+/// asks for its person's phone to be verified again (`notify::verify::relay_forgot`).
+pub const NOT_VERIFIED: &str = "That recipient isn't verified.";
+
 #[derive(Debug, Deserialize)]
 pub struct NotifyBody {
     pub idempotency_key: String,
@@ -73,7 +77,7 @@ pub async fn post_notify(State(ctx): State<Ctx>, headers: HeaderMap, ApiJson(b):
             .fetch_optional(ctx.db())
             .await?;
     if verified.is_none() {
-        return Err(ApiError::forbidden("That recipient isn't verified."));
+        return Err(ApiError::forbidden(NOT_VERIFIED));
     }
 
     let _held = super::LIMIT.lock().await;
