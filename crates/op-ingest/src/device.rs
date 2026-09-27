@@ -388,7 +388,8 @@ async fn insert_health(
 struct Want {
     /// Highest version held, applied or staged.
     have: Option<u32>,
-    /// Slots left; absent (a legacy collar) counts as 1.
+    /// Slots left. A legacy collar doesn't say: its slots less what its acks
+    /// say it holds (so a staged one it has no room for isn't sent to be refused).
     free: Option<usize>,
     /// Slot bytes left; absent means no byte limit.
     free_bytes: Option<usize>,
@@ -408,7 +409,11 @@ async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Wa
     if let Some(a) = split.active.as_ref().filter(wanted) {
         return Ok(Json(shape::command_for(&ctx, a, &caps)?).into_response());
     }
-    if q.free.unwrap_or(1) > 0
+    let free = match q.free {
+        Some(f) => f,
+        None => caps.limits.slots.saturating_sub(db::held_count(ctx.db(), &device.collar.id).await?),
+    };
+    if free > 0
         && let Some(s) = split.staged.iter().find(wanted)
         && q.free_bytes.is_none_or(|room| shape::record_bytes(s, &caps).is_ok_and(|n| n <= room))
     {

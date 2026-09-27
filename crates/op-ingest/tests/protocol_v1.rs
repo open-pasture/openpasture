@@ -228,7 +228,7 @@ async fn download_order_free_slots_and_bytes() {
     assert_eq!(bytes, 192 + 8 * 4);
     assert!(app.download(&key, &format!("have=1&free=3&free_bytes={}", bytes - 1)).await.is_none());
     assert_eq!(app.download(&key, &format!("have=1&free=3&free_bytes={bytes}")).await.unwrap().version, 2);
-    // A legacy collar says neither: one staged slot, no byte limit.
+    // A collar that doesn't say (legacy) gets what its slots hold less what its acks say it holds.
     assert_eq!(app.download(&key, "have=1").await.unwrap().version, 2);
     // The active one is never held back.
     assert_eq!(app.download(&key, "have=0&free=0&free_bytes=0").await.unwrap().version, 1);
@@ -695,6 +695,7 @@ async fn report_path_queries_use_indexes() {
         (op_ingest::sql::OWN_COPIES, 3, false),
         (op_ingest::sql::OPEN_PEN, 2, false),
         (op_ingest::sql::REJECTED, 1, false),
+        (op_ingest::sql::HELD, 1, false),
         (op_ingest::sql::NEXT_VERSION, 0, false),
         (op_ingest::sql::CONFIG, 1, false),
         // The activation watcher: a 2-second window of effective_at, then sorted.
@@ -714,4 +715,26 @@ async fn report_path_queries_use_indexes() {
         }
         assert!(details.iter().any(|d| d.contains("USING")), "{q}: {details:?}");
     }
+}
+
+#[tokio::test]
+async fn a_legacy_collar_is_sent_a_staged_boundary_only_when_it_has_room() {
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let (id, key) = app.device(&herd).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    let later = |m: i64| op_protocol::wire_time::format(&(Utc::now() + Duration::minutes(m)));
+    app.send(&herd, polygon(rect(0.0, 0.0, 280.0, 200.0), vec![]), json!({"effective_at": later(2)})).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 260.0, 200.0), vec![]), json!({"effective_at": later(4)})).await;
+    let v1 = app.download(&key, "have=0").await.unwrap();
+    app.ack(&key, &v1, "applied", None).await;
+    let v2 = app.download(&key, "have=1").await.unwrap();
+    app.ack(&key, &v2, "received", None).await;
+    // Two slots, both held: v3 waits instead of being refused (firmware 0.1 would give no code,
+    // and a refusal without a code is for good).
+    assert!(app.download(&key, "have=2").await.is_none());
+    // v2 took effect: room again.
+    app.ack(&key, &v2, "applied", None).await;
+    assert_eq!(app.download(&key, "have=2").await.unwrap().version, 3);
+    assert_eq!(app.slots(&id).await["slots"].as_array().unwrap().len(), 1);
 }

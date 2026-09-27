@@ -25,6 +25,8 @@ pub mod sql {
     /// Versions a collar refused for good (every code but `slots_full`; no code counts as permanent).
     pub const REJECTED: &str = "SELECT version FROM collar_slots WHERE collar_id = ?1 AND status = 'rejected'
          AND (code IS NULL OR code != 'slots_full')";
+    /// How many boundaries a collar holds (applied or staged), as the server knows.
+    pub const HELD: &str = "SELECT COUNT(*) FROM collar_slots WHERE collar_id = ?1 AND status != 'rejected'";
     /// The next boundary version (one sequence across herds).
     pub const NEXT_VERSION: &str = "SELECT COALESCE(MAX(version), 0) + 1 FROM boundaries";
     /// A collar's stored config.
@@ -120,6 +122,13 @@ pub async fn herd_boundaries_in(conn: &mut SqliteConnection, herd_id: &str, now:
 
 pub async fn herd_boundaries(db: &SqlitePool, herd_id: &str, now: DateTime<Utc>) -> anyhow::Result<HerdBoundaries> {
     herd_boundaries_in(&mut *db.acquire().await?, herd_id, now).await
+}
+
+/// Boundaries a collar holds as far as the server knows (its report's slot
+/// list, else its acks).
+pub async fn held_count(db: &SqlitePool, collar_id: &str) -> anyhow::Result<usize> {
+    let (n,): (i64,) = sqlx::query_as(sql::HELD).bind(collar_id).fetch_one(db).await?;
+    Ok(n as usize)
 }
 
 /// Versions a collar refused for good; the server doesn't offer them again.
