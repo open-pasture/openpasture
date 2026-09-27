@@ -18,6 +18,7 @@ import "./hub-ui";
 // @P
 // @Q
 // @C
+import "./c";
 // @F
 // @S
 // @A3
