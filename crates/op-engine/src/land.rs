@@ -20,6 +20,11 @@ pub const SECRET: &str = "firecrawl_api_key";
 const ALEXANDRIA_URL: &str = "https://api.firecrawl.dev/v2/scrape";
 const OPEN_METEO_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const NEEDS_ALEXANDRIA: &str = "Only available through Alexandria. Add a Firecrawl API key to enable it.";
+/// Snow deeper than this hides the grass from imagery: forage only from a measured height.
+pub const SNOW_DEPTH_CM: f64 = 2.0;
+/// A mean air temperature below this over the last [`DORMANT_DAYS`] days: grass is dormant.
+pub const DORMANT_MEAN_C: f64 = 5.0;
+pub const DORMANT_DAYS: usize = 7;
 
 /// The sections a decision asks for (kit `DEFAULT_DECISION_SECTIONS`).
 pub fn decision_sections() -> Value {
@@ -256,8 +261,11 @@ async fn open_meteo(lon: f64, lat: f64, history_days: i64, forecast_days: i64) -
         .query(&[
             ("latitude", lat.to_string()),
             ("longitude", lon.to_string()),
-            ("current", "temperature_2m,precipitation,wind_speed_10m,relative_humidity_2m".into()),
-            ("daily", "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,et0_fao_evapotranspiration".into()),
+            ("current", "temperature_2m,precipitation,wind_speed_10m,relative_humidity_2m,snow_depth".into()),
+            (
+                "daily",
+                "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,precipitation_probability_max,et0_fao_evapotranspiration".into(),
+            ),
             ("past_days", history_days.clamp(0, 92).to_string()),
             ("forecast_days", forecast_days.clamp(1, 16).to_string()),
             ("timezone", "UTC".into()),
@@ -286,6 +294,7 @@ pub fn weather_section(payload: &Value, today: &str) -> Value {
         });
         if d < today {
             row["et0_mm"] = pick("et0_fao_evapotranspiration", i);
+            row["temp_mean_c"] = pick("temperature_2m_mean", i);
             history.push(row);
         } else {
             row["precip_probability"] = fraction(&pick("precipitation_probability_max", i));
@@ -300,11 +309,30 @@ pub fn weather_section(payload: &Value, today: &str) -> Value {
             "precip_mm_24h": precip_24h,
             "wind_kph": current["wind_speed_10m"],
             "relative_humidity": fraction(&current["relative_humidity_2m"]),
+            // Open-Meteo gives metres.
+            "snow_depth_cm": current["snow_depth"].as_f64().map(|m| json!(crate::calc::round(m * 100.0, 1))).unwrap_or(Value::Null),
         },
         "history": history,
         "forecast": forecast,
         "sources": [{ "provider": "open-meteo", "retrieved_at": time::to_db(&time::now()), "resolution": "~11 km", "license": "CC BY 4.0" }],
     })
+}
+
+/// Why imagery can't give forage for this report, if it can't: `"snow"` when the
+/// current snow depth is over [`SNOW_DEPTH_CM`], `"dormant"` when the mean air
+/// temperature of the last [`DORMANT_DAYS`] days is under [`DORMANT_MEAN_C`]. A day's
+/// mean is `temp_mean_c`, else the midpoint of its high and low. Fewer than
+/// [`DORMANT_DAYS`] days of history never count as dormant.
+pub fn forage_withheld(report: &Value) -> Option<&'static str> {
+    let w = ok_section(report, "weather")?;
+    let snow = w.get("current").and_then(|c| c.get("snow_depth_cm")).and_then(Value::as_f64);
+    if snow.is_some_and(|d| d > SNOW_DEPTH_CM) {
+        return Some("snow");
+    }
+    let day_mean =
+        |r: &Value| r.get("temp_mean_c").and_then(Value::as_f64).or_else(|| Some((r.get("temp_max_c")?.as_f64()? + r.get("temp_min_c")?.as_f64()?) / 2.0));
+    let days: Vec<f64> = w.get("history").and_then(Value::as_array)?.iter().rev().take(DORMANT_DAYS).filter_map(day_mean).collect();
+    (days.len() == DORMANT_DAYS && days.iter().sum::<f64>() / (DORMANT_DAYS as f64) < DORMANT_MEAN_C).then_some("dormant")
 }
 
 /// One line per section, for the land endpoint and the context.
@@ -366,5 +394,26 @@ mod tests {
         assert_eq!(w["forecast"][1]["precip_probability"], 0.9);
         assert_eq!(w["current"]["precip_mm_24h"], 4.5);
         assert_eq!(w["current"]["relative_humidity"], 0.55);
+    }
+
+    #[test]
+    fn open_meteo_snow_depth_and_daily_means() {
+        let payload = json!({
+            "current": { "temperature_2m": -3.0, "snow_depth": 0.064 },
+            "daily": {
+                "time": ["2026-01-09", "2026-01-10", "2026-01-11"],
+                "temperature_2m_max": [1, 0, 2], "temperature_2m_min": [-7, -8, -5], "temperature_2m_mean": [-3.1, -4.0, -1.5],
+                "precipitation_sum": [0, 0, 1]
+            }
+        });
+        let w = weather_section(&payload, "2026-01-11");
+        assert_eq!(w["current"]["snow_depth_cm"], 6.4);
+        assert_eq!(w["history"][1]["temp_mean_c"], -4.0);
+        assert!(w["forecast"][0].get("temp_mean_c").is_none());
+        let report = json!({ "sections": { "weather": w } });
+        assert_eq!(forage_withheld(&report), Some("snow"));
+        // No snow reported: null, not zero.
+        let bare = weather_section(&json!({ "current": { "temperature_2m": 12.0 }, "daily": {} }), "2026-01-11");
+        assert!(bare["current"]["snow_depth_cm"].is_null());
     }
 }

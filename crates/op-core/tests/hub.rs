@@ -581,6 +581,8 @@ async fn place_phrases_name_the_paddock() {
     let (_dir, ctx) = ctx().await;
     assert_eq!(place::describe(&ctx, [-93.62, 42.03]).await.unwrap(), None, "no paddocks");
     farm(&ctx).await;
+    // The farm is in Iowa, so it starts imperial (B); metric first.
+    ctx.update_settings(&json!({"units": "metric"})).await.unwrap();
     let p = op_geo::Projection::new([-93.62, 42.03]);
     assert_eq!(place::describe(&ctx, p.offset(200.0, 200.0)).await.unwrap().as_deref(), Some("in P1"));
     assert_eq!(place::describe(&ctx, p.offset(200.0, 460.0)).await.unwrap().as_deref(), Some("60 m N of P1"));

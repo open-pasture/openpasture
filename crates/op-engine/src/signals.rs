@@ -10,7 +10,7 @@ use op_core::{Ctx, DbEnum, Decision, DecisionAction, DecisionStatus, Herd, Paddo
 use serde_json::{Map, Value, json};
 use sqlx::Row;
 
-use crate::{calc, land};
+use crate::{calc, heights, land};
 
 /// The decision window: signals look back one day.
 pub const WINDOW_HOURS: i64 = 24;
@@ -90,7 +90,8 @@ pub fn from_paddock(d: &Decision) -> Option<String> {
 }
 
 /// When each paddock was last grazed: applied moves out of it, the last collar
-/// fix in it, the farmer's `grazed_until`, and now for the current paddock.
+/// fix in it (hot fixes, plus rolled-up days and imported history from the
+/// `paddock_days` view), the farmer's `grazed_until`, and now for the current paddock.
 pub async fn last_grazed(
     ctx: &Ctx,
     herd: Option<&Herd>,
@@ -116,6 +117,17 @@ pub async fn last_grazed(
         }
     }
     if let Some(h) = herd {
+        // Days no longer in `fixes`: the rollup's and imported position history.
+        let days = sqlx::query("SELECT paddock_id, MAX(last_t) FROM paddock_days WHERE herd_id = ? AND paddock_id != '' AND fixes > 0 GROUP BY paddock_id")
+            .bind(&h.id)
+            .fetch_all(ctx.db())
+            .await?;
+        for r in &days {
+            let at = time::from_unix_ms(r.get::<i64, _>(1));
+            if at <= now {
+                bump(&r.get::<String, _>(0), at);
+            }
+        }
         for f in herd_fixes(ctx, &h.id, now - Duration::days(REST_LOOKBACK_DAYS), now, paddocks).await? {
             if let Some(p) = &f.paddock_id {
                 bump(p, time::from_unix_ms(f.t));
@@ -170,10 +182,11 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     let mut forage = Map::new();
     let mut recovery = Map::new();
     let mut risks = Map::new();
+    let measured = heights::current(ctx, i.now).await?;
     for p in i.paddocks {
         let report = i.reports.get(&p.id);
         let (ndvi, hist) = ndvi_inputs(report);
-        forage.insert(p.id.clone(), calc::forage_estimate(ndvi, None, calc::DEFAULT_RESIDUAL_INCHES));
+        forage.insert(p.id.clone(), paddock_forage(ndvi, measured.get(&p.id), report.and_then(land::forage_withheld)));
         recovery.insert(p.id.clone(), calc::recovery_trend(&hist));
         if let Some(r) = report {
             risks.insert(p.id.clone(), json!(calc::risk_flags(&land::section_data(r))));
@@ -224,12 +237,43 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     }))
 }
 
+/// A paddock's forage: a height measured in the last 21 days wins
+/// (`source: "measured"`, with `height_cm` and `measured_at`); otherwise NDVI,
+/// unless snow or dormant grass makes imagery meaningless, when the estimate is
+/// null and `reason` says why (`"snow"` or `"dormant"`).
+pub fn paddock_forage(ndvi: Option<f64>, measured: Option<&heights::Height>, withheld: Option<&'static str>) -> Value {
+    let residual = calc::DEFAULT_RESIDUAL_INCHES;
+    if let Some(h) = measured {
+        let mut f = calc::forage_estimate(ndvi, Some(h.height_cm / 2.54), residual);
+        f["source"] = json!("measured");
+        f["height_cm"] = json!(h.height_cm);
+        f["measured_at"] = json!(time::to_db(&h.at));
+        return f;
+    }
+    match withheld {
+        Some(reason) => {
+            let mut f = calc::forage_estimate(None, None, residual);
+            f["reason"] = json!(reason);
+            f
+        }
+        None => calc::forage_estimate(ndvi, None, residual),
+    }
+}
+
 /// Per-paddock view of the signals for `GET /api/signals`.
 pub fn per_paddock(signals: &Value, paddocks: &[Paddock], current: Option<&str>) -> Value {
+    let au = signals["herd_animal_units"].as_f64().filter(|a| *a > 0.0);
     let rows: Vec<Value> = paddocks
         .iter()
         .map(|p| {
             let id = p.id.as_str();
+            // Days of grazing this paddock's forage gives the herd, as for the current paddock.
+            let grazing_days = match (au, real_area(p), signals["forage"][id]["available_kg_dm_per_ha"].as_f64()) {
+                (Some(au), Some(area), Some(avail)) => {
+                    calc::feed_budget_days(avail * area, au, calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY, calc::DEFAULT_UTILIZATION, 0.0)
+                }
+                _ => None,
+            };
             json!({
                 "paddock_id": id,
                 "name": p.name,
@@ -239,6 +283,8 @@ pub fn per_paddock(signals: &Value, paddocks: &[Paddock], current: Option<&str>)
                 "rest_days": signals["rest_days"][id],
                 "grazing_pressure": signals["grazing_pressure"][id],
                 "forage": signals["forage"][id],
+                "grazing_days": grazing_days,
+                "last_grazed": signals["last_grazed"][id],
                 "recovery": signals["recovery"][id],
                 "risk_flags": signals["risk_flags_by_paddock"].get(id).cloned().unwrap_or_else(|| json!([])),
             })

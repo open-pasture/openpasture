@@ -478,6 +478,45 @@ days plus imported position history.
 <!-- @K-files -->
 <!-- @I -->
 <!-- @B -->
+
+## Map layers, measured heights (op-engine)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/layers/paddocks` | | `{ as_of, paddocks: PaddockLayer[] }` from the record and cached land reports only (never fetches) |
+| GET | `/api/paddocks/:id/heights` | `?limit` (default 50, at most 500) | `Height[]` newest first |
+| POST | `/api/paddocks/:id/heights` | `{ height_cm, residual_cm?, at? }` (hand and up) | 201 `Height` |
+
+```ts
+PaddockLayer { paddock_id, grazing?: true /* a herd is in it now */, rest_days?, last_grazed?,
+               ndvi?, ndvi_at? /* YYYY-MM-DD of the imagery */,
+               drought?: { category: "D0"|"D1"|"D2"|"D3"|"D4"|null /* null: not in drought */ },
+               flood?: { in_floodplain: boolean, zone?, risk?: "medium"|"high" /* 3-day forecast */ } }
+Height       { id /* hgt_… */, paddock_id, at, height_cm, residual_cm?, by: Actor, created_at }
+```
+
+A field is absent when nothing is known. Rest days count from when any herd last grazed the
+paddock (applied moves, collar fixes, rolled-up and imported history, `grazed_until`; a paddock
+with a herd in it now is 0). NDVI, drought and flood come from the newest cached land report:
+they need the land provider key (open data has only weather), so without it they are absent.
+
+A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
+behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
+it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
+signals; older ones stay listed but no longer count.
+
+Changes to existing shapes (all additive):
+- `Signals.paddocks[]` gains `grazing_days` (days this paddock's forage feeds the herd: 60 % of
+  standing forage above a 3 inch residual at 11.8 kg DM per AU a day, capped at 365) and
+  `last_grazed`.
+- `forage` (in `/api/signals` and the decision context) carries `source: "measured"` with
+  `height_cm` and `measured_at` when a height counts. When the paddock's land report shows snow
+  deeper than 2 cm or a 7-day mean air temperature under 5 °C, imagery forage is withheld:
+  `height_inches`, `available_kg_dm_per_ha` and `source` are null and `reason` is `"snow"` or
+  `"dormant"`. A measured height still counts.
+- The open-data weather section gains `current.snow_depth_cm` and `history[].temp_mean_c`.
+- `POST /api/farm` sets `settings.units` from the farm's time zone: imperial in US zones, metric
+  elsewhere. Only at creation; moving the farm later leaves the units alone.
 <!-- @G -->
 <!-- @P -->
 <!-- @Q -->
