@@ -1,4 +1,8 @@
 // Typed client for docs/API.md. Same origin: the Rust server serves this UI.
+// HTTP plumbing lives in ./api/http; each stream adds its own ./api/<id>.ts.
+
+import { del, get, getToken, patch, post, put, qs } from "./api/http";
+export { ApiError, authHeaders, downloadBlob, getToken, onUnauthorized, qs, setToken, type Query } from "./api/http";
 
 export type LonLat = [number, number];
 export type Polygon = { type: "Polygon"; coordinates: LonLat[][] };
@@ -20,12 +24,20 @@ export interface Farm { id: string; name: string; timezone: string; center: LonL
 export interface Paddock {
   id: string; name: string; geometry: Polygon; area_ha: number;
   status: "resting" | "grazing" | "planned"; notes?: string; grazed_until?: string; created_at: string;
+  // Free-form facts, e.g. FSA numbers fsa_farm, fsa_tract, fsa_field. Absent when empty.
+  props?: Record<string, unknown>;
 }
 export interface Herd {
   id: string; name: string; species: Species; count: number; paddock_id?: string;
   autonomy: Autonomy; timer_minutes: number; created_at: string;
 }
-export interface Animal { id: string; tag: string; name?: string; herd_id: string; collar_id?: string }
+export type Sex = "female" | "male" | "castrated";
+export type RemovedReason = "sold" | "died" | "culled" | "moved_off";
+export interface Animal {
+  id: string; tag: string; name?: string; herd_id: string; collar_id?: string;
+  // 15-digit EID; born is a date (YYYY-MM-DD). Removed animals keep their row.
+  eid?: string; breed?: string; sex?: Sex; born?: string; notes?: string; removed_at?: string; removed_reason?: RemovedReason;
+}
 export interface Settings {
   brain: { id: BrainId; model?: string };
   decision_time: string;
@@ -42,12 +54,19 @@ export interface AppState { farm: Farm | null; herds: Herd[]; paddocks: Paddock[
 export interface SecretStatus { name: SecretName; set: boolean }
 
 export interface Fix { at: string; point: LonLat; accuracy_m: number; sats: number; cn0?: number; ttf_s?: number }
+export type ParkReason = "charging" | "shelf" | "repair";
 // battery is 0-1.
 export interface Collar {
   id: string; name: string; herd_id: string; animal_id?: string; last_seen?: string;
   battery?: number; boundary_version?: number; state: CollarState; last_fix?: Fix;
+  // What the collar reports about itself (fw, caps), and park state: a parked collar is on a shelf or charger.
+  fw?: string; caps?: string[]; outside_since?: string; parked_at?: string; parked_reason?: ParkReason;
 }
 export interface Position { collar_id: string; animal_id?: string; fix: Fix; state: CollarState }
+// The latest position of one collar, as the map keeps it (op_core::live::PositionItem).
+export interface PositionItem {
+  collar_id: string; animal_id?: string; fix: Fix; state: CollarState; battery?: number; last_seen?: string;
+}
 export interface Boundary {
   id: string; herd_id: string; version: number; geometry: Polygon; warn_m: number; hysteresis_m: number;
   effective_at?: string; decision_id: string; created_at: string;
@@ -78,7 +97,12 @@ export interface BoundaryStatus {
   move?: Move;
   // Open escapes, and those ended in the last 10 min.
   escapes?: Escape[];
+  // Every staged boundary still to come, in version order (pending is the last), and per version
+  // how many of the herd's collars hold it.
+  staged?: Boundary[];
+  slots?: SlotCount[];
 }
+export interface SlotCount { version: number; effective_at?: string; applied: number; stored: number; rejected: number; collars: number }
 export interface NewCollar { collar: Collar; key: string; endpoint: string; public_key: string }
 
 export type DecisionStatus = "running" | "proposed" | "approved" | "applied" | "rejected" | "failed" | "superseded";
@@ -125,18 +149,81 @@ export interface PastureRow {
 export interface SqlResult { columns: string[]; rows: unknown[][]; ms: number; truncated?: boolean }
 export interface ServerInfo { version: string; data_dir: string; bind: string; port: number; lan_url?: string; public_url?: string }
 
-export type LiveEvent =
-  | { type: "fix"; collar_id: string; animal_id?: string; herd_id: string; fix: Fix; state: CollarState }
-  | { type: "cue"; collar_id: string; at: string; level: number; margin_m: number }
-  | { type: "ack"; collar_id: string; herd_id: string; version: number; status: AckStatus; reason?: string }
-  | { type: "collar"; collar: Collar }
-  | { type: "boundary"; herd_id: string; boundary: Boundary }
-  | { type: "decision"; decision: Decision }
-  | { type: "move"; move: Move }
-  | { type: "escape"; escape: Escape }
-  | { type: "decision_log"; decision_id: string; line: string }
+// Live events on /api/live, keyed by `type`. Each stream adds its own events from its
+// ui/src/api/<id>.ts:
+//   declare module "../api" { interface LiveEvents { schedule: { schedule: Schedule } } }
+// and mirrors the line in the events list of docs/API.md. LiveEvent is derived from it.
+export interface LiveEvents {
+  fix: { collar_id: string; animal_id?: string; herd_id: string; fix: Fix; state: CollarState };
+  // kind and ring come from collars that report them; older rows have neither.
+  cue: { collar_id: string; at: string; level: number; margin_m: number; kind?: CueKind; ring?: number };
+  ack: { collar_id: string; herd_id: string; version: number; status: AckStatus; reason?: string };
+  collar: { collar: Collar };
+  boundary: { herd_id: string; boundary: Boundary };
+  decision: { decision: Decision };
+  move: { move: Move };
+  escape: { escape: Escape };
+  decision_log: { decision_id: string; line: string };
   // The server dropped events for this socket; refetch everything.
-  | { type: "resync" };
+  resync: Record<never, never>;
+  alert: { alert: Alert };
+  // Manager and owner sockets only.
+  message: { message: MessageLog };
+  feature: { feature: MapFeature; deleted?: boolean };
+  animals_changed: { herd_id?: string };
+}
+export type LiveEventType = keyof LiveEvents;
+export type LiveEventOf<K extends LiveEventType> = { type: K } & LiveEvents[K];
+export type LiveEvent = { [K in LiveEventType]: LiveEventOf<K> }[LiveEventType];
+
+// ---- identity -----------------------------------------------------------------
+
+// Ordered: viewer < hand < manager < owner.
+export type Role = "viewer" | "hand" | "manager" | "owner";
+export type Via = "local" | "app_token" | "user_token" | "brain" | "text" | "system" | "anonymous";
+// Who did something, stored on records (acks, responses, schedules, imports).
+export interface Actor { via: Via; user_id?: string; name?: string }
+// GET /api/me
+export interface Me {
+  role: Role; via: Via;
+  user?: { id: string; name: string; phone?: string; phone_verified?: boolean; email?: string };
+}
+// A person on the farm (op_core::users). People who only text have a phone and no sign-in.
+export interface User {
+  id: string; name: string; role: Role; phone?: string; phone_verified_at?: string; email?: string;
+  created_at: string; disabled_at?: string;
+}
+
+// ---- shared op-core records ---------------------------------------------------
+
+export type Severity = "info" | "warning" | "critical";
+export type CueKind = "warn" | "outside";
+// One thing a check found, e.g. "No water inside", with what to draw and what it is about.
+export interface Finding {
+  code: string; severity: Severity; text: string; geometry?: GeoJSON.Geometry; targets?: [string, string][];
+}
+export type AlertStatus = "open" | "acked" | "resolved";
+export interface Alert {
+  id: string; kind: string; key: string; severity: Severity; status: AlertStatus; herd_id?: string;
+  title: string; body?: string; at?: LonLat; targets: [string, string][]; data: unknown;
+  opened_at: string; updated_at: string; acked_at?: string; acked_by?: Actor;
+  // resolved_at without resolved_by: it cleared by itself. rolled_into: it joined a herd rollup.
+  resolved_at?: string; resolved_by?: Actor; rolled_into?: string;
+}
+export interface MessageLog {
+  id: string; direction: "out" | "in"; channel: string; address: string; user_id?: string; kind: string; text: string;
+  status: string; error?: string; alert_id?: string; decision_id?: string; provider_id?: string;
+  created_at: string; updated_at: string;
+}
+export type FeatureKind = "exclusion" | "water" | "gate" | "shade" | "hazard" | "road" | "neighbour_line" | "farm_boundary";
+export type FeatureGeometry =
+  | { type: "Point"; coordinates: LonLat }
+  | { type: "LineString"; coordinates: LonLat[] }
+  | { type: "Polygon"; coordinates: LonLat[][] };
+export interface MapFeature {
+  id: string; kind: FeatureKind; name?: string; geometry: FeatureGeometry; paddock_id?: string; notes?: string;
+  props: Record<string, unknown>; active_from?: string; active_until?: string; created_at: string; updated_at: string;
+}
 
 export interface HostedKey { id: string; label?: string; created_at: string; last_used?: string }
 export interface NewHostedKey extends HostedKey { key: string }
@@ -147,63 +234,6 @@ function socket(path: string) {
   const q = token ? `?token=${encodeURIComponent(token)}` : "";
   return new WebSocket(`${proto}//${location.host}${path}${q}`);
 }
-
-// Off localhost the server wants the app token; the app asks for it on the first 401.
-let unauthorized: () => void = () => {};
-export const onUnauthorized = (f: () => void) => (unauthorized = f);
-
-const TOKEN_KEY = "openpasture.token";
-export const getToken = () => localStorage.getItem(TOKEN_KEY) ?? "";
-export const authHeaders = (): Record<string, string> => {
-  const t = getToken();
-  return t ? { Authorization: `Bearer ${t}` } : {};
-};
-export const setToken = (t: string) => (t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY));
-
-export class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
-  }
-}
-
-type Query = Record<string, string | number | undefined | null>;
-
-function qs(q?: Query) {
-  if (!q) return "";
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== null && v !== "") p.set(k, String(v));
-  const s = p.toString();
-  return s ? `?${s}` : "";
-}
-
-async function req<T>(method: string, path: string, body?: unknown, q?: Query): Promise<T> {
-  const headers = authHeaders();
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(path + qs(q), {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (res.status === 401) unauthorized();
-  if (!res.ok) {
-    let msg = res.statusText;
-    try {
-      msg = ((await res.json()) as { error?: string }).error ?? msg;
-    } catch {
-      /* not json */
-    }
-    throw new ApiError(res.status, msg);
-  }
-  if (res.status === 204) return undefined as T;
-  const type = res.headers.get("Content-Type") ?? "";
-  return (type.includes("json") ? res.json() : res.text()) as Promise<T>;
-}
-
-const get = <T>(p: string, q?: Query) => req<T>("GET", p, undefined, q);
-const post = <T>(p: string, b?: unknown) => req<T>("POST", p, b ?? {});
-const patch = <T>(p: string, b: unknown) => req<T>("PATCH", p, b);
-const put = <T>(p: string, b: unknown) => req<T>("PUT", p, b);
-const del = (p: string, q?: Query) => req<void>("DELETE", p, undefined, q);
 
 export type Range = { from?: string; to?: string };
 
@@ -272,6 +302,7 @@ export const api = {
 
   // server
   server: () => get<ServerInfo>("/api/server"),
+  me: () => get<Me>("/api/me"),
 };
 
 // Live feed with reconnect. Returns an unsubscribe function.
