@@ -22,6 +22,8 @@ export type { Role } from "./api";
 
 // Vite sets DEV false in production builds; bun test and the dev server leave it on.
 const DEV = import.meta.env.DEV !== false;
+// Under the dev server a feature module that is edited runs again and re-registers its items.
+const HOT = !!import.meta.hot;
 
 // ---- shortcut keys ------------------------------------------------------------------
 // One key space for the whole app. Views, tools and shortcuts claim their key when they
@@ -95,9 +97,11 @@ export function createRegistry<T extends Item>(name: string): Registry<T> {
   const reg: Registry<T> = {
     name,
     register(item) {
-      if (items.some((i) => i.id === item.id)) throw new Error(`${name}: "${item.id}" is registered twice.`);
+      const at = items.findIndex((i) => i.id === item.id);
+      if (at >= 0 && !HOT) throw new Error(`${name}: "${item.id}" is registered twice.`);
       if (item.key !== undefined && !claimKey(item.key, `${name} ${item.id}`)) item = { ...item, key: undefined };
-      items.push(item);
+      if (at >= 0) items[at] = item;
+      else items.push(item);
       bump();
     },
     list: sorted,
