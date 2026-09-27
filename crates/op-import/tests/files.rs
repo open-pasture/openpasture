@@ -432,6 +432,22 @@ async fn positions_without_offsets_read_in_the_farm_zone_or_the_one_chosen() {
 }
 
 #[tokio::test]
+async fn a_day_first_export_is_read_day_first_on_every_row() {
+    // A tracker that writes 01/06/2026 for June 1st, on the Iowa farm.
+    let app = App::new().await;
+    app.farm().await;
+    let mut csv = String::from("Animal ID,Date/Time,Latitude,Longitude\n");
+    for d in 1..=30 {
+        csv += &format!("031,{d:02}/06/2026 10:00,42.0318,-93.6225\n");
+    }
+    let (s, prev) = app.upload("/api/import/positions/preview", "tracker.csv", csv.as_bytes(), &[]).await;
+    assert_eq!(s, StatusCode::OK, "{prev}");
+    assert_eq!(prev["errors"], json!([]));
+    // 10:00 CDT is 15:00 UTC: June 1 to June 30, not January 6 to December 6.
+    assert_eq!((prev["labels"][0]["from"].as_str(), prev["labels"][0]["to"].as_str()), (Some("2026-06-01T15:00:00Z"), Some("2026-06-30T15:00:00Z")));
+}
+
+#[tokio::test]
 async fn gpx_tracks_are_named_by_tag() {
     let app = App::new().await;
     let farm = app.farm().await;
