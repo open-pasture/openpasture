@@ -699,14 +699,15 @@ sender to deliver. A person gets an alert when its severity is at least theirs, 
 theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
 that hasn't texted STOP; with no Twilio or SMTP of the farm's own, sms and email go over the relay
 (channel `relay`, address the phone or the email). The approval prompt (`decision_waiting`) goes only to
-managers and the owner, who alone may answer it. When anyone matching is on duty and not held by quiet
-hours, the first send goes only to them; otherwise to everyone matching (those held get it when their
-quiet hours end). Warnings wait `group_window_s` and go as one text per kind and herd ("3 outside P3:
+managers and the owner, who alone may answer it. When anyone matching is on duty, may answer it (OK
+is for hands and up, Y or N for managers and up) and is not held by quiet hours, the first send goes
+only to them; otherwise to everyone matching (those held get it when their quiet hours end). Warnings wait `group_window_s` and go as one text per kind and herd ("3 outside P3:
 214 031 118"); critical waits `critical_window_s` (a breakout of 250 is one text); info never pushes.
 Quiet hours (the person's, else the farm's) hold warnings until they end and let critical through
-unless `critical_in_quiet` is off. A timer decision's prompt goes after `critical_window_s` and through
-quiet hours like a critical alert, unless those end at least 30 min before the timer applies: then it
-waits for their end. A prompt whose decision was answered before it went out is resolved, not sent.
+unless `critical_in_quiet` is off. A prompt with a deadline (a timer decision's `apply_at`, or the
+`opens_at` of the strip a schedule call is about) goes after `critical_window_s` and through quiet
+hours like a critical alert, unless those end at least 30 min before the deadline: then it waits for
+their end. Past the deadline it is a plain warning. A prompt whose decision was answered before it went out is resolved, not sent.
 Unacked critical alerts are sent again every `renotify_every_min` up to `renotify_max` times and
 escalate every `escalate_after_min` to matching people of the next role up not yet told (hand →
 manager → owner). The farm webhook (channel `webhook`) gets every notified alert once.

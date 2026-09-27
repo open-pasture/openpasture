@@ -2,20 +2,21 @@
 //! (`op_core::messages::enqueue`); the sender delivers them.
 //!
 //! - A person matches an alert when its severity is at least theirs, its herd
-//!   is one of theirs and its kind isn't muted, they may answer it (the
-//!   approval prompt is for managers and up, [`answered_by`]), and they can
+//!   is one of theirs and its kind isn't muted, their role gets it (the
+//!   approval prompt is for managers and up, [`told_from`]), and they can
 //!   be reached over a configured channel: sms and whatsapp only to a
 //!   verified phone that hasn't texted STOP; sms and email go through the
 //!   relay when the farm has no Twilio or SMTP of its own.
-//! - When anyone matching is on duty and can be reached now (not held by
-//!   quiet hours), the first send goes only to them.
+//! - When anyone matching is on duty, may answer it ([`answered_by`]: OK is
+//!   for hands and up) and can be reached now (not held by quiet hours), the
+//!   first send goes only to them.
 //! - Warnings wait `group_window_s` and go out as one text for every alert of
 //!   that kind in that herd opened in the window; critical alerts wait only
 //!   `critical_window_s` (so a breakout is one rollup text). Info never pushes.
 //! - Quiet hours (the person's, else the farm's, farm time) hold a send until
-//!   they end; critical passes unless the person turned that off. The prompt
-//!   of a timer decision ([`deadline`]) goes like a critical alert unless
-//!   quiet hours end [`PROMPT_LEAD`] before the timer applies.
+//!   they end; critical passes unless the person turned that off. A prompt
+//!   with a deadline ([`deadline`]: a timer, or a strip about to open) goes
+//!   like a critical alert unless quiet hours end [`PROMPT_LEAD`] before it.
 //! - A prompt whose decision was answered before it went out closes instead.
 //! - Unacked critical alerts are sent again every `renotify_every_min` (up to
 //!   `renotify_max` times) and escalate every `escalate_after_min` to matching
@@ -93,35 +94,48 @@ pub fn deliveries(p: &Person, configured: &[&str]) -> Vec<(&'static str, String)
     out
 }
 
-/// The role a kind's text is for. The approval prompt ("Reply Y or N. Code
-/// 4821") asks for an answer only a manager or the owner may give (A3 refuses
-/// anyone else), so it goes to nobody below; everything else to anyone.
+/// The least role that may answer a kind's text: Y or N on the approval
+/// prompt ("Reply Y or N. Code 4821") is a manager's or the owner's (A3
+/// refuses anyone else); OK on an alert, or Ack in the app, a hand's.
 pub fn answered_by(kind: &str) -> Role {
     match kind {
         "decision_waiting" => Role::Manager,
+        _ => Role::Hand,
+    }
+}
+
+/// The least role that gets a kind's text at all: the approval prompt only
+/// those who may answer it (to anyone else it is only its code); an alert
+/// viewers too.
+pub fn told_from(kind: &str) -> Role {
+    match kind {
+        "decision_waiting" => answered_by(kind),
         _ => Role::Viewer,
     }
 }
 
-/// When a prompt's answer is due: a timer decision applies at `apply_at`
-/// unless someone says no, so its text can't wait for the grouping window,
-/// nor for quiet hours that end less than [`PROMPT_LEAD`] before it applies.
-/// It goes like a critical alert then (the short window, through quiet hours
-/// unless the person turned that off), though it stays a warning.
-pub fn deadline(kind: &str, data: &Value) -> Option<DateTime<Utc>> {
+/// When a prompt's answer is due: a timer decision applies at `apply_at`,
+/// and a strip schedule opens its next strip at `schedule.opens_at`, unless
+/// someone says no. Until then its text can't wait for the grouping window,
+/// nor for quiet hours that end less than [`PROMPT_LEAD`] before it; it goes
+/// like a critical alert (the short window, through quiet hours unless the
+/// person turned that off), though it stays a warning. Past it, nothing is
+/// left to stop and the prompt is a plain warning again.
+pub fn deadline(kind: &str, data: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     if kind != "decision_waiting" {
         return None;
     }
-    data.get("apply_at").and_then(Value::as_str).and_then(|t| op_core::time::from_db(t).ok())
+    let at = |v: Option<&Value>| v.and_then(Value::as_str).and_then(|t| op_core::time::from_db(t).ok());
+    [at(data.get("apply_at")), at(data.pointer("/schedule/opens_at"))].into_iter().flatten().min().filter(|t| *t > now)
 }
 
-/// How long before a timer applies its prompt must have gone out: quiet
-/// hours ending later than this hold it no longer.
+/// How long before its deadline a prompt must have gone out: quiet hours
+/// ending later than this hold it no longer.
 pub const PROMPT_LEAD: Duration = Duration::minutes(30);
 
 /// Whether a person wants this alert at all.
 pub fn matches(p: &Person, severity: Severity, herd_id: Option<&str>, kind: &str) -> bool {
-    p.user.role >= answered_by(kind)
+    p.user.role >= told_from(kind)
         && severity >= p.prefs.min_severity
         && severity >= Severity::Warning
         && !p.prefs.muted_kinds.iter().any(|k| k == kind)
@@ -177,8 +191,8 @@ pub fn holds(p: &Person, severity: Severity, policy: &Policy, tz: Tz, now: DateT
     in_quiet(p, policy, tz, now) && !(severity == Severity::Critical && p.prefs.critical_in_quiet)
 }
 
-/// A timer's prompt waits for the end of quiet hours only when that leaves
-/// [`PROMPT_LEAD`] before the timer applies (or they hold critical too).
+/// A prompt with a deadline waits for the end of quiet hours only when that
+/// leaves [`PROMPT_LEAD`] before it (or they hold critical too).
 pub fn holds_prompt(p: &Person, due: DateTime<Utc>, policy: &Policy, tz: Tz, now: DateTime<Utc>) -> bool {
     quiet_until(p, policy, tz, now).is_some_and(|end| !p.prefs.critical_in_quiet || end + PROMPT_LEAD <= due)
 }
@@ -373,8 +387,8 @@ async fn record(ctx: &Ctx, alert_id: &str, user_id: Option<&str>, channel: &str,
 async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now: DateTime<Utc>, report: &mut Report) -> anyhow::Result<()> {
     let head = &rows[0].alert;
     let severity = severity_of(rows);
-    // A timer's prompt: quiet hours hold it only while that leaves time to answer.
-    let due = rows.iter().filter_map(|r| deadline(&r.alert.kind, &r.alert.data)).min();
+    // A prompt with a deadline: quiet hours hold it only while that leaves time to answer.
+    let due = rows.iter().filter_map(|r| deadline(&r.alert.kind, &r.alert.data, now)).min();
     let waits = |p: &Person| match due {
         Some(t) => holds_prompt(p, t, &farm.policy, farm.tz, now),
         None => holds(p, severity, &farm.policy, farm.tz, now),
@@ -383,9 +397,10 @@ async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now
     let told: HashSet<(String, String)> = notified(ctx, &ids).await?.into_iter().filter_map(|(a, u, _, _)| Some((a, u?))).collect();
     let matching: Vec<&Person> =
         people.iter().filter(|p| matches(p, severity, head.herd_id.as_deref(), &head.kind) && !deliveries(p, &farm.configured).is_empty()).collect();
-    // On duty and reachable now; when nobody on duty is, everyone matching
-    // (those held get it when their quiet hours end).
-    let on_duty: Vec<&Person> = matching.iter().copied().filter(|p| p.prefs.on_duty && !waits(p)).collect();
+    // On duty, able to answer it and reachable now; when nobody on duty is,
+    // everyone matching (those held get it when their quiet hours end).
+    let can_answer = answered_by(&head.kind);
+    let on_duty: Vec<&Person> = matching.iter().copied().filter(|p| p.prefs.on_duty && p.user.role >= can_answer && !waits(p)).collect();
     let first = if on_duty.is_empty() { matching } else { on_duty };
     let mut held = false;
     let mut sent = false;

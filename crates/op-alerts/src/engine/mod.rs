@@ -485,7 +485,7 @@ async fn reconcile(
             continue;
         }
         let notify = cfg.notify && severity >= Severity::Warning;
-        let urgent = routing::deadline(kind, &c.data).is_some();
+        let urgent = routing::deadline(kind, &c.data, now).is_some();
         let batch = if notify { Some(batch_at(ctx, kind, c.herd_id.as_deref(), severity, urgent, policy, now).await?) } else { None };
         let row = Row {
             alert: Alert {

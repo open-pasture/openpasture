@@ -477,3 +477,84 @@ async fn a_critical_goes_past_an_on_duty_person_whose_quiet_hours_hold_it() {
     f.route(t("2026-09-28T11:00:00.000Z")).await;
     assert_eq!(f.messages_to(&duty).await.len(), 1);
 }
+
+/// A STAY on a herd whose strip schedule opens its next strip at `opens`
+/// (no timer: the strip opens then unless someone says N).
+async fn schedule_stay(f: &Farm, created: chrono::DateTime<chrono::Utc>, opens: chrono::DateTime<chrono::Utc>) -> String {
+    let d = f.decision("STAY", "proposed", created, None).await;
+    let inputs = json!({"schedule": {"next": {"strip": 3, "of": 3, "opens_at": op_core::time::to_db(&opens)}}});
+    f.exec(&format!("UPDATE decisions SET inputs = '{inputs}' WHERE id = '{d}'")).await;
+    d
+}
+
+#[tokio::test]
+async fn a_schedule_prompt_goes_before_its_strip_opens_through_quiet_hours() {
+    // Quiet until 09:00 on the farm; the daily call at 06:00, its prompt at 06:30, the strip at 08:37.
+    let six = t("2026-09-28T11:00:00.000Z");
+    let f = Farm::new().await;
+    f.sms().await;
+    f.policy(json!({"quiet_start": "21:00", "quiet_end": "09:00"})).await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    schedule_stay(&f, six, t("2026-09-28T13:37:00.000Z")).await;
+    f.eval(six + mins(30)).await;
+    f.route(six + mins(30) + secs(10)).await;
+    let m = f.messages_to(&owner).await;
+    assert_eq!(m.len(), 1, "before 08:37, not at 09:00 after the strip opened");
+    assert!(m[0].text.contains("Reply Y to keep, N to hold"), "{}", m[0].text);
+
+    // A strip that opens at noon: the prompt waits for 09:00, which still leaves time.
+    let g = Farm::new().await;
+    g.sms().await;
+    g.policy(json!({"quiet_start": "21:00", "quiet_end": "09:00"})).await;
+    let owner = g.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    schedule_stay(&g, six, t("2026-09-28T17:00:00.000Z")).await;
+    g.eval(six + mins(30)).await;
+    g.route(six + mins(31)).await;
+    assert!(g.messages_to(&owner).await.is_empty());
+    g.route(t("2026-09-28T14:00:00.000Z")).await;
+    assert_eq!(g.messages_to(&owner).await.len(), 1);
+
+    // One whose strip has already opened has no time left to save: a plain warning, held till 09:00.
+    let h = Farm::new().await;
+    h.sms().await;
+    h.policy(json!({"quiet_start": "21:00", "quiet_end": "09:00"})).await;
+    let owner = h.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    schedule_stay(&h, six, t("2026-09-28T11:10:00.000Z")).await;
+    h.eval(six + mins(30)).await;
+    h.route(six + mins(32)).await;
+    assert!(h.messages_to(&owner).await.is_empty());
+    h.route(t("2026-09-28T14:00:00.000Z")).await;
+    assert_eq!(h.messages_to(&owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_viewer_on_duty_doesnt_take_the_first_send_from_people_who_can_ack() {
+    let f = Farm::new().await;
+    f.sms().await;
+    f.policy(json!({"renotify_max": 0})).await;
+    // The owner put Vera (viewer) on duty: she can't reply OK, nor ack in the app.
+    let viewer = f.person("Vera", Role::Viewer, Some("+15155550101"), true, None).await;
+    f.prefs(&viewer, json!({"on_duty": true})).await;
+    let hand = f.person("Sam", Role::Hand, Some("+15155550102"), true, None).await;
+    let mgr = f.person("Mia", Role::Manager, Some("+15155550103"), true, None).await;
+    // A warning never escalates: with only her on duty, nobody who could act on it would hear.
+    let id = outside(&f, "214", t0()).await;
+    f.route(t0() + secs(60)).await;
+    let told: Vec<String> = tiers(&f, &id).await.into_iter().map(|(u, _)| u).collect();
+    assert_eq!(told.len(), 3, "everyone matching, she too: {told:?}");
+    for p in [&viewer, &hand, &mgr] {
+        assert!(told.contains(p));
+    }
+    // With a hand on duty as well, the first send goes to the hand alone.
+    let g = Farm::new().await;
+    g.sms().await;
+    g.policy(json!({"renotify_max": 0})).await;
+    let viewer = g.person("Vera", Role::Viewer, Some("+15155550101"), true, None).await;
+    g.prefs(&viewer, json!({"on_duty": true})).await;
+    let hand = g.person("Sam", Role::Hand, Some("+15155550102"), true, None).await;
+    g.prefs(&hand, json!({"on_duty": true})).await;
+    g.person("Mia", Role::Manager, Some("+15155550103"), true, None).await;
+    let id = outside(&g, "214", t0()).await;
+    g.route(t0() + secs(60)).await;
+    assert_eq!(tiers(&g, &id).await, vec![(hand, 0)]);
+}
