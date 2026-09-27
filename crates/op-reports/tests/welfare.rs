@@ -242,6 +242,10 @@ async fn the_welfare_record_as_csv() {
     assert_eq!(rows[h + 1][..4], ["Tag", "Warn cues", "Outside cues", "Tone (s)"]);
     let r214 = rows.iter().find(|r| r.first().map(String::as_str) == Some("214")).unwrap();
     assert_eq!(r214[..4], ["214", "3", "1", "1.6"]);
+    // 118 has no cues: its tone is an empty sum, which reads 0.0, never -0.0.
+    let r118 = rows.iter().find(|r| r.first().map(String::as_str) == Some("118")).unwrap();
+    assert_eq!(r118[..5], ["118", "0", "0", "0.0", "0.0"]);
+    assert!(!text.contains("-0.0"), "{text}");
     at("Learning");
     at("Collar care");
     at("Days with cues");

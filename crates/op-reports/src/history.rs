@@ -379,9 +379,11 @@ pub fn collar_days_in(dates: Option<&BTreeSet<NaiveDate>>, c: &Cut) -> usize {
     dates.range(a..=b).count()
 }
 
-/// A number rounded to `d` places, as a JSON value.
+/// A number rounded to `d` places, as a JSON value. Adding `0.0` turns a
+/// negative zero into zero: an empty `f64` sum is `-0.0`, and so is a small
+/// negative rounded away, and neither should print as "-0.0" in a report.
 pub fn n(x: f64, d: usize) -> Value {
-    json!(round(x, d))
+    json!(round(x, d) + 0.0)
 }
 
 /// "Cattle".
