@@ -3,6 +3,7 @@ import type { Map as MLMap } from "maplibre-gl";
 import { api, ApiError, downloadBlob, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
 import { DATA, dataSections, guarded, interleave } from "../registry";
 import { useStore } from "../store";
+import { useCan } from "../store/me";
 import { C, createMap, fc, fitPolys, onLoad, setData } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
 import { Animals } from "../map/animals";
@@ -16,6 +17,8 @@ export function DataView() {
   const [range, setRange] = useState<RangeKey>("24h");
   // SQL and export come from the analytics crate; show them once it answers.
   const [sqlOk, setSqlOk] = useState(false);
+  // The console is a POST, which managers and owners make.
+  const sqlRole = useCan("manager");
   useEffect(() => {
     api.sql("select count(*) from herds").then(() => setSqlOk(true), (e) => setSqlOk(!(e instanceof ApiError && e.status === 404)));
   }, []);
@@ -41,7 +44,7 @@ export function DataView() {
         { key: "health", order: DATA.health, node: <Health herdId={herdId} from={from} to={to} /> },
         { key: "replay", order: DATA.replay, node: <Replay herdId={herdId} from={from} to={to} /> },
         { key: "pasture", order: DATA.pasture, node: <Pasture herdId={herdId} /> },
-        { key: "sql", order: DATA.sql, node: sqlOk && <Sql /> },
+        { key: "sql", order: DATA.sql, node: sqlOk && sqlRole && <Sql /> },
       ], added)}
     </div>
   );

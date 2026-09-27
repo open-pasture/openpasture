@@ -29,5 +29,8 @@ export const can = (need: Role = "viewer") => {
 };
 
 export const useMe = () => me.use((m) => m);
+// The person this browser acts as (a person token, or the owner who added themselves to People).
+export const useMeUser = () => me.use((m) => m?.user);
+export const useVia = () => me.use((m) => m?.via);
 export const useRole = () => me.use((m) => m?.role);
 export const useCan = (need: Role = "viewer") => me.use((m) => (m ? atLeast(m.role, need) : false));

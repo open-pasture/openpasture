@@ -3,6 +3,7 @@ import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Padd
 import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabel, outOf, store, useStore } from "../store";
+import { useCan } from "../store/me";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { age, clock, useNow } from "../util";
 
@@ -31,6 +32,10 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const panelProps = { herdId: herdId ?? "" };
   const sections = useSections(herdPanel, panelProps);
   useEffect(() => setOpenItem(undefined), [herdId]);
+  // Controls show only to roles that may use them: hands stop moves and let animals go,
+  // managers decide, answer and set up.
+  const manage = useCan("manager");
+  const tend = useCan("hand");
 
   // Fix ages step every five seconds, so twelve rows don't tick at once.
   const calm = Math.ceil(now / 5000) * 5000;
@@ -83,14 +88,14 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const item = menu.find((m) => m.id === openItem);
 
   const decision = collars.length > 0 && <>
-      <div className="auto">
+      {manage && <div className="auto">
         <Segmented label="Autonomy" value={herd.autonomy} onChange={setAutonomy} options={[
           { value: "propose", label: "Propose" },
           { value: "timer", label: herd.autonomy === "timer" ? <>Timer <span className="mono">{mins(herd.timer_minutes)}</span></> : "Timer",
             title: herd.autonomy === "timer" ? "Click to change the timer" : undefined },
           { value: "auto", label: "Auto" },
         ]} />
-      </div>
+      </div>}
 
       <section className="dec">
         {sweeping && (
@@ -103,7 +108,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
               {behind.length > 0 && (
                 <button type="button" className="behind mono" onClick={() => onFocusCollars(behind)}>{behind.length} behind</button>
               )}
-              <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopMove(herd.id))}>Stop</Button>
+              {tend && <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopMove(herd.id))}>Stop</Button>}
             </div>
           </>
         )}
@@ -119,7 +124,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             <p className="call">{sentence(live)}</p>
             {live.reasoning && <Why key={live.id} text={live.reasoning} />}
             {/* The answer goes back as the farmer's note, then the brain decides again with it. */}
-            <form className="reply" onSubmit={(e) => {
+            {manage && <form className="reply" onSubmit={(e) => {
               e.preventDefault();
               const note = reply.trim();
               if (!note) return;
@@ -134,7 +139,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
                 <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>Dismiss</Button>
                 <Button small kind="primary" type="submit" disabled={busy || !reply.trim()}>Send</Button>
               </div>
-            </form>
+            </form>}
           </>
         )}
         {live?.status === "proposed" && live.action !== "NEEDS_INFO" && (
@@ -142,13 +147,13 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             <p className="call">{sentence(live)}</p>
             {live.reasoning && <Why key={live.id} text={live.reasoning} />}
             {live.apply_at && <p className="clock">{clock(Date.parse(live.apply_at) - now)}</p>}
-            <div className="acts">
+            {manage && <div className="acts">
               <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>Reject</Button>
               {live.geometry && <Button small disabled={busy || changing} onClick={onChange}>Change</Button>}
               <Button small kind="primary" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "approve" }))}>
                 {live.apply_at ? "Send now" : "Approve"}
               </Button>
-            </div>
+            </div>}
           </>
         )}
         {!live && move?.status === "done" ? (
@@ -158,9 +163,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         )}
         {!live && latest?.status === "failed" && latest.error && !err && <p className="why err">{latest.error}</p>}
         {err && <p className="why err">{err}</p>}
-        {!live && (
+        {!live && (manage || behind.length > 0) && (
           <div className="acts">
-            <Button small disabled={busy} onClick={() => act(() => api.decide(herd.id))}>Decide</Button>
+            {manage && <Button small disabled={busy} onClick={() => act(() => api.decide(herd.id))}>Decide</Button>}
             {behind.length > 0 && (
               <button type="button" className="behind mono end" onClick={() => onFocusCollars(behind)}>{behind.length} behind</button>
             )}
@@ -178,7 +183,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
                 {collars.find((c) => c.id === e.collar_id)?.label ?? "Collar"} out
               </button>
               {e.remaining_m >= 1 && <span className="rem mono" title="To the herd's boundary">{Math.round(e.remaining_m)} m</span>}
-              <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>
+              {tend && <Button small kind="plain" className="stop" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>}
             </div>
           ))}
         </section>
@@ -220,7 +225,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         { key: "decision", order: HERD_PANEL.decision, node: decision },
         { key: "escapes", order: HERD_PANEL.escapes, node: escapes },
         { key: "collars", order: HERD_PANEL.collars, node: list },
-        { key: "addCollar", order: HERD_PANEL.addCollar, node: <AddCollar herdId={herd.id} /> },
+        { key: "addCollar", order: HERD_PANEL.addCollar, node: manage && <AddCollar herdId={herd.id} /> },
       ], sectionNodes(sections, panelProps))}
     </aside>
   );
