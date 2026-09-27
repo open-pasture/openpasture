@@ -13,8 +13,9 @@
 //!    "Stopped 610 ft short, 250/250 collars confirmed." (its move stopped).
 //! 3. The one thing to check, when the decision asks for it.
 //! 4. Up to four reasons from the record, as written there.
-//! 5. Stale or missing data: silent collars, old imagery, a position from the
-//!    farm record, no recent field note.
+//! 5. Stale or missing data: silent collars (and apart, collars that haven't
+//!    reported yet), old imagery, a position from the farm record, no recent
+//!    field note.
 //! 6. The brief-line registry's lines (`ctx.brief_lines()`), in order.
 //!
 //! "Today" is the decision window: since the last `settings.decision_time`
@@ -114,12 +115,17 @@ pub async fn brief(ctx: &Ctx, herd: &Herd, now: DateTime<Utc>) -> anyhow::Result
             if let Some(s) = standing(ctx, d, &collars, &fmt, tz, now).await? {
                 lines.push(Line::keep(s));
             }
-            need = d.need.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(sentence);
-            if let Some(n) = &need {
-                lines.push(Line { text: n.clone(), drop: DROP_NEED });
-            }
-            for (i, r) in reasons(d.reasoning.as_deref().unwrap_or_default()).into_iter().take(MAX_REASONS).enumerate() {
-                lines.push(Line { text: r, drop: DROP_REASON[i] });
+            // The reasons and the check argued for the call as proposed; once the
+            // farmer changed it (N on a STAY made it a HOLD, or they drew their
+            // own boundary) they no longer describe it.
+            if !changed_by_farmer(d) {
+                need = d.need.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(sentence);
+                if let Some(n) = &need {
+                    lines.push(Line { text: n.clone(), drop: DROP_NEED });
+                }
+                for (i, r) in reasons(d.reasoning.as_deref().unwrap_or_default()).into_iter().take(MAX_REASONS).enumerate() {
+                    lines.push(Line { text: r, drop: DROP_REASON[i] });
+                }
             }
         }
     }
@@ -163,6 +169,13 @@ async fn todays_decision(ctx: &Ctx, herd_id: &str, since: DateTime<Utc>) -> anyh
 
 fn action_of(d: &Decision) -> String {
     d.action.map(|a| a.as_db()).unwrap_or_default()
+}
+
+/// The farmer answered with another call than the one proposed: S's HOLD
+/// for a STAY (`inputs.proposed_action`), or their own boundary for the
+/// proposed one (`inputs.proposed_geometry`).
+fn changed_by_farmer(d: &Decision) -> bool {
+    d.inputs.get("proposed_action").is_some_and(|a| a.as_str() != Some(action_of(d).as_str())) || d.inputs.get("proposed_geometry").is_some()
 }
 
 /// Is this a call that sends a boundary (MOVE, or S's HOLD)?
@@ -261,9 +274,14 @@ async fn stale(
 ) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     let quiet_since = now - Duration::hours(SILENT_HOURS);
-    let silent = collars.iter().filter(|c| c.last_seen.is_none_or(|t| t < quiet_since)).count();
+    // A collar that has never reported (linked, not on yet) isn't silent: it says so apart.
+    let silent = collars.iter().filter(|c| c.last_seen.is_some_and(|t| t < quiet_since)).count();
     if silent > 0 {
         out.push(format!("{silent} of {} collars silent for a day.", collars.len()));
+    }
+    let waiting = collars.iter().filter(|c| c.last_seen.is_none()).count();
+    if waiting > 0 {
+        out.push(format!("{waiting} of {} collars not reported yet.", collars.len()));
     }
     if !collars.is_empty() {
         match d.and_then(|d| d.inputs.get("position_source")).and_then(Value::as_str) {

@@ -1173,10 +1173,12 @@ time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`
 `Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
 once sent: collars not parked that applied its active boundary, and the sweep still left),
 the one thing to check when the decision asks for it, then up to four reasons as the record
-has them. When today's decision is still running, failed or missing, one line says so
-(`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars silent for a
-day.`, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20 days old.`,
-`No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
+has them (left out once the farmer changed the call: a HOLD made from a STAY, or their own
+boundary for the proposed one). When today's decision is still running, failed or missing, one
+line says so (`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars
+silent for a day.` for collars that reported before; `2 of 250 collars not reported yet.` for
+ones that never have, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20
+days old.`, `No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
 farm's units. `text` is the lines as one text: GSM-7 (curly quotes, dashes and accents made
 plain, emoji left out), at most 480 characters, giving up the fourth and third reason first,
 then stale-data lines, the second reason, other features' lines, the check and the first
