@@ -174,7 +174,7 @@ fn shapes_match_api_md() {
     assert_eq!(d.action, Some(DecisionAction::NeedsInfo));
     assert_eq!(DecisionAction::NeedsInfo.as_db(), "NEEDS_INFO");
     assert_eq!(FenceState::from_db("warning").unwrap(), FenceState::Warning);
-    let ev = Event::Ack { collar_id: "col_1".into(), herd_id: "herd_1".into(), version: 4, status: AckStatus::Applied, reason: None };
+    let ev = Event::Ack { collar_id: "col_1".into(), herd_id: "herd_1".into(), version: 4, status: AckStatus::Applied, reason: None, code: None };
     assert_eq!(serde_json::to_value(&ev).unwrap(), json!({"type": "ack", "collar_id": "col_1", "herd_id": "herd_1", "version": 4, "status": "applied"}));
 }
 

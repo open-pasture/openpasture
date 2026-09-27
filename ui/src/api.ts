@@ -2,6 +2,7 @@
 // HTTP plumbing lives in ./api/http; each stream adds its own ./api/<id>.ts.
 
 import { del, get, getToken, patch, post, put, qs } from "./api/http";
+import { liveEvents } from "./api/x1";
 export { ApiError, authHeaders, downloadBlob, getToken, onUnauthorized, qs, setToken, type Query } from "./api/http";
 
 export type LonLat = [number, number];
@@ -323,10 +324,18 @@ export function live(onEvent: (e: LiveEvent) => void, onStatus?: (up: boolean) =
       onStatus?.(true);
     };
     ws.onmessage = (m) => {
+      let msg: unknown;
       try {
-        onEvent(JSON.parse(typeof m.data === "string" ? m.data : "") as LiveEvent);
+        msg = JSON.parse(typeof m.data === "string" ? m.data : "");
       } catch {
-        /* ignore malformed */
+        return; /* ignore malformed */
+      }
+      for (const e of liveEvents(msg)) {
+        try {
+          onEvent(e);
+        } catch {
+          /* one bad event doesn't drop the rest of its batch */
+        }
       }
     };
     ws.onclose = () => {

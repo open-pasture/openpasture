@@ -364,7 +364,7 @@ GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
 Event =
   | { type: "fix", collar_id, animal_id?, herd_id, fix: Fix, state }
   | { type: "cue", collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }
-  | { type: "ack", collar_id, herd_id, version, status, reason? }
+  | { type: "ack", collar_id, herd_id, version, status, reason?, code? }   // code: protocol v1 reject code, only with rejected
   | { type: "collar", collar: Collar }
   | { type: "boundary", herd_id, boundary: Boundary }
   | { type: "decision", decision: Decision }
@@ -402,6 +402,8 @@ Event =
   // @L
   // @M
   // @Z
+  // @X1  (/api/live only: one farm window's batches together, see "Seams between streams")
+  | { type: "batch", events: Event[] }
 ```
 
 Each socket gets only the events its identity may see: `message` events go to managers and up
@@ -1091,10 +1093,11 @@ MCP (read, viewers): `get_coverage` `{metric?, from?, to?, cell_m?, herd_id?}` r
 
 ## Live feed at herd scale (op-server, P)
 
-`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd: 500 ms after the
-first of them for a herd, one `positions`, one `ack_batch` and one `cue_batch` message (each
-only when it has items). At 250 collars that is about one message a second, two during a sweep,
-instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
+`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd into one
+`positions`, one `ack_batch` and one `cue_batch` (each only when it has items), gathered for the
+whole farm: 500 ms after the first of them for any herd they go out together, as one message (a
+`batch` when there is more than one, see "Seams between streams"). At 250 collars that is about
+one message a second, at most two batched ones however many herds are live, instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
 
 ```ts
 PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
@@ -1229,3 +1232,53 @@ stay with the original.
 <!-- @L -->
 <!-- @M -->
 <!-- @Z -->
+<!-- @X1 -->
+
+## Seams between streams (X1)
+
+**Live feed, one message per farm window.** Every 500 ms window gathers the whole farm's
+batches. A window holding only one of them sends it as itself (`positions`, `ack_batch` or
+`cue_batch`, as above); a window holding more sends one message:
+
+```ts
+{ type: "batch", events: Event[] }   // each herd's positions, ack_batch, cue_batch, in herd id order
+```
+
+So several herds live at once still make at most two batched messages a second for the farm
+(before: up to three per herd). Clients read a `batch` as its events in order. Every batched
+event is for any role, so viewers get the same message; `message` events never ride in a batch.
+
+**Reject codes on the feed.** A collar's `rejected` ack with a protocol v1 code
+(`hole_too_close`, `slots_full`, …) carries it on the bus (`ack.code`) and in `AckItem.code`.
+
+**Someone else's alert prefs.** `PUT /api/alerts/prefs/{id}` is the owner's at the guard (people
+ids are `usr_…`), so a manager is refused before the body is read; `PUT /api/alerts/prefs/me`
+stays a hand's.
+
+**The brief after a stopped move.** When today's decision is a MOVE (or HOLD) whose move someone
+stopped before the target, where it stands reads `Stopped 610 ft short, 250/250 collars
+confirmed.` (the distance through the farm's units), also the next morning.
+
+**Imported history and collar data.** Committing a position import leaves out points the
+animal's collar already recorded, so an animal-hour's dwell is counted once, from the collar.
+`POST /api/import/positions/{id}/commit` gains:
+
+```ts
+{ …, collar_covered: number }   // points left out because the animal's collar recorded that time
+```
+
+"Recorded" is read at the dwell rule's resolution: for hot fixes, the 30-minute buckets
+holding a fix of that collar and animal; for days already rolled to Parquet, the stretch the
+collar day's dwell covers, ending 30 minutes after its last fix, credited to the animal the
+collar is on now. A file with nothing new left is 409.
+
+**Paddock areas stored before op-geo measured rings whichever way they wind** (a clockwise
+outer ring, or a hole wound like its outer ring) are measured again from their geometry when
+the data dir opens, in `paddocks` and in the geometry history reports use. Rows that are
+right are left alone.
+
+**Rest days at 250 collars.** "Last grazed" for signals, the decision context and
+`GET /api/layers/paddocks` reads the newest fix per herd and paddock from `fix_paddock_last`
+(kept by a trigger as fixes land), not the herd's hot fixes; the herd's position over the last
+day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
+holds more. No response shape changes.

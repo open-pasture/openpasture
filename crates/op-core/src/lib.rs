@@ -54,6 +54,8 @@ pub mod live;
 // @L
 // @M
 // @Z
+// @X1
+pub mod area_repair;
 
 pub use ctx::{BrainToken, Ctx, default_data_dir};
 pub use domain::*;

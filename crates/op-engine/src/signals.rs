@@ -17,7 +17,7 @@ pub const WINDOW_HOURS: i64 = 24;
 /// How far back "last grazed" looks in the fix record.
 const REST_LOOKBACK_DAYS: i64 = 120;
 /// Fix rows read per query; larger ranges are sampled evenly.
-const MAX_FIX_ROWS: i64 = 20_000;
+pub const MAX_FIX_ROWS: i64 = 20_000;
 
 pub struct FixSample {
     pub collar_id: String,
@@ -34,28 +34,66 @@ pub fn paddock_at<'a>(paddocks: &'a [Paddock], point: [f64; 2]) -> Option<&'a Pa
     paddocks.iter().find(|p| p.geometry.contains(point))
 }
 
-/// Fixes for a herd in `[from, to)`, evenly sampled to at most `MAX_FIX_ROWS`,
-/// each with the paddock it fell in.
+/// Fixes for a herd in `[from, to)`, at most `MAX_FIX_ROWS`, each with the
+/// paddock it fell in. A window holding no more than that is read whole; a
+/// larger one (a day of 250 collars is 4.3 M fixes) is sampled evenly in time
+/// per collar, each collar's first fix in each of its buckets, one index seek
+/// per bucket: the window is never walked.
 pub async fn herd_fixes(ctx: &Ctx, herd_id: &str, from: DateTime<Utc>, to: DateTime<Utc>, paddocks: &[Paddock]) -> anyhow::Result<Vec<FixSample>> {
     let (f, t) = (time::unix_ms(&from), time::unix_ms(&to));
-    let n: i64 =
-        sqlx::query("SELECT COUNT(*) FROM fixes WHERE herd_id = ? AND t >= ? AND t < ?").bind(herd_id).bind(f).bind(t).fetch_one(ctx.db()).await?.get(0);
-    let stride = (n / MAX_FIX_ROWS).max(1);
-    let rows = sqlx::query("SELECT collar_id, t, lon, lat, paddock_id FROM fixes WHERE herd_id = ? AND t >= ? AND t < ? AND id % ? = 0 ORDER BY t")
-        .bind(herd_id)
-        .bind(f)
-        .bind(t)
-        .bind(stride)
-        .fetch_all(ctx.db())
-        .await?;
-    Ok(rows
+    let n: i64 = sqlx::query_scalar(COUNT_UP_TO_SQL).bind(herd_id).bind(f).bind(t).bind(MAX_FIX_ROWS + 1).fetch_one(ctx.db()).await?;
+    let rows = if n <= MAX_FIX_ROWS {
+        sqlx::query("SELECT collar_id, t, lon, lat, paddock_id FROM fixes WHERE herd_id = ? AND t >= ? AND t < ? ORDER BY t")
+            .bind(herd_id)
+            .bind(f)
+            .bind(t)
+            .fetch_all(ctx.db())
+            .await?
+    } else {
+        sampled_fixes(ctx, herd_id, f, t).await?
+    };
+    let mut out: Vec<FixSample> = rows
         .iter()
         .map(|r| {
             let stored: Option<String> = r.get("paddock_id");
             let point = [r.get::<f64, _>("lon"), r.get::<f64, _>("lat")];
             FixSample { collar_id: r.get("collar_id"), t: r.get("t"), paddock_id: stored.or_else(|| paddock_at(paddocks, point).map(|p| p.id.clone())) }
         })
-        .collect())
+        .collect();
+    out.sort_by_key(|s| s.t);
+    Ok(out)
+}
+
+/// How many of a herd's fixes are in `[?2, ?3)`, counting no further than `?4`.
+pub const COUNT_UP_TO_SQL: &str = "SELECT COUNT(*) FROM (SELECT 1 FROM fixes WHERE herd_id = ? AND t >= ? AND t < ? LIMIT ?)";
+/// The herd's next collar in its fixes after `?2` (`fixes_herd_collar_t`).
+pub const NEXT_COLLAR_SQL: &str = "SELECT collar_id FROM fixes WHERE herd_id = ? AND collar_id > ? ORDER BY collar_id LIMIT 1";
+/// Whether the collar has a fix of the herd in `[?3, ?4)`.
+pub const COLLAR_IN_WINDOW_SQL: &str = "SELECT 1 FROM fixes WHERE herd_id = ? AND collar_id = ? AND t >= ? AND t < ? LIMIT 1";
+/// A collar's first fix in each of `?4` buckets of `?5` ms from `?3`, up to `?6`
+/// (`?1` herd, `?2` collar): one seek on `fixes_herd_collar_t` per bucket.
+pub const BUCKETS_SQL: &str = "WITH RECURSIVE b(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM b WHERE k + 1 < ?4)
+     SELECT f.collar_id, f.t, f.lon, f.lat, f.paddock_id FROM b JOIN fixes f ON f.id = (
+         SELECT id FROM fixes WHERE herd_id = ?1 AND collar_id = ?2 AND t >= ?3 + b.k * ?5 AND t < min(?6, ?3 + (b.k + 1) * ?5)
+         ORDER BY t, id LIMIT 1)";
+
+async fn sampled_fixes(ctx: &Ctx, herd_id: &str, from: i64, to: i64) -> anyhow::Result<Vec<sqlx::sqlite::SqliteRow>> {
+    let mut collars = Vec::new();
+    let mut after = String::new();
+    while let Some(c) = sqlx::query_scalar::<_, String>(NEXT_COLLAR_SQL).bind(herd_id).bind(&after).fetch_optional(ctx.db()).await? {
+        let here: Option<i64> = sqlx::query_scalar(COLLAR_IN_WINDOW_SQL).bind(herd_id).bind(&c).bind(from).bind(to).fetch_optional(ctx.db()).await?;
+        if here.is_some() {
+            collars.push(c.clone());
+        }
+        after = c;
+    }
+    let buckets = (MAX_FIX_ROWS / (collars.len() as i64).max(1)).max(1);
+    let width = ((to - from) + buckets - 1).div_euclid(buckets).max(1);
+    let mut rows = Vec::new();
+    for c in &collars {
+        rows.extend(sqlx::query(BUCKETS_SQL).bind(herd_id).bind(c).bind(from).bind(buckets).bind(width).bind(to).fetch_all(ctx.db()).await?);
+    }
+    Ok(rows)
 }
 
 /// (collar_id, margin_m) for a herd's cues in `[from, to)`.
@@ -92,6 +130,11 @@ pub fn from_paddock(d: &Decision) -> Option<String> {
 /// When each paddock was last grazed: applied moves out of it, the last collar
 /// fix in it (hot fixes, plus rolled-up days and imported history from the
 /// `paddock_days` view), the farmer's `grazed_until`, and now for the current paddock.
+///
+/// The newest hot fix per paddock is one row each in `fix_paddock_last` (a
+/// trigger keeps it as fixes land), not a walk of the herd's fixes. Fixes that
+/// landed outside every paddock are placed by today's shapes only when a
+/// paddock was drawn or reshaped since they landed (a bounded sample).
 pub async fn last_grazed(
     ctx: &Ctx,
     herd: Option<&Herd>,
@@ -128,9 +171,27 @@ pub async fn last_grazed(
                 bump(&r.get::<String, _>(0), at);
             }
         }
-        for f in herd_fixes(ctx, &h.id, now - Duration::days(REST_LOOKBACK_DAYS), now, paddocks).await? {
-            if let Some(p) = &f.paddock_id {
-                bump(p, time::from_unix_ms(f.t));
+        let since = now - Duration::days(REST_LOOKBACK_DAYS);
+        let newest: Vec<(String, i64)> =
+            sqlx::query_as("SELECT paddock_id, last_t FROM fix_paddock_last WHERE herd_id = ?").bind(&h.id).fetch_all(ctx.db()).await?;
+        let mut outside = false;
+        for (paddock, t) in newest {
+            let at = time::from_unix_ms(t);
+            if at < since {
+                continue;
+            }
+            if paddock.is_empty() {
+                outside = true;
+            } else {
+                // A fix stamped after `now` (a collar clock running ahead) is grazing now.
+                bump(&paddock, at.min(now));
+            }
+        }
+        if outside && let Some((from, to)) = reshaped_since(ctx, &h.id, since, now).await? {
+            for f in herd_fixes(ctx, &h.id, from, to, paddocks).await? {
+                if let Some(p) = &f.paddock_id {
+                    bump(p, time::from_unix_ms(f.t));
+                }
             }
         }
     }
@@ -140,6 +201,18 @@ pub async fn last_grazed(
         last.insert(c.to_owned(), Some(now));
     }
     Ok(last)
+}
+
+/// When a paddock was drawn or reshaped after some of the herd's hot fixes
+/// landed: the stretch of fixes whose stored paddock predates today's shapes,
+/// from the herd's oldest hot fix (or `since`) to that change.
+async fn reshaped_since(ctx: &Ctx, herd_id: &str, since: DateTime<Utc>, now: DateTime<Utc>) -> anyhow::Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    let changed: Option<String> = sqlx::query_scalar("SELECT MAX(at) FROM paddock_geometry_history WHERE source != 'deleted'").fetch_one(ctx.db()).await?;
+    let Some(changed) = changed.as_deref().and_then(|c| time::from_db(c).ok()) else { return Ok(None) };
+    let oldest: Option<i64> = sqlx::query_scalar("SELECT MIN(t) FROM fixes WHERE herd_id = ?").bind(herd_id).fetch_one(ctx.db()).await?;
+    let Some(from) = oldest.map(time::from_unix_ms).map(|o| o.max(since)) else { return Ok(None) };
+    let to = changed.min(now);
+    Ok((to > from).then_some((from, to)))
 }
 
 fn ndvi_inputs(report: Option<&Value>) -> (Option<f64>, Vec<(DateTime<Utc>, f64)>) {

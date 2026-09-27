@@ -36,6 +36,9 @@ pub enum Event {
         status: AckStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Protocol v1 reject code (e.g. `hole_too_close`), only with `rejected`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     Collar {
         collar: Collar,

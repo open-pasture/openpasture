@@ -486,7 +486,14 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
     }
     tx.commit().await?;
     tracing::info!(collar = %collar.id, version = a.version, status = a.status.as_str(), code = code.map(|c| c.as_str()), "boundary ack");
-    ctx.publish(Event::Ack { collar_id: collar.id.clone(), herd_id: collar.herd_id.clone(), version: a.version, status: a.status, reason: a.reason });
+    ctx.publish(Event::Ack {
+        collar_id: collar.id.clone(),
+        herd_id: collar.herd_id.clone(),
+        version: a.version,
+        status: a.status,
+        reason: a.reason,
+        code: code.map(|c| c.as_str().to_owned()),
+    });
     ctx.publish(Event::Collar { collar });
     Ok(StatusCode::NO_CONTENT)
 }

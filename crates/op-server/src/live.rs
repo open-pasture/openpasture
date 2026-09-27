@@ -1,7 +1,8 @@
 //! `/api/live`: what the socket's identity may see ([`op_core::Event::min_role`]),
 //! as JSON text messages. Fixes, acks, cues and telemetry-only collar changes
-//! arrive coalesced per herd every 500 ms (`positions`, `ack_batch`,
-//! `cue_batch`, see [`crate::coalesce`]); every other event as it happens.
+//! arrive coalesced per herd (`positions`, `ack_batch`, `cue_batch`), gathered
+//! for the whole farm every 500 ms and sent as one message (a `batch` when
+//! there are several, see [`crate::coalesce`]); every other event as it happens.
 
 use std::time::Duration;
 

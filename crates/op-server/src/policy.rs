@@ -153,6 +153,8 @@ pub const OWNER: &[Rule] = &[
     ("PUT", "/api/push/settings"),
     ("POST", "/api/collars/{id}/rekey"),
     // @A-engine
+    // Someone else's alert prefs (people ids are `usr_…`; `/api/alerts/prefs/me` stays a hand's).
+    ("PUT", "/api/alerts/prefs/usr_*"),
     // @A-notify
     // @D
     // @K-animals
@@ -353,6 +355,15 @@ mod tests {
         for (method, path, need) in cases {
             assert_eq!(required(&m(method), path), need, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn someone_elses_alert_prefs_are_the_owners_own_are_a_hands() {
+        use Role::*;
+        assert_eq!(required(&m("PUT"), "/api/alerts/prefs/usr_01J0000000000000000000000"), Owner);
+        assert_eq!(required(&m("PUT"), "/api/alerts/prefs/me"), Hand);
+        assert_eq!(required(&m("GET"), "/api/alerts/prefs/me"), Viewer);
+        assert_eq!(required(&m("GET"), "/api/alerts/prefs"), Manager);
     }
 
     #[test]
