@@ -36,10 +36,13 @@ pub struct Prepared {
 }
 
 /// Validate and fit a herd boundary before it is stored. Missing margins come
-/// from [`margins::default_margins`]. An invalid shape, or one that can't be
-/// fitted to the herd's collars, is 400. Findings: `simplified` when fitting
-/// changed the shape, `collars_no_holes` when it has holes and some of the
-/// herd's collars can't hold them (they get the outer ring alone).
+/// from [`margins::default_margins`]. Exclusions in effect when it takes
+/// effect (`opts.effective_at` when ahead, else now) are cut out or made
+/// holes first ([`crate::prepare`]). An invalid shape, or one that can't be
+/// fitted to the herd's collars, is 400. Findings, most severe first:
+/// `simplified` when fitting changed the shape, `collars_no_holes` when it has
+/// holes and some of the herd's collars can't hold them (they get the outer
+/// ring alone), and the pre-send findings of [`crate::prepare::findings`].
 pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts) -> ApiResult<Prepared> {
     let (default_warn, default_hyst) = margins::default_margins(ctx, herd_id).await?;
     let warn_m = opts.warn_m.unwrap_or(default_warn);
@@ -53,7 +56,10 @@ pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts
     let collars = herd_collars(ctx.db(), herd_id).await?;
     let limits = strictest(collars.iter().map(|c| &c.caps));
     let gap = shape::min_gap_m(warn_m) + SERVER_SLACK_M;
-    let fitted = shape::fit_gap(&geometry, &limits, gap);
+    // @F: exclusions in effect at the activation time, then the fit.
+    let at = crate::prepare::activation(opts);
+    let excluded = crate::prepare::exclude(ctx, &geometry, &limits, warn_m, gap, at).await?;
+    let fitted = excluded.fitted.clone();
     if let Err(code) = shape::check(&fitted, &limits, warn_m, hysteresis_m, SERVER_SLACK_M) {
         let msg = match code {
             shape::ShapeCode::HoleTooClose => {
@@ -65,7 +71,7 @@ pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts
         return Err(ApiError::bad_request(msg));
     }
     let mut findings = Vec::new();
-    if fitted.coordinates != geometry.coordinates {
+    if excluded.simplified {
         findings.push(Finding {
             code: "simplified".into(),
             severity: Severity::Info,
@@ -87,6 +93,9 @@ pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts
             });
         }
     }
+    // @F
+    findings.extend(crate::prepare::findings(ctx, herd_id, &fitted, &excluded, &collars, at, warn_m).await?);
+    crate::prepare::sort(&mut findings);
     Ok(Prepared { geometry: fitted, warn_m, hysteresis_m, findings })
 }
 
