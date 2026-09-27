@@ -277,3 +277,64 @@ async fn pasture_is_as_of_the_end_of_the_range() {
     assert!(pad(&gap, "pad_a")["last_grazed"].is_string());
     assert_eq!(pad(&gap, "pad_b")["last_grazed"], Value::Null);
 }
+
+#[tokio::test]
+async fn hot_dwell_summed_in_sqlite_matches_the_row_by_row_sum() {
+    use op_analytics::metrics::{Dwell, PaddockIndex};
+    use op_analytics::telemetry::{Scope, Source, each_fix, for_each, scan};
+
+    let app = app().await;
+    let now = time::now();
+    let day = midnight(now) - DAY_MS;
+    // Three collars, two herds, gaps short and long, across midnight, a fix stored with
+    // no paddock (in B by its point), one with a paddock since deleted, one arriving late.
+    let mut seed = 11u64;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut rows = Vec::new();
+    for (c, herd) in [("col_1", "herd_1"), ("col_2", "herd_1"), ("col_3", "herd_2")] {
+        let mut t = day - 3 * 3_600_000;
+        for i in 0..400 {
+            t += [5_000, 60_000, 45 * MIN][rnd(10) as usize % 3 * (rnd(7) == 0) as usize] as i64 + rnd(3000) as i64;
+            let (east, pad): (f64, Option<&str>) = match i % 7 {
+                0 => (150.0, None),
+                1 => (50.0, Some("pad_gone")),
+                2 | 3 => (150.0, Some("pad_b")),
+                _ => (50.0, Some("pad_a")),
+            };
+            rows.push((c, herd, t, at(east, 50.0), pad));
+        }
+    }
+    let late = rows.remove(100);
+    rows.push(late);
+    for (c, herd, t, p, pad) in &rows {
+        sqlx::query("INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, paddock_id) VALUES (?, ?, 'x', ?, ?, ?, 3, ?)")
+            .bind(c)
+            .bind(herd)
+            .bind(t)
+            .bind(p[0])
+            .bind(p[1])
+            .bind(pad)
+            .execute(app.ctx.db())
+            .await
+            .unwrap();
+    }
+    let index = PaddockIndex::new(&app.ctx.store().list_paddocks().await.unwrap());
+    let (from, end) = (day - 2 * DAY_MS, now.timestamp_millis());
+    for herd in [None, Some("herd_1")] {
+        let mut dwell = Dwell::default();
+        let range = TimeRange::new(time::from_unix_ms(from), time::from_unix_ms(end));
+        let scope = Scope { collar_ids: None, herd_id: herd.map(str::to_owned) };
+        for_each(scan(&app.ctx, "fixes", range, scope, Source::Hot), |b| {
+            each_fix(b, |f| dwell.push(f.collar_id, f.herd_id, index.resolve(f.paddock_id, [f.lon, f.lat]), f.t));
+        })
+        .await
+        .unwrap();
+        let want = dwell.finish(end);
+        let got = op_analytics::routes::hot_dwell(&app.ctx, from, end, herd, &index).await.unwrap();
+        assert!(want.len() >= 8 && want.keys().any(|k| k.3.is_empty() || k.3 == "pad_b"), "{want:?}");
+        assert_eq!(got, want, "herd {herd:?}");
+    }
+}

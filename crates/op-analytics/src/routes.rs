@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::metrics::{Cadence, Dwell, Grid, PaddockIndex, Walk, au_per_head, percentile, round, slope};
+use crate::metrics::{Cadence, Dwell, DwellAgg, DwellKey, Grid, MAX_DWELL_GAP_MS, PaddockIndex, Walk, au_per_head, percentile, round, slope};
 use crate::range::{self, TimeRange, bucket_ms};
 use crate::schema::table_schema;
 use crate::sql;
@@ -973,19 +973,12 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
         rolled.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()).map(|d| crate::range::day_start_ms(d) + DAY_MS).unwrap_or(i64::MIN / 2).max(0);
     let paddock_list = ctx.store().list_paddocks().await?;
     let index = PaddockIndex::new(&paddock_list);
-    let mut dwell = Dwell::default();
     if hot_from < end_ms {
-        let hot_range = TimeRange::new(op_core::time::from_unix_ms(hot_from), end);
-        let scope = Scope { collar_ids: None, herd_id: herd.map(str::to_owned) };
-        for_each(scan(ctx, "fixes", hot_range, scope, Source::Hot), |b| {
-            each_fix(b, |f| dwell.push(f.collar_id, f.herd_id, index.resolve(f.paddock_id, [f.lon, f.lat]), f.t));
-        })
-        .await?;
-    }
-    for ((day, h, _collar, paddock), agg) in dwell.finish(end_ms) {
-        let e = days.entry((day, h, paddock)).or_default();
-        e.0 += agg.dwell_ms as f64;
-        e.1 = e.1.max(agg.last_t);
+        for ((day, h, _collar, paddock), agg) in hot_dwell(ctx, hot_from, end_ms, herd, &index).await? {
+            let e = days.entry((day, h, paddock)).or_default();
+            e.0 += agg.dwell_ms as f64;
+            e.1 = e.1.max(agg.last_t);
+        }
     }
 
     let mut herd_total: HashMap<(i64, String), f64> = HashMap::new();
@@ -1052,6 +1045,64 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
             }
         })
         .collect())
+}
+
+/// One collar's hot dwell in `[?2, ?3)` (`?4` herd or NULL, `?5` the longest
+/// gap), the way [`Dwell`] sums it: each fix's time until the collar's next
+/// one, capped at the gap and the end of its UTC day (the last fix's until
+/// `?3`), goes to the fix's day, herd and stored paddock. SQLite does the
+/// window and the sums; fixes whose stored paddock is gone or unknown come
+/// back one by one with their point, for the caller to place.
+pub fn hot_dwell_sql(herd: bool) -> String {
+    let herd_filter = if herd { "AND herd_id = ?4" } else { "AND ?4 IS NULL" };
+    format!(
+        "WITH w AS (
+             SELECT herd_id, t, lon, lat, CASE WHEN paddock_id IN (SELECT id FROM paddocks) THEN paddock_id END AS pad,
+                    LEAD(t) OVER (ORDER BY t, id) AS nt
+             FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 {herd_filter}
+         ), d AS (
+             SELECT COALESCE(herd_id, '') AS herd, t, lon, lat, pad,
+                    MIN(COALESCE(nt, ?3) - t, ?5, (t / {DAY_MS} + 1) * {DAY_MS} - t) AS dt
+             FROM w
+         )
+         SELECT t / {DAY_MS} AS day, herd, pad, COUNT(*) AS n, SUM(dt) AS dwell, MAX(t) AS last_t, NULL AS lon, NULL AS lat
+         FROM d WHERE pad IS NOT NULL GROUP BY day, herd, pad
+         UNION ALL
+         SELECT t / {DAY_MS}, herd, NULL, 1, dt, t, lon, lat FROM d WHERE pad IS NULL"
+    )
+}
+
+/// Dwell per (day, herd, collar, paddock) of the hot fixes in `[from, end)`,
+/// one collar at a time by index, summed in SQLite: a day of 250 collars is
+/// never decoded row by row.
+pub async fn hot_dwell(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
+    let sql = hot_dwell_sql(herd.is_some());
+    let mut out: HashMap<DwellKey, DwellAgg> = HashMap::new();
+    let mut after = String::new();
+    loop {
+        let next = match herd {
+            Some(h) => sqlx::query_scalar(HERD_NEXT_COLLAR_SQL).bind(h).bind(&after).fetch_optional(ctx.db()).await?,
+            None => crate::rollup::next_collar(ctx, "fixes", &after).await?,
+        };
+        let Some(collar) = next else { break };
+        let rows = sqlx::query(&sql).bind(&collar).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS).fetch_all(ctx.db()).await?;
+        for r in rows {
+            let pad: Option<String> = r.try_get("pad")?;
+            let paddock = match pad {
+                Some(p) => p,
+                None => {
+                    let (lon, lat): (Option<f64>, Option<f64>) = (r.try_get("lon")?, r.try_get("lat")?);
+                    lon.zip(lat).and_then(|(lon, lat)| index.locate([lon, lat])).unwrap_or("").to_owned()
+                }
+            };
+            let e = out.entry((r.try_get("day")?, r.try_get("herd")?, collar.clone(), paddock)).or_default();
+            e.fixes += r.try_get::<i64, _>("n")?;
+            e.dwell_ms += r.try_get::<i64, _>("dwell")?;
+            e.last_t = e.last_t.max(r.try_get("last_t")?);
+        }
+        after = collar;
+    }
+    Ok(out)
 }
 
 /// Latest imagery NDVI mean per paddock from op-engine's land reports
