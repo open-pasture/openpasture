@@ -60,6 +60,25 @@ function inRing(p: LonLat, r: LonLat[]): boolean {
   return c;
 }
 
+// Where closed ring a lies against closed ring b: wholly inside it, wholly outside it, or cut
+// by its edge (touching counts as cut).
+export function ringAgainst(a: LonLat[], b: LonLat[]): "in" | "out" | "cut" {
+  for (let i = 0; i < a.length - 1; i++)
+    for (let j = 0; j < b.length - 1; j++) if (segmentsMeet(a[i], a[i + 1], b[j], b[j + 1])) return "cut";
+  return inRing(a[0], b) ? "in" : "out";
+}
+
+const orient = (a: LonLat, b: LonLat, c: LonLat) => Math.sign((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+const within = (a: LonLat, b: LonLat, c: LonLat) =>
+  Math.min(a[0], b[0]) <= c[0] && c[0] <= Math.max(a[0], b[0]) && Math.min(a[1], b[1]) <= c[1] && c[1] <= Math.max(a[1], b[1]);
+
+// Whether segments pq and rs share a point.
+function segmentsMeet(p: LonLat, q: LonLat, r: LonLat, s: LonLat): boolean {
+  const d1 = orient(r, s, p), d2 = orient(r, s, q), d3 = orient(p, q, r), d4 = orient(p, q, s);
+  if (d1 * d2 < 0 && d3 * d4 < 0) return true;
+  return (d1 === 0 && within(r, s, p)) || (d2 === 0 && within(r, s, q)) || (d3 === 0 && within(p, q, r)) || (d4 === 0 && within(p, q, s));
+}
+
 // Metres from p to the nearest edge of any ring. Positive inside, negative outside (a hole is outside).
 export function signedDistance(p: LonLat, poly: Polygon): number {
   const lat0 = p[1];

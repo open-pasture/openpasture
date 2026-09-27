@@ -15,7 +15,7 @@ export function score(q: string, fields: (string | undefined)[]): number {
   return words.every((w) => hay.some((f) => f.includes(w))) ? 1 : 0;
 }
 
-export interface AnimalHit { label: string; collarId?: string; tag?: string; score: number }
+export interface AnimalHit { label: string; animalId?: string; collarId?: string; tag?: string; score: number }
 
 // Animals still on the farm, then collars that no animal wears. Best first, at most `limit`.
 export function findAnimals(q: string, animals: Animal[], collars: Collar[], limit = 6): AnimalHit[] {
@@ -26,7 +26,7 @@ export function findAnimals(q: string, animals: Animal[], collars: Collar[], lim
     if (a.removed_at) continue;
     const collarId = a.collar_id ?? collars.find((c) => c.animal_id === a.id)?.id;
     const s = score(q, [a.tag, a.name, a.eid]);
-    if (s) hits.push({ label: a.name ? `${a.tag}  ${a.name}` : a.tag, collarId, tag: a.tag, score: s });
+    if (s) hits.push({ label: a.name ? `${a.tag}  ${a.name}` : a.tag, animalId: a.id, collarId, tag: a.tag, score: s });
   }
   for (const c of collars) {
     if (worn.has(c.id) || c.animal_id) continue;

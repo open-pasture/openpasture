@@ -3,20 +3,22 @@ import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
+import { nextStaged } from "../store/boundary";
 import { drawable, undrawn } from "../store/live";
 import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
 import { inside } from "../geo";
 import { Animals } from "../map/animals";
-import { createDraw, current, currentGeometry, editPolygon, editShape, type Draw, type DrawGeometry, type DrawKind } from "../map/draw";
+import { createDraw, current, currentGeometry, editPolygon, editShape, shapeError, type Draw, type DrawGeometry, type DrawKind } from "../map/draw";
 import { mountOverlay, overlayCtx, overlays, Rings, type MapHost, type OverlayHandle } from "../map/overlays";
 import { DRAW_ORDER, tools, type ToolCtx, type ToolItem } from "../map/tools";
 import { LayersMenu } from "../map/LayersMenu";
 import { interleave, PADDOCK_SHEET, paddockSheet, sectionNodes, useSections, views } from "../registry";
 import { Button, Input, Menu, Sheet } from "../ui";
 import { useUnits } from "../units";
-import { typing, useKey } from "../util";
+import { attempt, typing, useKey } from "../util";
+import { pageHash, pageKeys } from "../features/k-animals/herd";
 import { HerdPanel } from "./HerdPanel";
 
 type Mode =
@@ -101,8 +103,9 @@ export function MapView() {
       const id = animalAt(e)?.properties?.id as string | undefined;
       const c = id ? store.get().collars.find((x) => x.id === id) : undefined;
       if (!c) return;
-      const tag = store.get().animals.find((a) => a.id === c.animal_id || a.collar_id === c.id)?.tag;
-      location.hash = `/herd/${encodeURIComponent(tag ?? c.id)}`;
+      // This animal's page, not another herd's with the same tag.
+      const animals = store.get().animals;
+      location.hash = pageHash(pageKeys(animals)(animals.find((a) => a.id === c.animal_id || a.collar_id === c.id), c));
     });
     // Hovering an animal rings it and shows its name; nothing is labelled otherwise.
     m.on("mousemove", (e) => {
@@ -187,7 +190,8 @@ export function MapView() {
     if (!sweeping) restingActive.current = sameHerd ? act : undefined;
     sweep.current?.set({ active: act, target: sweeping ? move?.target : undefined, axis, ground }, sameHerd);
     animals.current?.showTrails(sweeping);
-    setBoundary(map, "pending", bstat?.pending?.geometry);
+    // The next staged move, not the last: a schedule stages days ahead (its rail shows those).
+    setBoundary(map, "pending", nextStaged(bstat)?.geometry);
     setBoundary(map, "proposed", mode.k === "change" ? undefined : bstat?.proposed?.geometry);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map, bstat, mode.k, herdId, sweeping, move?.id]);
@@ -262,15 +266,15 @@ export function MapView() {
   const change = useCallback(() => {
     const d = store.get().decisions.find((x) => x.status === "proposed");
     if (!d?.geometry || !draw.current) return;
-    editPolygon(draw.current, d.geometry, "boundary");
+    if (editPolygon(draw.current, d.geometry, "boundary") === undefined) return;
     setMode({ k: "change", decisionId: d.id });
   }, []);
 
   const reshapeShape = (g: DrawGeometry, kind: DrawKind, save: (g: DrawGeometry) => Promise<unknown>) => {
     if (!draw.current || modeRef.current.k !== "idle") return;
+    if (editShape(draw.current, g, kind) === undefined) return;
     setSheet(undefined);
     setErr(undefined);
-    editShape(draw.current, g, kind);
     setMode({ k: "reshape", save });
   };
   const startReshape = useRef(reshapeShape);
@@ -281,6 +285,8 @@ export function MapView() {
   const commit = async () => {
     const g = draw.current ? (mode.k === "reshape" ? currentGeometry(draw.current) : current(draw.current)) : undefined;
     if (!g) return;
+    const bad = g.type === "Polygon" ? shapeError(g as Polygon) : undefined;
+    if (bad) return setErr(bad);
     setBusy(true);
     setErr(undefined);
     try {
@@ -367,24 +373,29 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
   const u = useUnits();
   const [name, setName] = useState(p.name);
   const [notes, setNotes] = useState(p.notes ?? "");
+  // A refused edit says why under the actions.
+  const [err, setErr] = useState<string>();
+  const run = (f: () => Promise<unknown>) => attempt(f, { failed: setErr });
   const save = async () => {
-    if (name.trim() && name !== p.name) {
+    if (name.trim() && name !== p.name) await run(async () => {
       await api.updatePaddock(p.id, { name: name.trim() });
       await store.refresh();
-    }
+    });
   };
   // Standing notes go into every decision's context.
   const saveNotes = async () => {
     const v = notes.trim();
     if (v === (p.notes ?? "")) return;
-    await api.updatePaddock(p.id, { notes: (v || null) as string | undefined });
-    await store.refresh();
+    await run(async () => {
+      await api.updatePaddock(p.id, { notes: (v || null) as string | undefined });
+      await store.refresh();
+    });
   };
-  const remove = async () => {
+  const remove = () => run(async () => {
     await api.deletePaddock(p.id);
     onClose();
     await store.refresh();
-  };
+  });
   return interleave([
     { key: "name", order: PADDOCK_SHEET.name, node: (
       <form onSubmit={(e) => { e.preventDefault(); void save(); }}>
@@ -396,7 +407,8 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
     { key: "actions", order: PADDOCK_SHEET.actions, node: manage && (
       <div className="acts">
         <Button small onClick={onReshape}>Reshape</Button>
-        <Button small kind="plain" className="danger" onClick={remove}>Delete</Button>
+        <Button small kind="plain" className="danger" onClick={() => void remove()}>Delete</Button>
+        {err && <span className="mono err">{err}</span>}
       </div>
     ) },
   ], added);

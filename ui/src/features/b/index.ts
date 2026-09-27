@@ -9,6 +9,7 @@ import { animalPage, dataSections, paddockSheet, search, settingsSections, short
 import { store } from "../../store";
 import { bboxOf, layerData, searchOpen, show, startB } from "../../store/b";
 import "../../styles/b.css";
+import { pageHash, pageKeys } from "../k-animals/herd";
 import { findAnimals, findPaddocks } from "./find";
 import { hasData, type LayerKind } from "./have";
 import { KnowledgeSheet, SearchBox } from "./Search";
@@ -91,10 +92,12 @@ search.register({
   id: "b-animals", order: 10,
   async find(q) {
     const s = store.get();
+    const key = pageKeys(s.animals);
     return findAnimals(q, s.animals, s.collars).flatMap((h) => {
       const c = h.collarId ? s.collars.find((x) => x.id === h.collarId) : undefined;
       if (c?.last_fix && !c.parked_at) return [{ label: h.label, kind: "animal", run: () => show({ kind: "collar", id: c.id }) }];
-      if (h.tag && views.has("herd")) return [{ label: h.label, kind: "animal", run: () => void (location.hash = `/herd/${encodeURIComponent(h.tag!)}`) }];
+      const a = h.animalId ? s.animals.find((x) => x.id === h.animalId) : undefined;
+      if (a && views.has("herd")) return [{ label: h.label, kind: "animal", run: () => void (location.hash = pageHash(key(a))) }];
       return [];
     });
   },
