@@ -62,3 +62,17 @@ export function useHash(): [string, string, (h: string) => void] {
   const [view, rest] = parseHash(h);
   return [view, rest, (v) => (location.hash = "/" + v)];
 }
+
+// One pending timer per key (a herd): a new call replaces that key's timer only.
+export function perKey<K>() {
+  const timers = new Map<K, ReturnType<typeof setTimeout>>();
+  return {
+    set(k: K, ms: number, f: () => void) {
+      clearTimeout(timers.get(k));
+      timers.set(k, setTimeout(() => {
+        timers.delete(k);
+        f();
+      }, ms));
+    },
+  };
+}

@@ -6,6 +6,7 @@ import { api, live, onUnauthorized, type Animal, type AppState, type BoundarySta
 import "./api/p";
 import { loadMe } from "./store/me";
 import { applyAcks, applyCollar, applyPositions, indexById, labels } from "./store/live";
+import { perKey } from "./util";
 
 export interface Store {
   ready: boolean;
@@ -144,10 +145,10 @@ function refreshSoon() {
   herdTimer = setTimeout(() => void refreshHerd(), 800);
 }
 
-let boundaryTimer: ReturnType<typeof setTimeout> | undefined;
+// One refetch per herd at a time: several herds sweep at once.
+const boundaryTimers = perKey<string>();
 function refreshBoundarySoon(herd: string) {
-  clearTimeout(boundaryTimer);
-  boundaryTimer = setTimeout(async () => {
+  boundaryTimers.set(herd, 120, async () => {
     try {
       const b = await api.boundary(herd);
       set({ boundary: { ...s.boundary, [herd]: b } });
@@ -155,7 +156,7 @@ function refreshBoundarySoon(herd: string) {
     } catch {
       /* next event retries */
     }
-  }, 120);
+  });
 }
 
 function emit(e: LiveEvent) {
