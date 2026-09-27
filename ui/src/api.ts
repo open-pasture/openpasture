@@ -210,10 +210,14 @@ export interface Alert {
   // resolved_at without resolved_by: it cleared by itself. rolled_into: it joined a herd rollup.
   resolved_at?: string; resolved_by?: Actor; rolled_into?: string;
 }
+export type MessageChannel = "sms" | "whatsapp" | "email" | "webhook" | "relay" | "push";
+export type MessageKind = "alert" | "brief" | "reply" | "test" | "verify" | "inbound";
+export type MessageStatus = "queued" | "sending" | "sent" | "delivered" | "failed" | "received" | "ignored";
+// One text, email, webhook or push, out or in. address: phone, email, URL or push endpoint id.
 export interface MessageLog {
-  id: string; direction: "out" | "in"; channel: string; address: string; user_id?: string; kind: string; text: string;
-  status: string; error?: string; alert_id?: string; decision_id?: string; provider_id?: string;
-  created_at: string; updated_at: string;
+  id: string; direction: "out" | "in"; channel: MessageChannel; address: string; user_id?: string; kind: MessageKind;
+  text: string; subject?: string; status: MessageStatus; error?: string; alert_id?: string; decision_id?: string;
+  provider_id?: string; attempts: number; created_at: string; updated_at: string;
 }
 export type FeatureKind = "exclusion" | "water" | "gate" | "shade" | "hazard" | "road" | "neighbour_line" | "farm_boundary";
 export type FeatureGeometry =
