@@ -586,6 +586,30 @@ async fn a_bare_y_answers_only_the_decision_its_text_asked_about() {
 }
 
 #[tokio::test]
+async fn a_bare_y_after_texts_about_two_waiting_decisions_gets_the_list() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (_, h) = t.f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": t.f.paddocks[2]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    // Both herds' decision texts reached Mia (or both herds' briefs at 06:30).
+    let (cows, cows_code) = proposal(&t, &t.f.herd).await;
+    let (hf, _) = proposal(&t, &heifers).await;
+    asked(&t, MIA, mins(12), &cows).await;
+    asked(&t, MIA, mins(10), &hf).await;
+    // Her bare "y" could mean either: nothing is decided, she gets the numbered list.
+    assert_eq!(reply(&t, MIA, "y").await, "2 decisions waiting. 1. Cows: move to P2. 2. Heifers: move to P2. Reply Y or N and the number, like Y 1.");
+    assert_eq!((decision_status(ctx, &cows).await.0, decision_status(ctx, &hf).await.0), ("proposed".into(), "proposed".into()));
+    assert_eq!(reply(&t, MIA, "y 2").await, "Approved. Heifers moving to P2.");
+    assert_eq!(decision_status(ctx, &cows).await.0, "proposed");
+    // A second bare "n" (a resent text, or meant for the Heifers) still decides nothing: it names the Cows' decision with its code.
+    let r = reply(&t, MIA, "n").await;
+    assert!(r.starts_with("Heifers: move to P2 is already approved. Cows: move to P2 ") && r.ends_with(&format!("Code {cows_code}")), "{r}");
+    assert_eq!(decision_status(ctx, &cows).await.0, "proposed");
+    reply_sent(ctx, MIA).await;
+    assert_eq!(reply(&t, MIA, "N").await, "Rejected. Nothing sent for Cows.");
+}
+
+#[tokio::test]
 async fn a_code_still_answers_after_its_alert_is_resolved_by_hand() {
     let t = farm().await;
     let ctx = t.ctx();
@@ -659,6 +683,38 @@ async fn a_decision_text_that_waited_out_an_outage_isnt_sent_once_answered() {
     let m = notify_support::message(ctx, &to_mia.id).await;
     assert_eq!((m.status.as_str(), m.error.as_deref()), ("failed", Some("Resolved before it could be sent.")));
     assert!(t.twilio.texts().iter().all(|h| h.form()["To"] != MIA));
+}
+
+#[tokio::test]
+async fn a_grouped_text_that_waited_out_an_outage_goes_while_any_of_its_alerts_is_open() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    // Two animals outside in one window: one text for both.
+    for (tag, at) in [("214", t0()), ("031", t0() + Duration::seconds(20))] {
+        let c = t.f.collar(Some(tag), at).await;
+        t.f.outside(&c, at - mins(6), at + mins(600)).await;
+        t.f.eval(at).await;
+    }
+    let texts = t.f.route(t0() + Duration::seconds(90)).await;
+    let to_mia = texts.iter().find(|m| m.address == MIA).expect("Mia's text").clone();
+    assert!(to_mia.text.starts_with("2 outside P1"), "{}", to_mia.text);
+    // The farm's internet is down, and meanwhile the first animal walks back in.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}", l.local_addr().unwrap().port())
+    };
+    let a = notify_support::app(ctx);
+    assert_eq!(call(&a, "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": closed}))).await.0, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now()).await.unwrap();
+    assert_eq!(notify_support::message(ctx, &to_mia.id).await.status, "queued");
+    let first = to_mia.alert_id.clone().unwrap();
+    let hank = op_core::users::get_user(ctx, &t.id(HANK)).await.unwrap().unwrap();
+    op_alerts::engine::store::resolve_by(ctx, &first, &op_alerts::inbound::act::actor(&hank), now()).await.unwrap();
+    // Back online: the other animal is still out, so the text goes.
+    assert_eq!(call(&a, "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": t.twilio.url}))).await.0, StatusCode::OK);
+    op_alerts::notify::sender::run_once(ctx, now() + mins(2)).await.unwrap();
+    assert_eq!(notify_support::message(ctx, &to_mia.id).await.status, "sent");
+    assert!(t.twilio.texts().iter().any(|h| h.form()["To"] == MIA));
 }
 
 #[tokio::test]

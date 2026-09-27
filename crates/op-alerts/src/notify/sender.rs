@@ -58,15 +58,23 @@ pub fn offline_backoff(age: chrono::Duration) -> Option<chrono::Duration> {
     (age < chrono::Duration::hours(OFFLINE_KEEP_H)).then(|| chrono::Duration::seconds(age.num_seconds().clamp(5, OFFLINE_EVERY_S)))
 }
 
-/// Why a text or email that waited isn't worth sending any more: its alert
-/// resolved. (The webhook, a record for other systems, gets it anyway.)
+/// Why a text or email that waited isn't worth sending any more: every
+/// alert it tells about (one text can cover a group) resolved. (The
+/// webhook, a record for other systems, gets it anyway.)
 async fn stale(ctx: &Ctx, m: &MessageLog, now: DateTime<Utc>) -> anyhow::Result<Option<&'static str>> {
     let waited = m.kind == "alert" && m.channel != "webhook" && now - m.created_at >= chrono::Duration::seconds(WAITED_S);
     let Some(alert_id) = m.alert_id.as_deref().filter(|_| waited) else {
         return Ok(None);
     };
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM alerts WHERE id = ?").bind(alert_id).fetch_optional(ctx.db()).await?;
-    Ok((status.as_deref() == Some("resolved")).then_some("Resolved before it could be sent."))
+    let (known, open): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(status != 'resolved'), 0) FROM alerts
+         WHERE id = ?1 OR id IN (SELECT alert_id FROM alert_notifications WHERE message_id = ?2)",
+    )
+    .bind(alert_id)
+    .bind(&m.id)
+    .fetch_one(ctx.db())
+    .await?;
+    Ok((known > 0 && open == 0).then_some("Resolved before it could be sent."))
 }
 
 /// One pass over every channel: claim what is due at `now` (≤ 4 per channel,

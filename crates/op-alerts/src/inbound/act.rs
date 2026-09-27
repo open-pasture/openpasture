@@ -13,11 +13,13 @@
 //!
 //! A bare Y or N answers the decision the newest text that asked this number
 //! about one was about ([`ASKS`]: the decision's own text, a brief, a LATER
-//! reminder), and only while that decision still waits. When it doesn't (it
-//! was answered or replaced), or nothing asked, nothing is decided: the reply
-//! names what is waiting now, with its code, and that text is what the next
-//! bare Y answers. A code names its decision by the newest `decision_waiting`
-//! alert for it, open or resolved by hand, while the decision waits.
+//! reminder), and only while that decision still waits and no other text in
+//! the window asked about another one that still waits (then it gets the
+//! numbered list). When it doesn't wait (it was answered or replaced), or
+//! nothing asked, nothing is decided: the reply names what is waiting now,
+//! with its code, and that text is what the next bare Y answers. A code
+//! names its decision by the newest `decision_waiting` alert for it, open or
+//! resolved by hand, while the decision waits.
 
 use chrono::{DateTime, Duration, Utc};
 use op_brain::{AskError, AskRequest};
@@ -185,17 +187,25 @@ pub async fn asks_for_answer(ctx: &Ctx, id: &str) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM messages m WHERE m.id = ? AND {ASKS})")).bind(id).fetch_one(ctx.db()).await?)
 }
 
-/// The decision the newest text that reached `address` since `since` asked about.
-async fn prompted_decision(ctx: &Ctx, address: &str, since: DateTime<Utc>) -> anyhow::Result<Option<String>> {
-    Ok(sqlx::query_scalar(&format!(
+/// The decisions texts that reached `address` since `since` asked about,
+/// newest text first, each once.
+async fn prompted_decisions(ctx: &Ctx, address: &str, since: DateTime<Utc>) -> anyhow::Result<Vec<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT m.decision_id FROM messages m WHERE m.address = ? AND m.direction = 'out' AND m.status IN ('sending', 'sent', 'delivered')
            AND m.created_at >= ? AND {ASKS}
-         ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1"
+         ORDER BY m.created_at DESC, m.rowid DESC LIMIT 50"
     ))
     .bind(address)
     .bind(to_db(&since))
-    .fetch_optional(ctx.db())
-    .await?)
+    .fetch_all(ctx.db())
+    .await?;
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 async fn in_window(ctx: &Ctx, cfg: &TextingConfig, address: &str, now: DateTime<Utc>) -> anyhow::Result<bool> {
@@ -373,13 +383,27 @@ async fn pick_decision(
         Pick::Only => {
             let all = pending(ctx, user).await?;
             let since = now - Duration::hours(cfg.approve_window_h as i64);
-            let asked = match prompted_decision(ctx, &msg.address, since).await? {
-                Some(id) => decision(ctx, &id).await?,
-                None => None,
-            };
-            match asked {
-                // The decision the text they answer asked about, still waiting.
-                Some(d) if d.status == DecisionStatus::Proposed && answerable(&d) => Ok(Ok(d)),
+            let mut asked = Vec::new();
+            for id in prompted_decisions(ctx, &msg.address, since).await? {
+                asked.extend(decision(ctx, &id).await?);
+            }
+            let waits = |d: &Decision| d.status == DecisionStatus::Proposed && answerable(d);
+            match asked.first().cloned() {
+                // The decision the text they answer asked about, still waiting,
+                // and the only one their texts asked about that still waits.
+                Some(d) if waits(&d) && !asked[1..].iter().any(waits) => Ok(Ok(d)),
+                // Texts asked about more than one that still waits: which one
+                // isn't clear, so the numbered list (nothing is decided).
+                Some(d) if waits(&d) => {
+                    let mut list = all;
+                    for a in asked.into_iter().filter(|a| waits(a)) {
+                        if !list.iter().any(|x| x.id == a.id) {
+                            list.push(a);
+                        }
+                    }
+                    list.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+                    Ok(Err(waiting_reply(ctx, user, None, list, verb, max, now).await?))
+                }
                 // It was answered or replaced since: say so and what waits now.
                 Some(gone) => {
                     let herds = ctx.store().list_herds().await?;
