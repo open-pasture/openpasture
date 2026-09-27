@@ -1345,12 +1345,16 @@ ScheduledMove { schedule_id, index /* strip */, step /* 0 open, 1.. back-fence s
 `layout_id` and no `strips` they come from the layout, and the paddock from the layout, else the
 herd's. The first strip to open (`next_index`) defaults to the one after the strip the herd's
 boundary covers now, so the usual start is: send strip 1 (`POST /api/herds/:id/boundary`), then
-schedule. Without a back fence, opening strip k stages `strips[0..=k]`. With one it stages
-`strips[p-lag..=k]` (p = the strip opened before, so the animals keep the ground they stand on;
-skipped strips in between are old ground too), then `close_steps` steps `close_after_min` after
-the open and `close_every_min` apart sweep the old ground from the far side, the last being
-`strips[k-lag..=k]`. Every shape goes through `prepare` when it is staged (exclusions active at
-its time, fitting).
+schedule. An open never takes ground away: opening strip k stages the ground the herd has before
+it (the boundary in effect for the first open, else what the move before leaves) joined to the
+strips up to k and those between (skipped strips are walked through). Without a back fence that
+is `strips[0..=k]` and whatever ground the herd had. With one, `close_steps` steps per strip of old
+ground, `close_after_min` after the open and `close_every_min` apart (pressed closer when they
+would reach the next open), sweep everything else from the far side, from both ends when there is
+old ground on both sides, the last being `strips[k-lag..=k]`. So with the herd on strip k-1 the
+open is `strips[k-1-lag..=k]`, and a schedule made while the herd has the whole paddock opens
+strip 1 as the whole paddock and closes the rest behind it. Every shape goes through `prepare`
+when it is staged (exclusions active at its time, fitting).
 
 **Times.** Occurrence 0 is `starts_at`; occurrence n is `cadence.at` on the farm-local date
 n × `every_days` days later, so "daily 07:00" opens at 07:00 local on both sides of a DST change
@@ -1368,8 +1372,12 @@ three back-fence steps a day, about 3.75 days. A schedule's boundaries carry its
 **Immediates.** A sweep step, a farmer's draw or any immediate herd boundary drops the staged
 moves on the collars. The schedule stages again above it when the sequence settles: at the end of
 the move, or 60 s after a lone boundary. A move whose time passed without taking effect is
-applied at once if at most 30 minutes late, else marked `late` and never applied (with the
-back-fence steps of an open that never happened); later moves go ahead. Queue edits that change
+applied at once if at most 30 minutes late, else marked `late` and never applied (an open that is
+late or can't be sent takes its back-fence steps with it); later moves go ahead. Whenever the
+boundary in effect isn't the move before the next one (a move marked late or skipped, a boundary
+from elsewhere, move now), the moves still to come are planned again from the ground the herd is
+on, so no open or back-fence step leaves it outside. Move now skips what is left of the strip
+before's back fence: the open keeps that ground and its own back fence closes it. Queue edits that change
 what is staged (skip, hold, edit time, pause, end) send the herd's current strip again as a new
 immediate version so collars drop the staged moves, then stage the new plan. Move now sends the
 strip itself. An escape's pen drops only that collar's staged slots; when it ends the collar gets

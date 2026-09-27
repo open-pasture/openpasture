@@ -364,14 +364,27 @@ async fn a_sweep_drops_the_staged_moves_and_they_are_staged_again_once_it_ends()
     assert!(staged(&ms).is_empty(), "the sweep's step dropped them");
     assert!(app.status(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
 
-    // The move ends: staged again above the sweep's last step, at the same times.
+    // The move ends part way: staged again above the sweep's last step, the opens at the same times.
     let (st, _) = app.call("POST", &format!("/api/herds/{herd}/move/stop"), None).await;
     assert_eq!(st, StatusCode::OK);
     sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
     let ms2 = app.moves(&s).await;
-    assert_eq!(staged(&ms2).len(), 15);
-    assert!(ms2.iter().all(|m| m.boundary_version.unwrap() > stepped));
-    assert_eq!(ms.iter().map(|m| m.at).collect::<Vec<_>>(), ms2.iter().map(|m| m.at).collect::<Vec<_>>());
+    assert_eq!(staged(&ms2).len(), 15, "as many as the collar has room for");
+    assert!(staged(&ms2).iter().all(|m| m.boundary_version.unwrap() > stepped));
+    let opens = |ms: &[ScheduledMove]| ms.iter().filter(|m| m.step == 0).map(|m| (m.index, m.at)).collect::<Vec<_>>();
+    assert_eq!(opens(&ms), opens(&ms2));
+    // The herd is spread over the sweep's ground: strip 2's open keeps all of it,
+    // and its back fence closes it from both ends onto strip 2.
+    let swept: Polygon = serde_json::from_value(app.status(&herd).await["active"]["geometry"].clone()).unwrap();
+    let open2 = ms2.iter().find(|m| m.index == 1 && m.step == 0).unwrap();
+    for x in [25.0, 75.0, 275.0] {
+        assert!(swept.contains(m_at(x, 100.0)) && open2.geometry.contains(m_at(x, 100.0)), "x {x}");
+    }
+    let closes: Vec<&ScheduledMove> = ms2.iter().filter(|m| m.index == 1 && m.step > 0).collect();
+    let last = closes.iter().max_by_key(|m| m.step).unwrap();
+    assert!((last.geometry.area_ha() * 1e4 - 50.0 * 200.0).abs() < 100.0, "strip 2 alone");
+    assert!(closes.len() > 2 && closes.iter().all(|m| m.at < opens(&ms2)[1].1));
+    assert!(!closes[0].geometry.contains(m_at(298.0, 100.0)) && !closes[0].geometry.contains(m_at(23.0, 100.0)), "from both ends");
 }
 
 #[tokio::test]
@@ -518,15 +531,16 @@ async fn skip_moves_the_later_strips_up_one_occurrence() {
     // Strip 4 opens over the skipped ground: strips 2, 3 and 4, closing to strip 4.
     let area = |p: &Polygon| p.area_ha() * 10_000.0;
     assert!((area(&open(3).geometry) - 150.0 * 200.0).abs() < 150.0);
+    // Two strips of old ground: two back-fence steps each, a minute apart.
     let last_close = ms.iter().filter(|m| m.index == 3 && m.step > 0).max_by_key(|m| m.step).unwrap();
     assert!((area(&last_close.geometry) - 50.0 * 200.0).abs() < 100.0);
-    assert_eq!(last_close.at, open(3).at + Duration::minutes(3));
+    assert_eq!((last_close.step, last_close.at), (4, open(3).at + Duration::minutes(5)));
     // The collars dropped what was staged (the current strip went again) and got the new plan.
     let status = app.status(&herd).await;
     let reissued = status["active"]["version"].as_u64().unwrap() as u32;
     assert!(reissued > top && status["active"]["decision_id"] == json!(s.id));
     assert!(staged(&ms).iter().all(|m| m.boundary_version.unwrap() > reissued));
-    assert_eq!(staged(&ms).len(), 12);
+    assert_eq!(staged(&ms).len(), 14);
     assert_eq!(s.next_index, 1);
 }
 
@@ -766,4 +780,173 @@ async fn staging_250_collars_is_quick() {
     let t = std::time::Instant::now();
     sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
     assert!(t.elapsed() < std::time::Duration::from_secs(2), "a pass took {:?}", t.elapsed());
+}
+
+// ---- the ground the herd is on (FX-FENCE) ----
+
+/// Staged versions of a schedule, as the collars get them (prepared).
+async fn staged_shape(app: &App, herd: &str, version: u32) -> Polygon {
+    let status = app.status(herd).await;
+    let b = status["staged"].as_array().unwrap().iter().find(|b| b["version"].as_u64() == Some(u64::from(version))).expect("staged").clone();
+    serde_json::from_value(b["geometry"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn after_a_late_open_the_next_open_keeps_the_ground_the_herd_is_on() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let mut dev = app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(5));
+    let hourly = move |n: u32| start + Duration::minutes(60 * i64::from(n));
+    let s = sched::create(&app.ctx, new_schedule(&herd, &pad, start, quick_fence()), &hourly).await.unwrap();
+    // A lone boundary drops the staged moves; the server next looks 40 minutes after strip 2's time.
+    op_ingest::send_boundary(&app.ctx, &herd, strips()[0].clone(), Default::default(), "dec_other").await.unwrap();
+    sched::drive(&app.ctx, &s.id, start + Duration::minutes(40)).await.unwrap();
+    let ms = app.moves(&s).await;
+    assert!(ms.iter().filter(|m| m.index == 1).all(|m| m.skipped.as_deref() == Some("late")));
+    // The herd still stands on strip 1: strip 3's open keeps it, and the back fence closes it behind them.
+    let herd_at = m_at(25.0, 100.0);
+    let open3 = ms.iter().find(|m| m.index == 2 && m.step == 0).unwrap();
+    assert_eq!(open3.state, MoveState::Staged);
+    assert!(open3.geometry.contains(herd_at), "strip 3's open leaves the herd on strip 1 outside");
+    assert!(staged_shape(&app, &herd, open3.boundary_version.unwrap()).await.contains(herd_at), "as staged too");
+    let closes: Vec<&ScheduledMove> = ms.iter().filter(|m| m.index == 2 && m.step > 0).collect();
+    let last = closes.iter().max_by_key(|m| m.step).unwrap();
+    assert!((last.geometry.area_ha() * 1e4 - 50.0 * 200.0).abs() < 100.0, "closes to strip 3 alone");
+    // Two strips of old ground close at the back fence's pace: two steps each, all before strip 4 opens.
+    assert_eq!(closes.len(), 4);
+    let open4 = ms.iter().find(|m| m.index == 3 && m.step == 0).unwrap();
+    assert!(closes.iter().all(|m| m.at > open3.at && m.at < open4.at));
+    // The collar applies it on its own clock with the herd inside.
+    app.sync(&mut dev, Utc::now()).await;
+    dev.store.tick(open3.at + Duration::seconds(1)).expect("strip 3 opens");
+    assert!(dev.store.active().unwrap().cmd.polygon().contains(herd_at));
+}
+
+#[tokio::test]
+async fn back_fence_steps_missed_while_the_server_was_away_stay_in_the_next_open() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    // Two slots: one move staged ahead at a time.
+    app.collar(&herd, limits(2, 0)).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(5));
+    let hourly = move |n: u32| start + Duration::minutes(60 * i64::from(n));
+    let s = sched::create(&app.ctx, new_schedule(&herd, &pad, start, quick_fence()), &hourly).await.unwrap();
+    assert_eq!(staged(&app.moves(&s).await).len(), 1, "strip 2's open");
+    // Strip 2 opened on the collars' clocks; the server was away through its back fence.
+    sched::drive(&app.ctx, &s.id, start + Duration::minutes(40)).await.unwrap();
+    let ms = app.moves(&s).await;
+    let two: Vec<(u32, MoveState, Option<String>)> = ms.iter().filter(|m| m.index == 1).map(|m| (m.step, m.state, m.skipped.clone())).collect();
+    assert_eq!(two[0].1, MoveState::Done);
+    assert!(two[1..].iter().all(|m| m.2.as_deref() == Some("late")), "{two:?}");
+    // The herd still has strips 1 and 2: strip 3's open keeps both.
+    let open3 = ms.iter().find(|m| m.index == 2 && m.step == 0).unwrap();
+    assert_eq!(open3.state, MoveState::Staged);
+    for x in [25.0, 75.0, 125.0] {
+        assert!(open3.geometry.contains(m_at(x, 100.0)), "x {x}");
+    }
+}
+
+#[tokio::test]
+async fn a_schedule_from_the_whole_paddock_keeps_it_at_the_first_open_and_closes_it_behind_the_herd() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let dev = app.collar(&herd, CollarLimits::V0).await;
+    let (st, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(0.0, 0.0, 300.0, 200.0)}))).await;
+    assert_eq!((st, m["status"].as_str()), (StatusCode::CREATED, Some("done")), "{m}");
+    app.report(&dev, json!({"fixes": [fix(m_at(250.0, 100.0), Utc::now())]})).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    assert_eq!(s.next_index, 0);
+    let ms = app.moves(&s).await;
+    let open1 = ms.iter().find(|m| m.index == 0 && m.step == 0).unwrap();
+    // Nobody is left outside at the open: it is the whole paddock still.
+    for x in [25.0, 150.0, 250.0, 295.0] {
+        assert!(open1.geometry.contains(m_at(x, 100.0)), "x {x}");
+    }
+    // The back fence closes the other five strips from the far side, two steps a strip, before strip 2 opens.
+    let closes: Vec<&ScheduledMove> = ms.iter().filter(|m| m.index == 0 && m.step > 0).collect();
+    assert_eq!(closes.len(), 10);
+    let areas: Vec<f64> = closes.iter().map(|m| m.geometry.area_ha() * 1e4).collect();
+    assert!(areas.windows(2).all(|w| w[1] < w[0]), "{areas:?}");
+    assert!(!closes[0].geometry.contains(m_at(295.0, 100.0)) && closes[0].geometry.contains(m_at(25.0, 100.0)));
+    assert!((areas[9] - 50.0 * 200.0).abs() < 100.0, "strip 1 alone");
+    let open2 = ms.iter().find(|m| m.index == 1 && m.step == 0).unwrap();
+    assert!(closes.iter().all(|m| m.at > open1.at && m.at < open2.at));
+}
+
+#[tokio::test]
+async fn a_schedule_from_three_strips_keeps_them_at_the_first_open() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    let (st, _) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(0.0, 0.0, 150.0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    assert_eq!(s.next_index, 3);
+    let ms = app.moves(&s).await;
+    let open4 = ms.iter().find(|m| m.index == 3 && m.step == 0).unwrap();
+    assert!(open4.geometry.contains(m_at(25.0, 100.0)) && open4.geometry.contains(m_at(175.0, 100.0)));
+    let last = ms.iter().filter(|m| m.index == 3).max_by_key(|m| m.step).unwrap();
+    assert!((last.geometry.area_ha() * 1e4 - 50.0 * 200.0).abs() < 100.0, "strip 4 alone at the end");
+}
+
+#[tokio::test]
+async fn move_now_drops_the_back_fence_left_from_the_strip_before() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::seconds(2));
+    let bf = BackFence { enabled: true, lag_strips: 0, close_after_min: 5, close_steps: 1, close_every_min: 1 };
+    let s = app.schedule(&herd, &pad, start, bf).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
+    assert_eq!(app.moves(&s).await.iter().find(|m| m.index == 1 && m.step == 0).unwrap().state, MoveState::Done);
+    // Strip 2 is open (strips 1 and 2); its back fence is still to come. Move now opens strip 3.
+    let s = sched::move_now(&app.ctx, &s.id).await.unwrap();
+    let ms = app.moves(&s).await;
+    let close2 = ms.iter().find(|m| m.index == 1 && m.step == 1).unwrap();
+    assert_eq!(close2.state, MoveState::Skipped, "strip 2's back fence would cut strip 3 off");
+    let open3 = ms.iter().find(|m| m.index == 2 && m.step == 0).unwrap();
+    assert_eq!(open3.state, MoveState::Done);
+    assert!(open3.geometry.contains(m_at(25.0, 100.0)), "the herd keeps strip 1 until its back fence closes it");
+    // Nothing still to come fences the herd out of strip 3 before strip 4 opens.
+    for m in ms.iter().filter(|m| matches!(m.state, MoveState::Planned | MoveState::Staged) && m.index <= 2) {
+        assert!(m.geometry.contains(m_at(125.0, 100.0)), "strip {} step {}", m.index + 1, m.step);
+    }
+    let active: Polygon = serde_json::from_value(app.status(&herd).await["active"]["geometry"].clone()).unwrap();
+    assert!(active.contains(m_at(25.0, 100.0)) && active.contains(m_at(125.0, 100.0)));
+}
+
+#[tokio::test]
+async fn an_open_that_never_happened_takes_its_back_fence_steps_with_it() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(5));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    // Strip 2's open couldn't be sent (as when prepare refuses it), and a lone
+    // boundary dropped what was staged.
+    sqlx::query("UPDATE schedule_moves SET state = 'skipped', skipped = 'skipped', boundary_id = NULL, boundary_version = NULL WHERE schedule_id = ? AND strip = 1 AND step = 0")
+        .bind(&s.id)
+        .execute(app.ctx.db())
+        .await
+        .unwrap();
+    op_ingest::send_boundary(&app.ctx, &herd, strips()[0].clone(), Default::default(), "dec_other").await.unwrap();
+    sched::drive(&app.ctx, &s.id, Utc::now() + Duration::seconds(61)).await.unwrap();
+    let ms = app.moves(&s).await;
+    // Its back fence would have closed onto strip 2 with the herd on strip 1.
+    assert!(
+        ms.iter().filter(|m| m.index == 1).all(|m| m.state == MoveState::Skipped),
+        "{:?}",
+        ms.iter().map(|m| (m.index, m.step, m.state)).collect::<Vec<_>>()
+    );
+    let open3 = ms.iter().find(|m| m.index == 2 && m.step == 0).unwrap();
+    assert!(open3.geometry.contains(m_at(25.0, 100.0)));
+    assert!(ms.iter().filter(|m| m.state == MoveState::Staged).all(|m| m.geometry.contains(m_at(125.0, 100.0)) || m.index > 2));
 }
