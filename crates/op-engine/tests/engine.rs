@@ -543,6 +543,11 @@ async fn one_running_decision_per_herd() {
 async fn autonomy_change_follows_the_open_proposal() {
     let t = setup().await;
     let f = farm(&t, "propose", 1).await;
+    // The engine's scheduler must not start the herd's own daily decision
+    // mid-test (its events and its superseding raced the proposal's): the
+    // farm's decision time was two hours ago, and a missed one waits for tomorrow.
+    let at = (chrono::Utc::now().with_timezone(&chrono_tz::America::Chicago) - chrono::Duration::hours(2)).format("%H:%M").to_string();
+    t.ctx.update_settings(&json!({ "decision_time": at })).await.unwrap();
     op_engine::start(t.ctx.clone()).await.unwrap();
     let d = propose(&t, &f).await;
     assert!(d.apply_at.is_none());
@@ -554,8 +559,15 @@ async fn autonomy_change_follows_the_open_proposal() {
     let mins = (got.apply_at.expect("countdown started") - time::now()).num_seconds();
     assert!((29 * 60..=30 * 60).contains(&mins), "{mins}");
     assert_eq!(got.status, DecisionStatus::Proposed);
-    let ev = rx.try_recv().expect("a decision event for the UI");
-    assert!(matches!(ev, op_core::Event::Decision { ref decision } if decision.id == d.id && decision.apply_at.is_some()));
+    // The proposal's own event, whatever else the bus carried meanwhile.
+    let mut seen = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        seen.push(ev);
+    }
+    assert!(
+        seen.iter().any(|ev| matches!(ev, op_core::Event::Decision { decision } if decision.id == d.id && decision.apply_at.is_some())),
+        "a decision event for the UI: {seen:?}"
+    );
 
     // A new timer length restarts the countdown.
     t.ok("PATCH", &herd_path, Some(json!({ "timer_minutes": 60 }))).await;
