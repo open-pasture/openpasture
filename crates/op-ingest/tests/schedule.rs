@@ -706,6 +706,31 @@ async fn schedules_that_cant_work_are_refused() {
 }
 
 #[tokio::test]
+async fn strips_that_overlap_are_refused_rather_than_staged_with_a_hole() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    // The whole paddock, then a strip inside it: opening the second would have staged the
+    // first with a hole where the second is.
+    let mut inside = new_schedule(&herd, &pad, start, BackFence { enabled: false, ..quick_fence() });
+    inside.strips = vec![rect(0.0, 0.0, 300.0, 200.0), rect(100.0, 50.0, 150.0, 150.0)];
+    inside.next_index = Some(1);
+    let e = sched::create(&app.ctx, inside, &every(start)).await.unwrap_err();
+    assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    assert_eq!(e.message, "Strips 1 and 2 overlap. Each piece of ground belongs to one strip.");
+    // Strips that cross into each other by 10 m, with a back fence.
+    let mut over = new_schedule(&herd, &pad, start, quick_fence());
+    over.strips = vec![rect(0.0, 0.0, 60.0, 200.0), rect(50.0, 0.0, 100.0, 200.0), rect(100.0, 0.0, 150.0, 200.0)];
+    let e = sched::create(&app.ctx, over, &every(start)).await.unwrap_err();
+    assert!(e.message.starts_with("Strips 1 and 2 overlap."), "{}", e.message);
+    // Strips that only share edges are the usual case and still make a schedule.
+    let s = sched::create(&app.ctx, new_schedule(&herd, &pad, start, quick_fence()), &every(start)).await.unwrap();
+    assert_eq!(s.status, ScheduleStatus::Active);
+}
+
+#[tokio::test]
 async fn staging_250_collars_is_quick() {
     let app = App::new().await;
     let (herd, pad) = app.herd("Cows").await;

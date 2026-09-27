@@ -372,6 +372,29 @@ fn union_geo(polys: &[GeoPolygon]) -> MultiPolygon {
     MultiPolygon(polys.to_vec()).union(&MultiPolygon(vec![]))
 }
 
+/// The first two strips that share ground (a square metre or more), if any.
+/// `union_geo` puts every strip in one boolean op, and `geo`'s ops fill
+/// even-odd: ground two strips share cancels out there, so a strip lying
+/// inside another would be staged as a hole in the boundary that opens it.
+/// Strips that only share an edge (the strip cutter's) don't count.
+fn overlapping(strips: &[Polygon]) -> Option<(usize, usize)> {
+    use geo::BoundingRect;
+    let s = snapped(strips)?;
+    let boxes: Vec<_> = s.polys.iter().map(|p| p.bounding_rect()).collect();
+    for i in 0..s.polys.len() {
+        for j in i + 1..s.polys.len() {
+            let (Some(a), Some(b)) = (boxes[i], boxes[j]) else { continue };
+            if a.max().x <= b.min().x || b.max().x <= a.min().x || a.max().y <= b.min().y || b.max().y <= a.min().y {
+                continue;
+            }
+            if s.polys[i].intersection(&s.polys[j]).unsigned_area() >= 1.0 {
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
 /// One polygon covering these strips, or `None` when they don't join up.
 pub fn union_of(strips: &[Polygon]) -> Option<Polygon> {
     let s = snapped(strips)?;
@@ -582,6 +605,9 @@ async fn planned(ctx: &Ctx, n: NewSchedule, occ: Occurrences<'_>) -> ApiResult<(
     let mut strips = Vec::with_capacity(n.strips.len());
     for (i, s) in n.strips.iter().enumerate() {
         strips.push(s.validated().map_err(|e| ApiError::bad_request(format!("Strip {}: {e}", i + 1)))?);
+    }
+    if let Some((a, b)) = overlapping(&strips) {
+        return Err(ApiError::bad_request(format!("Strips {} and {} overlap. Each piece of ground belongs to one strip.", a + 1, b + 1)));
     }
     n.cadence.check().map_err(ApiError::bad_request)?;
     n.back_fence.check().map_err(ApiError::bad_request)?;
@@ -1468,6 +1494,13 @@ mod tests {
             assert!(near(area(closes.last().unwrap()), area(&s[4])), "{deg}°");
             let mid = area(&closes[0]);
             assert!(mid < area(&open) && mid > area(&s[4]), "{deg}°: part way");
+        }
+        // Cut strips share only edges, so they are never taken for overlapping ones.
+        for deg in [0.0, 17.0, 30.0, 45.0, 72.0, 90.0, 135.0, 161.0] {
+            for by in [op_geo::strip::StripBy::Count(8), op_geo::strip::StripBy::Width(23.0)] {
+                let s = op_geo::strip::strips(&paddock, deg, by, 5.0);
+                assert_eq!(overlapping(&s), None, "{deg}°");
+            }
         }
     }
 
