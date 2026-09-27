@@ -475,6 +475,72 @@ days plus imported position history.
 <!-- @A-notify -->
 <!-- @D -->
 <!-- @K-animals -->
+
+## Animals and collar linking (K-animals)
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/animals/import/preview` | CSV text (≤ 5 MB; comma, semicolon or tab; UTF-8, UTF-16 or Windows-1252), `?herd_id` optional | `{ import_id, columns, mapping, rows, total, errors }` |
+| POST | `/api/animals/import/:import_id/commit` | `{ mapping, herd_id }` | `{ created, updated, unchanged, total, errors }` (404 once the preview expired) |
+| POST | `/api/animals/:id/remove` | `{ reason: "sold"\|"died"\|"culled"\|"moved_off", at? }` | `Animal` (409 when already removed) |
+| POST | `/api/animals/:id/swap` | `{ collar_id }` | `Animal` |
+| POST | `/api/collars/:id/park` | `{ reason: "charging"\|"shelf"\|"repair" }` | `Collar` |
+| POST | `/api/collars/:id/unpark` | | `Collar` |
+| POST | `/api/collars/bulk` | CSV rows `tag,collar name` with `?herd_id`, or `{ herd_id, items: [{ tag?, name? }] }` | 201 `{ batch_id, collars: [{ collar, key, endpoint, public_key, tag? }] }` (keys shown once) |
+| POST | `/api/collars/:id/rekey` | | `{ collar, key, endpoint, public_key, tag? }` (owner) |
+| POST | `/api/cards` | `{ items: [{ collar_id, key }] }` | `[{ collar_id, qr_svg }]` |
+
+```ts
+Mapping    = { tag: column, eid?, name?, breed?, sex?, born?, collar?, notes? }   // field → column name
+RowError   { row /* spreadsheet row, header = 1 */, error }
+```
+
+`POST /api/animals` and `PATCH /api/animals/:id` also take `eid` (15 digits; spaces, dashes and dots
+are dropped), `breed`, `sex` (`female`\|`male`\|`castrated`), `born` (`YYYY-MM-DD`, not in the future)
+and `notes`. A tag names one animal on the farm per herd (409 `Tag 214 is already in this herd.`);
+an EID names one animal for good, removed ones included (409 `That EID is on 214.`). A removed
+animal frees its tag.
+
+**Head count.** Once a herd has any animal rows, `herds.count` is its animals on the farm (not
+removed), kept by every create, delete, herd change, import, remove and swap; `PATCH` of another
+`count` on such a herd is 400 `Count follows the animals in this herd.`. Every such change publishes
+`animals_changed { herd_id }`.
+
+**Import.** The preview guesses the mapping from the header (Tag, Visual ID, Ear tag; EID, RFID,
+ISO; Name; Breed; Sex, Gender; DOB, Birth date, Born; Collar; Notes, Comments), returns the first 20
+rows as they are in the file and the rows the guessed mapping would skip (with `herd_id`, checked
+against that herd too). Previews live in memory for 30 minutes. A commit creates animals whose tag
+isn't in the herd and updates those whose tag is; an empty cell leaves the field as it is, so
+committing the same file twice changes nothing. Sex reads F/female/cow/heifer, M/male/bull,
+steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (month first on a farm in a US time
+zone, day first elsewhere), `4/1/22`, `01.04.2022` (always day first). A `collar` column names a
+collar of the herd by name or id and puts it on the animal (a parked collar goes back on duty). A
+row with any error is skipped and listed; the rest go in, in one transaction.
+
+**Remove and swap.** Removing keeps the animal's row and fixes, takes its collar off and parks it
+(`shelf`). A swap puts another collar of the same herd on the animal; the old one comes off and is
+parked (`shelf`). Fixes carry `animal_id`, so both collars' fixes stay the animal's. Both write an
+activity event (`animal.removed`, `collar.swapped`; `payload.by` is the person's name when known).
+
+**Park.** A parked collar raises no alerts, isn't drawn or counted in slot counts, and its reports
+keep only battery, health and `last_seen`. Parking forgets its fence state and stops an open escape
+for it; parking again only changes the reason.
+
+**Bulk linking.** CSV rows `tag,collar name` with or without a header (columns found by header
+when there is one). An empty tag makes a spare collar; an empty name takes the tag, else
+`Collar N`. All or nothing: any row to fix is 400 `{ error, errors: [{ row, error }] }` (no animal
+with that tag in the herd, the animal already wears a collar, a repeated tag or name, a name
+already used in the herd) and nothing is created. `endpoint` is the server's base URL +
+`/collar/v1`. A new key (`rekey`, owner only) stops the old one at once.
+
+**Cards.** `qr_svg` is an inline SVG QR code (error correction M) of the provisioning payload,
+compact JSON in this order: `{"v":1,"c":"<collar id>","h":"<herd id>","k":"<collar key>","e":"<public url>/collar/v1","s":"<server public key, base64>"}`.
+Keys only ever travel in request bodies; each must be the collar's current key (400 otherwise:
+print again from a new key). Cards need `server.public_url` set to an https URL (409 otherwise),
+because the endpoint is written into the collar and a LAN or tunnel address would strand it.
+
+MCP: `list_animals` (read) `{ herd_id?, q?, removed? }` → `{ count, animals: [Animal & { herd, collar?: { id, name, state, battery?, last_seen?, position?, fix_at?, parked? } }] }`;
+animals on the farm unless `removed` is true.
 <!-- @K-files -->
 <!-- @I -->
 <!-- @B -->

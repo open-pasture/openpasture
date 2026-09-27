@@ -20,6 +20,7 @@ pub mod planner;
 // @A-notify
 // @D
 // @K-animals
+pub use collars::{NewLinked, collar_endpoint, collar_key_matches, create_linked_collars, link_collar, park_collar, rekey_collar, unpark_collar};
 // @K-files
 // @I
 // @B
@@ -60,6 +61,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @A-notify
         // @D
         // @K-animals
+        collars::lifecycle_router(),
         // @K-files
         // @I
         // @B

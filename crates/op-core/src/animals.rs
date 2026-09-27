@@ -1,0 +1,301 @@
+//! Animals (K-animals): the rules every path that writes animals shares
+//! (tags, EIDs, the head count that follows a herd's animals) and the
+//! `list_animals` MCP tool.
+//!
+//! Head count: once a herd has any animal rows, `herds.count` is its active
+//! animals (not removed). Every path that adds, removes or moves animals calls
+//! [`sync_herd_count`]; a manual count on such a herd is refused.
+
+use std::collections::HashMap;
+
+use chrono::NaiveDate;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::SqliteExecutor;
+
+use crate::domain::{Animal, Collar, Sex};
+use crate::error::{ApiError, ApiResult};
+use crate::identity::Role;
+use crate::tools::{ToolCall, ToolSpec};
+use crate::{Ctx, store};
+
+pub const MAX_TAG: usize = 64;
+const MAX_NAME: usize = 200;
+const MAX_BREED: usize = 100;
+const MAX_NOTES: usize = 4000;
+
+/// The 400 for a manual count on a herd whose count follows its animals.
+pub const COUNT_FOLLOWS: &str = "Count follows the animals in this herd.";
+
+/// A 15-digit electronic ID (ISO 11784) from what a person or a reader
+/// typed. Spaces, dashes and dots are dropped: "982 000 123 456 789" and
+/// "982-000123456789" are the same tag.
+pub fn normalize_eid(s: &str) -> Result<String, String> {
+    let digits: String = s.chars().filter(|c| !matches!(c, ' ' | '-' | '.' | '\u{a0}')).collect();
+    if digits.len() == 15 && digits.bytes().all(|b| b.is_ascii_digit()) { Ok(digits) } else { Err(format!("EID {} isn't 15 digits.", s.trim())) }
+}
+
+/// A visual tag: trimmed, 1 to 64 characters, no control characters.
+pub fn clean_tag(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("The animal needs a tag.".into());
+    }
+    if t.chars().count() > MAX_TAG {
+        return Err(format!("Tag {t} is longer than {MAX_TAG} characters."));
+    }
+    if t.chars().any(char::is_control) {
+        return Err("A tag can't hold control characters.".into());
+    }
+    Ok(t.to_owned())
+}
+
+/// Sex from the words herd records use: F, female, cow, heifer; M, male,
+/// bull; steer, castrated, bullock.
+pub fn parse_sex(s: &str) -> Option<Sex> {
+    match s.trim().to_lowercase().as_str() {
+        "f" | "female" | "cow" | "heifer" | "ewe" | "doe" | "nanny" => Some(Sex::Female),
+        "m" | "male" | "bull" | "ram" | "buck" | "billy" | "intact" => Some(Sex::Male),
+        "c" | "s" | "castrated" | "castrate" | "steer" | "bullock" | "wether" | "ox" => Some(Sex::Castrated),
+        _ => None,
+    }
+}
+
+/// A birth date as herd records write it: `2022-04-01`, `4/1/2022`
+/// (month first when `month_first`, else day first), `4/1/22`,
+/// `01.04.2022`, `2022/04/01`. A year alone isn't a date.
+pub fn parse_born(s: &str, month_first: bool) -> Result<NaiveDate, String> {
+    let t = s.trim();
+    let bad = || format!("Birth date {t} isn't a date.");
+    // Dotted dates (01.04.2022) are day first everywhere.
+    let dotted = t.contains('.');
+    // ISO first, with or without a time after it.
+    let head = t.split(['T', ' ']).next().unwrap_or(t);
+    if let Ok(d) = NaiveDate::parse_from_str(head, "%Y-%m-%d") {
+        return Ok(d);
+    }
+    let parts: Vec<&str> = t.split(['/', '.', '-']).map(str::trim).collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(bad());
+    }
+    let n: Vec<u32> = parts.iter().map(|p| p.parse().unwrap_or(0)).collect();
+    let (y, m, d) = if parts[0].len() == 4 {
+        (n[0] as i32, n[1], n[2])
+    } else {
+        let year = match parts[2].len() {
+            4 => n[2] as i32,
+            // Two-digit years are this century unless that is in the future.
+            2 => {
+                let this = (chrono::Utc::now().date_naive().format("%y").to_string().parse::<u32>().unwrap_or(0)) as i32;
+                if n[2] as i32 > this { 1900 + n[2] as i32 } else { 2000 + n[2] as i32 }
+            }
+            _ => return Err(bad()),
+        };
+        let (m, d) = if dotted || !month_first { (n[1], n[0]) } else { (n[0], n[1]) };
+        // "13/4/2022" can only be day first, "4/13/2022" only month first.
+        let (m, d) = if m > 12 && d <= 12 { (d, m) } else { (m, d) };
+        (year, m, d)
+    };
+    NaiveDate::from_ymd_opt(y, m, d).ok_or_else(bad)
+}
+
+fn tidy_text(v: &mut Option<String>, max: usize, what: &str) -> ApiResult<()> {
+    if let Some(s) = v.take() {
+        let s = s.trim();
+        if s.chars().count() > max {
+            return Err(ApiError::bad_request(format!("The {what} is longer than {max} characters.")));
+        }
+        if !s.is_empty() {
+            *v = Some(s.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Trim and check an animal's own fields: tag, EID shape, name, breed,
+/// notes, a birth date that isn't in the future. Blank optional fields
+/// become absent.
+pub fn tidy(a: &mut Animal) -> ApiResult<()> {
+    a.tag = clean_tag(&a.tag).map_err(ApiError::bad_request)?;
+    if let Some(e) = a.eid.take().filter(|e| !e.trim().is_empty()) {
+        a.eid = Some(normalize_eid(&e).map_err(ApiError::bad_request)?);
+    }
+    tidy_text(&mut a.name, MAX_NAME, "name")?;
+    tidy_text(&mut a.breed, MAX_BREED, "breed")?;
+    tidy_text(&mut a.notes, MAX_NOTES, "note")?;
+    if let Some(b) = a.born
+        && b > chrono::Utc::now().date_naive() + chrono::Duration::days(1)
+    {
+        return Err(ApiError::bad_request("The birth date is in the future."));
+    }
+    Ok(())
+}
+
+/// A tag names one active animal per herd, and an EID one animal on the
+/// farm for good: 409 otherwise. Removed animals keep their EID but free
+/// their tag.
+pub async fn check_unique(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
+    if a.removed_at.is_none() {
+        let taken: Option<(String,)> = sqlx::query_as("SELECT id FROM animals WHERE herd_id = ? AND tag = ? AND removed_at IS NULL AND id != ? LIMIT 1")
+            .bind(&a.herd_id)
+            .bind(&a.tag)
+            .bind(&a.id)
+            .fetch_optional(ctx.db())
+            .await?;
+        if taken.is_some() {
+            return Err(ApiError::conflict(format!("Tag {} is already in this herd.", a.tag)));
+        }
+    }
+    if let Some(eid) = &a.eid {
+        let on: Option<(String,)> =
+            sqlx::query_as("SELECT tag FROM animals WHERE eid = ? AND id != ? LIMIT 1").bind(eid).bind(&a.id).fetch_optional(ctx.db()).await?;
+        if let Some((tag,)) = on {
+            return Err(ApiError::conflict(format!("That EID is on {tag}.")));
+        }
+    }
+    Ok(())
+}
+
+/// Whether any animal row (active or removed) belongs to the herd: from then
+/// on its count follows its animals.
+pub async fn herd_has_animals(ctx: &Ctx, herd_id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query("SELECT 1 FROM animals WHERE herd_id = ? LIMIT 1").bind(herd_id).fetch_optional(ctx.db()).await?.is_some())
+}
+
+/// Set `herds.count` to the herd's active animals, once it has any animal
+/// rows. Writes only when the number changes (so history triggers see real
+/// changes) and returns the new count then.
+pub async fn sync_herd_count<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -> anyhow::Result<Option<u32>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE herds SET count = (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         WHERE id = ?1 AND EXISTS (SELECT 1 FROM animals WHERE herd_id = ?1)
+           AND count != (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         RETURNING count",
+    )
+    .bind(herd_id)
+    .fetch_optional(e)
+    .await?;
+    Ok(row.map(|(n,)| n.max(0) as u32))
+}
+
+// The list_animals tool
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListArgs {
+    herd_id: Option<String>,
+    q: Option<String>,
+    #[serde(default)]
+    removed: bool,
+}
+
+/// `list_animals` (read): the herd's animals with the collar each wears.
+pub fn tool() -> ToolSpec {
+    ToolSpec {
+        name: "list_animals",
+        description: "Animals in a herd (or on the whole farm): tag, name, EID, breed, sex, birth date, and the collar each wears with its battery (0-1), last contact, latest position [lon, lat] and fence state. A parked collar (charging, shelf, repair) says why. Only animals on the farm unless `removed` is true, which lists those sold, died, culled or moved off instead.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "herd_id": { "type": "string", "description": "Herd id. Absent: every herd." },
+                "q": { "type": "string", "description": "Only animals whose tag, name or EID contains this text." },
+                "removed": { "type": "boolean", "description": "List removed animals instead of those on the farm." }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        read: true,
+        brain: false,
+        min_role: Role::Viewer,
+        run: ToolSpec::run_fn(|c: ToolCall| async move { list_animals_tool(&c.ctx, c.args).await }),
+    }
+}
+
+async fn list_animals_tool(ctx: &Ctx, args: Value) -> ApiResult<Value> {
+    let args: ListArgs = serde_json::from_value(if args.is_null() { json!({}) } else { args }).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let herds = ctx.store().list_herds().await?;
+    let herd_id = args.herd_id.filter(|h| !h.trim().is_empty());
+    if let Some(h) = &herd_id
+        && !herds.iter().any(|x| &x.id == h)
+    {
+        return Err(ApiError::bad_request("No such herd."));
+    }
+    let herd_names: HashMap<&str, &str> = herds.iter().map(|h| (h.id.as_str(), h.name.as_str())).collect();
+    let rows = sqlx::query("SELECT * FROM collars").fetch_all(ctx.db()).await?;
+    let collars: HashMap<String, Collar> =
+        rows.iter().map(store::collar_from_row).collect::<anyhow::Result<Vec<_>>>()?.into_iter().map(|c| (c.id.clone(), c)).collect();
+    let q = args.q.as_deref().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    for a in ctx.store().list_animals(herd_id.as_deref()).await? {
+        if a.removed_at.is_some() != args.removed {
+            continue;
+        }
+        if let Some(q) = &q {
+            let hay = [Some(&a.tag), a.name.as_ref(), a.eid.as_ref()];
+            if !hay.iter().flatten().any(|s| s.to_lowercase().contains(q)) {
+                continue;
+            }
+        }
+        let mut v = serde_json::to_value(&a).map_err(anyhow::Error::from)?;
+        v["herd"] = json!(herd_names.get(a.herd_id.as_str()).copied().unwrap_or(""));
+        if let Some(c) = a.collar_id.as_ref().and_then(|id| collars.get(id)) {
+            let mut cv = json!({ "id": c.id, "name": c.name, "state": c.state });
+            if let Some(b) = c.battery {
+                cv["battery"] = json!((b * 100.0).round() / 100.0);
+            }
+            if let Some(t) = c.last_seen {
+                cv["last_seen"] = json!(t);
+            }
+            if let Some(f) = &c.last_fix {
+                cv["position"] = json!(f.point);
+                cv["fix_at"] = json!(f.at);
+            }
+            if let Some(r) = c.parked_reason {
+                cv["parked"] = json!(r);
+            }
+            v["collar"] = cv;
+        }
+        out.push(v);
+    }
+    Ok(json!({ "count": out.len(), "animals": out }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eids_lose_spaces_and_dashes() {
+        assert_eq!(normalize_eid("982 000 123 456 789").unwrap(), "982000123456789");
+        assert_eq!(normalize_eid("982-000123456789").unwrap(), "982000123456789");
+        assert!(normalize_eid("9.82E+14").is_err());
+        assert!(normalize_eid("98200012345678").is_err());
+        assert!(normalize_eid("98200012345678X").is_err());
+    }
+
+    #[test]
+    fn birth_dates_in_the_ways_records_write_them() {
+        let d = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        assert_eq!(parse_born("2022-04-01", true).unwrap(), d(2022, 4, 1));
+        assert_eq!(parse_born("2022-04-01T00:00:00", true).unwrap(), d(2022, 4, 1));
+        assert_eq!(parse_born("4/1/2022", true).unwrap(), d(2022, 4, 1));
+        assert_eq!(parse_born("4/1/2022", false).unwrap(), d(2022, 1, 4));
+        assert_eq!(parse_born("13/4/2022", true).unwrap(), d(2022, 4, 13));
+        assert_eq!(parse_born("01.04.2022", true).unwrap(), d(2022, 4, 1));
+        assert_eq!(parse_born("2022/04/01", false).unwrap(), d(2022, 4, 1));
+        assert_eq!(parse_born("4/1/21", true).unwrap(), d(2021, 4, 1));
+        assert_eq!(parse_born("4/1/99", true).unwrap(), d(1999, 4, 1));
+        assert!(parse_born("2021", true).is_err());
+        assert!(parse_born("2/30/2022", true).is_err());
+        assert!(parse_born("spring", true).is_err());
+    }
+
+    #[test]
+    fn sex_words() {
+        assert_eq!(parse_sex("Heifer"), Some(Sex::Female));
+        assert_eq!(parse_sex(" F "), Some(Sex::Female));
+        assert_eq!(parse_sex("BULL"), Some(Sex::Male));
+        assert_eq!(parse_sex("steer"), Some(Sex::Castrated));
+        assert_eq!(parse_sex("x"), None);
+    }
+}

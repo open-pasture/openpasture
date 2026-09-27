@@ -36,6 +36,7 @@ pub mod users;
 // @A-notify
 // @D
 // @K-animals
+pub mod animals;
 // @K-files
 // @I
 // @B
@@ -112,6 +113,7 @@ fn tool_specs() -> Vec<tools::ToolSpec> {
         // @A-notify
         // @D
         // @K-animals
+        animals::tool(),
         // @K-files
         // @I
         // @B
