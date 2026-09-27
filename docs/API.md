@@ -481,6 +481,45 @@ days plus imported position history.
 <!-- @G -->
 <!-- @P -->
 <!-- @Q -->
+
+## Questions and the morning brief (op-brain, op-engine)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/brief` | `?herd_id` (optional when the farm has one herd) | `Brief` (404 no such herd, 400 more than one herd and no `herd_id`) |
+| POST | `/v1/ask` | `{ question, context?, max_chars? /* default 320, at most 2000 */ }`, `Authorization: Bearer oph_…` | `{ answer }` |
+
+```ts
+Brief { herd_id, lines: string[], text /* GSM-7, at most 480 characters */ }
+```
+
+**The brief** is written from the decision record, no LLM: the same record gives the same
+brief. For today's decision (the herd's newest since the last `settings.decision_time` in farm
+time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`,
+`Cows: STAY in P3.`, `Cows: NEEDS_INFO.`), where it stands (`Reply Y or N.` while it waits,
+`Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
+once sent: collars not parked that applied its active boundary, and the sweep still left),
+the one thing to check when the decision asks for it, then up to four reasons as the record
+has them. When today's decision is still running, failed or missing, one line says so
+(`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars silent for a
+day.`, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20 days old.`,
+`No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
+farm's units. `text` is the lines as one text: GSM-7 (curly quotes, dashes and accents made
+plain, emoji left out), at most 480 characters, giving up the fourth and third reason first,
+then stale-data lines, the second reason, other features' lines, the check and the first
+reason; the call and where it stands always stay. MCP: `get_morning_brief { herd_id? }` (read).
+
+**Questions** (`Brain::ask`, used by texting) get a short answer from a farm summary and read
+tools, never `run_sql`: the Anthropic, OpenAI and compatible brains call up to 6 tools within
+45 s; Claude Code reaches this server's `/mcp?scope=brain` with a token that lists and calls only
+those tools; the hosted brain asks another server's `/v1/ask`; Codex and the heuristic don't
+answer questions. Answers are plain text cut to `max_chars` at a sentence end. A compatible
+server that refuses tools answers from the summary alone.
+
+`/v1/ask` is the hosted side: the hosted key applies, and this server's own brain answers from
+the `context` sent, with no tools. 401 bad key, 400 empty question, 409 when this server's brain
+is itself `hosted`, 501 `{"error": "This server's brain doesn't answer questions."}` for Codex
+and the heuristic, 503 brain not set up, 502 brain failed.
 <!-- @C -->
 <!-- @F -->
 <!-- @S -->
