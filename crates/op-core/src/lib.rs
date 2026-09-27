@@ -35,6 +35,7 @@ pub mod users;
 // @A-engine
 // @A-notify
 // @D
+pub mod features_api;
 // @K-animals
 // @K-files
 // @I
@@ -74,6 +75,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @A-engine
         // @A-notify
         // @D
+        features_api::router(),
         // @K-animals
         // @K-files
         // @I
@@ -111,6 +113,7 @@ fn tool_specs() -> Vec<tools::ToolSpec> {
         // @A-engine
         // @A-notify
         // @D
+        features_api::tool(),
         // @K-animals
         // @K-files
         // @I

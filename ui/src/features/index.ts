@@ -10,6 +10,7 @@ import "./hub-ui";
 // @A-engine
 // @A-notify
 // @D
+import "./d";
 // @K-animals
 // @K-files
 // @I

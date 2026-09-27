@@ -474,6 +474,32 @@ days plus imported position history.
 <!-- @A-engine -->
 <!-- @A-notify -->
 <!-- @D -->
+
+## Map features (op-core)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/features?kind=&paddock_id=&active=` | `MapFeature[]` in the order they were stored. `active=true`: in effect now; `active=<RFC 3339>`: in effect then; absent: all, whatever their window |
+| POST | `/api/features` | `{ kind, geometry, name?, paddock_id?, notes?, props?, active_from?, active_until? }` → 201 `MapFeature` |
+| GET | `/api/features/{id}` | `MapFeature` |
+| PATCH | `/api/features/{id}` | JSON merge patch → `MapFeature`. `null` clears a field (`paddock_id: null` = farm-wide, `active_until: null` = lasting); `id`, `kind` and the timestamps don't change |
+| DELETE | `/api/features/{id}` | 204 |
+
+Geometry per kind (400 otherwise, e.g. `{"error": "A gate is drawn as a point."}`): exclusion a one-ring
+Polygon; water, shade and hazard a Point or a Polygon (a hazard point needs `props.radius_m` > 0);
+gate a Point; road and neighbour line a LineString (≥ 2 points); farm boundary a Polygon.
+Coordinates are stored to 7 decimals and polygon rings closed. A second farm boundary is 409
+(`"The farm already has a boundary. Edit that one instead."`); an unknown `paddock_id` is 400;
+`active_until` must be after `active_from` (400); names ≤ 200 and notes ≤ 2,000 characters.
+Deleting a paddock deletes its features. Every create, change and delete publishes a `feature`
+event (`deleted: true` on delete). Writes are manager and up.
+
+MCP: `list_features` (read) `{ kind?, paddock_id?, active?: bool }` → `MapFeature[]`.
+
+Place phrases in texts and replies (`op_core::place::describe`) name the nearest named gate,
+water or shade in effect within 200 m: `"60 m N of east gate"`, `"at east gate"` (under 10 m),
+`"in north pond"` (inside a water or shade area); otherwise the paddock: `"in P3"`,
+`"60 m N of P3"`. Distances are in the farm's units.
 <!-- @K-animals -->
 <!-- @K-files -->
 <!-- @I -->
