@@ -415,6 +415,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn margins_do_not_depend_on_winding() {
+        // Reversed about the first vertex, so the projection origin stays put.
+        let rev = |r: &[[f64; 2]]| std::iter::once(r[0]).chain(r[1..].iter().rev().copied()).collect::<Vec<_>>();
+        let reference = holed();
+        let probes = [at(50.0, 50.0), at(50.0, 30.0), at(50.0, 5.0), at(50.0, -3.0), at(35.0, 35.0), at(59.0, 41.0)];
+        for outer in [SQUARE.to_vec(), rev(&SQUARE)] {
+            for hole in [MIDDLE.to_vec(), rev(&MIDDLE)] {
+                let gf = Geofence::from_polygon(CFG, &poly(&[&outer, &hole]), 1, &CollarLimits::V0).unwrap();
+                for q in probes {
+                    let (m, ring) = gf.measure(q);
+                    let (want, want_ring) = reference.measure(q);
+                    assert!(near(m, want, 1e-9) && ring == want_ring, "{m} {ring}, want {want} {want_ring}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn concave_hole() {
         // An L-shaped hole; its notch at (70,70) is grazeable.
         let l = [[40.0, 40.0], [80.0, 40.0], [80.0, 60.0], [60.0, 60.0], [60.0, 80.0], [40.0, 80.0]];

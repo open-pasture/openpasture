@@ -65,15 +65,14 @@ impl Polygon {
         self.validated().is_ok()
     }
 
-    /// Geodesic area in hectares, holes removed.
+    /// Geodesic area in hectares, holes removed, whichever way each ring
+    /// winds: the outer ring's area less each hole's, never below zero.
     pub fn area_ha(&self) -> f64 {
-        use geo::GeodesicArea;
-        let to_ls = |r: &Vec<LonLat>| geo::LineString::from(close(clean_ring(r)).into_iter().map(|p| (p[0], p[1])).collect::<Vec<_>>());
         let Some(outer) = self.coordinates.first() else {
             return 0.0;
         };
-        let poly = geo::Polygon::new(to_ls(outer), self.coordinates.iter().skip(1).map(to_ls).collect());
-        poly.geodesic_area_unsigned() / 10_000.0
+        let holes: f64 = self.coordinates.iter().skip(1).map(|r| ring_area_m2(r)).sum();
+        (ring_area_m2(outer) - holes).max(0.0) / 10_000.0
     }
 
     /// Inside the outer ring and outside every hole.
@@ -114,6 +113,20 @@ impl Polygon {
         let first = outer.first()?;
         Some(outer.iter().fold([first[0], first[1], first[0], first[1]], |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]))
     }
+}
+
+/// Geodesic area of one ring in m², either winding. `geo`'s unsigned area
+/// reads a ring wound against its expectation as the rest of the Earth, so
+/// take the signed area (negative when clockwise) and drop the sign.
+/// Paddock rings are far smaller than a hemisphere, where that would break.
+fn ring_area_m2(ring: &[LonLat]) -> f64 {
+    use geo::GeodesicArea;
+    let points = clean_ring(ring);
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let ls = geo::LineString::from(close(points).into_iter().map(|p| (p[0], p[1])).collect::<Vec<_>>());
+    geo::Polygon::new(ls, Vec::new()).geodesic_area_signed().abs()
 }
 
 fn close(mut ring: Vec<LonLat>) -> Vec<LonLat> {
@@ -183,5 +196,89 @@ mod tests {
     fn centroid_of_square() {
         let c = home().centroid().unwrap();
         assert!((c[0] + 92.405).abs() < 1e-6 && (c[1] - 38.125).abs() < 1e-6);
+    }
+
+    // The live-check paddock near Ames (about 16.5 ha), counter-clockwise.
+    fn ames() -> Vec<LonLat> {
+        vec![[-93.625, 42.03], [-93.62, 42.03], [-93.62, 42.0336], [-93.625, 42.0336], [-93.625, 42.03]]
+    }
+
+    // Counter-clockwise holes well inside it.
+    fn pond() -> Vec<LonLat> {
+        vec![[-93.6235, 42.0315], [-93.6215, 42.0315], [-93.6215, 42.0325], [-93.6235, 42.0325], [-93.6235, 42.0315]]
+    }
+
+    fn barn() -> Vec<LonLat> {
+        vec![[-93.6245, 42.0305], [-93.624, 42.0305], [-93.6242, 42.031], [-93.6245, 42.0305]]
+    }
+
+    fn cw(ring: &[LonLat]) -> Vec<LonLat> {
+        ring.iter().rev().copied().collect()
+    }
+
+    fn close_to(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn ring_area_ignores_winding() {
+        let ccw = Polygon::from_ring(ames()).area_ha();
+        assert!((ccw - 16.5).abs() < 0.3, "{ccw}");
+        assert!(close_to(Polygon::from_ring(cw(&ames())).area_ha(), ccw));
+        let pond = Polygon::from_ring(pond()).area_ha();
+        assert!((pond - 1.83).abs() < 0.05, "{pond}");
+        assert!(close_to(Polygon::from_ring(cw(&self::pond())).area_ha(), pond));
+    }
+
+    #[test]
+    fn a_hole_is_subtracted_whichever_way_each_ring_winds() {
+        let expected = Polygon::from_ring(ames()).area_ha() - Polygon::from_ring(pond()).area_ha();
+        for (outer, hole, label) in [
+            (ames(), pond(), "outer ccw, hole ccw"),
+            (ames(), cw(&pond()), "outer ccw, hole cw"),
+            (cw(&ames()), pond(), "outer cw, hole ccw"),
+            (cw(&ames()), cw(&pond()), "outer cw, hole cw"),
+        ] {
+            let a = Polygon::from_rings(outer, [hole]).area_ha();
+            assert!(close_to(a, expected), "{label}: {a} ha, want {expected}");
+            assert!((a - 14.67).abs() < 0.3, "{label}: {a}");
+        }
+    }
+
+    #[test]
+    fn several_holes_of_mixed_winding_are_each_subtracted() {
+        let expected = Polygon::from_ring(ames()).area_ha() - Polygon::from_ring(pond()).area_ha() - Polygon::from_ring(barn()).area_ha();
+        for outer in [ames(), cw(&ames())] {
+            for holes in [vec![pond(), barn()], vec![cw(&pond()), barn()], vec![pond(), cw(&barn())], vec![cw(&pond()), cw(&barn())]] {
+                let a = Polygon::from_rings(outer.clone(), holes).area_ha();
+                assert!(close_to(a, expected), "{a} ha, want {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn area_is_never_negative() {
+        // A hole bigger than its outer ring is invalid; the area floors at zero.
+        assert_eq!(Polygon::from_rings(pond(), [ames()]).area_ha(), 0.0);
+        let empty = Polygon { kind: PolygonType::Polygon, coordinates: vec![] };
+        assert_eq!(empty.area_ha(), 0.0);
+    }
+
+    #[test]
+    fn contains_and_centroid_ignore_winding() {
+        let inside = [-93.6245, 42.033];
+        let in_pond = [-93.6225, 42.032];
+        let outside = [-93.61, 42.032];
+        let centre = Polygon::from_ring(ames()).centroid().unwrap();
+        for outer in [ames(), cw(&ames())] {
+            for hole in [pond(), cw(&pond())] {
+                let p = Polygon::from_rings(outer.clone(), [hole]);
+                assert!(p.contains(inside));
+                assert!(!p.contains(in_pond));
+                assert!(!p.contains(outside));
+                assert_eq!(p.centroid(), Some(centre));
+                assert_eq!(p.validated().unwrap().area_ha(), p.area_ha());
+            }
+        }
     }
 }
