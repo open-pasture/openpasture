@@ -31,6 +31,11 @@ pub fn decode_signing_key(s: &str) -> Result<SigningKey, ProtocolError> {
 
 /// The bytes that get signed: canonical JSON of the command without `sig`.
 pub fn signing_payload(command: &BoundaryCommand) -> Vec<u8> {
+    payload(command)
+}
+
+/// Canonical JSON of any flat command without its `sig`.
+pub(crate) fn payload<T: serde::Serialize>(command: &T) -> Vec<u8> {
     let mut value = serde_json::to_value(command).expect("command serializes");
     if let Value::Object(map) = &mut value {
         map.remove("sig");
@@ -38,11 +43,15 @@ pub fn signing_payload(command: &BoundaryCommand) -> Vec<u8> {
     canonical_json(&value).into_bytes()
 }
 
+/// Base64 Ed25519 signature over `payload`.
+pub(crate) fn sign_payload(payload: &[u8], key: &SigningKey) -> String {
+    STANDARD.encode(key.sign(payload).to_bytes())
+}
+
 /// Set `command.sig`.
 pub fn sign_command(command: &mut BoundaryCommand, key: &SigningKey) {
     command.sig = None;
-    let sig = key.sign(&signing_payload(command));
-    command.sig = Some(STANDARD.encode(sig.to_bytes()));
+    command.sig = Some(sign_payload(&signing_payload(command), key));
 }
 
 pub fn verify_command(command: &BoundaryCommand, key: &VerifyingKey) -> Result<(), ProtocolError> {
@@ -50,8 +59,10 @@ pub fn verify_command(command: &BoundaryCommand, key: &VerifyingKey) -> Result<(
     verify_bytes(&signing_payload(command), sig, key)
 }
 
-/// Verify a command as received, before parsing it into a struct. This is
-/// what a collar does: drop `sig`, canonicalise, check.
+/// Verify a command as received, before parsing it into a struct: drop
+/// `sig`, canonicalise, check. It can't see duplicate keys (serde_json keeps
+/// the last one), nesting or size; collars and collar-sim use
+/// [`crate::verify_wire`], which can. Kept for existing callers.
 pub fn verify_json(command: &Value, key: &VerifyingKey) -> Result<(), ProtocolError> {
     let mut value = command.clone();
     let sig = match &mut value {
@@ -64,7 +75,7 @@ pub fn verify_json(command: &Value, key: &VerifyingKey) -> Result<(), ProtocolEr
     verify_bytes(canonical_json(&value).as_bytes(), &sig, key)
 }
 
-fn verify_bytes(payload: &[u8], sig: &str, key: &VerifyingKey) -> Result<(), ProtocolError> {
+pub(crate) fn verify_bytes(payload: &[u8], sig: &str, key: &VerifyingKey) -> Result<(), ProtocolError> {
     let bytes: [u8; 64] = STANDARD.decode(sig).ok().and_then(|b| b.try_into().ok()).ok_or(ProtocolError::BadSignature)?;
     key.verify(payload, &Signature::from_bytes(&bytes)).map_err(|_| ProtocolError::BadSignature)
 }
