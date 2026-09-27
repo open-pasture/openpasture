@@ -482,6 +482,56 @@ days plus imported position history.
 <!-- @P -->
 <!-- @Q -->
 <!-- @C -->
+
+## Strips and layouts (op-engine)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/strips/preview` | `{ paddock_id, herd_id?, orientation_deg, width_m? \| count? \| days?, head?, warn_m? }` | `StripPreview` |
+| GET POST | `/api/layouts` | `?paddock_id=` / `{ paddock_id, herd_id?, name?, orientation_deg, width_m? \| count? \| days?, head?, warn_m? }` | `Layout[]` / `Layout` (201) |
+| GET PATCH DELETE | `/api/layouts/:id` | PATCH `{ name }` | `Layout` / 204 |
+| POST | `/api/layouts/:id/apply` | `{ herd_id?, head? }` | `AppliedLayout` |
+| POST | `/api/paddocks/:id/copy` | `{ name?, offset_m?: [east, north] }` | `Paddock` (201) |
+
+```ts
+StripParams   { orientation_deg, width_m?, count?, days?, head?, warn_m? }   // exactly one of width_m, count, days
+StripFacts    { geometry: Polygon, area_ha, grazeable_ha, days? }
+StripPreview  { paddock_id, strips: StripFacts[], width_m, depth_m, head, animal_units,
+                forage_kg_dm_per_ha?, forage_source?, warn_m }
+Layout        { id /* lay_… */, paddock_id, name, params: StripParams, strips: Polygon[], created_by: Actor, created_at, updated_at }
+AppliedLayout = StripPreview & { layout: Layout }
+```
+
+Strips are parallel bands across the paddock. `orientation_deg` is the compass bearing they
+advance toward: 0 = strips run east-west and advance north (strip 1 is the southernmost), 90 =
+they run north-south and advance east. `width_m` cuts bands of that width from the start (the
+last keeps what is left), `count` cuts that many equal bands, and `days` picks the width that
+gives that many days per strip. A band thinner than two warning zones and the collar's gap
+between them (`2·warn_m + 2.5` m, 12.5 m at the default 5 m) joins its neighbour, so the result
+can hold fewer strips than asked. On a concave paddock a band can fall into pieces; each piece is
+its own strip, in order across the band, and a thin wedge joins the piece it shares the longest
+cut with. The strips always cover the whole paddock; holes stay holes. More than 200 strips is a
+400. `width_m` in the answer is the band width used (for `count`, depth ÷ count).
+
+`grazeable_ha` is the strip less the exclusions in effect now (farm-wide and the paddock's).
+`days` = forage × `grazeable_ha` ÷ (animal units × 11.8 kg DM a day), to 0.1 d, where forage is
+the paddock's standing forage above the residual from its grazing signals (a cached land report,
+or a measured height when one is recorded; never fetched here). Without forage or animals there
+are no days, and sizing by `days` is 400. Head is `head`, else the herd's count; animal units
+follow the herd's species (cattle when no herd). Exclusion holes are not cut into strips: sending
+a strip is the farmer drawing that boundary (`POST /api/herds/:id/boundary`), which applies them.
+
+A layout keeps its settings and its strips. Sized by `days`, it also keeps the `width_m` that
+chose, so its strips stay put when the forage changes. `apply` lays it on its paddock now: the
+stored strips with today's grazeable ground and days for the herd (or `head`, else the head it
+was sized for); if the paddock changed shape since, the strips are cut again from the same
+settings and stored. Default names are `"12 strips"`, then `"12 strips 2"`… Deleting a paddock
+deletes its layouts.
+
+`copy` makes a new paddock of the same shape named `"P3 copy"` (then `"P3 copy 2"`…), moved by
+`offset_m` metres east and north (each within 10 km) when given. Notes, props and grazing history
+stay with the original.
+
 <!-- @F -->
 <!-- @S -->
 <!-- @A3 -->
