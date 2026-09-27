@@ -27,6 +27,9 @@ pub mod telemetry;
 // @I
 // @B
 // @G
+pub mod coverage;
+pub mod days;
+pub mod fleet;
 // @P
 // @Q
 // @C
@@ -66,6 +69,8 @@ pub fn router() -> axum::Router<Ctx> {
         // @I
         // @B
         // @G
+        coverage::router(),
+        fleet::router(),
         // @P
         // @Q
         // @C
@@ -100,6 +105,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @I
     // @B
     // @G
+    days::spawn(ctx.clone());
     // @P
     // @Q
     // @C
@@ -134,6 +140,8 @@ fn tool_specs() -> Vec<op_core::tools::ToolSpec> {
         // @I
         // @B
         // @G
+        coverage::tool(),
+        fleet::tool(),
         // @P
         // @Q
         // @C

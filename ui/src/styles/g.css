@@ -1,0 +1,18 @@
+/* Coverage and fleet care (stream G). Patterns from app.css and base.css. */
+
+/* map: accuracy · fixes above the Layers button, and a square's value under the pointer */
+.gcov{position:absolute;left:12px;bottom:52px;z-index:2}
+.gcov .seg{background:rgba(11,12,9,.82);backdrop-filter:blur(6px)}
+.gcovtip{position:absolute;left:0;top:0;z-index:3;display:none;pointer-events:none;padding:2px 6px;border-radius:5px;background:rgba(11,12,9,.88);color:var(--fg);font-size:11.5px;white-space:nowrap}
+
+/* herd table and animal page */
+.gtrend{display:inline-flex;align-items:center;gap:8px}
+.gline{display:inline-flex;align-items:center;gap:8px}
+.glate{color:var(--warn)}
+.kv b.glate{color:var(--warn)}
+.gcare{display:grid;gap:10px}
+.gcare .acts{display:flex;align-items:center;gap:12px}
+.gcare .err{font-size:12px}
+
+/* settings */
+.gdays{width:calc(4ch + 26px);text-align:right}
