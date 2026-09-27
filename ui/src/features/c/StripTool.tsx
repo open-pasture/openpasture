@@ -161,7 +161,7 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
       <div className="cfoot">
         {(error || strip) && <p className={"mono " + (error ? "err" : "cfacts")}>{error ?? facts(u, strip!, preview!.head)}</p>}
         {herdId && preview && (
-          <ToolFooter tool="strip" strips={preview.strips.map((s) => s.geometry)} layoutId={layout?.id} herdId={herdId} opts={{}} />
+          <ToolFooter tool="strip" geometry={strip?.geometry} strips={preview.strips.map((s) => s.geometry)} layoutId={layout?.id} herdId={herdId} opts={{}} />
         )}
       </div>
     </>
