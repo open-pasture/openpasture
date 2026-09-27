@@ -1222,7 +1222,8 @@ cut with. The strips always cover the whole paddock; holes stay holes. More than
 400. `width_m` in the answer is the band width used (for `count`, depth ÷ count).
 
 `grazeable_ha` is the strip less the exclusions in effect now (farm-wide and the paddock's).
-`days` = forage × `grazeable_ha` ÷ (animal units × 11.8 kg DM a day), to 0.1 d, where forage is
+`days` = 60 % of forage × `grazeable_ha` ÷ (animal units × 11.8 kg DM a day), to 0.1 d (the rule
+the pre-send check and the grazing signals use too, so a strip and its check say the same days), where forage is
 the paddock's standing forage above the residual from its grazing signals (a cached land report,
 or a measured height when one is recorded; never fetched here). Without forage or animals there
 are no days, and sizing by `days` is 400. Head is `head`, else the herd's count; animal units
@@ -1276,7 +1277,7 @@ ring (at most 64 corners, no holes) that firmware 0.1 collars enforce, when the 
 Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage from the paddock
 holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
 or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
-= 60 % of it at 11.8 kg DM per animal unit a day; `rest_days` since that paddock was last grazed
+= 60 % of it at 11.8 kg DM per animal unit a day (as strip days); `rest_days` since that paddock was last grazed
 (0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it, the
 newest collar fix in it and the days collars spent in it, any herd); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
 

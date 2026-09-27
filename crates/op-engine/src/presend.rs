@@ -8,7 +8,7 @@
 //!   enforces, when the herd has one.
 //! - facts: area, head, area per head, forage and grazing days from the
 //!   containing paddock's forage (a measured height, else imagery;
-//!   `feed_budget_days(forage × area, AU, 11.8, 0.6, 0)`), rest days, corners,
+//!   [`calc::grazing_days`] of forage × area, as strips), rest days, corners,
 //!   holes, and the sweep's minutes.
 //! - findings: [`op_ingest::prepare`]'s (map features, collars, slots) plus
 //!   `forage_short`, `area_per_head_low`, `rested_short` and `weak_coverage`
@@ -149,7 +149,8 @@ pub async fn check(ctx: &Ctx, herd_id: &str, req: &CheckRequest) -> ApiResult<Ch
         None => None,
     };
     let forage_kg_dm = forage.as_ref().map(|f| calc::round(f.kg_dm_per_ha * area_ha, 0));
-    let grazing_days = forage_kg_dm.and_then(|kg| calc::feed_budget_days(kg, au, calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY, calc::DEFAULT_UTILIZATION, 0.0));
+    // The rule strip days use, so a strip and its check say the same days.
+    let grazing_days = forage_kg_dm.and_then(|kg| calc::grazing_days(kg, au));
     let forage_source = forage.and_then(|f| f.source).map(|s| if s == "imagery" { "ndvi".to_owned() } else { s });
     let rest_days = match &paddock {
         Some(p) => rest_days(ctx, p, now).await?,

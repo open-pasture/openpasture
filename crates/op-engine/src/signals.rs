@@ -282,7 +282,7 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     let units = i.herd.map(|h| calc::animal_units(&h.species.as_db(), h.count as i64, None));
     let feed_budget = match (units, i.current) {
         (Some(au), Some(cur)) if au > 0.0 => match (areas.get(cur).copied().flatten(), forage.get(cur).and_then(|f| f["available_kg_dm_per_ha"].as_f64())) {
-            (Some(area), Some(avail)) => calc::feed_budget_days(avail * area, au, calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY, calc::DEFAULT_UTILIZATION, 0.0),
+            (Some(area), Some(avail)) => calc::grazing_days(avail * area, au),
             _ => None,
         },
         _ => None,
@@ -415,9 +415,7 @@ pub fn per_paddock(signals: &Value, paddocks: &[Paddock], current: Option<&str>)
             let id = p.id.as_str();
             // Days of grazing this paddock's forage gives the herd, as for the current paddock.
             let grazing_days = match (au, real_area(p), signals["forage"][id]["available_kg_dm_per_ha"].as_f64()) {
-                (Some(au), Some(area), Some(avail)) => {
-                    calc::feed_budget_days(avail * area, au, calc::DEFAULT_INTAKE_KG_DM_PER_AU_DAY, calc::DEFAULT_UTILIZATION, 0.0)
-                }
+                (Some(au), Some(area), Some(avail)) => calc::grazing_days(avail * area, au),
                 _ => None,
             };
             json!({

@@ -198,15 +198,15 @@ async fn days_come_from_the_paddock_forage_estimate() {
     assert_eq!(v["forage_kg_dm_per_ha"], 672.0);
     assert_eq!(v["forage_source"], "imagery");
     for s in strips_of(&v) {
-        let want = calc::round(672.0 * s["grazeable_ha"].as_f64().unwrap() / (250.0 * 11.8), 1);
+        let want = calc::round(672.0 * s["grazeable_ha"].as_f64().unwrap() * 0.6 / (250.0 * 11.8), 1);
         assert_eq!(s["days"].as_f64().unwrap(), want, "{s}");
     }
-    // 16.556 ha x 672 kg / 2,950 kg a day is 3.77 days over the paddock (each strip to 0.1 d).
-    assert!(close(sum(&v, "days"), 3.77, 0.2), "{}", sum(&v, "days"));
-    // Fewer head, more days: 50 head of the same herd.
+    // 60 % of 16.556 ha x 672 kg eaten at 2,950 kg a day is 2.26 days over the paddock (each strip to 0.1 d).
+    assert!(close(sum(&v, "days"), 2.26, 0.2), "{}", sum(&v, "days"));
+    // Fewer head, more days: 50 head of the same herd (590 kg a day), 11.31 days.
     let v = t.preview(json!({ "paddock_id": f.paddock, "herd_id": f.herd, "orientation_deg": 0, "count": 4, "head": 50 })).await;
     assert_eq!(v["head"], 50);
-    assert!(close(sum(&v, "days"), 18.86, 0.2), "{}", sum(&v, "days"));
+    assert!(close(sum(&v, "days"), 11.31, 0.2), "{}", sum(&v, "days"));
 }
 
 #[tokio::test]
@@ -214,15 +214,15 @@ async fn days_pick_the_width_that_gives_that_many_days_per_strip() {
     let t = setup().await;
     let f = farm(&t).await;
     ndvi_report(&t.ctx, &f.paddock, 0.5).await;
-    // Half a day of 250 head is 1,475 kg DM, 2.195 ha of 672 kg: 53 m of the 400 m.
+    // Half a day of 250 head eats 1,475 kg DM, 60 % of 2,458 kg standing: 3.658 ha of 672 kg, 88 m of the 400 m.
     let v = t.preview(json!({ "paddock_id": f.paddock, "herd_id": f.herd, "orientation_deg": 0, "days": 0.5 })).await;
-    assert!(close(v["width_m"].as_f64().unwrap(), 53.07, 0.1), "{}", v["width_m"]);
+    assert!(close(v["width_m"].as_f64().unwrap(), 88.45, 0.1), "{}", v["width_m"]);
     let ss = strips_of(&v);
-    assert_eq!(ss.len(), 8, "7 of 53 m and a 29 m rest");
-    for s in &ss[..7] {
+    assert_eq!(ss.len(), 5, "4 of 88 m and a 46 m rest");
+    for s in &ss[..4] {
         assert_eq!(s["days"].as_f64().unwrap(), 0.5, "{s}");
     }
-    assert!(ss[7]["days"].as_f64().unwrap() < 0.5);
+    assert!(ss[4]["days"].as_f64().unwrap() < 0.5);
     // Without a forage estimate days can't size anything.
     let p2 = t.ok("POST", "/api/paddocks", Some(json!({ "name": "P2", "geometry": p1() }))).await;
     let (s, e) = t.req("POST", "/api/strips/preview", Some(json!({ "paddock_id": p2["id"], "herd_id": f.herd, "orientation_deg": 0, "days": 1 }))).await;
@@ -246,18 +246,20 @@ async fn a_measured_height_sizes_strips_the_same_way() {
     let by_count = StripParams { orientation_deg: 0.0, count: Some(4), ..Default::default() };
     let v = strips::preview_with(&t.ctx, &paddock, Some(&herd), &by_count, Some(forage.clone())).await.unwrap();
     for s in &v.strips {
-        assert_eq!(s.days, Some(calc::round(1008.0 * s.grazeable_ha / 2950.0, 1)));
+        assert_eq!(s.days, Some(calc::round(1008.0 * s.grazeable_ha * 0.6 / 2950.0, 1)));
     }
     assert_eq!(v.forage_source.as_deref(), Some("farmer"));
-    // Sized by days: 1 day for 250 head is 2,950 kg DM, 2.93 ha of 1,008 kg: about 71 m of the 400 m.
+    // Sized by days: 1 day for 250 head eats 2,950 kg DM, 60 % of 4,917 kg standing: 4.88 ha of 1,008 kg, about 118 m of the 400 m.
     let by_days = StripParams { orientation_deg: 0.0, days: Some(1.0), ..Default::default() };
     let v = strips::preview_with(&t.ctx, &paddock, Some(&herd), &by_days, Some(forage)).await.unwrap();
-    let want = v.depth_m * (2950.0 / 1008.0) / paddock.geometry.area_ha();
-    assert!(close(v.width_m, want, 0.01) && close(want, 70.76, 0.1), "{} vs {want}", v.width_m);
-    assert_eq!(v.strips.len(), 6, "5 of 71 m and a 46 m rest");
-    assert!(v.strips[..5].iter().all(|s| s.days == Some(1.0)), "{:?}", v.strips.iter().map(|s| s.days).collect::<Vec<_>>());
-    // The pure rule: forage × grazeable ÷ (AU × 11.8 kg DM a day), none without animals.
-    assert_eq!(strips::strip_days(1008.0, 2.95, 250.0), Some(1.0));
+    let want = v.depth_m * (2950.0 / 0.6 / 1008.0) / paddock.geometry.area_ha();
+    assert!(close(v.width_m, want, 0.01) && close(want, 117.93, 0.1), "{} vs {want}", v.width_m);
+    assert_eq!(v.strips.len(), 4, "3 of 118 m and a 46 m rest");
+    assert!(v.strips[..3].iter().all(|s| s.days == Some(1.0)), "{:?}", v.strips.iter().map(|s| s.days).collect::<Vec<_>>());
+    // The pure rule, the pre-send check's too: 60 % of forage × grazeable ÷ (AU × 11.8 kg DM a day), none without animals.
+    // 1,008 kg × 2.95 ha × 0.6 ÷ 2,950 kg a day = 0.6048.
+    assert_eq!(strips::strip_days(1008.0, 2.95, 250.0), Some(0.6));
+    assert_eq!(strips::strip_days(1180.0, 2.5, 60.0), Some(2.5));
     assert_eq!(strips::strip_days(1008.0, 2.95, 0.0), None);
 }
 

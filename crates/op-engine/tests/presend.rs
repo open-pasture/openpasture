@@ -293,6 +293,29 @@ async fn facts_forage_and_area_per_head() {
 }
 
 #[tokio::test]
+async fn a_strip_and_its_check_say_the_same_days() {
+    let t = T::new().await;
+    // 6 in measured: 1,008 kg DM/ha above the residual.
+    t.ok("POST", &format!("/api/paddocks/{}/heights", t.p1), json!({ "height_cm": 15.24 })).await;
+    for days in [0.5, 1.0] {
+        let v = t.ok("POST", "/api/strips/preview", json!({ "paddock_id": t.p1, "herd_id": t.herd, "orientation_deg": 0, "days": days })).await;
+        let strip = &v["strips"][0];
+        assert_eq!(strip["days"], days, "{strip}");
+        let c = t.check(json!({ "geometry": strip["geometry"] })).await;
+        // 60 % of 1,008 kg × the strip's area at 2,950 kg DM a day: the strip's own days.
+        let kg = c["facts"]["forage_kg_dm"].as_f64().unwrap();
+        assert_eq!(c["facts"]["grazing_days"], json!(days), "{}", c["facts"]);
+        assert_eq!(op_engine::calc::round(kg * 0.6 / 2950.0, 1), days);
+        assert!(!codes(&c).contains(&"forage_short"), "{days} d isn't short");
+    }
+    // Twice a day (0.4 d strips) is short, and both say 0.4.
+    let v = t.ok("POST", "/api/strips/preview", json!({ "paddock_id": t.p1, "herd_id": t.herd, "orientation_deg": 0, "days": 0.4 })).await;
+    let c = t.check(json!({ "geometry": v["strips"][0]["geometry"] })).await;
+    assert_eq!((v["strips"][0]["days"].clone(), c["facts"]["grazing_days"].clone()), (json!(0.4), json!(0.4)));
+    assert_eq!(finding(&c, "forage_short")["text"], "Grass for 0.4 d");
+}
+
+#[tokio::test]
 async fn short_rest_is_found_for_ground_the_herd_isnt_on() {
     let t = T::new().await;
     let c = t.check(json!({ "geometry": p2() })).await;
