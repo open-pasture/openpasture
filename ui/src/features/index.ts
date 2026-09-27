@@ -24,6 +24,7 @@ import "./i";
 // @B
 import "./b";
 // @G
+import "./g";
 // @P
 // @Q
 // @C

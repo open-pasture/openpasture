@@ -1034,6 +1034,54 @@ Changes to existing shapes (all additive):
 - `POST /api/farm` sets `settings.units` from the farm's time zone: imperial in US zones, metric
   elsewhere. Only at creation; moving the farm later leaves the units alone.
 <!-- @G -->
+
+## Coverage and fleet care (op-analytics)
+
+| Method | Path | Query or body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/coverage` | `metric=accuracy\|fixes&from&to&cell_m=10&herd_id?` (default the last 7 days) | `Coverage` |
+| GET | `/api/fleet` | `herd_id?&collar_id?` | `FleetRow[]` |
+| GET | `/api/fleet/{collar_id}/fit-checks` | | `FitCheck[]`, newest first |
+| POST | `/api/fleet/{collar_id}/fit-checks` | `{ checked_at?, notes? }` or no body (hand) | 201 `FitCheck` |
+| POST | `/api/fleet/fit-checks` | `{ collar_ids: string[], checked_at?, notes? }` (hand; a chute day) | 201 `FitCheck[]` |
+| GET | `/api/fleet/settings` | | `{ fit_check_days: 30 }` |
+| PUT | `/api/fleet/settings` | `{ fit_check_days }` (1–365; manager) | the same |
+
+```ts
+Coverage  { metric: "accuracy"|"fixes", cell_m, unit: "m"|"ratio",
+            size?: [dlon, dlat],                 // degrees one cell spans; absent before any fix is counted
+            cells: [lon, lat, value, n][] }      // each cell at its centre
+FleetRow  { collar_id, name, herd_id, tag? /* the animal wearing it */, battery? /* 0-1 */,
+            trend_pct_day?,                      // percentage points a day, last 7 days since the last charge, 2+ days of data
+            days_left?,                          // at that trend: only when falling, 3+ days of data
+            fit_checked_at?, fit_due_at,         // due = last check (else when the collar was added) + fit_check_days
+            last_seen?, parked: boolean,
+            daily: (number|null)[] }             // mean battery of each of the last 14 UTC days, oldest first, today last
+FitCheck  { id /* fit_… */, collar_id, checked_at, by?: Actor, notes? }
+```
+
+Both read only the day tables op-analytics keeps: `coverage_days` (per herd, UTC day and 10 m
+cell: fixes, an accuracy histogram of 8 buckets `<1, <2, <3, <5, <8, <12, <20, ≥20 m`, fixes
+expected and fixes that came) and `battery_days` (per collar and UTC day: min, max, mean and last
+battery). Neither ever reads `fixes` or `health`. A background task rewrites the days that changed
+(new rows, or a Parquet day file that gained rows) a minute after start and then every 10 minutes
+(less often when a run is slow, at most hourly); its first run covers every day there is data for,
+Parquet included. Today is the partial day so far.
+
+- `accuracy`: each cell's median fix accuracy in metres from the histogram; `n` is the fixes in it.
+- `fixes`: fixes that came ÷ fixes the collar's cadence called for (its median gap that day), 0–1.
+  A fix that never came counts where the animal was before the gap; a gap longer than 6 h means
+  the collar was off and counts nothing. `n` is the fixes called for.
+- Cells with `n` under 5 are left out. `cell_m` is a multiple of 10 up to 1,000: blocks of 10 m
+  cells. Cells are counted from a fixed origin (the farm's centre when the first fix is counted),
+  so a cell is the same ground every day.
+- A fit check records who made it; the collar's next check is due `fit_check_days` after its latest
+  check. Each check is also an activity event `fleet.fit_checked`.
+
+MCP (read, viewers): `get_coverage` `{metric?, from?, to?, cell_m?, herd_id?}` returns a
+`Coverage` (at most the 500 weakest cells, with `truncated: <cells there were>` when cut);
+`get_fleet` `{herd_id?}` returns `{ fit_check_days, collars: FleetRow[] }`.
+
 <!-- @P -->
 <!-- @Q -->
 <!-- @C -->
