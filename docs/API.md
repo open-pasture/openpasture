@@ -29,16 +29,18 @@ checked. Debug builds also allow CORS and `Origin` from the Vite dev server
 | GET POST | `/api/herds` | `{ name, species, count, paddock_id? }` | `Herd[]` / `Herd` |
 | PATCH DELETE | `/api/herds/:id` | partial (incl. `autonomy`) | `Herd` / 204 |
 | GET POST | `/api/animals` | `{ tag, name?, herd_id, collar_id? }` | `Animal[]` / `Animal` |
-| PATCH DELETE | `/api/animals/:id` | partial | `Animal` / 204 |
+| PATCH DELETE | `/api/animals/:id` | partial (not `removed_at`/`removed_reason`) | `Animal` / 204 |
 | GET PUT | `/api/settings` | partial `Settings` | `Settings` |
 | GET | `/api/secrets` | | `{ name, set: bool }[]` (never values) |
 | PUT DELETE | `/api/secrets/:name` | `{ value }` | 204 |
 
 ```ts
 Farm     { id, name, timezone, center: [lon, lat], created_at }
-Paddock  { id, name, geometry: Polygon, area_ha, status: "resting"|"grazing"|"planned", notes?, grazed_until?, created_at }
+Paddock  { id, name, geometry: Polygon, area_ha, status: "resting"|"grazing"|"planned", notes?, grazed_until?, created_at,
+           props?: { fsa_farm?, fsa_tract?, fsa_field?, … } }
 Herd     { id, name, species: "cattle"|"sheep"|"goats", count, paddock_id?, autonomy: "propose"|"timer"|"auto", timer_minutes, created_at }
-Animal   { id, tag, name?, herd_id, collar_id? }
+Animal   { id, tag, name?, herd_id, collar_id?, eid? /* 15 digits */, breed?, sex?: "female"|"male"|"castrated",
+           born?: "YYYY-MM-DD", notes?, removed_at?, removed_reason?: "sold"|"died"|"culled"|"moved_off" }
 Settings { brain: { id: BrainId, model?: string }, decision_time: "HH:MM",
            server: { bind: string, port: number, public_url?: string, app_token: string },
            units: "metric"|"imperial" }
@@ -68,21 +70,23 @@ Autonomy follows the website's switch: `propose` waits for approval, `timer` app
 | --- | --- | --- | --- |
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id }` | `{ collar: Collar, key: string, endpoint: string, public_key: string }` (key shown once) |
-| PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written) | `Collar` / 204 |
+| PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
 
 ```ts
 Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
-           boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix }
+           boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix,
+           fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair" }
 Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
            decision_id, created_at, collar_id? /* one collar's own, see Escapes */ }
 BoundaryStatus { active?: Boundary, pending?: Boundary, proposed?: { decision_id, geometry },
            acks: { collar_id, version, status: "received"|"applied"|"rejected", reason?, at }[],
-           move?: Move, escapes?: Escape[] }
+           move?: Move, escapes?: Escape[], staged?: Boundary[], slots?: SlotCount[] }
+SlotCount { version, effective_at?, applied, stored, rejected, collars }
 ```
 
 Boundary versions come from one sequence shared by every herd (herd A may hold v1, v3, v4 and
@@ -95,6 +99,13 @@ target.
 
 Collar state and `last_fix` only move with fixes newer than the current `last_fix`; late or
 backfilled fixes are stored but don't move the collar or send `fix` events.
+
+`outside_since` is the time of the first fix outside after the last one inside (as escapes count
+it), cleared once a newer fix is back in (inside or warning) or the fence goes away. A parked
+collar (`parked_at` set) still reports: its battery, health and `last_seen` are kept, but its
+fixes and cues are not stored and it gets no fence or escape work. Each ack also updates
+`collar_boundary_state` (the collar's highest acked version and that version's latest status),
+so nothing scans `acks` for it.
 
 ### Moves: target and sweep
 
@@ -347,12 +358,12 @@ GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
 | --- | --- | --- |
 | GET | `/api/server` | `{ version, data_dir, bind, port, lan_url?, public_url? }` |
 | GET | `/api/live` | WebSocket, server → client `Event` messages |
-| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`); `?scope=brain` lists only the read tools. A brain run off a loopback URL gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only) |
+| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`), tools listed and called as the caller's identity; `?scope=brain` lists only the brain tools. A brain run off a loopback URL gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only and lists and calls only the tools it was minted with) |
 
 ```ts
 Event =
   | { type: "fix", collar_id, animal_id?, herd_id, fix: Fix, state }
-  | { type: "cue", collar_id, at, level, margin_m }
+  | { type: "cue", collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }
   | { type: "ack", collar_id, herd_id, version, status, reason? }
   | { type: "collar", collar: Collar }
   | { type: "boundary", herd_id, boundary: Boundary }
@@ -361,7 +372,37 @@ Event =
   | { type: "escape", escape: Escape } // an escape started, stepped, ended or was stopped
   | { type: "decision_log", decision_id, line }   // brain progress, one line at a time
   | { type: "resync" }   // this socket fell behind and missed events: refetch state
+  // @HUB
+  | { type: "alert", alert: Alert }
+  | { type: "message", message: MessageLog }   // managers and up only
+  | { type: "feature", feature: MapFeature, deleted?: true }
+  | { type: "animals_changed", herd_id? }
+  // @HUB-UI
+  // @E-lib
+  // @E-srv
+  // @J
+  // @A-engine
+  // @A-notify
+  // @D
+  // @K-animals
+  // @K-files
+  // @I
+  // @B
+  // @G
+  // @P
+  // @Q
+  // @C
+  // @F
+  // @S
+  // @A3
+  // @H
+  // @L
+  // @M
+  // @Z
 ```
+
+Each socket gets only the events its identity may see: `message` events go to managers and up
+(they carry phone numbers), everything else to every role.
 
 A report publishes one `fix` event per collar (its newest new fix), not one per fix.
 
@@ -372,3 +413,79 @@ Read tools for the brain and for any agent: `get_farm`, `list_paddocks`, `get_he
 `get_herd_positions`, `get_boundary_status`, `get_signals`, `get_land_report`,
 `search_knowledge`, `list_decisions`, `get_decision`, `run_sql`. Write tools for outside
 agents only: `propose_boundary` (records a decision; autonomy still applies).
+
+<!-- @HUB -->
+
+## Identity, people, shared records (op-core)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/me` | `{ role, via, user?: { id, name, phone?, phone_verified?: bool, email? } }` |
+
+```ts
+Role     = "viewer"|"hand"|"manager"|"owner"          // ordered
+Via      = "local"|"app_token"|"user_token"|"brain"|"text"|"system"|"anonymous"
+Actor    { via: Via, user_id?, name? }                 // who did something, stored on records
+User     { id /* usr_… */, name, role: Role, phone? /* E.164 */, phone_verified_at?, email?, created_at, disabled_at? }
+Severity = "info"|"warning"|"critical"
+Finding  { code, severity: Severity, text, geometry?: GeoJSON, targets?: [kind, id][] }
+Alert    { id /* alr_… */, kind, key, severity, status: "open"|"acked"|"resolved", herd_id?, title, body?,
+           at?: [lon, lat], targets: [kind, id][], data, opened_at, updated_at, acked_at?, acked_by?: Actor,
+           resolved_at?, resolved_by?: Actor, rolled_into? }
+MessageLog { id /* ntf_… */, direction: "out"|"in", channel: "sms"|"whatsapp"|"email"|"webhook"|"relay"|"push",
+           address, user_id?, kind: "alert"|"brief"|"reply"|"test"|"verify"|"inbound", text, subject?,
+           status: "queued"|"sending"|"sent"|"delivered"|"failed"|"received"|"ignored", error?,
+           alert_id?, decision_id?, provider_id?, attempts, created_at, updated_at }
+MapFeature { id /* fea_… */, kind: "exclusion"|"water"|"gate"|"shade"|"hazard"|"road"|"neighbour_line"|"farm_boundary",
+           name?, geometry: Point|LineString|Polygon, paddock_id? /* none = farm-wide */, notes?, props,
+           active_from?, active_until?, created_at, updated_at }
+```
+
+Every request carries an identity. The app token and local requests are the owner
+(`via: "app_token"` / `"local"`); a brain token on `/mcp?scope=brain` is the brain (a viewer that
+lists and calls only its tools); `/collar/v1`, `/v1/*` and `/hooks/*` authenticate themselves.
+`/hooks/*` paths that don't exist are JSON 404s. A handler that needs a role answers 401 without
+credentials and 403 `{"error": "Your role can't do this."}` when the role is too low.
+
+People (`users`) need no sign-in: someone who only texts is a user with a phone. Phones are stored
+as E.164 (10 digits are a US number); changing a phone clears its verification. `users`,
+`messages` and the other tables holding phone numbers are never readable through `/api/sql` or
+export.
+
+Map features: an exclusion is one polygon ring; water, shade and hazards are a point or a polygon
+(a hazard point needs `props.radius_m`); a gate is a point; roads and neighbour lines are lines;
+there is at most one farm boundary (409). A feature is active from `active_from` (inclusive) to
+`active_until` (exclusive); either may be absent. Exclusions become boundary holes on sends whose
+activation time falls in their window; the rest are checked before a send, never enforced.
+
+Numbers people read (reports, texts, the brief) go through the farm's `settings.units`: metric
+(ha, m, cm, kg, m²/hd, AU/ha) or imperial (ac, ft, in, lb, ft²/hd, AU/ac), rounded the same in
+op-core and the UI: area one decimal (two below 0.1, none from 1,000), lengths whole (nearest 10
+from 100), heights whole, mass and area per head three significant figures, density one decimal,
+"," between thousands. The API is always SI.
+
+Pasture history (`/api/analytics/pasture`) reads daily dwell from `paddock_days`: the rollup's own
+days plus imported position history.
+
+<!-- @HUB-UI -->
+<!-- @E-lib -->
+<!-- @E-srv -->
+<!-- @J -->
+<!-- @A-engine -->
+<!-- @A-notify -->
+<!-- @D -->
+<!-- @K-animals -->
+<!-- @K-files -->
+<!-- @I -->
+<!-- @B -->
+<!-- @G -->
+<!-- @P -->
+<!-- @Q -->
+<!-- @C -->
+<!-- @F -->
+<!-- @S -->
+<!-- @A3 -->
+<!-- @H -->
+<!-- @L -->
+<!-- @M -->
+<!-- @Z -->
