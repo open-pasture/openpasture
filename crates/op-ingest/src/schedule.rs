@@ -1085,13 +1085,16 @@ async fn alive_staged(ctx: &Ctx, herd_id: &str, rows: &[Row], now: DateTime<Utc>
 /// the herd is on when that is what's in effect (it goes through `prepare`
 /// again), else the boundary in effect as it is.
 async fn reissue(ctx: &Ctx, p: &Plan) -> ApiResult<Option<Boundary>> {
-    let split = db::herd_boundaries(ctx.db(), &p.s.herd_id, now()).await?;
+    reissue_current(ctx, &p.s, &p.rows).await
+}
+
+async fn reissue_current(ctx: &Ctx, s: &Schedule, rows: &[Row]) -> ApiResult<Option<Boundary>> {
+    let split = db::herd_boundaries(ctx.db(), &s.herd_id, now()).await?;
     let Some(a) = split.active else { return Ok(None) };
-    let geometry =
-        p.rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
+    let geometry = rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
     let opts = SendOpts { warn_m: Some(a.warn_m), hysteresis_m: Some(a.hysteresis_m), effective_at: None };
-    let b = send_boundary(ctx, &p.s.herd_id, geometry, opts, &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
-    tracing::info!(schedule = %p.s.id, herd = %p.s.herd_id, version = b.version, "current strip reissued");
+    let b = send_boundary(ctx, &s.herd_id, geometry, opts, &s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    tracing::info!(schedule = %s.id, herd = %s.herd_id, version = b.version, "current strip reissued");
     Ok(Some(b))
 }
 
@@ -1529,6 +1532,7 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
                     return give_up(ctx, s, rows, gone, &active).await;
                 }
             }
+            restage_for_exclusions(ctx, &s, &mut rows, at).await?;
             stage(ctx, &s, &mut rows, at).await?;
             if !rows.iter().any(Row::pending) {
                 s.status = ScheduleStatus::Done;
@@ -1675,16 +1679,55 @@ async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec
     Ok(())
 }
 
-/// Stage pending moves ahead, in time order, as far as the collars have room.
-async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
-    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].pending() && rows[i].at > at).collect();
-    if order.is_empty() {
+/// What the farm's exclusions are now, to see one drawn, changed or removed
+/// (they are deleted outright, hence the count).
+async fn exclusions_mark(ctx: &Ctx) -> anyhow::Result<String> {
+    let (n, last): (i64, Option<String>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM features WHERE kind = 'exclusion'").fetch_one(ctx.db()).await?;
+    Ok(format!("{n} {}", last.unwrap_or_default()))
+}
+
+/// Per schedule, the exclusions its staged moves were last checked against.
+static EXCLUSIONS_SEEN: LazyLock<std::sync::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// A staged move was prepared with the exclusions of the time it was staged.
+/// When they have changed since (or nothing is known: the server started),
+/// each staged move goes through `prepare` again as it was staged, and the
+/// first whose shape now comes out otherwise is unstaged, so [`stage`] sends
+/// the current strip again and stages everything afresh. So an exclusion
+/// drawn tonight is kept out of tomorrow's strip, and one removed no longer
+/// is. Nothing is sent when no staged move changes.
+async fn restage_for_exclusions(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mark = exclusions_mark(ctx).await?;
+    if EXCLUSIONS_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&s.id) == Some(&mark) {
         return Ok(());
     }
+    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].state == MoveState::Staged && rows[i].at > at).collect();
+    if !order.is_empty() {
+        order.sort_by_key(|&i| (rows[i].at, rows[i].strip, rows[i].step));
+        let split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+        let stored: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
+        for i in order {
+            let Some(b) = rows[i].version.and_then(|v| stored.get(&v)) else { continue };
+            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: Some(rows[i].at) };
+            let now_shape = shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts).await.ok().map(|p| p.geometry);
+            if now_shape.as_ref() != Some(&b.geometry) {
+                tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = b.version, "exclusions changed: staged again from here");
+                rows[i].unstage();
+                break;
+            }
+        }
+    }
+    EXCLUSIONS_SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(s.id.clone(), mark);
+    Ok(())
+}
+
+/// The pending moves after `at` in time order, and how many of them lead the
+/// way still staged alive, in rising versions and at the times planned.
+fn staged_prefix(rows: &[Row], at: DateTime<Utc>, split: &HerdBoundaries) -> (Vec<usize>, usize) {
+    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].pending() && rows[i].at > at).collect();
     order.sort_by_key(|&i| (rows[i].at, rows[i].strip, rows[i].step));
-    let split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
     let alive: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
-    // The prefix still staged alive, in rising versions and at the times planned.
     let mut prefix = 0;
     let mut last_version = split.active.as_ref().map_or(0, |b| b.version);
     for &i in &order {
@@ -1696,6 +1739,67 @@ async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> 
         last_version = rows[i].version.unwrap_or(last_version);
         prefix += 1;
     }
+    (order, prefix)
+}
+
+/// Stage pending moves ahead, in time order, as far as the collars have room.
+///
+/// A staged move is never replaced in place. A collar holding the old
+/// version with no free slot is never offered the new one (it has no room
+/// until the new one kills the old), so its own clock would still apply the
+/// old shape. So when a version of this schedule is still alive that the
+/// moves staged ahead don't stand for (a move planned again from the ground
+/// the herd is on, shaped again for an exclusion drawn since, or staged
+/// half-way when a pass failed), the current strip goes again first as a new
+/// immediate version, which drops every staged slot on the collars, and the
+/// moves are staged afresh above it.
+async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mut split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+    let (order, prefix) = staged_prefix(rows, at, &split);
+    let standing: HashSet<u32> = order[..prefix].iter().filter_map(|&i| rows[i].version).collect();
+    let stale: Vec<u32> = split.staged.iter().filter(|b| b.decision_id == s.id && !standing.contains(&b.version)).map(|b| b.version).collect();
+    if !stale.is_empty() {
+        tracing::info!(schedule = %s.id, versions = ?stale, "staged moves out of date: the current strip goes again, then staged afresh");
+        if let Err(e) = reissue_current(ctx, s, rows).await {
+            // It can't be prepared again as it stands (an exclusion drawn over
+            // all of it): the boundary in effect goes again exactly as it is.
+            tracing::warn!(schedule = %s.id, "current strip not reissued ({}): sent again as it is", e.message);
+            resend_as_is(ctx, s, &split).await?;
+        }
+        for r in rows.iter_mut() {
+            r.unstage();
+        }
+        split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+    }
+    stage_ahead(ctx, s, rows, at, &split).await
+}
+
+/// The herd's boundary in effect again, unchanged, as a new immediate
+/// version: collars drop every staged slot below it.
+async fn resend_as_is(ctx: &Ctx, s: &Schedule, split: &HerdBoundaries) -> anyhow::Result<()> {
+    let Some(a) = &split.active else { return Ok(()) };
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let nb = crate::boundary::NewBoundary {
+        herd_id: &s.herd_id,
+        geometry: &a.geometry,
+        warn_m: a.warn_m,
+        hysteresis_m: a.hysteresis_m,
+        effective_at: None,
+        decision_id: &s.id,
+        created_at: now(),
+        collar_id: None,
+        copy_of: None,
+    };
+    let b = crate::boundary::insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?;
+    tx.commit().await?;
+    crate::boundary::announce(ctx, &b).await;
+    Ok(())
+}
+
+/// [`stage`]'s staging, above what is still staged alive.
+async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>, split: &HerdBoundaries) -> anyhow::Result<()> {
+    let (order, prefix) = staged_prefix(rows, at, split);
+    let alive: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
     for &i in &order[prefix..] {
         rows[i].unstage();
     }
@@ -1703,7 +1807,7 @@ async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> 
         return Ok(());
     }
     let ours: HashSet<u32> = split.staged.iter().filter(|b| b.decision_id == s.id).map(|b| b.version).collect();
-    let room = budget(ctx, &s.herd_id, &split, &ours, at).await?;
+    let room = budget(ctx, &s.herd_id, split, &ours, at).await?;
     let (warn, hyst) = crate::margins::default_margins(ctx, &s.herd_id).await?;
     let mut used = vec![0usize; room.groups.len()];
     for &i in &order[..prefix] {

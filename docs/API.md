@@ -1285,7 +1285,9 @@ one closer to the edge than the collars' gap is joined to it by a notch, close o
 hole, one covering the whole shape is left alone. This happens on every path (a farmer's draw, an
 applied decision, each sweep step, a staged boundary, a reissue), so an exclusion that starts later
 takes effect on the first send at or after it starts, and one that has ended no longer shapes
-sends. An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
+sends. Drawing an exclusion doesn't by itself send the boundary in effect again; when it changes
+a strip schedule's staged moves, those are staged again and the current strip goes again with them
+(see Schedules). An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
 doesn't change. Hazards, roads, neighbour lines, water and the farm boundary are only checked.
 
 `sent` is what sending the same shape now stores, byte for byte (holes and cuts from exclusions,
@@ -1411,7 +1413,14 @@ late or can't be sent takes its back-fence steps with it); later moves go ahead.
 boundary in effect isn't the move before the next one (a move marked late or skipped, a boundary
 from elsewhere, move now), the moves still to come are planned again from the ground the herd is
 on, so no open or back-fence step leaves it outside. Move now skips what is left of the strip
-before's back fence: the open keeps that ground and its own back fence closes it. Queue edits that change
+before's back fence: the open keeps that ground and its own back fence closes it. A staged move is
+never replaced in place (a collar with no free slot is never offered the new version, so its own
+clock would apply the old one): whenever a staged move no longer stands (planned again from the
+ground the herd is on, or shaped again, below), the current strip goes again first as a new
+immediate version and the moves are staged afresh above it. When an exclusion is drawn, changed or
+removed, each staged move goes through `prepare` again, and if any now comes out otherwise the
+moves are staged afresh that way, so tonight's exclusion is kept out of tomorrow's strip (the
+current strip, sent again, takes it too). Queue edits that change
 what is staged (skip, hold, edit time, pause, end) send the herd's current strip again as a new
 immediate version so collars drop the staged moves, then stage the new plan. Move now sends the
 strip itself. An escape's pen drops only that collar's staged slots; when it ends the collar gets

@@ -1054,3 +1054,120 @@ async fn strips_narrower_than_the_herds_two_warning_zones_are_refused() {
     app.ctx.store().set_setting(op_ingest::margins::TRAINING_KEY, &json!({})).await.unwrap();
     sched::create(&app.ctx, n, &every(start)).await.unwrap();
 }
+
+// ---- exclusions drawn after the moves were staged (FX-FENCE) ----
+
+async fn exclusion(app: &App, name: &str, area: &Polygon) -> String {
+    let geometry = json!({"type": "Polygon", "coordinates": [area.outer_ring()]});
+    let (s, v) = app.call("POST", "/api/features", Some(json!({"kind": "exclusion", "name": name, "geometry": geometry}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    v["id"].as_str().unwrap().to_owned()
+}
+
+/// Every alive staged boundary of the herd, as the collars get them.
+async fn staged_shapes(app: &App, herd: &str) -> Vec<(u32, Polygon)> {
+    let status = app.status(herd).await;
+    status["staged"]
+        .as_array()
+        .map_or(vec![], |a| a.iter().map(|b| (b["version"].as_u64().unwrap() as u32, serde_json::from_value(b["geometry"].clone()).unwrap())).collect())
+}
+
+#[tokio::test]
+async fn an_exclusion_drawn_after_the_strips_were_staged_is_kept_out_of_them() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let mut dev = app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    app.sync(&mut dev, Utc::now()).await;
+    let before = app.moves(&s).await;
+    assert_eq!(staged(&before).len(), 15);
+    // A washout in strip 3, drawn after tomorrow's strips went to the collars.
+    let washout = m_at(125.0, 100.0);
+    exclusion(&app, "Washout", &rect(115.0, 60.0, 135.0, 140.0)).await;
+    sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
+    let after = app.moves(&s).await;
+    assert_eq!(staged(&after).len(), 15);
+    // The collars can't swap a staged slot in place (they have no room until
+    // the new one kills the old): strip 1 went again, then all fifteen above it.
+    let top = before.iter().filter_map(|m| m.boundary_version).max().unwrap();
+    let reissued = app.status(&herd).await["active"]["version"].as_u64().unwrap() as u32;
+    assert!(reissued > top);
+    assert!(staged(&after).iter().all(|m| m.boundary_version.unwrap() > reissued));
+    // Everything staged that takes in strip 3's ground keeps the washout out.
+    let shapes = staged_shapes(&app, &herd).await;
+    assert_eq!(shapes.len(), 15, "the old versions are dead");
+    for (v, g) in &shapes {
+        assert!(!g.contains(washout), "v{v} takes in the washout");
+    }
+    let open3 = after.iter().find(|m| m.index == 2 && m.step == 0).unwrap();
+    assert!(shapes.iter().any(|(v, g)| Some(*v) == open3.boundary_version && g.contains(m_at(125.0, 50.0)) && g.coordinates.len() == 2));
+    // On the collar's own clock, strip 3 opens with the washout kept out.
+    app.sync(&mut dev, Utc::now()).await;
+    dev.store.tick(open3.at + Duration::seconds(1)).expect("strip 3 opens");
+    let enforced = dev.store.active().unwrap().cmd.polygon();
+    assert!(enforced.contains(m_at(125.0, 50.0)) && !enforced.contains(washout));
+    // Once in step, a pass changes nothing.
+    assert!(!sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_staged_move_an_exclusion_leaves_no_room_in_goes_from_the_collars() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let mut dev = app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    app.sync(&mut dev, Utc::now()).await;
+    // Reseeding over all of strip 4 but a sliver on its west side: strip 4
+    // alone (its last back-fence step) has nowhere clear of the warning zone.
+    let reseeded = m_at(175.0, 100.0);
+    exclusion(&app, "Reseeding", &rect(158.0, -20.0, 320.0, 220.0)).await;
+    sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
+    // Nothing alive on the collars takes the reseeded ground in.
+    for (v, g) in staged_shapes(&app, &herd).await {
+        assert!(!g.contains(reseeded), "v{v} takes in the reseeding");
+    }
+    app.sync(&mut dev, Utc::now()).await;
+    let mut t = start;
+    while t < start + Duration::minutes(EVERY * 6) {
+        if dev.store.tick(t).is_some() {
+            assert!(!dev.store.active().unwrap().cmd.polygon().contains(reseeded), "applied at {t} with the reseeding in it");
+        }
+        t += Duration::seconds(30);
+    }
+    // Strip 4's own back fence can't go; what comes before it is still staged.
+    let ms = app.moves(&s).await;
+    assert!(ms.iter().any(|m| m.index == 1 && m.state == MoveState::Staged), "strip 2 is still staged");
+}
+
+#[tokio::test]
+async fn an_exclusion_over_the_strip_the_herd_is_on_still_restages_the_strips_ahead() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    let mut dev = app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    app.sync(&mut dev, Utc::now()).await;
+    let in_effect = app.status(&herd).await["active"].clone();
+    let top = app.moves(&s).await.iter().filter_map(|m| m.boundary_version).max().unwrap();
+    // A wet patch over all of strip 1 but a sliver: strip 1 can't go again as
+    // it stands, so the boundary in effect goes again unchanged.
+    let wet = m_at(20.0, 100.0);
+    exclusion(&app, "Wet patch", &rect(-20.0, -20.0, 42.0, 220.0)).await;
+    sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap();
+    let now_in_effect = app.status(&herd).await["active"].clone();
+    assert!(now_in_effect["version"].as_u64().unwrap() as u32 > top);
+    assert_eq!(now_in_effect["geometry"], in_effect["geometry"], "the fence under the herd doesn't change");
+    let ms = app.moves(&s).await;
+    assert!(!staged(&ms).is_empty());
+    for (v, g) in staged_shapes(&app, &herd).await {
+        assert!(!g.contains(wet), "v{v} takes in the wet patch");
+    }
+    app.sync(&mut dev, Utc::now()).await;
+    dev.store.tick(start + Duration::seconds(1)).expect("strip 2 opens");
+    assert!(!dev.store.active().unwrap().cmd.polygon().contains(wet));
+}

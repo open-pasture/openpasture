@@ -355,17 +355,20 @@ async fn in_reach(ctx: &Ctx, herd_id: &str, herd: &Boundary, point: LonLat, at: 
     if paddock.is_some_and(|p| p.contains(point)) {
         return Ok(true);
     }
-    let rows = sqlx::query("SELECT geometry, created_at FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version DESC LIMIT 500")
-        .bind(herd_id)
-        .fetch_all(ctx.db())
-        .await?;
-    for r in &rows {
-        let g: Polygon = serde_json::from_str(&r.try_get::<String, _>("geometry")?)?;
+    // The day's boundaries, and the one in effect when it began (a bounded read: this runs on every try).
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT geometry FROM (SELECT geometry, version FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL AND created_at >= ?2 ORDER BY version DESC LIMIT 400)
+         UNION ALL
+         SELECT geometry FROM (SELECT geometry FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL AND created_at < ?2 ORDER BY version DESC LIMIT 1)",
+    )
+    .bind(herd_id)
+    .bind(to_db(&(at - OWN_GROUND)))
+    .fetch_all(ctx.db())
+    .await?;
+    for g in &rows {
+        let g: Polygon = serde_json::from_str(g)?;
         if Polygon::from_ring(g.outer_ring()).contains(point) {
             return Ok(true);
-        }
-        if from_db(&r.try_get::<String, _>("created_at")?)? < at - OWN_GROUND {
-            break;
         }
     }
     Ok(false)
