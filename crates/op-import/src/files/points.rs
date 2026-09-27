@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use super::geojson;
+use crate::animals::table::MAX_COLUMNS;
 
 /// Which column (CSV) or property (GeoJSON) holds each field. `tag` absent =
 /// the whole file is one animal, labelled by the file name.
@@ -291,9 +292,17 @@ impl DateOrder {
     }
 }
 
+/// Whether a written date names a year a position fix can carry: 2000 to
+/// 2099, the range unix times are taken in. `%Y` reads the 26 of 06/14/26
+/// as the year 26 (and 14/06/26 as year 14, June 26), so a two-digit year
+/// has to fall through to `%y`.
+fn plausible(n: &NaiveDateTime) -> bool {
+    (2000..2100).contains(&n.year())
+}
+
 /// A timestamp as devices write them: RFC 3339, ISO with or without offset,
-/// slash dates in the file's `order`, dotted day-first dates, or unix
-/// seconds or ms.
+/// slash dates in the file's `order` (four- or two-digit years), dotted
+/// day-first dates, or unix seconds or ms, from 2000 to 2099.
 pub fn parse_time(s: &str, order: DateOrder) -> Option<When> {
     let s = s.trim();
     if s.is_empty() {
@@ -305,7 +314,9 @@ pub fn parse_time(s: &str, order: DateOrder) -> Option<When> {
         let t = DateTime::<Utc>::from_timestamp_millis(ms.round() as i64)?;
         return (946_684_800_000..4_102_444_800_000).contains(&t.timestamp_millis()).then_some(When::Utc(t));
     }
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s)
+        && plausible(&t.naive_utc())
+    {
         return Some(When::Utc(t.with_timezone(&Utc)));
     }
     let (body, utc) = match s.strip_suffix(" UTC").or_else(|| s.strip_suffix(" GMT")).or_else(|| s.strip_suffix('Z')) {
@@ -314,34 +325,59 @@ pub fn parse_time(s: &str, order: DateOrder) -> Option<When> {
     };
     if !utc {
         for f in OFFSET {
-            if let Ok(t) = DateTime::parse_from_str(body, f) {
+            if let Ok(t) = DateTime::parse_from_str(body, f)
+                && plausible(&t.naive_utc())
+            {
                 return Some(When::Utc(t.with_timezone(&Utc)));
             }
         }
     }
     for f in NAIVE.iter().chain(order.formats()) {
-        if let Ok(n) = NaiveDateTime::parse_from_str(body, f) {
+        if let Ok(n) = NaiveDateTime::parse_from_str(body, f)
+            && plausible(&n)
+        {
             return Some(if utc { When::Utc(n.and_utc()) } else { When::Local(n) });
         }
     }
     None
 }
 
+/// The same animal's point before the one being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Near {
+    /// Its instant, unix ms.
+    pub t: i64,
+    /// Whether the animal's track runs forward in time through the file
+    /// (newest last); `None` until it has two points at different times.
+    pub forward: Option<bool>,
+}
+
 /// The instant a parsed time names, reading local times in `zone`. A local
-/// time the clocks go back through (the repeated hour in the fall) is the
-/// one nearest `near` (the same animal's point before it, so a track through
-/// the repeated hour keeps both hours, whichever way the file runs), else the
-/// earlier.
-pub fn resolve(w: When, zone: Tz, near: Option<i64>) -> Result<DateTime<Utc>, String> {
+/// time the clocks go back through (the repeated hour in the fall) is read
+/// from `near`, so a track through the repeated hour keeps both hours,
+/// whichever way the file runs and however often it fixes: not the instant
+/// of the point before it (the same local time again is the hour's second
+/// pass, as an hourly tracker writes 01:00 twice), else the nearer of the
+/// two, and when they are as near (a fix every 30 minutes), the one the
+/// track is heading to. With no point before it, the earlier.
+pub fn resolve(w: When, zone: Tz, near: Option<Near>) -> Result<DateTime<Utc>, String> {
     match w {
         When::Utc(t) => Ok(t),
         When::Local(n) => match zone.from_local_datetime(&n) {
             LocalResult::Single(t) => Ok(t.with_timezone(&Utc)),
             LocalResult::Ambiguous(a, b) => {
                 let (a, b) = (a.with_timezone(&Utc), b.with_timezone(&Utc));
+                let (ta, tb) = (a.timestamp_millis(), b.timestamp_millis());
                 Ok(match near {
-                    Some(p) if (b.timestamp_millis() - p).abs() < (a.timestamp_millis() - p).abs() => b,
-                    _ => a,
+                    None => a,
+                    Some(p) if p.t == ta => b,
+                    Some(p) if p.t == tb => a,
+                    Some(p) => match (ta - p.t).abs().cmp(&(tb - p.t).abs()) {
+                        std::cmp::Ordering::Less => a,
+                        std::cmp::Ordering::Greater => b,
+                        std::cmp::Ordering::Equal if p.forward == Some(true) => b,
+                        std::cmp::Ordering::Equal => a,
+                    },
                 })
             }
             LocalResult::None => Err(format!("{} doesn't exist in {zone} (the clocks skipped it).", n.format("%Y-%m-%d %H:%M"))),
@@ -355,8 +391,8 @@ struct Builder {
     labels: Vec<String>,
     index: HashMap<String, u32>,
     points: Vec<Pt>,
-    /// Each label's last point (unix ms), for the repeated fall-back hour.
-    last: HashMap<u32, i64>,
+    /// Each label's last point, for the repeated fall-back hour.
+    last: HashMap<u32, Near>,
     errors: Errors,
     needs_zone: bool,
     zone: Tz,
@@ -415,7 +451,13 @@ impl Builder {
             }
         };
         let accuracy_m = accuracy.filter(|a| a.is_finite() && *a >= 0.0);
-        self.last.insert(i, t.timestamp_millis());
+        let t_ms = t.timestamp_millis();
+        let forward = match self.last.get(&i) {
+            Some(p) if p.t != t_ms => Some(t_ms > p.t),
+            Some(p) => p.forward,
+            None => None,
+        };
+        self.last.insert(i, Near { t: t_ms, forward });
         self.points.push(Pt { label: i, t: t.timestamp_millis(), lon, lat, accuracy_m });
     }
 
@@ -444,6 +486,10 @@ fn csv(text: &str, mapping: Option<&Mapping>, zone: Tz, stem: &str) -> Result<Pa
     if columns.iter().all(String::is_empty) {
         return Err("The CSV has no header row.".to_owned());
     }
+    // A header this wide is a broken export (the animal import's limit too).
+    if columns.len() > MAX_COLUMNS {
+        return Err(format!("The CSV has more than {MAX_COLUMNS} columns."));
+    }
     let mapping = mapping.cloned().unwrap_or_else(|| guess_mapping(&columns, true));
     let col = |name: &Option<String>| name.as_ref().and_then(|n| columns.iter().position(|c| c == n));
     let (tag, time, lat, lon, acc) = (col(&mapping.tag), col(&mapping.time), col(&mapping.lat), col(&mapping.lon), col(&mapping.accuracy));
@@ -469,7 +515,8 @@ fn csv(text: &str, mapping: Option<&Mapping>, zone: Tz, stem: &str) -> Result<Pa
         }
         total += 1;
         if rows.len() < PREVIEW_ROWS {
-            rows.push(rec.iter().map(str::to_owned).collect());
+            // As wide as the header: cells past it have no column to show under.
+            rows.push(rec.iter().take(columns.len()).map(str::to_owned).collect());
         }
         let (Some(time), Some(lat), Some(lon)) = (time, lat, lon) else { continue };
         let get = |c: usize| rec.get(c).unwrap_or_default();
@@ -575,6 +622,18 @@ mod tests {
         assert_eq!(at("14/06/2025 07:05"), utc("2025-06-14T12:05:00Z"));
         assert!(matches!(parse_time("2025-06-14 07:05:00", DateOrder::MonthFirst), Some(When::Local(_))));
         assert!(parse_time("yesterday", DateOrder::MonthFirst).is_none());
+        // Two-digit years are this century, either way round: `%Y` used to take
+        // 06/14/26 as the year 26 and 14/06/26 as the year 14, June 26.
+        let local = |s: &str, o| match parse_time(s, o) {
+            Some(When::Local(n)) => n.format("%Y-%m-%d %H:%M").to_string(),
+            w => panic!("{s}: {w:?}"),
+        };
+        assert_eq!(local("06/14/26 10:00", DateOrder::MonthFirst), "2026-06-14 10:00");
+        assert_eq!(local("06/14/26 10:00:00", DateOrder::MonthFirst), "2026-06-14 10:00");
+        assert_eq!(local("14/06/26 10:00", DateOrder::DayFirst), "2026-06-14 10:00");
+        assert_eq!(local("05/06/26 10:00", DateOrder::DayFirst), "2026-06-05 10:00");
+        // A year no fix carries isn't a time.
+        assert!(parse_time("0026-06-14 10:00", DateOrder::MonthFirst).is_none());
         // 02:30 on the spring-forward night doesn't exist in Chicago.
         assert!(resolve(parse_time("2025-03-09 02:30", DateOrder::MonthFirst).unwrap(), chicago, None).is_err());
     }
@@ -626,17 +685,27 @@ mod tests {
 
     #[test]
     fn the_repeated_fall_back_hour_keeps_both_hours() {
-        // Every 20 minutes through 2026-11-01 00:40 to 02:20 Chicago time: the
-        // 01:00-01:40 stretch comes twice, first CDT (UTC-5), then CST (UTC-6).
-        let local = ["00:40", "01:00", "01:20", "01:40", "01:00", "01:20", "01:40", "02:00", "02:20"];
-        let want = ["05:40", "06:00", "06:20", "06:40", "07:00", "07:20", "07:40", "08:00", "08:20"];
-        let rows: Vec<String> = local.iter().map(|t| format!("214,2026-11-01 {t},42.031,-93.622")).collect();
-        for rows in [rows.clone(), rows.into_iter().rev().collect::<Vec<_>>()] {
-            let text = format!("tag,time,lat,lon\n{}\n", rows.join("\n"));
-            let p = parse("gps.csv", text.as_bytes(), None, "America/Chicago".parse().unwrap()).unwrap();
-            let mut got: Vec<String> = p.points.iter().map(|x| DateTime::<Utc>::from_timestamp_millis(x.t).unwrap().format("%H:%M").to_string()).collect();
-            got.sort();
-            assert_eq!(got, want, "newest first or last, nine distinct times");
+        // Through 2026-11-01 in Chicago the 01:00-01:59 stretch comes twice,
+        // first CDT (UTC-5), then CST (UTC-6). Every 20 minutes, every 30 and
+        // every hour (01:00 written twice), newest last or first: each fix
+        // keeps its own instant.
+        let cases: [(&[&str], &[&str]); 3] = [
+            (
+                &["00:40", "01:00", "01:20", "01:40", "01:00", "01:20", "01:40", "02:00", "02:20"],
+                &["05:40", "06:00", "06:20", "06:40", "07:00", "07:20", "07:40", "08:00", "08:20"],
+            ),
+            (&["00:30", "01:00", "01:30", "01:00", "01:30", "02:00"], &["05:30", "06:00", "06:30", "07:00", "07:30", "08:00"]),
+            (&["00:00", "01:00", "01:00", "02:00", "03:00"], &["05:00", "06:00", "07:00", "08:00", "09:00"]),
+        ];
+        for (local, want) in cases {
+            let rows: Vec<String> = local.iter().map(|t| format!("214,2026-11-01 {t},42.031,-93.622")).collect();
+            for rows in [rows.clone(), rows.into_iter().rev().collect::<Vec<_>>()] {
+                let text = format!("tag,time,lat,lon\n{}\n", rows.join("\n"));
+                let p = parse("gps.csv", text.as_bytes(), None, "America/Chicago".parse().unwrap()).unwrap();
+                let mut got: Vec<String> = p.points.iter().map(|x| DateTime::<Utc>::from_timestamp_millis(x.t).unwrap().format("%H:%M").to_string()).collect();
+                got.sort();
+                assert_eq!(got, want, "{rows:?}");
+            }
         }
     }
 

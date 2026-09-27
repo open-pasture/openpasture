@@ -933,10 +933,14 @@ Position history: CSV columns are guessed from the headers (tag, time, lat, lon,
 be changed with `mapping`; GPX tracks are labelled by their names (the animal's tag); GeoJSON Points
 take time and tag from properties. Times with an offset (RFC 3339, `…-05:00`, `Z`, ` UTC`) or unix
 seconds/milliseconds are exact; times without one are read in `zone` (default the farm's time zone),
-and `needs_zone` says so; in the hour the clocks go back through, each point is the one nearest the
-same animal's point before it, so both hours stay. Slash dates are read one way per file: day first
-when its dates show it (`13/06/2026`), month first when they show that, else by `zone` (month first
-in a US zone); a row the other way is an error row. A point at `0,0` or out of range is an error row. Each animal keeps one
+and `needs_zone` says so; in the hour the clocks go back through, each point is read from the same
+animal's point before it (the same local time again is the hour's second pass, else the nearer of
+the two instants, and on a tie the one the track is heading to), so both hours stay at any fix
+rate. Slash dates are read one way per file: day first when its dates show it (`13/06/2026`), month
+first when they show that, else by `zone` (month first in a US zone); a row the other way is an
+error row. Years are 2000 to 2099 (`06/14/26` is 2026). A CSV header wider than 256 columns is 400
+`The CSV has more than 256 columns.`; preview rows are as wide as the header. A point at `0,0` or out
+of range is an error row. Each animal keeps one
 point per instant (`duplicates` counts the rest; a file with nothing new is 409). Commit stores the points in `imported_fixes` and
 each animal's daily dwell per paddock in `imported_paddock_days` (today's paddocks, the rollup's
 30-minute gap rule), so pasture history's rest days and last grazed include it; the rollup never
