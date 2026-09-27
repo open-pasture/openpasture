@@ -7,6 +7,7 @@ import { useCan } from "../store/me";
 import { C, createMap, fc, fitPolys, onLoad, setData } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
 import { Animals } from "../map/animals";
+import { positionsAt } from "./replay";
 import { Button, Icon, Menu, Segmented } from "../ui";
 import { useUnits, type Fmt } from "../units";
 
@@ -150,6 +151,8 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
   const [layer, setLayer] = useState<"tracks" | "heat">("tracks");
   const [pos, setPos] = useState(1000);
   const [playing, setPlaying] = useState(false);
+  // Dragging the scrubber jumps the animals; playing eases them.
+  const scrubbing = useRef(false);
 
   useEffect(() => {
     const m = createMap(el.current!, { center: state.farm!.center, zoom: 16, dim: 0.6 });
@@ -213,17 +216,19 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
   const [t0, t1] = span;
   const at = t0 + ((t1 - t0) * pos) / 1000;
 
+  // Who is in the replay: once per set of tracks. Where they are: at each step.
   useEffect(() => {
-    if (!animals.current) return;
-    const s = at / 1000;
-    animals.current.set(tracks.flatMap((t) => {
-      const p = t.points.find((q) => q[2] >= s) ?? t.points[t.points.length - 1];
-      return p ? [{ id: t.collar_id, point: [p[0], p[1]] as [number, number], state: "inside" as const }] : [];
-    }));
-  }, [at, tracks, map]);
+    animals.current?.set(positionsAt(tracks, at / 1000));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tracks, map]);
+  useEffect(() => {
+    animals.current?.moveMany(positionsAt(tracks, at / 1000), scrubbing.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [at]);
 
   useEffect(() => {
     if (!playing) return;
+    scrubbing.current = false;
     const t = setInterval(() => setPos((p) => (p >= 1000 ? (setPlaying(false), 1000) : p + 4)), 40);
     return () => clearInterval(t);
   }, [playing]);
@@ -237,7 +242,7 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
         <button type="button" className="play" aria-label={playing ? "Pause" : "Play"} onClick={() => { if (pos >= 1000) setPos(0); setPlaying(!playing); }}>
           {playing ? <span className="pause" /> : <Icon name="chev" size={7} />}
         </button>
-        <input type="range" min={0} max={1000} value={pos} onChange={(e) => { setPlaying(false); setPos(Number(e.target.value)); }} aria-label="Time" />
+        <input type="range" min={0} max={1000} value={pos} onChange={(e) => { scrubbing.current = true; setPlaying(false); setPos(Number(e.target.value)); }} aria-label="Time" />
         <span className="mono dim">{when.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })}</span>
       </div>
     </div>

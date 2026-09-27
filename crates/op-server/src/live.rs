@@ -1,48 +1,81 @@
-//! `/api/live`: every [`op_core::Event`] the socket's identity may see
-//! ([`op_core::Event::min_role`]), as a JSON text message.
+//! `/api/live`: what the socket's identity may see ([`op_core::Event::min_role`]),
+//! as JSON text messages. Fixes, acks, cues and telemetry-only collar changes
+//! arrive coalesced per herd every 500 ms (`positions`, `ack_batch`,
+//! `cue_batch`, see [`crate::coalesce`]); every other event as it happens.
 
+use std::time::Duration;
+
+use axum::Extension;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
+use futures::SinkExt;
+use op_core::people::SessionToken;
 use op_core::{Ctx, Identity};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 
-pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity) -> Response {
-    ws.on_upgrade(move |socket| stream(socket, ctx, identity))
+use crate::coalesce::{self, Out};
+
+const RESYNC: &str = r#"{"type":"resync"}"#;
+/// How often a socket opened with a person's token checks it still holds.
+pub const SESSION_CHECK: Duration = Duration::from_secs(5);
+
+pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity, token: Option<Extension<SessionToken>>) -> Response {
+    // Subscribed before the upgrade answers, so a client that just connected
+    // misses nothing published after that.
+    let rx = coalesce::hub(&ctx).subscribe();
+    let token = token.map(|Extension(SessionToken(id))| id);
+    ws.on_upgrade(move |socket| stream(socket, ctx, identity, token, rx))
 }
 
-async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity) {
-    let mut rx = ctx.subscribe();
+/// Sockets listening on this context's live feed.
+pub fn subscribers(ctx: &Ctx) -> usize {
+    coalesce::hub(ctx).subscribers()
+}
+
+async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity, token: Option<String>, mut rx: broadcast::Receiver<Out>) {
     let shutdown = ctx.on_shutdown();
     tokio::pin!(shutdown);
+    let mut check = tokio::time::interval_at(tokio::time::Instant::now() + SESSION_CHECK, SESSION_CHECK);
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 let _ = socket.send(Message::Close(None)).await;
                 break;
             }
-            ev = rx.recv() => match ev {
-                Ok(ev) => {
-                    if !identity.can(ev.min_role()) {
+            // A revoked token, a disabled person or a changed role closes the socket.
+            _ = check.tick(), if token.is_some() => {
+                let id = token.as_deref().unwrap_or_default();
+                if !op_core::live::session_holds(ctx.store(), id, identity.role).await.unwrap_or(true) {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            out = rx.recv() => match out {
+                Ok(out) => {
+                    if !identity.can(out.role) {
                         continue;
                     }
-                    let Ok(text) = serde_json::to_string(&ev) else { continue };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    if socket.send(Message::Text(out.text)).await.is_err() {
                         break;
                     }
                 }
                 Err(RecvError::Lagged(n)) => {
-                    // The client missed events: tell it to refetch.
-                    tracing::warn!("live client lagged, dropped {n} events; sending resync");
-                    let Ok(text) = serde_json::to_string(&op_core::Event::Resync) else { continue };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    // The client missed messages: tell it to refetch.
+                    tracing::warn!("live client lagged, dropped {n} messages; sending resync");
+                    if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         break;
                     }
                 }
                 Err(RecvError::Closed) => break,
             },
             msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Close(_))) => {
+                    // The close reply is queued; write it out so the client sees a clean close.
+                    let _ = socket.flush().await;
+                    break;
+                }
+                Some(Err(_)) | None => break,
                 _ => {}
             },
         }

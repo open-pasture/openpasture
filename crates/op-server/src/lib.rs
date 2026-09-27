@@ -20,6 +20,7 @@ mod policy;
 // @B
 // @G
 // @P
+pub mod coalesce;
 // @Q
 // @C
 // @F

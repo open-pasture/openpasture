@@ -97,6 +97,22 @@ pub enum Event {
     // @B
     // @G
     // @P
+    /// Per herd, every 500 ms: the collars whose position or telemetry changed.
+    /// Built by op-server for `/api/live` only, never published on the bus.
+    Positions {
+        herd_id: String,
+        items: Vec<crate::live::PositionItem>,
+    },
+    /// Per herd, every 500 ms: each collar's latest boundary ack. `/api/live` only.
+    AckBatch {
+        herd_id: String,
+        items: Vec<crate::live::AckItem>,
+    },
+    /// Per herd, every 500 ms: every cue in the window. `/api/live` only.
+    CueBatch {
+        herd_id: String,
+        items: Vec<crate::live::CueItem>,
+    },
     // @Q
     // @C
     // @F

@@ -134,13 +134,12 @@ async fn the_first_run_backfills_day_files_once() {
         app.health(&r).await;
     }
     app.steady("col_1", d + 8 * HOUR, d + 8 * HOUR + 10 * MIN, 5 * SEC, cell(0, 0), 2.5).await;
-    // The rollup moves the old days' fixes to day files; health of the older
-    // day goes to its file too, as a rollup of `health` does.
+    // The rollup moves the old days' fixes and health to day files.
     let rolled = op_analytics::rollup::rollup(&app.ctx, 3, time::now()).await.unwrap();
     assert_eq!(rolled.iter().filter(|r| r.table == "fixes").count(), 2, "{rolled:?}");
-    app.roll_health_day(older).await;
+    assert_eq!(rolled.iter().filter(|r| r.table == "health").count(), 2, "{rolled:?}");
     assert_eq!(app.count(&format!("SELECT COUNT(*) FROM fixes WHERE t < {d}")).await, 0);
-    assert_eq!(app.count(&format!("SELECT COUNT(*) FROM health WHERE t < {old}")).await, 0);
+    assert_eq!(app.count(&format!("SELECT COUNT(*) FROM health WHERE t < {d}")).await, 0);
 
     let done = run(&app).await;
     assert_eq!(done.coverage, vec![date(older), date(old), date(d)]);
@@ -148,11 +147,11 @@ async fn the_first_run_backfills_day_files_once() {
     let want = json!({ "herd_1 2 2": [1080, [0, 720, 0, 360, 0, 0, 0, 0], 1080, 1080] });
     assert_eq!(cells(&app, older).await, want);
     assert_eq!(cells(&app, old).await, want);
-    let from_file = battery(&app, "col_1", older).await.unwrap();
-    let from_sqlite = battery(&app, "col_1", old).await.unwrap();
-    assert_eq!((from_file.4, from_file.3), (24, 0.6 - 0.001 * 23.0));
-    assert_eq!((from_sqlite.4, from_sqlite.3), (24, 0.6 - 0.001 * 23.0));
-    assert_eq!(from_file.5 - older, from_sqlite.5 - old);
+    let older_day = battery(&app, "col_1", older).await.unwrap();
+    let old_day = battery(&app, "col_1", old).await.unwrap();
+    assert_eq!((older_day.4, older_day.3), (24, 0.6 - 0.001 * 23.0));
+    assert_eq!((old_day.4, old_day.3), (24, 0.6 - 0.001 * 23.0));
+    assert_eq!(older_day.5 - older, old_day.5 - old);
 
     // Once only.
     assert_eq!(run(&app).await, Aggregated::default());

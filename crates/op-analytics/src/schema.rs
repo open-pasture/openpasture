@@ -18,11 +18,12 @@ use serde_json::{Number, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
-/// Tables with a `t` column that roll over to Parquet.
-pub const TELEMETRY_TABLES: [&str; 2] = ["fixes", "cues"];
+/// Tables with a `t` column that roll over to Parquet. `health` is one row
+/// per report (battery, receiver, cell).
+pub const TELEMETRY_TABLES: [&str; 3] = ["fixes", "cues", "health"];
 
 /// Tables the SQL console and export can read.
-pub const SQL_TABLES: [&str; 9] = ["fixes", "cues", "acks", "boundaries", "decisions", "collars", "animals", "paddocks", "herds"];
+pub const SQL_TABLES: [&str; 10] = ["fixes", "cues", "health", "acks", "boundaries", "decisions", "collars", "animals", "paddocks", "herds"];
 
 /// Columns never exposed.
 const HIDDEN: &[(&str, &str)] = &[("collars", "key_hash")];
@@ -140,7 +141,7 @@ impl BatchBuilder {
             match c {
                 ColBuilder::Int(b) => b.append_option(row.try_get_unchecked::<Option<i64>, _>(i).ok().flatten()),
                 ColBuilder::Real(b) => b.append_option(row.try_get_unchecked::<Option<f64>, _>(i).ok().flatten()),
-                ColBuilder::Text(b) => b.append_option(row.try_get_unchecked::<Option<String>, _>(i).ok().flatten()),
+                ColBuilder::Text(b) => b.append_option(row.try_get_unchecked::<Option<&str>, _>(i).ok().flatten()),
             }
         }
         self.len += 1;

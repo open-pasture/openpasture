@@ -21,6 +21,17 @@ pub const DB_FILE: &str = "openpasture.db";
 /// Every migration in `crates/op-core/migrations`, embedded at build time.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Environment variable for the number of SQLite connections (default [`DEFAULT_POOL`]).
+pub const POOL_ENV: &str = "OPENPASTURE_DB_POOL";
+pub const DEFAULT_POOL: u32 = 16;
+
+/// Connections in the pool: `OPENPASTURE_DB_POOL` when it is a whole number
+/// from 1 to 256, else [`DEFAULT_POOL`]. WAL lets readers run beside the one
+/// writer, so 250 collars reporting and a page of analytics don't queue.
+pub fn pool_size(env: Option<&str>) -> u32 {
+    env.and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (1..=256).contains(n)).unwrap_or(DEFAULT_POOL)
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -39,7 +50,11 @@ impl Store {
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(10));
-        let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await.with_context(|| format!("opening {}", path.display()))?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(pool_size(std::env::var(POOL_ENV).ok().as_deref()))
+            .connect_with(opts)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
         MIGRATOR.run(&pool).await.context("running migrations")?;
         Ok(Self { pool })
     }

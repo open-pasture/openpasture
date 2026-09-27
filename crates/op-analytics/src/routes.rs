@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::metrics::{Cadence, Dwell, Grid, PaddockIndex, Walk, au_per_head, percentile, round, slope};
-use crate::range::{TimeRange, bucket_ms};
+use crate::metrics::{Cadence, Dwell, DwellAgg, DwellKey, Grid, MAX_DWELL_GAP_MS, PaddockIndex, Walk, au_per_head, percentile, round, slope};
+use crate::range::{self, TimeRange, bucket_ms};
 use crate::schema::table_schema;
 use crate::sql;
 use crate::telemetry::{Scope, Source, each_cue, each_fix, for_each, scan};
@@ -109,18 +109,62 @@ pub async fn collars(ctx: &Ctx, herd_id: Option<&str>, collar_id: Option<&str>) 
 
 // ---------------------------------------------------------------- tracks
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct Track {
     pub collar_id: String,
     pub points: Vec<[f64; 3]>,
 }
 
+/// One collar's track as it is built: the first fix in each time bucket and
+/// the latest fix, from however many sources in whatever order.
 #[derive(Default)]
 struct TrackAcc {
-    points: Vec<[f64; 3]>,
-    bucket: Option<i64>,
-    last: Option<(i64, [f64; 3])>,
-    last_emitted: i64,
+    first: BTreeMap<i64, (i64, f64, f64)>,
+    last: Option<(i64, f64, f64)>,
+    /// The bucket of the previous push and its first time, so sorted input
+    /// touches the map once per bucket.
+    run: Option<(i64, i64)>,
+}
+
+impl TrackAcc {
+    fn push(&mut self, bucket: i64, t: i64, lon: f64, lat: f64) {
+        if self.last.is_none_or(|(lt, _, _)| t > lt) {
+            self.last = Some((t, lon, lat));
+        }
+        if let Some((b, bt)) = self.run {
+            if b == bucket && t >= bt {
+                return;
+            }
+        }
+        let e = self.first.entry(bucket).or_insert((t, lon, lat));
+        if t < e.0 {
+            *e = (t, lon, lat);
+        }
+        self.run = Some((bucket, e.0));
+    }
+
+    fn merge(&mut self, other: TrackAcc) {
+        for (b, (t, lon, lat)) in other.first {
+            self.run = None;
+            self.push(b, t, lon, lat);
+        }
+        if let Some((t, lon, lat)) = other.last {
+            if self.last.is_none_or(|(lt, _, _)| t > lt) {
+                self.last = Some((t, lon, lat));
+            }
+        }
+    }
+
+    fn into_track(self, collar_id: String) -> Track {
+        let pt = |(t, lon, lat): (i64, f64, f64)| [round(lon, 7), round(lat, 7), unix_s(t)];
+        let mut points: Vec<[f64; 3]> = self.first.into_values().map(pt).collect();
+        if let Some(last) = self.last {
+            if points.last().is_none_or(|p| p[2] != unix_s(last.0)) {
+                points.push(pt(last));
+            }
+        }
+        Track { collar_id, points }
+    }
 }
 
 pub async fn tracks(State(ctx): State<Ctx>, Query(p): Query<Params>) -> ApiResult<Json<Vec<Track>>> {
@@ -130,43 +174,163 @@ pub async fn tracks(State(ctx): State<Ctx>, Query(p): Query<Params>) -> ApiResul
 }
 
 /// Tracks downsampled by time: the first fix in each of `max_points` equal
-/// time buckets, plus each collar's latest fix.
+/// time buckets, plus each collar's latest fix. Hot days seek each bucket's
+/// first fix by index; Parquet days read only the five columns a track needs.
 pub async fn track_points(ctx: &Ctx, range: TimeRange, collar: Option<&str>, herd: Option<&str>, max_points: usize) -> anyhow::Result<Vec<Track>> {
-    let scope = Scope { collar_ids: collar.map(|c| vec![c.to_owned()]), herd_id: herd.map(str::to_owned) };
     let width = (range.span_ms() / max_points as i64).max(1);
-    let from = range.from_ms();
     let mut accs: BTreeMap<String, TrackAcc> = BTreeMap::new();
-    for_each(scan(ctx, "fixes", range, scope, Source::All), |b| {
-        each_fix(b, |f| {
-            if !accs.contains_key(f.collar_id) {
-                accs.insert(f.collar_id.to_owned(), TrackAcc::default());
-            }
-            let a = accs.get_mut(f.collar_id).expect("inserted");
-            if a.last.is_some_and(|(t, _)| f.t <= t) {
-                return;
-            }
-            let pt = [round(f.lon, 7), round(f.lat, 7), unix_s(f.t)];
-            let bucket = (f.t - from) / width;
-            if a.bucket != Some(bucket) {
-                a.points.push(pt);
-                a.bucket = Some(bucket);
-                a.last_emitted = f.t;
-            }
-            a.last = Some((f.t, pt));
-        })
-    })
-    .await?;
-    Ok(accs
-        .into_iter()
-        .map(|(collar_id, mut a)| {
-            if let Some((t, pt)) = a.last {
-                if t != a.last_emitted {
-                    a.points.push(pt);
+    let (first, last) = (range::date_of(range.from_ms()), range::date_of(range.to_ms() - 1));
+    for (date, path) in crate::telemetry::list_days(ctx.data_dir(), "fixes") {
+        if date < first || date > last {
+            continue;
+        }
+        let (c, h) = (collar.map(str::to_owned), herd.map(str::to_owned));
+        let day = tokio::task::spawn_blocking(move || cold_track_day(&path, range, width, c.as_deref(), h.as_deref())).await??;
+        for (id, acc) in day {
+            accs.entry(id).or_default().merge(acc);
+        }
+    }
+    hot_tracks(ctx, range, collar, herd, width, &mut accs).await?;
+    Ok(accs.into_iter().filter(|(_, a)| a.last.is_some()).map(|(id, a)| a.into_track(id)).collect())
+}
+
+/// One Parquet day: row groups outside the range (or not holding the collar)
+/// are skipped by their statistics, and only the track columns are decoded.
+fn cold_track_day(path: &std::path::Path, range: TimeRange, width: i64, collar: Option<&str>, herd: Option<&str>) -> anyhow::Result<HashMap<String, TrackAcc>> {
+    use datafusion::arrow::array::Array;
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::statistics::Statistics;
+
+    let (from, to) = (range.from_ms(), range.to_ms());
+    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+    let descr = builder.parquet_schema();
+    let col = |name: &str| descr.columns().iter().position(|c| c.name() == name);
+    let (t_idx, collar_idx) = (col("t"), col("collar_id"));
+    let groups: Vec<usize> = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, rg)| {
+            let t_ok = match t_idx.and_then(|i| rg.column(i).statistics()) {
+                Some(Statistics::Int64(s)) => s.min_opt().is_none_or(|lo| *lo < to) && s.max_opt().is_none_or(|hi| *hi >= from),
+                _ => true,
+            };
+            let collar_ok = match (collar, collar_idx.and_then(|i| rg.column(i).statistics())) {
+                (Some(c), Some(Statistics::ByteArray(s))) => {
+                    s.min_opt().is_none_or(|lo| lo.data() <= c.as_bytes()) && s.max_opt().is_none_or(|hi| hi.data() >= c.as_bytes())
                 }
-            }
-            Track { collar_id, points: a.points }
+                _ => true,
+            };
+            t_ok && collar_ok
         })
-        .collect())
+        .map(|(i, _)| i)
+        .collect();
+    let mask = ProjectionMask::columns(descr, ["collar_id", "herd_id", "t", "lon", "lat"]);
+    let reader = builder.with_projection(mask).with_row_groups(groups).with_batch_size(crate::telemetry::BATCH_ROWS).build()?;
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut accs: Vec<(String, TrackAcc)> = Vec::new();
+    for b in reader {
+        let b = b?;
+        let c = crate::schema::Cols::new(&b);
+        let (Some(ids), Some(ts), Some(lons), Some(lats)) = (c.str("collar_id"), c.i64("t"), c.f64("lon"), c.f64("lat")) else { continue };
+        let herds = c.str("herd_id");
+        let mut cur: Option<usize> = None;
+        for i in 0..b.num_rows() {
+            if ids.is_null(i) || ts.is_null(i) || lons.is_null(i) || lats.is_null(i) {
+                continue;
+            }
+            let t = ts.value(i);
+            if t < from || t >= to {
+                continue;
+            }
+            let id = ids.value(i);
+            if collar.is_some_and(|c| c != id) || herd.is_some_and(|h| herds.is_none_or(|a| a.is_null(i) || a.value(i) != h)) {
+                continue;
+            }
+            let slot = match cur.filter(|s| accs[*s].0 == id) {
+                Some(s) => s,
+                None => {
+                    let s = *index.entry(id.to_owned()).or_insert_with(|| {
+                        accs.push((id.to_owned(), TrackAcc::default()));
+                        accs.len() - 1
+                    });
+                    cur = Some(s);
+                    s
+                }
+            };
+            accs[slot].1.push((t - from) / width, t, lons.value(i), lats.value(i));
+        }
+    }
+    Ok(accs.into_iter().collect())
+}
+
+/// The next collar after `?2` with fixes in herd `?1` (by `fixes_herd_collar_t`).
+pub const HERD_NEXT_COLLAR_SQL: &str = "SELECT collar_id FROM fixes WHERE herd_id = ? AND collar_id > ? ORDER BY collar_id LIMIT 1";
+
+/// A collar's first fix, last fix and first fix per bucket in `[?3, ?4)`
+/// (`?1` collar, `?2` herd or NULL, buckets `?5..=?6` of `?7` ms from `?3`).
+/// Each is an index seek: `fixes_herd_collar_t` for a herd, else `fixes_collar_t`.
+pub fn hot_track_sql(herd: bool) -> [String; 3] {
+    let herd_filter = if herd { "herd_id = ?2 AND" } else { "?2 IS NULL AND" };
+    let edge =
+        |dir: &str| format!("SELECT t, lon, lat FROM fixes WHERE {herd_filter} collar_id = ?1 AND t >= ?3 AND t < ?4 ORDER BY t {dir}, id {dir} LIMIT 1");
+    [
+        edge("ASC"),
+        edge("DESC"),
+        format!(
+            "WITH RECURSIVE b(k) AS (SELECT ?5 UNION ALL SELECT k + 1 FROM b WHERE k < ?6)
+             SELECT f.t, f.lon, f.lat FROM b JOIN fixes f ON f.id = (
+                 SELECT id FROM fixes WHERE {herd_filter} collar_id = ?1 AND t >= max(?3, ?3 + k * ?7) AND t < min(?4, ?3 + (k + 1) * ?7)
+                 ORDER BY t, id LIMIT 1)"
+        ),
+    ]
+}
+
+/// Hot fixes: each collar's first fix per bucket by one index seek per
+/// bucket (never a scan of the day), and its latest.
+async fn hot_tracks(
+    ctx: &Ctx,
+    range: TimeRange,
+    collar: Option<&str>,
+    herd: Option<&str>,
+    width: i64,
+    accs: &mut BTreeMap<String, TrackAcc>,
+) -> anyhow::Result<()> {
+    let (from, to) = (range.from_ms(), range.to_ms());
+    let [first_sql, last_sql, buckets_sql] = hot_track_sql(herd.is_some());
+    let mut after = String::new();
+    loop {
+        let next = match (collar, herd) {
+            (Some(c), _) => (after.is_empty()).then(|| c.to_owned()),
+            (None, Some(h)) => sqlx::query_scalar(HERD_NEXT_COLLAR_SQL).bind(h).bind(&after).fetch_optional(ctx.db()).await?,
+            (None, None) => crate::rollup::next_collar(ctx, "fixes", &after).await?,
+        };
+        let Some(id) = next else { break };
+        let edge_row = |sql: String| {
+            let id = id.clone();
+            async move { sqlx::query_as::<_, (i64, f64, f64)>(&sql).bind(id).bind(herd).bind(from).bind(to).fetch_optional(ctx.db()).await }
+        };
+        if let (Some(first), Some(last)) = (edge_row(first_sql.clone()).await?, edge_row(last_sql.clone()).await?) {
+            let acc = accs.entry(id.clone()).or_default();
+            let rows: Vec<(i64, f64, f64)> = sqlx::query_as(&buckets_sql)
+                .bind(&id)
+                .bind(herd)
+                .bind(from)
+                .bind(to)
+                .bind((first.0 - from) / width)
+                .bind((last.0 - from) / width)
+                .bind(width)
+                .fetch_all(ctx.db())
+                .await?;
+            for (t, lon, lat) in rows.into_iter().chain([first, last]) {
+                acc.push((t - from) / width, t, lon, lat);
+            }
+        }
+        after = id;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- health
@@ -317,7 +481,7 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
     })
     .await?;
 
-    let battery = battery_readings(ctx, &ids, from, to).await?;
+    let battery = battery_series(ctx, &ids, first, bucket, n_buckets, from, to).await?;
     let acks = latest_acks(ctx, &ids).await?;
     let now = op_core::time::now().timestamp_millis();
 
@@ -325,8 +489,8 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
     for c in list {
         let Some((buckets, mut total, cadence)) = per.remove(&c.id) else { continue };
         let cadence_s = c.cadence_s.or_else(|| cadence.median_s());
-        let readings = battery.get(&c.id).map(Vec::as_slice).unwrap_or(&[]);
-        let point = |a: &mut HealthAcc, start: i64, end: i64| -> HealthPoint {
+        let series = battery.get(&c.id).cloned().unwrap_or_else(|| Battery::new(n_buckets));
+        let point = |a: &mut HealthAcc, start: i64, end: i64, battery: Option<f64>| -> HealthPoint {
             let lo = start.max(from).max(c.created_ms.unwrap_or(i64::MIN));
             let hi = end.min(to).min(now);
             let fix_rate = match cadence_s {
@@ -342,15 +506,20 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
                 sats: mean(a.sats).map(|v| round(v, 1)),
                 cn0: mean(a.cn0).map(|v| round(v, 1)),
                 ttf_s: mean(a.ttf).map(|v| round(v, 1)),
-                battery: battery_at(readings, start, end),
+                battery,
                 cues: a.cues,
             }
         };
-        let points: Vec<HealthPoint> =
-            buckets.into_iter().enumerate().map(|(i, mut a)| point(&mut a, first + i as i64 * bucket, first + (i as i64 + 1) * bucket)).collect();
-        let mut summary = point(&mut total, from, to);
+        let points: Vec<HealthPoint> = buckets
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut a)| {
+                let start = first + i as i64 * bucket;
+                point(&mut a, start, start + bucket, series.at(i, start))
+            })
+            .collect();
+        let mut summary = point(&mut total, from, to, series.summary(from).or(c.battery));
         summary.t = rfc3339(from);
-        summary.battery = battery_at(readings, from, to).or(c.battery);
         out.push(CollarHealth {
             ack: acks.get(&c.id).cloned(),
             collar_id: c.id,
@@ -366,40 +535,153 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
     Ok(out)
 }
 
-/// Mean of the readings (0-1) in `[start, end)`, else the last earlier reading if
-/// it is recent enough.
-fn battery_at(readings: &[(i64, f64)], start: i64, end: i64) -> Option<f64> {
-    let inside: Vec<f64> = readings.iter().filter(|(t, _)| *t >= start && *t < end).map(|(_, b)| *b).collect();
-    if !inside.is_empty() {
-        return Some(round(inside.iter().sum::<f64>() / inside.len() as f64, 3));
-    }
-    readings.iter().rev().find(|(t, _)| *t < start).filter(|(t, _)| start - t <= BATTERY_CARRY_MS).map(|(_, b)| round(*b, 3))
+/// Battery (0-1) of one collar over the health buckets: per bucket the sum,
+/// count and last reading, plus the last reading before the range.
+#[derive(Debug, Clone, Default)]
+struct Battery {
+    buckets: Vec<Option<BatteryBucket>>,
+    before: Option<(i64, f64)>,
 }
 
-/// Battery readings per collar in `[from, to)`, plus the last one before `from`.
-async fn battery_readings(ctx: &Ctx, ids: &[String], from: i64, to: i64) -> anyhow::Result<HashMap<String, Vec<(i64, f64)>>> {
-    let mut out: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+#[derive(Debug, Clone, Copy)]
+struct BatteryBucket {
+    sum: f64,
+    n: i64,
+    last: (i64, f64),
+}
+
+impl Battery {
+    fn new(n_buckets: usize) -> Self {
+        Self { buckets: vec![None; n_buckets], before: None }
+    }
+
+    fn add(&mut self, i: usize, sum: f64, n: i64, last: (i64, f64)) {
+        let Some(slot) = self.buckets.get_mut(i) else { return };
+        match slot {
+            Some(b) => {
+                b.sum += sum;
+                b.n += n;
+                if last.0 >= b.last.0 {
+                    b.last = last;
+                }
+            }
+            None => *slot = Some(BatteryBucket { sum, n, last }),
+        }
+    }
+
+    /// The last reading before bucket `i`.
+    fn carried(&self, i: usize) -> Option<(i64, f64)> {
+        self.buckets[..i].iter().rev().find_map(|b| b.map(|b| b.last)).or(self.before)
+    }
+
+    /// Mean of bucket `i`'s readings, else the last earlier reading if it is
+    /// recent enough.
+    fn at(&self, i: usize, start: i64) -> Option<f64> {
+        match self.buckets.get(i).copied().flatten() {
+            Some(b) => Some(round(b.sum / b.n as f64, 3)),
+            None => self.carried(i.min(self.buckets.len())).filter(|(t, _)| start - t <= BATTERY_CARRY_MS).map(|(_, v)| round(v, 3)),
+        }
+    }
+
+    /// Mean over the whole range, else the reading carried into it.
+    fn summary(&self, from: i64) -> Option<f64> {
+        let (sum, n) = self.buckets.iter().flatten().fold((0.0, 0), |(s, n), b| (s + b.sum, n + b.n));
+        if n > 0 {
+            return Some(round(sum / n as f64, 3));
+        }
+        self.before.filter(|(t, _)| from - t <= BATTERY_CARRY_MS).map(|(_, v)| round(v, 3))
+    }
+}
+
+/// Battery per collar over `[from, to)` in buckets of `bucket` ms starting at
+/// `first`: SQLite groups its rows itself, Parquet days are read three
+/// columns at a time, and the reading before `from` (up to
+/// [`BATTERY_CARRY_MS`] earlier) is one index seek per collar.
+async fn battery_series(ctx: &Ctx, ids: &[String], first: i64, bucket: i64, n_buckets: usize, from: i64, to: i64) -> anyhow::Result<HashMap<String, Battery>> {
+    let mut out: HashMap<String, Battery> = ids.iter().map(|id| (id.clone(), Battery::new(n_buckets))).collect();
     if ids.is_empty() {
         return Ok(out);
     }
-    let marks = vec!["?"; ids.len()].join(",");
-    // op-ingest's `health` table: one row per position report.
-    let before =
-        format!("SELECT collar_id, MAX(t) AS t, battery FROM health WHERE battery IS NOT NULL AND t < ? AND collar_id IN ({marks}) GROUP BY collar_id");
-    let within =
-        format!("SELECT collar_id, t, battery FROM health WHERE battery IS NOT NULL AND t >= ? AND t < ? AND collar_id IN ({marks}) ORDER BY collar_id, t");
-    let mut q = sqlx::query(&before).bind(from);
+    let idx = |t: i64| (((t - first) / bucket).max(0) as usize).min(n_buckets - 1);
+    let range = TimeRange::new(op_core::time::from_unix_ms(from - BATTERY_CARRY_MS), op_core::time::from_unix_ms(to));
+    // Parquet days: the readings in range and the latest before it.
+    let (d0, d1) = (range::date_of(range.from_ms()), range::date_of(to - 1));
+    for (date, path) in crate::telemetry::list_days(ctx.data_dir(), "health") {
+        if date < d0 || date > d1 {
+            continue;
+        }
+        let wanted: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let rows = tokio::task::spawn_blocking(move || cold_battery_day(&path, &wanted, from - BATTERY_CARRY_MS, to)).await??;
+        for (id, t, v) in rows {
+            let Some(b) = out.get_mut(&id) else { continue };
+            if t < from {
+                if b.before.is_none_or(|(bt, _)| t > bt) {
+                    b.before = Some((t, v));
+                }
+            } else {
+                b.add(idx(t), v, 1, (t, v));
+            }
+        }
+    }
+    let grouped = battery_sql(ids.len());
+    let mut q = sqlx::query(&grouped).bind(first).bind(bucket).bind(from).bind(to);
     for id in ids {
         q = q.bind(id);
     }
-    let mut rows = q.fetch_all(ctx.db()).await?;
-    let mut q = sqlx::query(&within).bind(from).bind(to);
-    for id in ids {
-        q = q.bind(id);
+    for r in q.fetch_all(ctx.db()).await? {
+        let id: String = r.try_get("collar_id")?;
+        let Some(b) = out.get_mut(&id) else { continue };
+        let i = (r.try_get::<i64, _>("b")?.max(0) as usize).min(n_buckets - 1);
+        b.add(i, r.try_get("s")?, r.try_get("n")?, (r.try_get("last_t")?, r.try_get("battery")?));
     }
-    rows.extend(q.fetch_all(ctx.db()).await?);
-    for r in rows {
-        out.entry(r.try_get("collar_id")?).or_default().push((r.try_get("t")?, r.try_get("battery")?));
+    for id in ids {
+        let row: Option<(i64, f64)> = sqlx::query_as(BATTERY_BEFORE_SQL).bind(id).bind(from).bind(from - BATTERY_CARRY_MS).fetch_optional(ctx.db()).await?;
+        if let (Some((t, v)), Some(b)) = (row, out.get_mut(id)) {
+            if b.before.is_none_or(|(bt, _)| t > bt) {
+                b.before = Some((t, v));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Battery readings of `n` collars grouped per bucket: `?1` first bucket
+/// start, `?2` bucket ms, `[?3, ?4)`, then the collar ids. op-ingest's
+/// `health` table is one row per report; the bare `battery` is the one at MAX(t).
+pub fn battery_sql(n: usize) -> String {
+    format!(
+        "SELECT collar_id, (t - ?) / ? AS b, SUM(battery) AS s, COUNT(*) AS n, MAX(t) AS last_t, battery FROM health
+         WHERE battery IS NOT NULL AND t >= ? AND t < ? AND collar_id IN ({}) GROUP BY collar_id, b",
+        vec!["?"; n].join(",")
+    )
+}
+
+/// A collar's last battery reading in `[?3, ?2)`.
+pub const BATTERY_BEFORE_SQL: &str = "SELECT t, battery FROM health WHERE collar_id = ? AND battery IS NOT NULL AND t < ? AND t >= ? ORDER BY t DESC LIMIT 1";
+
+/// `(collar, t, battery)` of one Parquet health day, only the wanted collars
+/// in `[from, to)`.
+fn cold_battery_day(path: &std::path::Path, wanted: &std::collections::HashSet<String>, from: i64, to: i64) -> anyhow::Result<Vec<(String, i64, f64)>> {
+    use datafusion::arrow::array::Array;
+    use parquet::arrow::ProjectionMask;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+    let mask = ProjectionMask::columns(builder.parquet_schema(), ["collar_id", "t", "battery"]);
+    let mut out = Vec::new();
+    for b in builder.with_projection(mask).with_batch_size(crate::telemetry::BATCH_ROWS).build()? {
+        let b = b?;
+        let c = crate::schema::Cols::new(&b);
+        let (Some(ids), Some(ts), Some(vs)) = (c.str("collar_id"), c.i64("t"), c.f64("battery")) else { continue };
+        for i in 0..b.num_rows() {
+            if ids.is_null(i) || ts.is_null(i) || vs.is_null(i) {
+                continue;
+            }
+            let t = ts.value(i);
+            if t >= from && t < to && wanted.contains(ids.value(i)) {
+                out.push((ids.value(i).to_owned(), t, vs.value(i)));
+            }
+        }
     }
     Ok(out)
 }
@@ -655,15 +937,23 @@ pub async fn pasture(State(ctx): State<Ctx>, Query(p): Query<Params>) -> ApiResu
 /// (`analytics_paddock_days` plus `imported_paddock_days`), the rest from SQLite.
 /// Pressure follows the agent kit: a herd's AU times its share of the day
 /// in the paddock, summed over days.
+///
+/// Everything is as of the end of the range (or now, if sooner): no day or
+/// fix after it counts, `last_grazed` is the last grazing day up to it (days
+/// before `from` included, from the daily summaries), and rest runs to it.
+/// A day the range's end falls inside counts whole once it is rolled.
 pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -> anyhow::Result<Vec<PaddockPasture>> {
+    let now = op_core::time::now();
+    let end = range.to.min(now).max(range.from + Duration::milliseconds(1));
+    let end_ms = end.timestamp_millis();
     // (day, herd, paddock) -> (dwell_ms, last_t)
     let mut days: HashMap<(i64, String, String), (f64, i64)> = HashMap::new();
-    let mut sql = "SELECT date, herd_id, paddock_id, SUM(dwell_s) AS dwell, MAX(last_t) AS last_t FROM paddock_days".to_owned();
+    let mut sql = "SELECT date, herd_id, paddock_id, SUM(dwell_s) AS dwell, MAX(last_t) AS last_t FROM paddock_days WHERE date <= ?".to_owned();
     if herd.is_some() {
-        sql.push_str(" WHERE herd_id = ?");
+        sql.push_str(" AND herd_id = ?");
     }
     sql.push_str(" GROUP BY date, herd_id, paddock_id");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(&sql).bind(range::date_of(end_ms - 1).format("%Y-%m-%d").to_string());
     if let Some(h) = herd {
         q = q.bind(h);
     }
@@ -676,20 +966,19 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
         e.1 = e.1.max(r.try_get("last_t")?);
     }
 
+    // Hot fixes after the last day the rollup summarised (a rolled day's rows
+    // may still be in SQLite while it deletes them), up to the end.
+    let rolled: Option<String> = sqlx::query_scalar("SELECT MAX(date) FROM analytics_paddock_days").fetch_one(ctx.db()).await?;
+    let hot_from =
+        rolled.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()).map(|d| crate::range::day_start_ms(d) + DAY_MS).unwrap_or(i64::MIN / 2).max(0);
     let paddock_list = ctx.store().list_paddocks().await?;
     let index = PaddockIndex::new(&paddock_list);
-    let now = op_core::time::now();
-    let hot_range = TimeRange::new(DateTime::<Utc>::UNIX_EPOCH, now + Duration::days(1));
-    let mut dwell = Dwell::default();
-    let scope = Scope { collar_ids: None, herd_id: herd.map(str::to_owned) };
-    for_each(scan(ctx, "fixes", hot_range, scope, Source::Hot), |b| {
-        each_fix(b, |f| dwell.push(f.collar_id, f.herd_id, index.resolve(f.paddock_id, [f.lon, f.lat]), f.t));
-    })
-    .await?;
-    for ((day, h, _collar, paddock), agg) in dwell.finish(now.timestamp_millis()) {
-        let e = days.entry((day, h, paddock)).or_default();
-        e.0 += agg.dwell_ms as f64;
-        e.1 = e.1.max(agg.last_t);
+    if hot_from < end_ms {
+        for ((day, h, _collar, paddock), agg) in hot_dwell(ctx, hot_from, end_ms, herd, &index).await? {
+            let e = days.entry((day, h, paddock)).or_default();
+            e.0 += agg.dwell_ms as f64;
+            e.1 = e.1.max(agg.last_t);
+        }
     }
 
     let mut herd_total: HashMap<(i64, String), f64> = HashMap::new();
@@ -735,7 +1024,6 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
     }
 
     let ndvi = latest_ndvi(ctx).await?;
-    let now_ms = now.timestamp_millis();
     Ok(paddock_list
         .into_iter()
         .map(|p| {
@@ -744,7 +1032,7 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
             let au_days = any_in_window.then(|| a.as_ref().map_or(0.0, |a| a.au_days));
             PaddockPasture {
                 grazing_days: any_in_window.then(|| a.as_ref().map_or(0, |a| a.grazing.len() as i64)),
-                rest_days: last.map(|l| round(((now_ms - l).max(0)) as f64 / DAY_MS as f64, 1)),
+                rest_days: last.map(|l| round(((end_ms - l).max(0)) as f64 / DAY_MS as f64, 1)),
                 pressure: au_days.and_then(|d| (p.area_ha > 0.0).then(|| round(d / p.area_ha, 2))),
                 au_days: au_days.map(|d| round(d, 2)),
                 last_grazed: last.map(rfc3339),
@@ -757,6 +1045,64 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
             }
         })
         .collect())
+}
+
+/// One collar's hot dwell in `[?2, ?3)` (`?4` herd or NULL, `?5` the longest
+/// gap), the way [`Dwell`] sums it: each fix's time until the collar's next
+/// one, capped at the gap and the end of its UTC day (the last fix's until
+/// `?3`), goes to the fix's day, herd and stored paddock. SQLite does the
+/// window and the sums; fixes whose stored paddock is gone or unknown come
+/// back one by one with their point, for the caller to place.
+pub fn hot_dwell_sql(herd: bool) -> String {
+    let herd_filter = if herd { "AND herd_id = ?4" } else { "AND ?4 IS NULL" };
+    format!(
+        "WITH w AS (
+             SELECT herd_id, t, lon, lat, CASE WHEN paddock_id IN (SELECT id FROM paddocks) THEN paddock_id END AS pad,
+                    LEAD(t) OVER (ORDER BY t, id) AS nt
+             FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 {herd_filter}
+         ), d AS (
+             SELECT COALESCE(herd_id, '') AS herd, t, lon, lat, pad,
+                    MIN(COALESCE(nt, ?3) - t, ?5, (t / {DAY_MS} + 1) * {DAY_MS} - t) AS dt
+             FROM w
+         )
+         SELECT t / {DAY_MS} AS day, herd, pad, COUNT(*) AS n, SUM(dt) AS dwell, MAX(t) AS last_t, NULL AS lon, NULL AS lat
+         FROM d WHERE pad IS NOT NULL GROUP BY day, herd, pad
+         UNION ALL
+         SELECT t / {DAY_MS}, herd, NULL, 1, dt, t, lon, lat FROM d WHERE pad IS NULL"
+    )
+}
+
+/// Dwell per (day, herd, collar, paddock) of the hot fixes in `[from, end)`,
+/// one collar at a time by index, summed in SQLite: a day of 250 collars is
+/// never decoded row by row.
+pub async fn hot_dwell(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
+    let sql = hot_dwell_sql(herd.is_some());
+    let mut out: HashMap<DwellKey, DwellAgg> = HashMap::new();
+    let mut after = String::new();
+    loop {
+        let next = match herd {
+            Some(h) => sqlx::query_scalar(HERD_NEXT_COLLAR_SQL).bind(h).bind(&after).fetch_optional(ctx.db()).await?,
+            None => crate::rollup::next_collar(ctx, "fixes", &after).await?,
+        };
+        let Some(collar) = next else { break };
+        let rows = sqlx::query(&sql).bind(&collar).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS).fetch_all(ctx.db()).await?;
+        for r in rows {
+            let pad: Option<String> = r.try_get("pad")?;
+            let paddock = match pad {
+                Some(p) => p,
+                None => {
+                    let (lon, lat): (Option<f64>, Option<f64>) = (r.try_get("lon")?, r.try_get("lat")?);
+                    lon.zip(lat).and_then(|(lon, lat)| index.locate([lon, lat])).unwrap_or("").to_owned()
+                }
+            };
+            let e = out.entry((r.try_get("day")?, r.try_get("herd")?, collar.clone(), paddock)).or_default();
+            e.fixes += r.try_get::<i64, _>("n")?;
+            e.dwell_ms += r.try_get::<i64, _>("dwell")?;
+            e.last_t = e.last_t.max(r.try_get("last_t")?);
+        }
+        after = collar;
+    }
+    Ok(out)
 }
 
 /// Latest imagery NDVI mean per paddock from op-engine's land reports
