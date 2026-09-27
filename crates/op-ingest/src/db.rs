@@ -1,20 +1,42 @@
 //! SQL over the tables op-ingest writes: collars, boundaries, acks, fixes,
-//! cues, health.
+//! cues, health, collar slots, episodes and collar configs.
 
 use chrono::{DateTime, Utc};
 use op_core::store::{boundary_from_row, collar_from_row};
 use op_core::time::to_db;
 use op_core::{Boundary, BoundaryAck, Collar, DbEnum, Paddock};
 use sqlx::Row;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
+
+/// The statements on the report and download path, so tests can check their
+/// query plans use indexes (`EXPLAIN QUERY PLAN`).
+#[doc(hidden)]
+pub mod sql {
+    /// The herd boundary in effect at `?2`: the highest version activating by then.
+    pub const HERD_ACTIVE: &str = "SELECT * FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL
+         AND (effective_at IS NULL OR effective_at <= ?2) ORDER BY version DESC LIMIT 1";
+    /// Herd boundaries above the active version: staged ones (dead ones are dropped after).
+    pub const HERD_ABOVE: &str = "SELECT * FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL AND version > ?2 ORDER BY version";
+    /// A collar's copies of herd boundaries (handed back after an escape) above a version.
+    pub const OWN_COPIES: &str = "SELECT * FROM boundaries WHERE herd_id = ?1 AND collar_id = ?2 AND copy_of IS NOT NULL AND version > ?3 ORDER BY version";
+    /// The pen of a collar's open escape.
+    pub const OPEN_PEN: &str = "SELECT b.* FROM escapes e JOIN boundaries b ON b.id = e.boundary_id
+         WHERE e.collar_id = ?1 AND e.status = 'returning' AND b.herd_id = ?2";
+    /// Versions a collar refused for good (every code but `slots_full`; no code counts as permanent).
+    pub const REJECTED: &str = "SELECT version FROM collar_slots WHERE collar_id = ?1 AND status = 'rejected'
+         AND (code IS NULL OR code != 'slots_full')";
+    /// How many boundaries a collar holds (applied or staged), as the server knows.
+    pub const HELD: &str = "SELECT COUNT(*) FROM collar_slots WHERE collar_id = ?1 AND status != 'rejected'";
+    /// The next boundary version (one sequence across herds).
+    pub const NEXT_VERSION: &str = "SELECT COALESCE(MAX(version), 0) + 1 FROM boundaries";
+    /// A collar's stored config.
+    pub const CONFIG: &str = "SELECT body, reject_version FROM collar_config WHERE collar_id = ?1";
+    /// Staged boundaries taking effect in a window (the activation watcher).
+    pub const TAKING_EFFECT: &str = "SELECT * FROM boundaries WHERE effective_at > ?1 AND effective_at <= ?2 AND collar_id IS NULL ORDER BY version";
+}
 
 pub async fn get_collar(db: &SqlitePool, id: &str) -> anyhow::Result<Option<Collar>> {
     let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(id).fetch_optional(db).await?;
-    row.map(|r| collar_from_row(&r)).transpose()
-}
-
-pub async fn collar_by_key_hash(db: &SqlitePool, hash: &str) -> anyhow::Result<Option<Collar>> {
-    let row = sqlx::query("SELECT * FROM collars WHERE key_hash = ?").bind(hash).fetch_optional(db).await?;
     row.map(|r| collar_from_row(&r)).transpose()
 }
 
@@ -39,64 +61,97 @@ pub async fn insert_collar(db: &SqlitePool, id: &str, name: &str, herd_id: &str,
     Ok(())
 }
 
+/// Delete a collar with what the server keeps of its slots and config.
 pub async fn delete_collar(db: &SqlitePool, id: &str) -> anyhow::Result<bool> {
-    Ok(sqlx::query("DELETE FROM collars WHERE id = ?").bind(id).execute(db).await?.rows_affected() > 0)
+    let mut tx = op_core::store::begin_immediate(db).await?;
+    let gone = sqlx::query("DELETE FROM collars WHERE id = ?").bind(id).execute(&mut *tx).await?.rows_affected() > 0;
+    for t in ["collar_slots", "collar_config"] {
+        sqlx::query(&format!("DELETE FROM {t} WHERE collar_id = ?")).bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(gone)
 }
 
 // Boundaries
-
-pub async fn boundaries_for_herd(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<Boundary>> {
-    let rows = sqlx::query("SELECT * FROM boundaries WHERE herd_id = ? AND collar_id IS NULL ORDER BY version").bind(herd_id).fetch_all(db).await?;
-    rows.iter().map(boundary_from_row).collect()
-}
 
 pub async fn boundary_by_id(db: &SqlitePool, id: &str) -> anyhow::Result<Option<Boundary>> {
     let row = sqlx::query("SELECT * FROM boundaries WHERE id = ?").bind(id).fetch_optional(db).await?;
     row.map(|r| boundary_from_row(&r)).transpose()
 }
 
-/// The herd's boundaries split by time: the newest one in effect, and the
-/// staged ones (newer version, `effective_at` still ahead) in version order.
+/// A set of boundaries split at one moment (protocol v1 §3.7): the one in
+/// effect, and the staged ones still alive, in version order.
+#[derive(Debug, Clone, Default)]
 pub struct HerdBoundaries {
     pub active: Option<Boundary>,
     pub staged: Vec<Boundary>,
 }
 
-pub fn split_boundaries(all: Vec<Boundary>, now: DateTime<Utc>) -> HerdBoundaries {
-    let mut active: Option<Boundary> = None;
-    let mut future = Vec::new();
-    for b in all {
-        if b.effective_at.is_none_or(|t| t <= now) {
-            if active.as_ref().is_none_or(|a| b.version > a.version) {
-                active = Some(b);
-            }
-        } else {
-            future.push(b);
-        }
+impl HerdBoundaries {
+    /// Highest version in the set.
+    pub fn latest(&self) -> Option<&Boundary> {
+        self.staged.last().or(self.active.as_ref())
     }
+}
+
+/// When a boundary takes effect: `effective_at`; one without takes effect
+/// as it is received, which orders before any time a staged one names (a
+/// collar applies it at once and drops every lower version).
+pub fn activation(b: &Boundary) -> DateTime<Utc> {
+    b.effective_at.unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// The collars' rule: in effect at `now` is the highest version activating at
+/// or before then; a staged version is dead once a higher version activates
+/// at or before it.
+pub fn split_boundaries(all: Vec<Boundary>, now: DateTime<Utc>) -> HerdBoundaries {
+    let s = op_protocol::split_by_activation(all, now, |b| (b.version, activation(b)));
+    HerdBoundaries { active: s.active, staged: s.staged }
+}
+
+/// A herd's boundaries in effect and staged at `now`, read with two index
+/// lookups (the active one, then those above it), never every version.
+pub async fn herd_boundaries_in(conn: &mut SqliteConnection, herd_id: &str, now: DateTime<Utc>) -> anyhow::Result<HerdBoundaries> {
+    let active = sqlx::query(sql::HERD_ACTIVE).bind(herd_id).bind(to_db(&now)).fetch_optional(&mut *conn).await?;
+    let active = active.map(|r| boundary_from_row(&r)).transpose()?;
     let floor = active.as_ref().map_or(0, |a| a.version);
-    future.retain(|b| b.version > floor);
-    future.sort_by_key(|b| b.version);
-    HerdBoundaries { active, staged: future }
+    let above = sqlx::query(sql::HERD_ABOVE).bind(herd_id).bind(floor as i64).fetch_all(&mut *conn).await?;
+    let mut all = above.iter().map(boundary_from_row).collect::<anyhow::Result<Vec<_>>>()?;
+    all.extend(active);
+    Ok(split_boundaries(all, now))
 }
 
 pub async fn herd_boundaries(db: &SqlitePool, herd_id: &str, now: DateTime<Utc>) -> anyhow::Result<HerdBoundaries> {
-    Ok(split_boundaries(boundaries_for_herd(db, herd_id).await?, now))
+    herd_boundaries_in(&mut *db.acquire().await?, herd_id, now).await
 }
 
-/// Latest ack per collar still in the herd: highest version first, then the
-/// most recent status for that version. A collar handed back to the herd's
-/// boundary after an escape holds a copy of it; its ack shows the herd
-/// version it copies.
+/// Boundaries a collar holds as far as the server knows (its report's slot
+/// list, else its acks).
+pub async fn held_count(db: &SqlitePool, collar_id: &str) -> anyhow::Result<usize> {
+    let (n,): (i64,) = sqlx::query_as(sql::HELD).bind(collar_id).fetch_one(db).await?;
+    Ok(n as usize)
+}
+
+/// Versions a collar refused for good; the server doesn't offer them again.
+pub async fn rejected_versions(db: &SqlitePool, collar_id: &str) -> anyhow::Result<Vec<u32>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(sql::REJECTED).bind(collar_id).fetch_all(db).await?;
+    Ok(rows.into_iter().map(|r| r.0 as u32).collect())
+}
+
+/// Each collar's latest boundary state, for collars still in the herd (from
+/// `collar_boundary_state`, kept by the ack handler). A collar holding a copy
+/// of a herd boundary (handed back after an escape) shows the herd version it
+/// copies. The reason is the latest ack's, for a rejection.
 pub async fn latest_acks(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<BoundaryAck>> {
     let rows = sqlx::query(
-        "SELECT a.collar_id, COALESCE(b.copy_of, a.version) AS version, a.status, a.reason, a.at FROM (
-             SELECT a.*, ROW_NUMBER() OVER (PARTITION BY a.collar_id ORDER BY a.version DESC, a.id DESC) AS rn
-             FROM acks a JOIN collars c ON c.id = a.collar_id
-             WHERE c.herd_id = ? AND a.herd_id = ?
-         ) a LEFT JOIN boundaries b ON b.id = a.command_id WHERE a.rn = 1 ORDER BY a.collar_id",
+        "SELECT s.collar_id, COALESCE(b.copy_of, s.version) AS version, s.status, s.code, s.at,
+             CASE WHEN s.status = 'rejected' THEN
+                 (SELECT a.reason FROM acks a WHERE a.collar_id = s.collar_id AND a.version = s.version ORDER BY a.id DESC LIMIT 1)
+             END AS reason
+         FROM collar_boundary_state s JOIN collars c ON c.id = s.collar_id
+         LEFT JOIN boundaries b ON b.id = s.command_id
+         WHERE c.herd_id = ?1 AND s.herd_id = ?1 ORDER BY s.collar_id",
     )
-    .bind(herd_id)
     .bind(herd_id)
     .fetch_all(db)
     .await?;
@@ -108,6 +163,7 @@ pub async fn latest_acks(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<B
                 status: op_core::AckStatus::from_db(&r.try_get::<String, _>("status")?)?,
                 reason: r.try_get("reason")?,
                 at: op_core::time::from_db(&r.try_get::<String, _>("at")?)?,
+                code: r.try_get("code")?,
             })
         })
         .collect()

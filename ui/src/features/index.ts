@@ -6,6 +6,7 @@
 import "./hub-ui";
 // @E-lib
 // @E-srv
+import "./e-srv";
 // @J
 import "./j";
 // @A-engine

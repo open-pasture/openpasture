@@ -15,13 +15,15 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use op_core::time::{from_db, now, to_db};
 use op_core::{ApiError, ApiResult, Boundary, Ctx, DbEnum, Event, LonLat, Move, MoveStatus, Polygon, id};
+use op_geo::CollarLimits;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::boundary::{NewBoundary, announce, insert_boundary};
-use crate::db;
 use crate::planner::{self, BACK_FACTOR, Frame, Plan, PlanInput, Space};
+use crate::shape::{Prepared, prepare};
+use crate::{SendOpts, config, db};
 
 /// At most one step this often.
 pub const STEP_EVERY: Duration = Duration::seconds(30);
@@ -65,7 +67,7 @@ pub struct Track {
 }
 
 /// What the server knows about the herd right now.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Situation {
     pub active: Option<Polygon>,
     /// A staged boundary is waiting to take effect.
@@ -73,6 +75,14 @@ pub struct Situation {
     pub paddock: Option<Polygon>,
     /// Fresh positions per collar.
     pub positions: Vec<(String, LonLat)>,
+    /// What the herd's collars hold (the strictest limits among those that hold holes).
+    pub limits: CollarLimits,
+}
+
+impl Default for Situation {
+    fn default() -> Self {
+        Self { active: None, pending: false, paddock: None, positions: vec![], limits: CollarLimits::V0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +132,7 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
             animals: &animals,
             warn_m: m.warn_m,
             frame: sweep.frame,
+            limits: sit.limits,
         };
         let plan = planner::plan(&input);
         let due = m.step == 0 || sweep.last_step_at.is_none_or(|t| now - t >= STEP_EVERY);
@@ -263,7 +274,14 @@ async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
             (at - f.at <= FRESH_FIX).then_some((c.id, f.point))
         })
         .collect();
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending: !split.staged.is_empty(), paddock, positions })
+    let limits = crate::shape::herd_limits(ctx, herd_id).await?;
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending: !split.staged.is_empty(), paddock, positions, limits })
+}
+
+/// A sweep step on its way to the collars, like every herd boundary.
+async fn prepare_step(ctx: &Ctx, herd_id: &str, polygon: &Polygon, warn_m: f64, hysteresis_m: f64) -> ApiResult<Polygon> {
+    let opts = SendOpts { warn_m: Some(warn_m), hysteresis_m: Some(hysteresis_m), effective_at: None };
+    Ok(prepare(ctx, herd_id, polygon, &opts).await?.geometry)
 }
 
 /// Moves are driven one herd at a time.
@@ -289,27 +307,38 @@ pub struct Started {
 /// Start a move toward `target` under `decision_id`, replacing any running
 /// move for the herd (it is marked stopped). Sends the target at once when
 /// the herd is already in it, else the first sweep step.
-pub async fn start_move(ctx: &Ctx, herd_id: &str, target: Polygon, opts: crate::SendOpts, decision_id: &str) -> anyhow::Result<Started> {
-    begin(ctx, herd_id, target, opts, decision_id, None).await.map_err(|e| anyhow::anyhow!(e.message))
+pub async fn start_move(ctx: &Ctx, herd_id: &str, target: Polygon, opts: SendOpts, decision_id: &str) -> anyhow::Result<Started> {
+    let go = async {
+        if ctx.store().get_herd(herd_id).await?.is_none() {
+            return Err(ApiError::not_found("No such herd."));
+        }
+        let prepared = prepare(ctx, herd_id, &target, &opts).await?;
+        begin(ctx, herd_id, prepared, opts.effective_at, decision_id, None).await
+    };
+    go.await.map_err(|e| anyhow::anyhow!(e.message))
 }
 
+/// Start a move toward a prepared target (see [`start_move`]).
 pub(crate) async fn begin(
     ctx: &Ctx,
     herd_id: &str,
-    target: Polygon,
-    opts: crate::SendOpts,
+    target: Prepared,
+    effective_at: Option<DateTime<Utc>>,
     decision_id: &str,
     farmer: Option<FarmerDecision<'_>>,
 ) -> ApiResult<Started> {
     if ctx.store().get_herd(herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
-    let (target, warn_m, hysteresis_m) = crate::boundary::check(&target, &opts)?;
+    let Prepared { geometry: target, warn_m, hysteresis_m, .. } = target;
     let _guard = herd_lock(herd_id).await;
     let at = now();
-    let effective_at = opts.effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
+    let effective_at = effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
     let sit = situation(ctx, herd_id, at).await?;
-    let out = advance(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, &sit, at);
+    let mut out = advance(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, &sit, at);
+    if let Next::Send { polygon, last: false, .. } = &mut out.next {
+        *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?;
+    }
 
     let mut m = Move {
         id: id::new_id(id::MOVE),
@@ -387,6 +416,10 @@ pub(crate) async fn begin(
     }
     log_move(&m, boundary.as_ref(), sit.positions.len());
     ctx.publish(Event::Move { r#move: m.clone() });
+    // A sweep: the herd's collars report and poll fast until it is over.
+    if m.status == MoveStatus::Sweeping {
+        config::refresh_quietly(ctx, config::Scope::Herd(herd_id)).await;
+    }
     Ok(Started { r#move: m, boundary })
 }
 
@@ -452,7 +485,16 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     }
     let mut m = row.m.clone();
     let state = MoveState { target: &m.target, warn_m: row.warn_m, step: m.step, sweep: &row.sweep, stragglers: &m.stragglers };
-    let out = advance(&state, &sit, at);
+    let mut out = advance(&state, &sit, at);
+    if let Next::Send { polygon, last: false, .. } = &mut out.next {
+        match prepare_step(ctx, herd_id, polygon, row.warn_m, row.hysteresis_m).await {
+            Ok(p) => *polygon = p,
+            Err(e) => {
+                tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: {}", e.message);
+                return Ok(None);
+            }
+        }
+    }
     let visible = out.stragglers != m.stragglers || matches!(out.next, Next::Send { .. });
     if !visible && out.sweep == row.sweep {
         return Ok(None);

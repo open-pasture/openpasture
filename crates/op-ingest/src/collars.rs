@@ -118,6 +118,8 @@ async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): A
         if let Some(held) = current.boundary_version {
             crate::boundary::reissue_for_moved_collar(&ctx, &next.herd_id, held).await?;
         }
+        // Its signed config names the new herd, so it accepts that herd's boundaries.
+        crate::config::refresh_quietly(&ctx, crate::config::Scope::Collar(&id)).await;
     }
     let next = find(&ctx, &id).await?;
     ctx.publish(Event::Collar { collar: next.clone() });

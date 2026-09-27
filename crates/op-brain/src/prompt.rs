@@ -13,7 +13,7 @@ Rules:
 before you answer.
 - Only use paddock ids that appear in the context. For MOVE set to_paddock_id.
 - Leave geometry null unless the herd needs a custom boundary (a strip or part of a paddock). \
-Geometry is a GeoJSON Polygon, [longitude, latitude], at most 64 corners, not crossing itself.
+Geometry is a GeoJSON Polygon, [longitude, latitude], at most 128 corners, not crossing itself.
 - Confidence is a number from 0 to 1. Be honest; thin data means low confidence.
 - For NEEDS_INFO, set need to the one thing the farmer should check.
 - Write reasoning for the farmer in a few plain sentences.

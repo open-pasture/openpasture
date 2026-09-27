@@ -15,6 +15,10 @@ pub mod planner;
 // @HUB-UI
 // @E-lib
 // @E-srv
+pub mod config;
+pub mod margins;
+pub mod shape;
+pub mod slots;
 // @J
 // @A-engine
 // @A-notify
@@ -42,6 +46,11 @@ pub use boundary::{SendOpts, boundary_status, move_herd_on_record, send_boundary
 pub use collars::latest_positions;
 pub use escapes::{current_escapes, stop_escape};
 pub use moves::{Started, current_move, start_move, stop_move};
+// @E-srv
+pub use boundary::announce_activations;
+pub use db::{HerdBoundaries, herd_boundaries, sql};
+pub use margins::default_margins;
+pub use shape::{CollarCaps, Prepared, command_for, fence_geometry, herd_limits, prepare};
 
 /// Routes from docs/API.md, "Collars and boundaries (op-ingest)".
 pub fn router() -> axum::Router<Ctx> {
@@ -56,6 +65,8 @@ pub fn router() -> axum::Router<Ctx> {
         // @HUB-UI
         // @E-lib
         // @E-srv
+        config::router(),
+        slots::router(),
         // @J
         // @A-engine
         // @A-notify

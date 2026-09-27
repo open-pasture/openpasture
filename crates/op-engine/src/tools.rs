@@ -103,7 +103,7 @@ pub fn specs() -> Vec<ToolSpec> {
                 json!({
                     "herd_id": herd_prop(),
                     "to_paddock_id": { "type": "string", "description": "Paddock to move to. Its shape is the boundary unless geometry is given." },
-                    "geometry": { "type": "object", "description": "GeoJSON Polygon, [longitude, latitude], 3-64 corners." },
+                    "geometry": { "type": "object", "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners." },
                     "reasoning": { "type": "string", "description": "Two to four short lines, each a reason tied to a fact." },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 }),
