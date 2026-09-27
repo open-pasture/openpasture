@@ -192,6 +192,42 @@ async fn previews_take_files_up_to_five_megabytes() {
 }
 
 #[tokio::test]
+async fn one_wide_row_is_cheap_and_a_row_past_256_columns_is_refused() {
+    let app = App::new().await;
+    // A header, one row of 5,000 commas and 5,000 one-cell rows: every row
+    // used to be padded to 5,001 cells (630 MB held for 30 minutes).
+    let csv = format!("Tag\n214{}\n{}", ",".repeat(5000), "x\n".repeat(5000));
+    let started = Instant::now();
+    let p = app.preview(csv.into_bytes()).await;
+    assert!(started.elapsed().as_secs_f64() < 2.0, "{:?}", started.elapsed());
+    assert_eq!((p["total"].as_u64(), p["columns"].clone()), (Some(5001), json!(["Tag"])));
+    assert_eq!(p["rows"][0], json!(["214"]));
+    // The preview shows each row as wide as the header.
+    let p = app.preview(b"Tag,Name,Breed\n214\n215,Bella\n".to_vec()).await;
+    assert_eq!(p["rows"], json!([["214", "", ""], ["215", "Bella", ""]]));
+    assert_eq!(app.commit(&p).await["created"], 2);
+
+    let wide = format!("Tag\n214\n{}\n", vec!["x"; 257].join(","));
+    let (s, e) = app.csv("/api/animals/import/preview", wide.clone()).await;
+    assert_eq!((s, e["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Row 3 has more than 256 columns.")));
+    let (s, e) = app.csv(&format!("/api/collars/bulk?herd_id={}", app.herd), wide).await;
+    assert_eq!((s, e["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Row 3 has more than 256 columns.")));
+}
+
+#[tokio::test]
+async fn a_preview_outlives_many_newer_ones() {
+    // Previews are kept by bytes, not by count: sixteen newer ones (other
+    // tests in this binary make as many in parallel) don't push one out.
+    let app = App::new().await;
+    let p = app.preview(b"Tag\n214\n".to_vec()).await;
+    for i in 0..40 {
+        app.preview(format!("Tag\n{}\n", 300 + i).into_bytes()).await;
+    }
+    assert_eq!(app.commit(&p).await["created"], 1);
+    assert_eq!(app.commit(&p).await["unchanged"], 1);
+}
+
+#[tokio::test]
 async fn a_commit_creates_or_updates_by_tag_and_twice_changes_nothing() {
     let app = App::new().await;
     let mut events = app.ctx.subscribe();

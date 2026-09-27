@@ -106,7 +106,9 @@ async fn bulk(
         (b.herd_id, b.items.into_iter().enumerate().map(|(i, it)| (i + 1, it.tag, it.name)).collect::<Vec<_>>())
     } else {
         let herd = q.herd_id.filter(|h| !h.is_empty()).ok_or_else(|| ApiError::bad_request("Say which herd: ?herd_id=").into_response())?;
-        (herd, csv_items(&body).map_err(|e| ApiError::bad_request(e).into_response())?)
+        // Read off the async workers, as the animal import does.
+        let rows = tokio::task::spawn_blocking(move || csv_items(&body)).await.map_err(|e| ApiError::from(anyhow::Error::from(e)).into_response())?;
+        (herd, rows.map_err(|e| ApiError::bad_request(e).into_response())?)
     };
     if items.is_empty() {
         return Err(ApiError::bad_request("The list is empty.").into_response());
