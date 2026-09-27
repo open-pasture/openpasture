@@ -710,6 +710,61 @@ because the endpoint is written into the collar and a LAN or tunnel address woul
 MCP: `list_animals` (read) `{ herd_id?, q?, removed? }` → `{ count, animals: [Animal & { herd, collar?: { id, name, state, battery?, last_seen?, position?, fix_at?, parked? } }] }`;
 animals on the farm unless `removed` is true.
 <!-- @K-files -->
+
+## Paddock files and position history (op-import)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/import/paddocks/preview` | multipart `file` (≤ 20 MB): GeoJSON, KML, KMZ, or a zipped shapefile | `PaddockPreview` |
+| POST | `/api/import/paddocks/commit` | `{ import_id, keep: number[], names?: (string\|null)[] }` | 201 `{ paddocks: Paddock[] }` |
+| POST | `/api/import/positions/preview` | multipart `file` (≤ 64 MB): CSV, GPX or GeoJSON points; optional fields `mapping` (JSON) and `zone` | `PositionPreview` |
+| POST | `/api/import/positions/{id}/preview` | `{ mapping?, zone? }` (the same file read again) | `PositionPreview` |
+| POST | `/api/import/positions/{id}/commit` | `{ mapping?, zone?, animals?: Record<label, animal_id \| null> }` | 201 `PositionCommit` |
+| GET | `/api/import/positions` | | `PositionImport[]` (newest first) |
+| GET | `/api/import/positions/{id}` | | `PositionImport & { days: ImportedDay[] }` |
+| DELETE | `/api/import/positions/{id}` | | 204 (its points and days go too) |
+| GET | `/api/import/positions/tracks` | `animal_id?&import_id?&from?&to?&max_points?` (default 2000) | `ImportTrack[]` |
+
+```ts
+Draft           { name, layer?, geometry: Polygon, area_ha, props?: { fsa_farm?, fsa_tract?, fsa_field? } }
+PaddockPreview  { import_id /* imp_… */, file, drafts: Draft[], errors: string[] }   // errors: polygons left out, one sentence each
+Mapping         { tag?, time?, lat?, lon?, accuracy? }        // CSV column or GeoJSON property per field; no tag = one animal per file
+ImportLabel     { label, points, from, to, animal_id?, tag? } // matched by tag, EID, collar name, then a numeric tag without leading zeros
+PositionPreview { import_id, file, source: "csv"|"gpx"|"geojson", columns?: string[], mapping: Mapping, rows?: string[][] /* first 20 */,
+                  total, points, labels: ImportLabel[], tracks: { label, points: [lon, lat, t_unix_seconds][] }[] /* ≤ 200 each */,
+                  needs_zone: boolean, zone, errors: string[] }
+PositionImport  { id, file_name, source, zone?, fixes, animals, from?, to?, created_by: Actor, created_at }
+PositionCommit  { import: PositionImport, duplicates, skipped: string[] /* labels left out */, errors: string[] }
+ImportedDay     { date /* YYYY-MM-DD UTC */, animal_id, paddock_id /* "" = outside every paddock */, fixes, dwell_s }
+ImportTrack     { animal_id, points: [lon, lat, t_unix_seconds][] }   // first point per time bucket + the last, like Track
+```
+
+Paddock files: every polygon (and each part of a multipolygon) is a draft; holes stay holes. Zips
+are searched at any depth, so a John Deere Operations Center export with nested folders and several
+layers gives drafts from every polygon layer (points and lines are skipped, as are `__MACOSX/`
+shadows). Names come from the attributes `NAME`, `FIELD_NAME`, `FIELD` (and similar), else the KML
+Placemark name, else `Field <CLU number>`, else the layer name. FSA numbers come from
+`FARM_NBR`/`FARMNBR`, `TRACT_NBR`/`TRACTNBR` and `CLU_NBR`/`CLUNBR`/`FIELD_NBR`. Shapefile
+projections are read from the `.prj` (ESRI or OGC WKT 1): geographic WGS 84 or NAD83, Transverse
+Mercator (UTM and state plane TM zones) and Lambert Conformal Conic with one or two standard
+parallels (e.g. Iowa North/South, EPSG 26975/26976 in metres and 3417/3418 in US survey feet), in
+metres, US survey feet or feet. NAD83 is taken as WGS 84 (they differ by under 2 m). Anything else
+is refused with the projection, datum or unit named. A shapefile with no `.prj` is read as longitude
+and latitude only when its coordinates fit. GeoJSON is WGS 84; an old `crs` member naming a UTM or
+Iowa state plane EPSG code is projected. At most 2,000 polygons per file and 20,000 corners per ring.
+A preview waits 30 minutes for its commit; a commit uses it up. Commit needs the farm.
+
+Position history: CSV columns are guessed from the headers (tag, time, lat, lon, accuracy) and can
+be changed with `mapping`; GPX tracks are labelled by their names (the animal's tag); GeoJSON Points
+take time and tag from properties. Times with an offset (RFC 3339, `…-05:00`, `Z`, ` UTC`) or unix
+seconds/milliseconds are exact; times without one are read in `zone` (default the farm's time zone),
+and `needs_zone` says so. A point at `0,0` or out of range is an error row. Each animal keeps one
+point per instant (`duplicates` counts the rest; a file with nothing new is 409). Commit stores the points in `imported_fixes` and
+each animal's daily dwell per paddock in `imported_paddock_days` (today's paddocks, the rollup's
+30-minute gap rule), so pasture history's rest days and last grazed include it; the rollup never
+touches either table. Points are written in transactions of 5,000 so a large file never holds the
+database long. After a commit or a delete: `animals_changed` for each herd concerned.
+
 <!-- @I -->
 <!-- @B -->
 <!-- @G -->
