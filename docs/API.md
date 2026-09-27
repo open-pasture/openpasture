@@ -472,6 +472,80 @@ days plus imported position history.
 <!-- @E-srv -->
 <!-- @J -->
 <!-- @A-engine -->
+
+## Alerts (op-alerts)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/alerts?status=&herd_id=&from=&to=&limit=` | `Alert[]`. `status`: `open` (unacked), `acked`, `resolved`, `all`; absent = open and acked, critical first, then newest. `from`/`to` (RFC 3339) bound `opened_at`; `limit` 1–1000, default 100 |
+| GET | `/api/alerts/{id}` | `Alert` |
+| POST | `/api/alerts/{id}/ack` | `Alert`; hand and up. Stops re-notification and escalation; acking again returns it unchanged; resolved → 409 |
+| POST | `/api/alerts/{id}/resolve` | `Alert`; hand and up. Stays closed while its cause lasts; resolved → 409 |
+| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email")[] }` |
+| PUT | `/api/alerts/rules` | same; manager and up. Body `{ rules?: { <kind>: Partial<RuleConfig> }, policy?: Partial<Policy> }` (merge; `null` puts a rule's number back to its default and clears quiet hours) |
+| GET | `/api/alerts/prefs` | `PersonPrefs[]`, every person; manager and up |
+| GET | `/api/alerts/prefs/me` | `PersonPrefs` of the caller's person; 404 when the sign-in isn't a person |
+| PUT | `/api/alerts/prefs/me` | `PersonPrefs`; hand and up. Body: JSON merge patch of `AlertPrefs` |
+| PUT | `/api/alerts/prefs/{user_id}` | `PersonPrefs`; owner only |
+
+```ts
+RuleConfig { enabled: bool, severity: Severity, after_min?: number, threshold?: number, notify: bool }
+RuleView   = RuleConfig & { kind, sentence /* "Collar silent for {n}" */, unit: "min"|"%"|"m"|"", cadence_s, default: RuleConfig }
+Policy     { renotify_every_min: 30, renotify_max: 3, escalate_after_min: 15, group_window_s: 60, rollup_min: 4,
+             herd_silent_share: 0.5, clear_after_min: 2, start_grace_min: 20, critical_window_s: 10,
+             quiet_start?: "HH:MM", quiet_end?: "HH:MM" /* the farm's, farm time */ }
+AlertPrefs { channels: ("sms"|"whatsapp"|"email")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
+             herds?: string[] /* absent = every herd */, muted_kinds: string[], quiet_start?, quiet_end? /* absent = the farm's */,
+             critical_in_quiet: bool /* true */, on_duty: bool /* false */ }
+PersonPrefs = AlertPrefs & { user_id, name, role: Role, sms_opt_out: bool, updated_at? }
+```
+
+Rules (`kind`, default severity, number, notify): `escaped` an open escape (critical) · `outside` outside
+the herd's boundary ≥ 5 min with no escape running and not let go on this trip out (warning; critical
+when the collar is silent too) · `silent` no report for max(20 min, 3 × its median report interval
+over 24 h); held for `start_grace_min` after a server start (warning) · `herd_silent` more than
+`herd_silent_share` of a herd's reporting collars silent, at least two (critical; takes in that herd's
+`silent` alerts) · `low_battery` < 20 % (warning, no texts; in the brief) · `boundary_not_applied` the
+herd's boundary in effect ≥ 10 min and the collar holds an older one (or rejected it), not escaped and
+not silent (warning) · `decision_waiting` a proposal unanswered 30 min, or a timer decision at once
+(warning; `data.code` is the 4-digit approval code) · `move_stalled` a sweeping move with no step for
+15 min (warning; `data.staged` when it waits on a staged boundary) · `stragglers` a move left animals
+behind (info) · `drop_off` every fix (sampled every 5 min) within 4 m of their median for 240 min
+(warning) · `gps_degraded` median accuracy over the last 10 min worse than 10 m, or no fix for 10 min
+while reports arrive (info, no texts). Parked collars and removed animals never alert.
+
+Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
+are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
+members until the last clears; members already open resolve with `rolled_into`. A key gone for
+`clear_after_min` resolves by itself (`resolved_at` without `resolved_by`); back within that time it
+keeps its row; back after it resolved it opens a new row. `decision_waiting` resolves as soon as the
+decision is answered. `data` carries what the texts need: `label`, `herd`, `paddock`, `since`, …
+
+Rules run on a 10 s tick (each on its `cadence_s`: `drop_off` 300 s, `low_battery` and `gps_degraded`
+60 s) and early, after 2 quiet seconds, on bus `escape`, `decision`, `move`, `ack` and `boundary`
+events; never on `fix` or `collar`.
+
+Notifications are queued as `messages` (kind `alert`, `alert_id`, `decision_id` for decisions) for the
+sender to deliver. A person gets an alert when its severity is at least theirs, its herd and kind are
+theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
+that hasn't texted STOP; with no Twilio or SMTP of the farm's own, sms and email go over the relay
+(channel `relay`, address the phone or the email). When anyone matching is on duty the first send goes
+only to them. Warnings wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214
+031 118"); critical waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet
+hours (the person's, else the farm's) hold warnings until they end and let critical through unless
+`critical_in_quiet` is off. Unacked critical alerts are sent again every `renotify_every_min` up to
+`renotify_max` times and escalate every `escalate_after_min` to matching people of the next role up not
+yet told (hand → manager → owner). The farm webhook (channel `webhook`) gets every notified alert once.
+
+Texts are GSM-7, at most 160 characters, names cut to fit, numbers in the farm's units:
+`214 outside P3, 200 ft N of east gate, 6m. Reply OK to ack` · `31 outside P3 since 06:12. Reply OK to
+ack` · `Cows: 180 of 250 collars silent 25m. Check coverage or the server` · `Cows: move to P4 (30.6 ac,
+3 d)? Reply Y or N. Code 4821`.
+
+MCP tools: `list_alerts` (read; `status?`, `herd_id?`, `limit?`), `ack_alert` and `resolve_alert` (hand;
+`id`). The morning brief's `attention` line lists what doesn't text: "Battery low: 031 14%, 118 16%.
+GPS weak: 207".
+
 <!-- @A-notify -->
 <!-- @D -->
 <!-- @K-animals -->
