@@ -131,61 +131,6 @@ pub(crate) async fn announce(ctx: &Ctx, boundary: &Boundary) {
     ctx.publish(Event::Boundary { herd_id: herd_id.clone(), boundary: boundary.clone() });
 }
 
-/// A collar joined `herd_id` holding `held` from its old herd. If the herd's
-/// boundaries are all at or below that version, the collar would never ask
-/// for them, so they are stored again (same shapes, margins and times, fitted
-/// again to the herd's collars now that it has joined) with new versions.
-/// Returns what was re-issued.
-pub(crate) async fn reissue_for_moved_collar(ctx: &Ctx, herd_id: &str, held: u32) -> anyhow::Result<Vec<Boundary>> {
-    let versions = |bs: &[Boundary]| bs.iter().map(|b| b.version).collect::<Vec<_>>();
-    let mut attempt = 0;
-    let (mut tx, current, prepared) = loop {
-        let split = db::herd_boundaries(ctx.db(), herd_id, now()).await?;
-        let current: Vec<Boundary> = split.active.into_iter().chain(split.staged).collect();
-        if current.last().is_none_or(|b| b.version > held) {
-            return Ok(vec![]);
-        }
-        let mut prepared = Vec::with_capacity(current.len());
-        for b in &current {
-            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: b.effective_at };
-            prepared.push(prepare(ctx, herd_id, &b.geometry, &opts).await.map_err(|e| anyhow::anyhow!(e.message))?);
-        }
-        // Prepared outside the write lock: go ahead only if nothing was sent meanwhile.
-        let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-        let again = db::herd_boundaries_in(&mut tx, herd_id, now()).await?;
-        let again: Vec<Boundary> = again.active.into_iter().chain(again.staged).collect();
-        if versions(&again) == versions(&current) {
-            break (tx, current, prepared);
-        }
-        tx.rollback().await?;
-        attempt += 1;
-        if attempt >= 3 {
-            anyhow::bail!("the herd's boundaries kept changing");
-        }
-    };
-    let created_at = now();
-    let mut out = Vec::new();
-    for (b, p) in current.iter().zip(&prepared) {
-        let nb = NewBoundary {
-            herd_id,
-            geometry: &p.geometry,
-            warn_m: p.warn_m,
-            hysteresis_m: p.hysteresis_m,
-            effective_at: b.effective_at.filter(|t| *t > created_at),
-            decision_id: &b.decision_id,
-            created_at,
-            collar_id: None,
-            copy_of: None,
-        };
-        out.push(insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?);
-    }
-    tx.commit().await?;
-    for b in &out {
-        announce(ctx, b).await;
-    }
-    Ok(out)
-}
-
 /// Older proposals for the herd give way to a newer decision. Only rows still
 /// `proposed` change, so a decision the timer or the farmer already claimed is
 /// left alone. Publishes each superseded decision.

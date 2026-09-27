@@ -738,3 +738,165 @@ async fn a_legacy_collar_is_sent_a_staged_boundary_only_when_it_has_room() {
     assert_eq!(app.download(&key, "have=2").await.unwrap().version, 3);
     assert_eq!(app.slots(&id).await["slots"].as_array().unwrap().len(), 1);
 }
+
+// ---- collars out of step with their herd (FX-FENCE) ----
+
+/// A firmware 0.2 collar as `op_protocol::SlotStore` models it: it reports
+/// what it holds and its config version, takes the config in the reply
+/// (which names its herd), and downloads, stores and acks boundaries.
+struct Fw {
+    id: String,
+    key: String,
+    store: op_protocol::SlotStore,
+    config: Option<u32>,
+}
+
+impl Fw {
+    async fn new(app: &App, herd: &str) -> Self {
+        let (id, key) = app.device(herd).await;
+        let mut fw = Self { id: id.clone(), key, store: op_protocol::SlotStore::new(CollarLimits::V0, Some(herd.to_owned()), Some(id)), config: None };
+        fw.report(app, json!({})).await;
+        fw
+    }
+
+    async fn report(&mut self, app: &App, extra: Value) -> Value {
+        let mut device = v0_device();
+        if let Some(v) = self.config {
+            device["config_version"] = json!(v);
+        }
+        let mut body = json!({"device": device, "slots": self.store.report()});
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            b.extend(e.clone());
+        }
+        let reply = app.report(&self.key, body).await;
+        if reply["config"].is_object() {
+            let cfg: ConfigCommand = serde_json::from_value(reply["config"].clone()).unwrap();
+            cfg.check(&self.id, self.config).unwrap();
+            self.store.set_herd(cfg.herd_id.clone());
+            self.config = Some(cfg.version);
+        }
+        reply
+    }
+
+    /// One download, stored and acked; its ack.
+    async fn poll(&mut self, app: &App, now: DateTime<Utc>) -> Option<op_protocol::Ack> {
+        let mut q = format!("have={}&free={}", self.store.have(), self.store.free());
+        if let Some(b) = self.store.free_bytes() {
+            q.push_str(&format!("&free_bytes={b}"));
+        }
+        let cmd = app.download(&self.key, &q).await?;
+        let ack = self.store.insert(cmd, Some(now)).to_ack(now);
+        let (s, v) = app.req("POST", "/collar/v1/ack", Some(&self.key), Some(serde_json::to_value(&ack).unwrap())).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+        Some(ack)
+    }
+
+    /// Report, then download until there is nothing more, a few rounds.
+    async fn sync(&mut self, app: &App, now: DateTime<Utc>) {
+        for _ in 0..3 {
+            self.report(app, json!({})).await;
+            for _ in 0..40 {
+                if self.poll(app, now).await.is_none() {
+                    break;
+                }
+            }
+        }
+        self.report(app, json!({})).await;
+    }
+
+    fn enforces(&self) -> op_geo::Polygon {
+        self.store.active().expect("a boundary in effect").cmd.polygon()
+    }
+}
+
+#[tokio::test]
+async fn a_collar_moved_holding_its_old_herds_staged_strips_drops_them_for_its_new_herds_fence() {
+    let app = App::new().await;
+    let a = app.herd("Cows").await;
+    let b = app.herd("Heifers").await;
+    let mut fw = Fw::new(&app, &a).await;
+    let later = |m: i64| op_protocol::wire_time::format(&(Utc::now() + Duration::minutes(m)));
+    // A: west strip now, two more strips staged. B: the east end.
+    app.send(&a, polygon(rect(0.0, 0.0, 50.0, 200.0), vec![]), json!({})).await;
+    app.send(&b, polygon(rect(200.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    app.send(&a, polygon(rect(50.0, 0.0, 100.0, 200.0), vec![]), json!({"effective_at": later(60)})).await;
+    app.send(&a, polygon(rect(100.0, 0.0, 150.0, 200.0), vec![]), json!({"effective_at": later(120)})).await;
+    let now = Utc::now();
+    fw.sync(&app, now).await;
+    assert_eq!((fw.store.active().unwrap().cmd.version, fw.store.have()), (1, 4), "A's strip in effect, A's strips staged");
+
+    let (s, c) = app.call("PATCH", &format!("/api/collars/{}", fw.id), Some(json!({"herd_id": b}))).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    fw.sync(&app, now).await;
+    // It enforces B's fence, and none of A's strips is left to open on it.
+    let east = m_at(250.0, 100.0);
+    assert!(fw.enforces().contains(east), "B's fence in effect");
+    assert!(fw.store.staged().is_empty(), "A's staged strips dropped: {:?}", fw.store.staged().iter().map(|s| s.cmd.version).collect::<Vec<_>>());
+    assert!(fw.store.tick(now + Duration::minutes(61)).is_none());
+    assert!(fw.enforces().contains(east), "still B's after A's strip time");
+    // B's other collars download nothing new.
+    assert_eq!(app.status(&b).await["active"]["version"], 2);
+}
+
+#[tokio::test]
+async fn the_new_herds_boundary_refused_before_the_herd_change_arrived_is_offered_again() {
+    let app = App::new().await;
+    let a = app.herd("Cows").await;
+    let b = app.herd("Heifers").await;
+    let mut fw = Fw::new(&app, &a).await;
+    app.send(&a, polygon(rect(0.0, 0.0, 50.0, 200.0), vec![]), json!({})).await;
+    let now = Utc::now();
+    fw.sync(&app, now).await;
+    // B's fence is newer than anything the collar holds, so it is served as it is.
+    app.send(&b, polygon(rect(200.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    app.call("PATCH", &format!("/api/collars/{}", fw.id), Some(json!({"herd_id": b}))).await;
+    // It polls before it reports, so before its config names herd B.
+    let refused = fw.poll(&app, now).await.expect("B's boundary");
+    assert_eq!((refused.status, refused.code), (op_protocol::AckStatus::Rejected, Some(op_protocol::RejectCode::WrongHerd)));
+    // Its reports bring the config naming B, and then B's fence.
+    fw.sync(&app, now).await;
+    assert_eq!(fw.store.active().unwrap().cmd.herd_id.as_deref(), Some(b.as_str()));
+    assert!(fw.enforces().contains(m_at(250.0, 100.0)));
+    let (_, c) = app.call("GET", &format!("/api/collars/{}/slots", fw.id), None).await;
+    assert!(c["slots"].as_array().unwrap().iter().all(|s| s["status"] != "rejected"), "{c}");
+    // A refusal from a collar that already holds its config stands: no retry loop.
+    app.send(&b, polygon(rect(150.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
+    let q = format!("have={}&free={}", fw.store.have(), fw.store.free());
+    let cmd = app.download(&fw.key, &q).await.unwrap();
+    app.ack(&fw.key, &cmd, "rejected", Some("wrong_herd")).await;
+    for _ in 0..2 {
+        fw.report(&app, json!({})).await;
+        assert!(app.download(&fw.key, &q).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_collar_that_lost_its_boundary_in_effect_gets_it_again_above_the_staged_ones() {
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let mut fw = Fw::new(&app, &herd).await;
+    let later = op_protocol::wire_time::trunc_secs(Utc::now() + Duration::hours(20));
+    app.send(&herd, polygon(rect(0.0, 0.0, 100.0, 200.0), vec![]), json!({})).await;
+    app.send(&herd, polygon(rect(0.0, 0.0, 150.0, 200.0), vec![]), json!({"effective_at": op_protocol::wire_time::format(&later)})).await;
+    let now = Utc::now();
+    fw.sync(&app, now).await;
+    assert_eq!((fw.store.active().unwrap().cmd.version, fw.store.have()), (1, 2));
+    // After a reboot its record of the boundary in effect didn't read back:
+    // it holds only tomorrow's strip, and so has no fence until then.
+    let staged = fw.store.staged()[0].cmd.clone();
+    fw.store = op_protocol::SlotStore::new(CollarLimits::V0, Some(herd.clone()), Some(fw.id.clone()));
+    fw.store.insert(staged, Some(now));
+    assert!(fw.store.active().is_none());
+    fw.sync(&app, now).await;
+    let active = fw.store.active().expect("a fence again");
+    assert!(active.cmd.version > 2 && active.cmd.polygon().contains(m_at(50.0, 100.0)) && !active.cmd.polygon().contains(m_at(125.0, 100.0)));
+    // Tomorrow's strip is still staged, at its time.
+    let st = fw.store.staged();
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].cmd.effective_at, Some(later));
+    assert!(st[0].cmd.polygon().contains(m_at(125.0, 100.0)));
+    // In step now: nothing more on the next report.
+    let top = fw.store.have();
+    fw.sync(&app, now).await;
+    assert_eq!(fw.store.have(), top);
+}

@@ -402,6 +402,28 @@ async fn fence_state_positions_and_events() {
 }
 
 #[tokio::test]
+async fn a_new_boundary_starts_the_fence_state_over_as_the_collar_does() {
+    let app = App::new().await;
+    let herd = app.herd().await;
+    let (id, key) = app.device(&herd).await;
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": square(0.0)}))).await;
+    // 10 m south of it: outside.
+    let fix = |dy: f64, at: &str| json!({"fixes": [{"at": at, "point": [-92.405, 38.1245 + dy / 111_195.0], "accuracy_m": 2.0, "sats": 9}]});
+    app.req("POST", "/collar/v1/report", Some(&key), Some(fix(-10.0, "2026-09-25T10:40:00Z"))).await;
+    assert_eq!(app.call("GET", &format!("/api/collars/{id}"), None).await.1["state"], "outside");
+    // The farmer lets the herd 10.5 m further south: the animal is 0.5 m inside the new edge.
+    let (w, s, e, n) = (-92.4055, 38.1245 - 10.5 / 111_195.0, -92.4045, 38.1255);
+    let bigger = json!({"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]});
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": bigger}))).await;
+    // The collar rearms on the new boundary and says warning; so does the server,
+    // rather than keeping it outside until it is past the hysteresis margin.
+    app.req("POST", "/collar/v1/report", Some(&key), Some(fix(-10.0, "2026-09-25T10:40:30Z"))).await;
+    let c = app.call("GET", &format!("/api/collars/{id}"), None).await.1;
+    assert_eq!(c["state"], "warning", "{c}");
+    assert!(c.get("outside_since").is_none_or(|v| v.is_null()), "{c}");
+}
+
+#[tokio::test]
 async fn proposed_boundary_comes_from_decisions() {
     let app = App::new().await;
     let herd = app.herd().await;
@@ -515,20 +537,22 @@ async fn a_moved_collar_gets_its_new_herds_boundary() {
     let (s, c) = app.call("PATCH", &format!("/api/collars/{id}"), Some(json!({"herd_id": herd_b}))).await;
     assert_eq!(s, StatusCode::OK, "{c}");
     assert!(c.get("boundary_version").is_none());
-    // The collar still says it has v3; B's boundary comes again as a newer version.
+    // The collar still says it has v3; B's boundary comes again as a newer
+    // version, its own copy: the rest of B's collars download nothing.
     let (s, cmd) = app.req("GET", "/collar/v1/boundary?have=3", Some(&key), None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(cmd["version"], 4);
     assert_eq!(cmd["herd_id"], json!(herd_b));
     op_protocol::verify_json(&cmd, &app.ctx.public_key()).unwrap();
     let (_, st) = app.call("GET", &format!("/api/herds/{herd_b}/boundary"), None).await;
-    assert_eq!(st["active"]["version"], 4);
+    assert_eq!(st["active"]["version"], 1);
     assert_eq!(st["active"]["geometry"], bb["geometry"]);
-    // Moving a collar whose version is already below the herd's changes nothing.
-    let (id2, _) = app.device(&herd_a).await;
+    // Moving a collar that holds nothing yet changes nothing: it gets B's own.
+    let (id2, key2) = app.device(&herd_a).await;
     app.call("PATCH", &format!("/api/collars/{id2}"), Some(json!({"herd_id": herd_b}))).await;
-    let (_, st) = app.call("GET", &format!("/api/herds/{herd_b}/boundary"), None).await;
-    assert_eq!(st["active"]["version"], 4);
+    let (_, own) = app.req("GET", "/collar/v1/boundary?have=0", Some(&key2), None).await;
+    assert_eq!(own["version"], 1);
+    assert_eq!(own["boundary"], cmd["boundary"], "the copy is B's shape");
 }
 
 #[tokio::test]

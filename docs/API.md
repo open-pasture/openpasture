@@ -91,8 +91,12 @@ SlotCount { version, effective_at?, applied, stored, rejected, collars }
 
 Boundary versions come from one sequence shared by every herd (herd A may hold v1, v3, v4 and
 herd B v2); `active`/`pending` are still per herd. A collar moved to another herd starts over
-(`boundary_version` cleared, state `unknown`); if the new herd's boundaries are all at or below
-the version the collar held, they are stored again as new versions so the collar picks them up.
+(`boundary_version` cleared, state `unknown`). It still holds its old herd's versions, applied
+and staged, and asks only for versions above the highest; so when any of the new herd's
+boundaries sits at or below what it holds (applied or staged), or what it holds isn't known, it
+is handed copies of the new herd's boundary in effect and of each staged one, its own
+(`collar_id` + `copy_of`, new versions): the copy in effect drops the old herd's strips, and the
+rest of the new herd downloads nothing.
 `POST /api/herds/:id/boundary` writes the farmer decision, the move and its first boundary
 together, then supersedes the herd's open proposals and moves the herd to the paddock under the
 target.
@@ -516,7 +520,7 @@ BoundaryStatus.acks[].code?         // the reject code of a collar's latest ack
 ```
 
 **Every herd boundary is prepared** before it is stored (farmer draw, applied decision, each
-sweep step, reissue for a moved collar): the shape is validated and fitted to the strictest limits
+sweep step, schedule stage): the shape is validated and fitted to the strictest limits
 among the herd's collars that hold holes (V0 when none report caps). Outer rings only shrink and
 holes only grow. An invalid shape is 400 with a sentence, e.g. "Holes need 13 m between them and
 from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). Missing
@@ -531,11 +535,21 @@ ring, so `state` matches what the collar enforces. Selection (§3.3): its bounda
 with its own copies after an escape; only its pen while out on one) split at now by the
 activation rule (the highest version whose `effective_at`, or receipt, has passed is in effect; a
 staged version is dead once a higher one takes effect at or before it); versions it refused for
-good are dropped (every code except `slots_full`, and a rejection without a code); then the
+good are dropped (every code except `slots_full`, and a rejection without a code; `wrong_herd`
+and `bad_sig` refusals made before the collar's current config last went out are offered again
+once it reports holding that config, since it has then checked the server's signature and knows
+its herd); then the
 version in effect if newer than `have`, else the lowest staged one above `have` when `free` > 0
 and its record (`192 + 8 × vertices` bytes) fits `free_bytes`. A collar that sends no `free`
 (firmware 0.1) has its slots less what its acks say it holds. `latest_version` in report replies is
 the highest version of that set it hasn't refused.
+
+**Out of step.** When a report's `slots` show a collar can't get some version of its set the
+usual way (one it doesn't hold, hasn't refused, sits at or below the highest it holds: its record
+of the boundary in effect was lost, it holds another herd's versions), it is handed copies of its
+herd's boundary in effect and of each staged one, as after an escape, and `latest_version` names
+them. The server-side fence starts from `unknown` when the herd's boundary took effect after the
+collar's last report, as the collar rearms on a new boundary.
 
 **Reports** (§3.8) may carry `device { fw, caps, limits, config_version, config_reject }` (stored
 on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`), `slots` (the complete
@@ -567,7 +581,7 @@ comes.
 Tables: `collar_slots(collar_id, version, status, effective_at, reported_at, code)`,
 `episodes(id epi_…, collar_id, herd_id, animal_id, start_t, end_t, start_at, end_at,
 boundary_version, ring, cues, max_level, min_margin_m, outcome)`, `collar_config(collar_id,
-version, body, updated_at, reject_version, reject_code)`; boundary indexes `(herd_id, collar_id,
+version, body, updated_at, reject_version, reject_code, sent_at)`; boundary indexes `(herd_id, collar_id,
 version)`, `(effective_at)`, `(version)`.
 <!-- @J -->
 

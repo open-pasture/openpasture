@@ -113,17 +113,47 @@ async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): A
             .bind(&id)
             .execute(ctx.db())
             .await?;
-        // The collar still holds its old herd's version; make sure the new
-        // herd's boundary is newer than that.
-        if let Some(held) = current.boundary_version {
-            crate::boundary::reissue_for_moved_collar(&ctx, &next.herd_id, held).await?;
-        }
+        hand_over(&ctx, &id, current.boundary_version, current.last_seen.is_some()).await?;
         // Its signed config names the new herd, so it accepts that herd's boundaries.
         crate::config::refresh_quietly(&ctx, crate::config::Scope::Collar(&id)).await;
     }
     let next = find(&ctx, &id).await?;
     ctx.publish(Event::Collar { collar: next.clone() });
     Ok(Json(next))
+}
+
+/// A collar just moved to another herd still holds its old herd's versions,
+/// applied and staged (the old herd's strips would open on it at their
+/// times), and asks only for versions above the highest. When the new herd's
+/// boundaries sit at or below that, or what it holds isn't known (it has been
+/// heard from, but nothing of what it holds reached us), it gets copies of
+/// them above everything it holds; the one in effect drops the rest.
+async fn hand_over(ctx: &Ctx, collar_id: &str, applied: Option<u32>, heard: bool) -> ApiResult<()> {
+    let Some(collar) = db::get_collar(ctx.db(), collar_id).await? else { return Ok(()) };
+    let at = op_core::time::now();
+    let set = crate::escapes::collar_boundaries(ctx.db(), &collar, at).await?;
+    if set.active.is_none() && set.staged.is_empty() {
+        return Ok(());
+    }
+    let mut holds: Vec<u32> = sqlx::query_scalar::<_, i64>("SELECT version FROM collar_slots WHERE collar_id = ? AND status != 'rejected'")
+        .bind(collar_id)
+        .fetch_all(ctx.db())
+        .await?
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    holds.extend(applied);
+    let unknown = holds.is_empty() && heard;
+    // When everything the new herd has sits above what it holds, it asks for those.
+    let below = holds.iter().max().is_some_and(|&top| set.active.iter().chain(&set.staged).any(|b| b.version <= top));
+    if !(unknown || below) {
+        return Ok(());
+    }
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let copies = crate::escapes::hand_copies(&mut tx, &collar, at).await?;
+    tx.commit().await?;
+    tracing::info!(collar = %collar_id, herd = %collar.herd_id, holds = ?holds, copies = ?copies.iter().map(|b| b.version).collect::<Vec<_>>(), "moved collar: its new herd's boundaries as its own copies");
+    Ok(())
 }
 
 /// Put the collar on an animal (or take it off with `None`), through the
