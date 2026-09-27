@@ -254,6 +254,8 @@ async fn rules_and_policy_read_and_validate() {
     let kinds: Vec<&str> = v["rules"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap()).collect();
     // A-engine's rules first, in Settings order; later streams' follow under their anchors.
     assert!(kinds.contains(&"schedule_not_stored"), "{kinds:?}");
+    // @H
+    assert!(kinds.contains(&"fit_check_due"), "{kinds:?}");
     assert_eq!(
         kinds[..11],
         [
@@ -267,9 +269,7 @@ async fn rules_and_policy_read_and_validate() {
             "move_stalled",
             "stragglers",
             "drop_off",
-            "gps_degraded",
-            // @H
-            "fit_check_due"
+            "gps_degraded"
         ]
     );
     let silent = v["rules"].as_array().unwrap().iter().find(|r| r["kind"] == "silent").unwrap();
