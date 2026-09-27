@@ -54,14 +54,11 @@ async fn require_farm(ctx: &Ctx) -> ApiResult<Farm> {
 
 // State
 
-async fn get_state(State(ctx): State<Ctx>) -> ApiResult<Json<AppState>> {
+async fn get_state(State(ctx): State<Ctx>, identity: crate::Identity) -> ApiResult<Json<AppState>> {
     let store = ctx.store();
-    Ok(Json(AppState {
-        farm: store.get_farm().await?,
-        herds: store.list_herds().await?,
-        paddocks: store.list_paddocks().await?,
-        settings: ctx.settings().await?,
-    }))
+    let mut settings = ctx.settings().await?;
+    crate::people::redact_settings(&identity, &mut settings);
+    Ok(Json(AppState { farm: store.get_farm().await?, herds: store.list_herds().await?, paddocks: store.list_paddocks().await?, settings }))
 }
 
 // Farm
@@ -361,8 +358,10 @@ async fn delete_animal(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiRes
 
 // Settings
 
-async fn get_settings(State(ctx): State<Ctx>) -> ApiResult<Json<Settings>> {
-    Ok(Json(ctx.settings().await?))
+async fn get_settings(State(ctx): State<Ctx>, identity: crate::Identity) -> ApiResult<Json<Settings>> {
+    let mut settings = ctx.settings().await?;
+    crate::people::redact_settings(&identity, &mut settings);
+    Ok(Json(settings))
 }
 
 async fn put_settings(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Settings>> {

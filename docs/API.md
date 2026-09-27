@@ -471,6 +471,73 @@ days plus imported position history.
 <!-- @E-lib -->
 <!-- @E-srv -->
 <!-- @J -->
+
+## People, roles and sign-in (op-core, op-server)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/users` | | `Person[]`, enabled first, by name |
+| POST | `/api/users` | `{ name, role, phone?, email? }` | 201 `Person` (no sign-in); 409 phone or email taken |
+| GET | `/api/users/:id` | | `Person` / 404 |
+| PATCH | `/api/users/:id` | `{ name?, role?, phone?, email?, disabled? }` (`null` clears phone, email) | `Person`; a new phone clears its verification; `disabled: true` also revokes every token and open link |
+| DELETE | `/api/users/:id` | | 204 / 404; their tokens and links go too, records keep the name they stored |
+| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped |
+| GET | `/api/invites` | | `Invite[]` open (not accepted, not expired), newest first |
+| POST | `/api/invites` | `{ user_id }` or `{ name, role, phone?, email? }` (adds the person now) | 201 `Invite & { code, url }`; `code` and `url` are shown once; replaces the person's open link |
+| DELETE | `/api/invites/:id` | | 204 / 404 (open links only) |
+| POST | `/api/invites/accept` | `{ code, label? }`, no token needed | `{ token, user: User }`; `token` (`opu_` + 64 hex) is shown once. 404 unknown or dropped link, 410 used, expired or person disabled, 429 after 5 tries a minute from one peer |
+| GET | `/api/tokens` | | `TokenInfo[]` not revoked, newest first |
+| DELETE | `/api/tokens/:id` | | 204 / 404; that browser gets 401 on its next request |
+| PATCH | `/api/me/profile` | `{ name?, phone?, email? }` | `User` (your own; 404 when you aren't in People; role can't be changed here) |
+| GET | `/api/me/tokens` | | your own `TokenInfo[]` |
+| DELETE | `/api/me/tokens/:id` | | 204 / 404 |
+| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) |
+
+```ts
+Person    = User & { tokens: number /* browsers signed in */, last_used?, invite_until? /* open link expires */ }
+Invite    { id /* inv_… */, user_id, name, role: Role, phone?, email?, created_by?: Actor, created_at, expires_at, accepted_at? }
+TokenInfo { id /* tok_… */, user_id, label, created_at, last_used?, revoked_at? }
+```
+
+**Sign-in.** No passwords. Adding a person gives them no sign-in: someone who only texts is a
+person with a phone. A sign-in link is `{base_url}/#/join/<code>` (a 128-bit code in hex, valid
+7 days, accepted once; the code rides in the URL fragment, which browsers don't send). Accepting
+it returns a person token (`opu_…`) that the browser keeps and sends as
+`Authorization: Bearer opu_…` (or `?token=` on the WebSocket), everywhere the app token works. A
+person may have several tokens (one per browser); a new link for the same person signs in another
+browser. Codes and tokens are stored as sha256 only. Tokens resolve through a 30 s cache;
+revoking a token or a person's sign-in, or changing, disabling or removing a person, applies to
+the next request. `last_used` is written at most once a minute. A revoked or unknown person token
+is 401 even from this machine (it never falls back to the local owner). The app token and local
+requests are the owner; when the owner added themselves to People (as an owner), they act as the
+first enabled owner person (`/api/me` shows it, records name them).
+
+**Roles** (`viewer < hand < manager < owner`), checked for every `/api` request before the route:
+
+- viewer: `GET`/`HEAD` everywhere except the reads below; `/api/live`; MCP read tools.
+  Every role may also use `/api/me` and `/api/me/*` and `POST`/`DELETE /api/push/subscriptions*`.
+- hand: a viewer plus `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`,
+  `PUT /api/alerts/prefs/me`, `POST /api/herds/:id/move/stop`, `POST /api/collars/:id/escape/stop`,
+  `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/fleet/:id/fit-checks`,
+  `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`, `POST /api/feed-log`,
+  `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
+- manager: every other `/api` request except the owner's; `GET /api/messages` and
+  `GET /api/alerts/prefs` are managers' reads; all MCP tools.
+- owner: also `PUT /api/settings`, `/api/secrets*`, `/api/users*`, `/api/invites*` (except
+  `accept`, which needs no sign-in), `/api/tokens*`, `/api/brains/hosted/keys*`, `/api/notify/*`,
+  `/api/texting*`, `PUT /api/push/settings`, `POST /api/collars/:id/rekey`.
+
+A role too low is 403 `{"error": "Your role can't do this."}`. `GET /api/settings` and
+`GET /api/state` send `server.app_token: ""` to everyone but owners. `POST /api/sql` is a
+manager's (it is a POST). MCP lists and calls tools as the caller: a viewer or hand never sees
+`propose_boundary`, and calling it answers "Unknown tool".
+
+**Who answered.** `POST /api/decisions/:id/respond` records the caller:
+`inputs.farmer_response.by = Actor` (e.g. `{ via: "user_token", user_id, name: "Ana" }`, or
+`{ via: "local" }` for the owner on this machine without a person), and the activity events the
+answer causes (`decision.approved`, `decision.rejected`, `decision.applied`) carry the name in
+`payload.by` ("owner" for the app token or a local request without a person). A proposal made
+through MCP `propose_boundary` keeps its caller as `inputs.by`.
 <!-- @A-engine -->
 <!-- @A-notify -->
 <!-- @D -->

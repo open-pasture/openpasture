@@ -2,6 +2,7 @@ import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
 import { behindOf, outOf, store, useStore } from "../store";
+import { useCan } from "../store/me";
 import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
@@ -316,6 +317,8 @@ function DrawGroup({ items, onPick }: { items: ToolItem[]; onPick: (t: ToolItem)
 }
 
 function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: string; onReshape: () => void; onClose: () => void }) {
+  // Managers edit paddocks; everyone else reads them.
+  const manage = useCan("manager");
   const props = { paddock: p, herdId };
   const added = sectionNodes(useSections(paddockSheet, props), props);
   const [name, setName] = useState(p.name);
@@ -341,12 +344,12 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
   return interleave([
     { key: "name", order: PADDOCK_SHEET.name, node: (
       <form onSubmit={(e) => { e.preventDefault(); void save(); }}>
-        <Input className="title" value={name} onChange={(e) => setName(e.target.value)} onBlur={save} aria-label="Name" />
+        <Input className="title" value={name} onChange={(e) => setName(e.target.value)} onBlur={save} aria-label="Name" readOnly={!manage} tabIndex={manage ? undefined : -1} />
       </form>
     ) },
     { key: "facts", order: PADDOCK_SHEET.facts, node: <p className="facts mono">{p.area_ha.toFixed(1)} ha  {p.status}</p> },
-    { key: "notes", order: PADDOCK_SHEET.notes, node: <AutoText value={notes} onChange={setNotes} onBlur={saveNotes} placeholder="Notes" aria-label="Notes" /> },
-    { key: "actions", order: PADDOCK_SHEET.actions, node: (
+    { key: "notes", order: PADDOCK_SHEET.notes, node: (manage || notes) && <AutoText value={notes} onChange={setNotes} onBlur={saveNotes} placeholder="Notes" aria-label="Notes" readOnly={!manage} /> },
+    { key: "actions", order: PADDOCK_SHEET.actions, node: manage && (
       <div className="acts">
         <Button small onClick={onReshape}>Reshape</Button>
         <Button small kind="plain" className="danger" onClick={remove}>Delete</Button>
