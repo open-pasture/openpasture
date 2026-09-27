@@ -1226,6 +1226,78 @@ stay with the original.
 <!-- @S -->
 <!-- @A3 -->
 <!-- @H -->
+
+## Welfare record and training mode (op-analytics, H)
+
+The collars are audio only. Cue kinds are `warn` (the warning tone in the zone inside the line,
+level 1–4) and `outside` (a tone for up to 10 s after a crossing); there are no others.
+
+| Method | Path | Query or body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/welfare/animals` | `herd_id?` (every herd when left out) | `HerdWelfare` |
+| GET | `/api/welfare/animals/{animal_id}/cues` | `from&to` (default the last 14 days) | `AnimalWelfare` |
+| GET | `/api/welfare/cues/points` | `herd_id?&from&to` (default the last 7 days) | `CuePoints` |
+| GET | `/api/welfare/training/{herd_id}` | | `HerdTraining` |
+| PUT | `/api/welfare/training/{herd_id}` | `{ enabled?, warn_m?, trained_after? }` (manager; left out keeps) | `HerdTraining` |
+
+```ts
+Learning       { status?: "trained"|"learning", since?, streak, // turned back in a row since the last crossing
+                 outcomes: { turned_back, crossed, rest, boundary_changed },
+                 last_episode_at?, derived?: true }             // some episodes rebuilt from fixes
+HerdWelfare    { herd_id?, training?: Training, head /* animals not removed */, trained, learning,
+                 animals: (Learning & { animal_id, tag, herd_id, collar_id? })[] }   // in tag order
+AnimalWelfare  { animal_id, tag, herd_id, collar_id?, from, to, trained_after,
+                 learning: Learning,                            // from all its episodes, now
+                 days: { date /* farm day */, warn, outside, tone_s, episodes, longest_s?, max_level? }[],  // every farm day in the range
+                 episodes: Episode[],                            // in the range, newest first
+                 cues: LedgerRow[], truncated?,                  // newest first, at most 2,000
+                 fit_checks: { collar_id, checked_at, by?: Actor, notes? }[],  // of every collar it wore
+                 drop_offs: { from, to? }[] }                    // drop_off alerts on it or its collars, merged
+Episode        { id /* epi_… */, collar_id, herd_id?, animal_id?, start, end, ring /* 0 edge, 1.. holes */, cues,
+                 max_level, min_margin_m, outcome: "turned_back"|"crossed"|"rest"|"boundary_changed",
+                 boundary_version?, derived?: true }
+LedgerRow      { at, kind: "warn"|"outside", level, tone_ms, dur_ms? /* as the collar reported */, margin_m,
+                 ring?, boundary_version?, collar_id, outcome?, episode_id?, derived?: true }
+CuePoints      { cell_m: 2, size?: [dlon, dlat], ticks: [lon, lat, warn, outside][], truncated? }  // most cued first, at most 5,000
+Training       { enabled: false, warn_m: 10, trained_after: 5 }  // setting `welfare.training`, per herd
+HerdTraining   Training & { herd_id }
+```
+
+- **Episodes**: a run of warning tones ending `turned_back` (back inside), `crossed`, `rest` (after
+  20 s of warning the collar is quiet for 30 s) or `boundary_changed`. Firmware 0.2 collars report
+  them. For firmware 0.1 collars (cues with no kind) a background task, every 30 s, rebuilds them
+  from the stored fixes (the server fence's state and margin at each fix) and cues by the collar's
+  own rules, and stores them in `episodes` with `derived = 1`; an episode whose end hasn't arrived
+  waits for the next run, and one with nothing stored after it for 10 minutes is left out. Tone
+  for those collars counts 0.3 s a cue (their beep; they don't report it).
+- **Learning status**: trained after `trained_after` turned-back episodes in a row with no crossing
+  (rest and boundary changes neither count nor break the run); learning once it has any episode;
+  no status without episodes. `since`: the episode that made it trained; for learning, the crossing
+  that ended being trained, else its first episode. `trained_after` is its herd's.
+- **Training mode** per herd: while `enabled`, a boundary sent for the herd without `warn_m` takes
+  the training `warn_m` (op-ingest's `default_margins`); a send that names `warn_m` keeps it.
+  Boundaries already sent keep theirs. `warn_m` 1–100 m, `trained_after` 1–50.
+- Days are farm days (the farm's time zone). Cues are read from SQLite and the Parquet day files
+  (a row in both while a rollup deletes counts once).
+- MCP (read, viewers): `get_welfare` `{ herd_id?, animal_id?, from?, to? }`: without `animal_id`
+  a `HerdWelfare`, with it an `AnimalWelfare` with at most 50 cues and episodes.
+- Report `welfare` ("Welfare record", `GET /api/reports/welfare?from&to&herd_id`): per animal,
+  cues by kind, tone (total, a day, most in one farm day), longest episode, loudest level;
+  episodes by outcome, status and since as of the end of the dates, "From fixes"; fit checks and
+  times the collar lay still; the farm days with cues; method notes; an Operator signature line.
+
+Coverage (G's `/api/coverage`) gains two metrics from the collars' health reports, each report
+counted in the cell of that collar's fix nearest in time (within 6 h):
+- `fix_rate`: fixes the receivers got ÷ fixes they tried (`health.fix_ok / fix_attempts`), 0–1,
+  unit `ratio`; `n` is the attempts.
+- `cell`: the median LTE cell signal (`health.rsrp_dbm`, whole dBm), unit `dBm`; `n` is the reports
+  that measured it. Only boards with a modem report one.
+
+Alert rules (H): `drop_off` also reads a collar's IMU (`health.still_s`, `tilt_deg`): still for
+45 min (or the rule's `after_min` if sooner) and tilted past 60° is a collar lying on its side
+(`data.imu: true`, `tilt_deg`); an IMU collar is judged on that alone. `fit_check_due` (info, no
+texts): a collar on an animal whose fit hasn't been checked for `fleet.fit_check_days` since its
+last check (else since it was added); the brief counts them ("Fit check due: 5").
 <!-- @L -->
 <!-- @M -->
 <!-- @Z -->
