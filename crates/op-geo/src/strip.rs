@@ -511,6 +511,26 @@ mod tests {
     }
 
     #[test]
+    fn a_detailed_paddock_cuts_cleanly_into_many_strips() {
+        // A 400-vertex wobbly field about 1 km across, as an imported boundary might be.
+        let ring: Vec<LonLat> = (0..400)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 400.0;
+                let r = 1.0 + 0.04 * (7.0 * a).sin() + 0.02 * (23.0 * a).cos();
+                [-93.62 + 0.006 * r * a.cos(), 42.03 + 0.0045 * r * a.sin()]
+            })
+            .collect();
+        let p = Polygon::from_ring(ring);
+        let ss = strips(&p, 30.0, StripBy::Width(15.0), 5.0);
+        assert!(ss.len() > 50, "{}", ss.len());
+        assert!(gaps_and_overlaps(&p, &ss) < 1e-2, "{}", gaps_and_overlaps(&p, &ss));
+        assert!(close(total_ha(&ss), p.area_ha(), p.area_ha() * 1e-4));
+        for s in &ss {
+            assert!(s.validated().is_ok());
+        }
+    }
+
+    #[test]
     fn area_outside_subtracts_what_overlaps() {
         let s = &strips(&ames(), 0.0, StripBy::Count(4), 5.0)[0];
         assert!(close(area_outside_ha(s, &[]), s.area_ha(), 1e-12));
