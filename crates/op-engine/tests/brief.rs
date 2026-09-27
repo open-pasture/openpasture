@@ -248,6 +248,8 @@ async fn a_farmer_boundary_with_no_sweep_is_sent_and_confirmed() {
     assert_eq!(active.decision_id, started["decision_id"].as_str().unwrap());
     let ack = json!({ "command_id": active.id, "version": active.version, "status": "applied", "at": time::now().format("%Y-%m-%dT%H:%M:%SZ").to_string() });
     assert!(t.req("POST", "/collar/v1/ack", Some(ack), Some(&f.keys[0])).await.0.is_success());
+    // A farm at Ames starts imperial; the call is checked in metric.
+    t.units("metric").await;
     let lines = t.lines(&f).await;
     assert_eq!(lines[0], format!("Cows: MOVE to P2 ({}).", Fmt::new(Units::Metric).area(area(&f.p2))));
     assert_eq!(lines[1], "Sent, 1/1 collars confirmed.");
