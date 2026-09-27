@@ -373,18 +373,30 @@ async fn a_sweep_drops_the_staged_moves_and_they_are_staged_again_once_it_ends()
     assert!(staged(&ms2).iter().all(|m| m.boundary_version.unwrap() > stepped));
     let opens = |ms: &[ScheduledMove]| ms.iter().filter(|m| m.step == 0).map(|m| (m.index, m.at)).collect::<Vec<_>>();
     assert_eq!(opens(&ms), opens(&ms2));
-    // The herd is spread over the sweep's ground: strip 2's open keeps all of it,
-    // and its back fence closes it from both ends onto strip 2.
+    // The herd is spread over the sweep's ground: strip 2's open keeps all of it.
     let swept: Polygon = serde_json::from_value(app.status(&herd).await["active"]["geometry"].clone()).unwrap();
     let open2 = ms2.iter().find(|m| m.index == 1 && m.step == 0).unwrap();
     for x in [25.0, 75.0, 275.0] {
         assert!(swept.contains(m_at(x, 100.0)) && open2.geometry.contains(m_at(x, 100.0)), "x {x}");
     }
-    let closes: Vec<&ScheduledMove> = ms2.iter().filter(|m| m.index == 1 && m.step > 0).collect();
-    let last = closes.iter().max_by_key(|m| m.step).unwrap();
-    assert!((last.geometry.area_ha() * 1e4 - 50.0 * 200.0).abs() < 100.0, "strip 2 alone");
-    assert!(closes.len() > 2 && closes.iter().all(|m| m.at < opens(&ms2)[1].1));
-    assert!(!closes[0].geometry.contains(m_at(298.0, 100.0)) && !closes[0].geometry.contains(m_at(23.0, 100.0)), "from both ends");
+    // No back-fence step takes the ground ahead, where the herd was sent: each
+    // closes only what lies behind its strip, and the strips ahead open in turn.
+    let swept_to = |x: f64| swept.contains(m_at(x, 100.0));
+    for m in ms2.iter().filter(|m| m.step > 0) {
+        let k = f64::from(m.index);
+        for x in [50.0 * k + 25.0, 295.0] {
+            assert!(m.geometry.contains(m_at(x, 100.0)) || !swept_to(x), "strip {} step {} keeps x {x}", m.index + 1, m.step);
+        }
+    }
+    for k in 2..6u32 {
+        let last = ms2.iter().filter(|m| m.index == k).max_by_key(|m| m.step).unwrap();
+        assert!(last.step > 0 && !last.geometry.contains(m_at(50.0 * f64::from(k) - 3.0, 100.0)), "strip {}'s back fence closes behind it", k + 1);
+    }
+    // Planned again from the swept ground once: later passes change nothing (no restaging churn).
+    for _ in 0..3 {
+        assert!(!sched::drive(&app.ctx, &s.id, Utc::now()).await.unwrap(), "a pass with nothing new changes nothing");
+    }
+    assert_eq!(app.moves(&s).await, ms2);
 }
 
 #[tokio::test]
@@ -850,7 +862,7 @@ async fn back_fence_steps_missed_while_the_server_was_away_stay_in_the_next_open
 }
 
 #[tokio::test]
-async fn a_schedule_from_the_whole_paddock_keeps_it_at_the_first_open_and_closes_it_behind_the_herd() {
+async fn a_schedule_from_the_whole_paddock_keeps_it_and_the_back_fence_takes_only_ground_behind() {
     let app = App::new().await;
     let (herd, pad) = app.herd("Cows").await;
     let dev = app.collar(&herd, CollarLimits::V0).await;
@@ -861,20 +873,22 @@ async fn a_schedule_from_the_whole_paddock_keeps_it_at_the_first_open_and_closes
     let s = app.schedule(&herd, &pad, start, quick_fence()).await;
     assert_eq!(s.next_index, 0);
     let ms = app.moves(&s).await;
-    let open1 = ms.iter().find(|m| m.index == 0 && m.step == 0).unwrap();
-    // Nobody is left outside at the open: it is the whole paddock still.
+    let at = |k: u32, step: u32| ms.iter().find(|m| m.index == k && m.step == step).unwrap();
+    let last = |k: u32| ms.iter().filter(|m| m.index == k).max_by_key(|m| m.step).unwrap();
+    // Nobody is left outside at the open: it is the whole paddock still, and
+    // nothing lies behind strip 1 to close. The herd stands on the ground
+    // ahead with no reason to leave it, so no timed step takes it away.
     for x in [25.0, 150.0, 250.0, 295.0] {
-        assert!(open1.geometry.contains(m_at(x, 100.0)), "x {x}");
+        assert!(at(0, 0).geometry.contains(m_at(x, 100.0)), "x {x}");
     }
-    // The back fence closes the other five strips from the far side, two steps a strip, before strip 2 opens.
-    let closes: Vec<&ScheduledMove> = ms.iter().filter(|m| m.index == 0 && m.step > 0).collect();
-    assert_eq!(closes.len(), 10);
-    let areas: Vec<f64> = closes.iter().map(|m| m.geometry.area_ha() * 1e4).collect();
-    assert!(areas.windows(2).all(|w| w[1] < w[0]), "{areas:?}");
-    assert!(!closes[0].geometry.contains(m_at(295.0, 100.0)) && closes[0].geometry.contains(m_at(25.0, 100.0)));
-    assert!((areas[9] - 50.0 * 200.0).abs() < 100.0, "strip 1 alone");
-    let open2 = ms.iter().find(|m| m.index == 1 && m.step == 0).unwrap();
-    assert!(closes.iter().all(|m| m.at > open1.at && m.at < open2.at));
+    assert_eq!(last(0).step, 0, "no back fence over the ground ahead");
+    // Strip 2 opens on the paddock still whole; its back fence takes strip 1 alone, from the far side.
+    assert!(at(1, 0).geometry.contains(m_at(25.0, 100.0)) && at(1, 0).geometry.contains(m_at(295.0, 100.0)));
+    assert_eq!(last(1).step, 2);
+    assert!(!at(1, 1).geometry.contains(m_at(5.0, 100.0)) && at(1, 1).geometry.contains(m_at(45.0, 100.0)));
+    assert!(!last(1).geometry.contains(m_at(45.0, 100.0)) && last(1).geometry.contains(m_at(55.0, 100.0)) && last(1).geometry.contains(m_at(295.0, 100.0)));
+    // And so on: strip 6 is left alone at the end.
+    assert!((last(5).geometry.area_ha() * 1e4 - 50.0 * 200.0).abs() < 100.0, "strip 6 alone");
 }
 
 #[tokio::test]

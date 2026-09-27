@@ -35,7 +35,9 @@
 //!
 //! **The ground under the herd.** An open never takes ground away: it is the
 //! ground the herd has joined to the new strip ([`opening`]); only back-fence
-//! steps take ground, from the far side. Each open is planned from what the
+//! steps take ground, and only ground behind the strip, from the far side
+//! (ground ahead, where the herd was moved on further, stays until its strips
+//! open). Each open is planned from what the
 //! move before it leaves. When the boundary in effect isn't that move (one
 //! was late or couldn't be sent, a boundary came from elsewhere, move now),
 //! what is still to come is planned again from the ground the herd is on
@@ -409,12 +411,19 @@ pub fn union_of(strips: &[Polygon]) -> Option<Polygon> {
     s.local.one(&union_geo(&s.polys))
 }
 
+/// A shape a collar takes as a boundary, as far as its rings go (the margins
+/// and limits are `prepare`'s): boolean ops can leave a ring pinched at a vertex.
+fn sound(p: &Polygon) -> bool {
+    const ANY: CollarLimits = CollarLimits { outer: 1 << 20, holes: 1 << 12, hole_vertices: 1 << 20, total: 1 << 22, slots: 1, slot_bytes: 0 };
+    op_geo::shape::check(p, &ANY, 0.0, 0.0, 0.0).is_ok()
+}
+
 /// Where a back fence stands part way through closing: `region` (the whole
-/// open ground) less the far `1 - keep` of the old ground's depth on each
-/// side it has some (`behind` the strips kept, `ahead` of them), measured
-/// along `axis` (from, toward). One intersection with a band just bigger than
-/// the region, so the result keeps the region's own edges.
-fn part_toward(region: &GeoPolygon, behind: Option<&MultiPolygon>, ahead: Option<&MultiPolygon>, axis: ([f64; 2], [f64; 2]), keep: f64) -> MultiPolygon {
+/// open ground) less the far `1 - keep` of the depth of the old ground
+/// `behind` the strips kept, measured along `axis` (from, toward). One
+/// intersection with a band just bigger than the region, so the result keeps
+/// the region's own edges.
+fn part_toward(region: &GeoPolygon, behind: &MultiPolygon, axis: ([f64; 2], [f64; 2]), keep: f64) -> MultiPolygon {
     let (from, toward) = axis;
     let (dx, dy) = (toward[0] - from[0], toward[1] - from[1]);
     let len = dx.hypot(dy).max(1e-9);
@@ -424,25 +433,14 @@ fn part_toward(region: &GeoPolygon, behind: Option<&MultiPolygon>, ahead: Option
         |cs: &mut dyn Iterator<Item = &Coord>, f: &dyn Fn(&Coord) -> f64| cs.map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
     let along = |c: &Coord| c.x * ux + c.y * uy;
     let across = |c: &Coord| c.x * px + c.y * py;
-    let coords = |m: &MultiPolygon| m.0.iter().flat_map(|p| p.exterior().0.iter()).copied().collect::<Vec<Coord>>();
+    let old: Vec<Coord> = behind.0.iter().flat_map(|p| p.exterior().0.iter()).copied().collect();
     let keep = keep.clamp(0.0, 1.0);
-    let (near, far) = span(&mut region.exterior().0.iter(), &along);
+    let (_, far) = span(&mut region.exterior().0.iter(), &along);
     let (a0, a1) = span(&mut region.exterior().0.iter(), &across);
     let (a0, a1) = (a0 - 10.0, a1 + 10.0);
-    let lower = match behind {
-        Some(b) => {
-            let (lo, hi) = span(&mut coords(b).iter(), &along);
-            hi - keep * (hi - lo)
-        }
-        None => near - 10.0,
-    };
-    let upper = match ahead {
-        Some(a) => {
-            let (lo, hi) = span(&mut coords(a).iter(), &along);
-            lo + keep * (hi - lo)
-        }
-        None => far + 10.0,
-    };
+    let (lo, hi) = span(&mut old.iter(), &along);
+    let lower = hi - keep * (hi - lo);
+    let upper = far + 10.0;
     let at = |t: f64, s: f64| (ux * t + px * s, uy * t + py * s);
     let band = GeoPolygon::new(LineString::from(vec![at(lower, a0), at(upper, a0), at(upper, a1), at(lower, a1), at(lower, a0)]), vec![]);
     MultiPolygon(vec![region.clone()]).intersection(&MultiPolygon(vec![band]))
@@ -536,10 +534,13 @@ async fn on_paddock(ctx: &Ctx, s: &Schedule, g: &Polygon) -> anyhow::Result<f64>
 /// An open never takes ground away: it is the ground the herd has joined to
 /// the strips up to `k` and to the strips between (the herd walks through
 /// them; skipped strips are such ground). Without a back fence that is all:
-/// `strips[0 ..= k]` and the ground. With one, the steps then sweep all but
-/// `strips[k-lag ..= k]` from the far side, `close_steps` steps for each strip
-/// of old ground, the last being `strips[k-lag ..= k]`; old ground on both
-/// sides closes from both ends. `None`: nothing known, the strip alone.
+/// `strips[0 ..= k]` and the ground. With one, the steps then close the old
+/// ground behind `strips[k-lag ..= k]` from its far side, `close_steps` steps
+/// for each strip of it, the last leaving `strips[k-lag ..= k]`. Ground ahead
+/// of strip `k` (a herd that had more than the strips before it, or was moved
+/// on further by hand) isn't closed: the herd stands on ground it has no
+/// reason to leave, and a timed step would leave it outside, uncued. Its
+/// strips open in their turn. `None`: nothing known, the strip alone.
 pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackFence) -> Result<Opening, String> {
     let n = strips.len();
     if k >= n {
@@ -582,32 +583,19 @@ pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackF
     if let Some(g) = drawn {
         whole = whole.union(&MultiPolygon(vec![g]));
     }
-    let open = sn.local.one(&whole).ok_or_else(|| apart(lo.min(k), hi.max(k)))?;
-    // Old ground: what the herd has besides strips[end ..= k].
-    let old_strips: Vec<usize> =
-        (lo..=hi).chain(touched.iter().copied()).filter(|&i| i < end || i > k).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    let beyond = shape.as_ref().is_some_and(|_| {
-        let kept = union_geo(&sn.polys[at(end)..=at(k)]);
-        whole.difference(&kept).unsigned_area() >= 1.0
-    });
-    if !bf.enabled || (old_strips.is_empty() && !beyond) {
-        let after = match &shape {
-            Some(_) => ground_of(strips, &open),
-            None => Ground::Strips(lo, hi),
-        };
-        return Ok(Opening { open, closes: vec![], after });
-    }
-    let kept = union_geo(&sn.polys[at(end)..=at(k)]);
-    let last = sn.local.one(&kept).ok_or_else(|| apart(end, k))?;
-    let one_of = |m: &MultiPolygon| {
-        let big: Vec<&GeoPolygon> = m.0.iter().filter(|p| p.unsigned_area() >= 1.0).collect();
-        (big.len() == 1).then(|| big[0].clone())
+    let open = sn.local.one(&whole).filter(sound).ok_or_else(|| apart(lo.min(k), hi.max(k)))?;
+    let unclosed = |open: &Polygon| match &shape {
+        Some(_) => ground_of(strips, open),
+        None => Ground::Strips(lo, hi),
     };
-    // The old ground behind the strips kept and ahead of them, each closed from its far side.
+    if !bf.enabled {
+        return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+    }
+    // Old ground: what the herd has besides strips[end ..= k], behind them or ahead.
+    let kept = union_geo(&sn.polys[at(end)..=at(k)]);
     use geo::Centroid;
     let centre = |p: &GeoPolygon| p.centroid().map(|c| [c.x(), c.y()]);
-    let region = one_of(&whole).ok_or_else(|| apart(lo, hi))?;
-    let (Some(first), Some(front)) = (centre(&sn.polys[at(end)]), centre(&sn.polys[at(k)])) else { return Err(apart(end, k)) };
+    let Some(first) = centre(&sn.polys[at(end)]) else { return Err(apart(end, k)) };
     // Which way the strips advance: from one strip to the next.
     let centre_of = |i: usize| sn.local.to_geo(&strips[i]).as_ref().and_then(centre);
     let (a, b) = if k >= 1 { (k - 1, k) } else { (0, 1.min(n - 1)) };
@@ -622,30 +610,43 @@ pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackF
         let side = (c[0] - first[0]) * step_dir[0] + (c[1] - first[1]) * step_dir[1];
         if side < 0.0 || step_dir == [0.0, 0.0] { behind.push(p.clone()) } else { ahead.push(p.clone()) }
     }
-    let deep = |n: usize, any: bool| if any { n.max(1) } else { 0 };
-    let depth =
-        deep(old_strips.iter().filter(|&&i| i < end).count(), !behind.is_empty()).max(deep(old_strips.iter().filter(|&&i| i > k).count(), !ahead.is_empty()));
-    let steps = (bf.close_steps.max(1) as usize * depth.max(1)).min(MAX_CLOSE_STEPS);
-    let (behind, ahead) = ((!behind.is_empty()).then(|| MultiPolygon(behind)), (!ahead.is_empty()).then(|| MultiPolygon(ahead)));
-    let axis = match (&behind, &ahead) {
-        (Some(b), None) => b.centroid().map(|c| ([c.x(), c.y()], first)),
-        (None, Some(a)) => a.centroid().map(|c| (front, [c.x(), c.y()])),
-        (Some(b), Some(a)) => b.centroid().zip(a.centroid()).map(|(b, a)| ([b.x(), b.y()], [a.x(), a.y()])),
-        (None, None) => None,
+    if behind.is_empty() {
+        return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+    }
+    let region = {
+        let big: Vec<&GeoPolygon> = whole.0.iter().filter(|p| p.unsigned_area() >= 1.0).collect();
+        if big.len() != 1 {
+            return Err(apart(lo, hi));
+        }
+        big[0].clone()
+    };
+    let behind_strips = (lo..=hi).chain(touched.iter().copied()).filter(|&i| i < end).collect::<std::collections::BTreeSet<_>>().len();
+    let steps = (bf.close_steps.max(1) as usize * behind_strips.max(1)).min(MAX_CLOSE_STEPS);
+    let behind = MultiPolygon(behind);
+    // What is left once the back fence has closed: the strips kept, and any ground ahead.
+    let (last, after) = if ahead.is_empty() {
+        (sn.local.one(&kept).filter(sound).ok_or_else(|| apart(end, k))?, Ground::Strips(end, k))
+    } else {
+        // Ground that won't come apart cleanly (a sliver behind drawn ground) stays open.
+        let Some(rest) = sn.local.one(&whole.difference(&behind)).filter(sound) else {
+            return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+        };
+        let after = ground_of(strips, &rest);
+        (rest, after)
     };
     let mut closes = Vec::with_capacity(steps);
-    if let Some(axis) = axis.filter(|_| steps > 1) {
+    if let Some(axis) = behind.centroid().map(|c| ([c.x(), c.y()], first)).filter(|_| steps > 1) {
         for s in 1..steps {
             let keep = 1.0 - s as f64 / steps as f64;
             // A step that would fall apart (ground that bends round) is left
             // out: the next one takes its ground too.
-            if let Some(p) = sn.local.one(&part_toward(&region, behind.as_ref(), ahead.as_ref(), axis, keep)) {
+            if let Some(p) = sn.local.one(&part_toward(&region, &behind, axis, keep)).filter(sound) {
                 closes.push(p);
             }
         }
     }
     closes.push(last);
-    Ok(Opening { open, closes, after: Ground::Strips(end, k) })
+    Ok(Opening { open, closes, after })
 }
 
 /// What opening strip `k` stages, then each back-fence close step, when the

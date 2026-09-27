@@ -1381,12 +1381,14 @@ schedule. An open never takes ground away: opening strip k stages the ground the
 it (the boundary in effect for the first open, else what the move before leaves) joined to the
 strips up to k and those between (skipped strips are walked through). Without a back fence that
 is `strips[0..=k]` and whatever ground the herd had. With one, `close_steps` steps per strip of old
-ground, `close_after_min` after the open and `close_every_min` apart (pressed closer when they
-would reach the next open), sweep everything else from the far side, from both ends when there is
-old ground on both sides, the last being `strips[k-lag..=k]`. So with the herd on strip k-1 the
-open is `strips[k-1-lag..=k]`, and a schedule made while the herd has the whole paddock opens
-strip 1 as the whole paddock and closes the rest behind it. Every shape goes through `prepare`
-when it is staged (exclusions active at its time, fitting).
+ground behind strip k, `close_after_min` after the open and `close_every_min` apart (pressed
+closer when they would reach the next open), close that ground from its far side, the last leaving
+`strips[k-lag..=k]`. Ground ahead of strip k (a herd that had more than the strips before it, or
+was moved on further) is never closed: the herd stands on it with no reason to leave, and a timed
+step would leave it outside, uncued; those strips open in their turn. So with the herd on strip
+k-1 the open is `strips[k-1-lag..=k]`, and a schedule made while the herd has the whole paddock
+opens strip 1 as the whole paddock, then each later open's back fence takes the strip behind it.
+Every shape goes through `prepare` when it is staged (exclusions active at its time, fitting).
 
 **Times.** Occurrence 0 is `starts_at`; occurrence n is `cadence.at` on the farm-local date
 n × `every_days` days later, so "daily 07:00" opens at 07:00 local on both sides of a DST change
