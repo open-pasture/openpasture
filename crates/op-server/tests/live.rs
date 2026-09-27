@@ -335,3 +335,51 @@ async fn a_client_closing_gets_a_clean_close_back() {
     }
     assert!(saw_close, "the server answered the close");
 }
+
+/// A viewer signed in with a person token on a real server, from elsewhere.
+async fn viewer_socket() -> (tempfile::TempDir, op_server::ServerHandle, op_core::users::User, Ws) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let handle = op_server::serve(op_server::ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
+    let ctx = handle.ctx().clone();
+    let invite = op_core::people::NewInvite { name: Some("Vic".into()), role: Some(Role::Viewer), ..Default::default() };
+    let (_, code) = op_core::people::create_invite(&ctx, invite, &owner().actor()).await.unwrap();
+    let accepted = op_core::people::accept_invite(&ctx, &code, None).await.unwrap();
+    let mut req = format!("{}/api/live?token={}", handle.url().replace("http://", "ws://"), accepted.token).into_client_request().unwrap();
+    req.headers_mut().insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    (dir, handle, accepted.user, ws)
+}
+
+/// Whether the server closes the socket within `wait` (messages before it are skipped).
+async fn closed_within(ws: &mut Ws, wait: Duration) -> bool {
+    let end = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(end, ws.next()).await {
+            Ok(Some(Ok(m))) if m.is_close() => return true,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_sign_in_closes_its_open_socket() {
+    let (_dir, handle, user, mut ws) = viewer_socket().await;
+    let ctx = handle.ctx().clone();
+    assert!(!closed_within(&mut ws, op_server::live::SESSION_CHECK + Duration::from_secs(1)).await, "open while the token holds");
+    op_core::people::revoke_sign_in(&ctx, &user.id).await.unwrap();
+    assert!(closed_within(&mut ws, op_server::live::SESSION_CHECK + Duration::from_secs(2)).await, "closed once revoked");
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_changed_role_closes_the_socket_so_it_reconnects_as_the_new_one() {
+    let (_dir, handle, user, mut ws) = viewer_socket().await;
+    let ctx = handle.ctx().clone();
+    let patch = op_core::users::UserPatch { role: Some(Role::Manager), name: None, phone: None, email: None, disabled: None };
+    op_core::people::update_person(&ctx, &user.id, patch).await.unwrap();
+    assert!(closed_within(&mut ws, op_server::live::SESSION_CHECK + Duration::from_secs(2)).await);
+    handle.shutdown().await.unwrap();
+}

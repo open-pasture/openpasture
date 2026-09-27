@@ -70,3 +70,17 @@ pub async fn stored_collars(store: &crate::Store) -> anyhow::Result<Vec<crate::C
 pub async fn collar_herd(store: &crate::Store, collar_id: &str) -> anyhow::Result<Option<String>> {
     Ok(sqlx::query_scalar("SELECT herd_id FROM collars WHERE id = ?").bind(collar_id).fetch_optional(store.pool()).await?)
 }
+
+/// Whether a person's token still opens the feed as it did: not revoked, the
+/// person enabled, the role unchanged. A socket that no longer holds closes
+/// (the browser reconnects as whoever it is now, or is refused).
+pub async fn session_holds(store: &crate::Store, token_id: &str, role: crate::Role) -> anyhow::Result<bool> {
+    use crate::domain::DbEnum;
+    let now: Option<String> = sqlx::query_scalar(
+        "SELECT u.role FROM user_tokens t JOIN users u ON u.id = t.user_id WHERE t.id = ? AND t.revoked_at IS NULL AND u.disabled_at IS NULL",
+    )
+    .bind(token_id)
+    .fetch_optional(store.pool())
+    .await?;
+    Ok(now.is_some_and(|r| r == role.as_db()))
+}
