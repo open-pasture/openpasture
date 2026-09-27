@@ -950,3 +950,47 @@ async fn an_open_that_never_happened_takes_its_back_fence_steps_with_it() {
     assert!(open3.geometry.contains(m_at(25.0, 100.0)));
     assert!(ms.iter().filter(|m| m.state == MoveState::Staged).all(|m| m.geometry.contains(m_at(125.0, 100.0)) || m.index > 2));
 }
+
+#[tokio::test]
+async fn a_move_off_every_mapped_paddock_ends_the_schedule() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    // The farmer draws the unmapped field next door: the decision names no paddock.
+    let (st, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(320.0, 0.0, 520.0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    let row = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(m["decision_id"].as_str().unwrap()).fetch_one(app.ctx.db()).await.unwrap();
+    let d = op_core::store::decision_from_row(&row).unwrap();
+    assert_eq!(d.to_paddock_id, None);
+    // The draw itself ends it: nothing waits on the event bus.
+    let s = sched::get(&app.ctx, &s.id).await.unwrap().unwrap();
+    assert_eq!(s.status, ScheduleStatus::Done);
+    assert!(app.moves(&s).await.iter().all(|m| m.state != MoveState::Staged && m.state != MoveState::Planned));
+    // And the move ending restages nothing of the old paddock.
+    app.call("POST", &format!("/api/herds/{herd}/move/stop"), None).await;
+    sched::drive(&app.ctx, &s.id, Utc::now() + Duration::seconds(61)).await.unwrap();
+    assert!(app.status(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
+    let e = sched::on_decision(&app.ctx, &d).await.unwrap();
+    assert!(e.is_none(), "already ended");
+}
+
+#[tokio::test]
+async fn a_boundary_mostly_off_the_strips_ends_the_schedule_on_the_next_pass() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Cows").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    app.on_strip_one(&herd).await;
+    let start = whole(Utc::now() + Duration::minutes(30));
+    let s = app.schedule(&herd, &pad, start, quick_fence()).await;
+    // A boundary the schedule never heard about: mostly the field next door.
+    op_ingest::send_boundary(&app.ctx, &herd, rect(280.0, 0.0, 480.0, 200.0), Default::default(), "dec_elsewhere").await.unwrap();
+    sched::drive(&app.ctx, &s.id, Utc::now() + Duration::seconds(61)).await.unwrap();
+    let s = sched::get(&app.ctx, &s.id).await.unwrap().unwrap();
+    assert_eq!(s.status, ScheduleStatus::Done, "the strips would drag the herd back across");
+    assert!(app.moves(&s).await.iter().all(|m| m.state != MoveState::Staged && m.state != MoveState::Planned));
+    // The collars drop anything of the schedule's still staged.
+    assert!(app.status(&herd).await["staged"].as_array().is_none_or(|a| a.is_empty()));
+}

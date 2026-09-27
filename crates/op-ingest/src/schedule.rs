@@ -512,6 +512,15 @@ pub fn ground_of(strips: &[Polygon], g: &Polygon) -> Ground {
     Ground::Shape(outer)
 }
 
+/// How much of `g` lies on the strips (0 to 1).
+fn on_strips(strips: &[Polygon], g: &Polygon) -> f64 {
+    let area = Polygon::from_ring(g.outer_ring()).area_ha();
+    if area <= 0.0 {
+        return 0.0;
+    }
+    shares(strips, g).iter().zip(strips).map(|(f, s)| f * s.area_ha()).sum::<f64>() / area
+}
+
 /// What opening strip `k` stages when the herd has `ground`, then each
 /// back-fence close step.
 ///
@@ -544,8 +553,9 @@ pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackF
             let touched: Vec<usize> = shares(strips, g).iter().enumerate().filter(|(_, f)| **f >= TOUCHES).map(|(i, _)| i).collect();
             let below = touched.iter().copied().filter(|&i| i <= k).max();
             let above = touched.iter().copied().filter(|&i| i > k).min();
-            let lo = if bf.enabled { below.map_or(end, |b| (b + 1).min(end)) } else { 0 };
-            let hi = above.map_or(k, |a| (a - 1).max(k));
+            // The strips it touches are taken in whole, so the ground joins up.
+            let lo = if bf.enabled { below.map_or(end, |b| b.min(end)) } else { 0 };
+            let hi = above.map_or(k, |a| a.max(k));
             (lo, hi, Some(Polygon::from_ring(g.outer_ring())), touched)
         }
     };
@@ -1313,23 +1323,23 @@ async fn end_plan(ctx: &Ctx, mut p: Plan, reissue_staged: bool) -> ApiResult<Sch
     Ok(s)
 }
 
-/// A MOVE to another paddock ends the herd's schedule when it applies (the
-/// move's own boundaries replace the staged strips). Idempotent.
+/// A MOVE off the schedule's paddock ends the herd's schedule when it
+/// applies (the move's own boundaries replace the staged strips): to another
+/// paddock, or to ground in no mapped paddock (`to_paddock_id` none). Idempotent.
 pub async fn on_decision(ctx: &Ctx, d: &Decision) -> anyhow::Result<Option<Schedule>> {
     if d.status != DecisionStatus::Applied || d.action != Some(DecisionAction::Move) {
         return Ok(None);
     }
     let Some(s) = running(ctx, &d.herd_id).await? else { return Ok(None) };
-    match d.to_paddock_id.as_deref() {
-        Some(p) if p != s.paddock_id => {}
-        _ => return Ok(None),
+    if d.to_paddock_id.as_deref() == Some(s.paddock_id.as_str()) {
+        return Ok(None);
     }
     let _g = lock(&s.id).await;
     let p = load_plan(ctx, &s.id).await.map_err(|e| anyhow::anyhow!(e.message))?;
     if p.s.status == ScheduleStatus::Done {
         return Ok(None);
     }
-    tracing::info!(schedule = %s.id, decision = %d.id, "a move to another paddock ends the schedule");
+    tracing::info!(schedule = %s.id, decision = %d.id, to = ?d.to_paddock_id, "a move off the paddock ends the schedule");
     Ok(Some(end_plan(ctx, p, false).await.map_err(|e| anyhow::anyhow!(e.message))?))
 }
 
@@ -1493,12 +1503,18 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
     if s.status == ScheduleStatus::Active {
         if settled(ctx, &s, at).await? {
             settle_due(ctx, &s, &mut rows, &mut gone, at).await?;
-            // What is still to come starts from the ground the herd is on.
-            if let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active
-                && let Err(e) = rechain(&s, &mut rows, &mut gone, &active)
-            {
-                tracing::warn!(schedule = %s.id, "the herd's ground doesn't join the strips still to open: {e}");
-                return give_up(ctx, s, rows, gone, &active).await;
+            // What is still to come starts from the ground the herd is on. A
+            // herd moved mostly off the strips (a draw or MOVE elsewhere whose
+            // decision this schedule never saw) isn't dragged back onto them.
+            if let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active {
+                if active.decision_id != s.id && on_strips(&s.strips, &active.geometry) < 0.5 {
+                    tracing::warn!(schedule = %s.id, version = active.version, "the herd was moved off the schedule's strips");
+                    return give_up(ctx, s, rows, gone, &active).await;
+                }
+                if let Err(e) = rechain(&s, &mut rows, &mut gone, &active) {
+                    tracing::warn!(schedule = %s.id, "the herd's ground doesn't join the strips still to open: {e}");
+                    return give_up(ctx, s, rows, gone, &active).await;
+                }
             }
             stage(ctx, &s, &mut rows, at).await?;
             if !rows.iter().any(Row::pending) {

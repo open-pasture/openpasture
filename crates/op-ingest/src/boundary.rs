@@ -279,7 +279,12 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer)).await?;
 
     if let Some(r) = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(&decision_id).fetch_optional(ctx.db()).await? {
-        ctx.publish(Event::Decision { decision: decision_from_row(&r)? });
+        let decision = decision_from_row(&r)?;
+        // A draw off the paddock ends the herd's strip schedule now, not when the bus gets to it.
+        if let Err(e) = crate::schedule::on_decision(&ctx, &decision).await {
+            tracing::warn!("schedule: {e:#}");
+        }
+        ctx.publish(Event::Decision { decision });
     }
     // The farmer's target replaces any open proposal and moves the herd on the record.
     if let Err(e) = supersede_proposals(&ctx, &herd_id, &decision_id).await {

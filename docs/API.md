@@ -1385,8 +1385,9 @@ copies at the same times (see "Protocol v1 on the server").
 
 **Decisions.** While a schedule is active the daily decision is about it: the context has
 `schedule` (below). `STAY` keeps it (the next strip opens on time), `HOLD` (new action) repeats
-today's strip (as `/hold`), and a `MOVE` to another paddock ends the schedule when it applies (a
-farmer's draw included). `HOLD` without an active schedule fails the decision. `respond` with
+today's strip (as `/hold`), and a `MOVE` off the schedule's paddock ends the schedule when it applies
+(to another paddock or to ground in no mapped paddock; a farmer's draw included, ended as it is
+drawn). A boundary in effect that lies mostly off the strips ends it too on the driver's next pass. `HOLD` without an active schedule fails the decision. `respond` with
 `reject` on a proposed `STAY` while the herd's schedule is active holds: the decision becomes
 `action: "HOLD"`, `status: "applied"`, `inputs.proposed_action: "STAY"`. The approval text reads
 `Cows: strip 4 of 12 opens 07:00. Reply Y to keep, N to hold. Code 4821`. HOLD follows the herd's
