@@ -7,11 +7,16 @@ use serde_json::Value;
 
 use crate::ReportDoc;
 
-fn cell(v: &Value) -> String {
+/// A cell; numbers with their column's places when it has them.
+fn cell(v: &Value, decimals: Option<u8>) -> String {
     match v {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
-        Value::Number(n) => n.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 1e15).map_or_else(|| n.to_string(), |f| format!("{f:.0}")),
+        Value::Number(n) => match (n.as_f64(), decimals) {
+            (Some(f), Some(d)) => format!("{f:.*}", d as usize),
+            (Some(f), None) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{f:.0}"),
+            _ => n.to_string(),
+        },
         Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
@@ -37,7 +42,7 @@ pub fn write(doc: &ReportDoc) -> anyhow::Result<String> {
         w.write_record([s.title.as_str()])?;
         w.write_record(s.columns.iter().map(|c| column_heading(&c.label, c.unit.as_deref())))?;
         for r in s.rows.iter().chain(s.totals.iter()) {
-            w.write_record(r.iter().map(cell))?;
+            w.write_record(r.iter().enumerate().map(|(i, v)| cell(v, s.columns.get(i).and_then(|c| c.decimals))))?;
         }
         w.write_record(blank)?;
     }

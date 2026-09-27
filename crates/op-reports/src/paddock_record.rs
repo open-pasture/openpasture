@@ -112,16 +112,16 @@ impl Report for PaddockRecord {
             Column::new("herd", "Herd"),
             Column::new("in", "In"),
             Column::new("out", "Out"),
-            Column::new("days", "Days"),
-            Column::new("head", "Head"),
-            Column::new("au", "AU"),
-            Column::new("head_days", "Head-days"),
-            Column::new("au_days", "AU-days"),
-            Column::unit("density", "Stocking density", f.unit_label("density")),
-            Column::new("rest_days", "Rest before in"),
+            Column::new("days", "Days").dp(1),
+            Column::new("head", "Head").dp(0),
+            Column::new("au", "AU").dp(1),
+            Column::new("head_days", "Head-days").dp(1),
+            Column::new("au_days", "AU-days").dp(1),
+            Column::unit("density", "Stocking density", f.unit_label("density")).dp(1),
+            Column::new("rest_days", "Rest before in").dp(1),
         ]);
         if collar {
-            columns.push(Column::new("collar_days", "Collar days"));
+            columns.push(Column::new("collar_days", "Collar days").dp(0));
         }
 
         let mut rows = Vec::new();
@@ -176,11 +176,11 @@ impl Report for PaddockRecord {
         }
         let columns = vec![
             Column::new("paddock", "Paddock"),
-            Column::unit("area", "Area", f.unit_label("area")),
-            Column::new("events", "Events"),
-            Column::new("days", "Days"),
-            Column::new("head_days", "Head-days"),
-            Column::new("au_days", "AU-days"),
+            Column::unit("area", "Area", f.unit_label("area")).dp(1),
+            Column::new("events", "Events").dp(0),
+            Column::new("days", "Days").dp(1),
+            Column::new("head_days", "Head-days").dp(1),
+            Column::new("au_days", "AU-days").dp(1),
         ];
         let mut sum = (0.0, 0usize, 0.0, 0.0, 0.0);
         let rows: Vec<Vec<Value>> = by

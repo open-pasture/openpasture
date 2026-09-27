@@ -8,21 +8,31 @@ use serde::{Deserialize, Serialize};
 
 /// One column of a table. `unit` comes from `op_core::units` ("ac", "lb",
 /// "AU/ac"), or names a currency or a percentage; counts and days have none.
+/// `decimals`: the places a number column prints with (CSV and the UI), so a
+/// column reads 250.0, 325.5 and money always has two.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub key: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
 }
 
 impl Column {
     pub fn new(key: &str, label: &str) -> Self {
-        Self { key: key.into(), label: label.into(), unit: None }
+        Self { key: key.into(), label: label.into(), unit: None, decimals: None }
     }
 
     pub fn unit(key: &str, label: &str, unit: impl Into<String>) -> Self {
-        Self { key: key.into(), label: label.into(), unit: Some(unit.into()) }
+        Self { key: key.into(), label: label.into(), unit: Some(unit.into()), decimals: None }
+    }
+
+    /// A number column printed with `d` places.
+    pub fn dp(mut self, d: u8) -> Self {
+        self.decimals = Some(d);
+        self
     }
 }
 

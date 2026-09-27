@@ -120,18 +120,18 @@ impl Report for LeaseHeadDays {
             let one_currency = (currencies.len() == 1).then(|| currencies.iter().next().map(|c| c.to_string())).flatten();
             let mut columns = vec![
                 Column::new("paddock", "Paddock"),
-                Column::unit("area", "Area", f.unit_label("area")),
+                Column::unit("area", "Area", f.unit_label("area")).dp(1),
                 Column::new("dates", "Dates"),
-                Column::new("head_days", "Head-days"),
-                Column::new("au_days", "AU-days"),
-                Column::new("aum", "AUM"),
+                Column::new("head_days", "Head-days").dp(1),
+                Column::new("au_days", "AU-days").dp(1),
+                Column::new("aum", "AUM").dp(1),
             ];
             if pairs {
-                columns.push(Column::new("pair_months", "Pair-months"));
+                columns.push(Column::new("pair_months", "Pair-months").dp(1));
             }
             columns.push(Column::new("rate", "Rate"));
             columns.push(match &one_currency {
-                Some(c) => Column::unit("amount", "Amount", c.clone()),
+                Some(c) => Column::unit("amount", "Amount", c.clone()).dp(2),
                 None => Column::new("amount", "Amount"),
             });
 

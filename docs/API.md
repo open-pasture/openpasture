@@ -494,7 +494,8 @@ days plus imported position history.
 ReportDoc     { id, title, farm, from: "YYYY-MM-DD", to: "YYYY-MM-DD", herd_id?, generated_at,
                 header: [label, value][],          // Farm, Operator, FSA farm, Dates, Herd: only those known
                 sections: ReportSection[], notes: string[] /* method lines */, signatures: string[] /* signature-line labels */ }
-ReportSection { title, columns: { key, label, unit? }[], rows: (string|number|null)[][], totals?: (string|number|null)[] }
+ReportSection { title, columns: { key, label, unit?, decimals? /* places a number column prints with */ }[],
+                rows: (string|number|null)[][], totals?: (string|number|null)[] }
 ReportInputs  { operator?, fsa_farm?, au: { cow: 1.0, bull: 1.35, pair: 1.3, weaned_calf: 0.5 },
                 herds: Record<herd_id, { mean_weight_kg?, intake_pct: 2.5, mix?: { cows, bulls, calves, pairs: bool } }> }
 FeedEntry     { id /* fed_… */, herd_id, date: "YYYY-MM-DD", kg_dm, kind /* default "hay" */, note?, created_by?: Actor, created_at }
@@ -511,7 +512,7 @@ names it (`ac`/`ha`, `AU/ac`/`AU/ha`, `lb`/`kg`, `%`, or a currency). `null` is 
 CSV (`format=csv`, `text/csv`, attachment `<id>-<from>-<to>.csv`): the title row and the header
 rows (`label,value`), a blank line, then each section: its title row, the column row (`Label (unit)`),
 the rows, the totals row (first cell `Total`), a blank line; then `Notes` and one note per row.
-Numbers have no thousands separators.
+Numbers have no thousands separators and keep their column's `decimals`.
 
 History comes from triggers, not the API: `herd_history` records each herd's count and paddock
 whenever either changes (and its creation and deletion), `paddock_geometry_history` each paddock's

@@ -566,6 +566,9 @@ async fn csv_is_one_file_that_parses_back() {
         assert!(it.next().unwrap().iter().all(String::is_empty), "blank line after a section");
     }
     assert_eq!(it.next().unwrap(), ["Notes"]);
+    // Number columns keep their places: AU 100.0, head 100, area 40.9.
+    let first = text.lines().find(|l| l.starts_with("P1,")).unwrap();
+    assert_eq!(first, "P1,Cows,2025-09-01 07:00,2025-09-06 07:00,5.0,100,100.0,500.0,500.0,2.4,");
     let notes: Vec<Value> = it.map(|r| json!(r[0])).collect();
     assert_eq!(Value::Array(notes), doc["notes"]);
 }

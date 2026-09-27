@@ -46,15 +46,15 @@ impl Report for Nrcs528 {
             }
         }
         columns.extend([
-            Column::unit("area", "Area", f.unit_label("area")),
+            Column::unit("area", "Area", f.unit_label("area")).dp(1),
             Column::new("date_in", "Date in"),
             Column::new("date_out", "Date out"),
             Column::new("kind", "Kind"),
-            Column::new("number", "Number"),
-            Column::new("au", "AU"),
-            Column::new("days", "Days"),
-            Column::new("aud", "AUD"),
-            Column::new("rest", "Rest period"),
+            Column::new("number", "Number").dp(0),
+            Column::new("au", "AU").dp(1),
+            Column::new("days", "Days").dp(1),
+            Column::new("aud", "AUD").dp(1),
+            Column::new("rest", "Rest period").dp(1),
         ]);
 
         let mut rows = Vec::new();
