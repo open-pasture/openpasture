@@ -755,6 +755,29 @@ async fn collar_days_are_days_the_herd_spent_real_time_in_the_paddock() {
 }
 
 #[tokio::test]
+async fn a_herd_created_empty_and_filled_by_its_animals_goes_in_at_their_head() {
+    // The usual start: a herd made with no head, its animals imported five
+    // seconds later. The event read Head 0 and AU 0 (the count for those five
+    // seconds), so its stocking density and the NRCS number were 0 too.
+    let app = App::new().await;
+    let f = farm(&app).await;
+    let h = herd(&app, "Cows", 0, Some(&f.p2)).await;
+    register(&app, &h, 1, 20).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z", "2025-09-01T12:00:05.000Z"]).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "head"), column(ev, "au")), (vec![json!(20)], vec![json!(20.0)]));
+    // 20 AU over the paddock (acres on this farm).
+    let ac = f.area * AC_PER_HA;
+    assert_eq!(column(ev, "density"), [json!(round(20.0 / ac, 1))]);
+    // Head-days from the moment they were on record: 20 x (29 d 17 h less 5 s).
+    let hd = 20.0 * (29.0 + 17.0 / 24.0 - 5.0 / 86_400.0);
+    assert_eq!(column(ev, "head_days"), [json!(round(hd, 1))]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "number"), column(rec, "aud")), (vec![json!(20)], vec![json!(round(hd, 1))]));
+}
+
+#[tokio::test]
 async fn csv_is_one_file_that_parses_back() {
     let app = App::new().await;
     grazing(&app).await;

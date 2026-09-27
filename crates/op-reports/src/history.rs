@@ -63,7 +63,8 @@ pub struct Cut {
     /// The stay went on past the window: `end` is the window's end (the
     /// midnight after the report's last day), not a day the herd left.
     pub cut_end: bool,
-    /// Head on the first day of the cut.
+    /// Head on the first day of the cut: the first count above 0 in it (0
+    /// only when it never had any).
     pub head: u32,
     pub days: f64,
     pub head_days: f64,
@@ -338,7 +339,11 @@ impl Stay {
         for p in &self.parts {
             let (a, b) = (p.start.max(start), p.end.unwrap_or(DateTime::<Utc>::MAX_UTC).min(stop));
             if b > a {
-                head.get_or_insert(p.count);
+                // The head that went in: a herd made with no head and filled by
+                // its animals a moment later goes in at their count, not at 0.
+                if p.count > 0 {
+                    head.get_or_insert(p.count);
+                }
                 counts.push((p.count, days(b - a)));
                 head_days += p.count as f64 * days(b - a);
             }
