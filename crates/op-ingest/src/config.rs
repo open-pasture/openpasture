@@ -224,6 +224,30 @@ pub(crate) async fn sync(
     Ok(current.filter(|s| reported.is_none_or(|r| s.cmd.version > r) && s.reject_version != Some(s.cmd.version)).map(|s| s.cmd))
 }
 
+/// The collar's current config goes out in a report reply now.
+pub(crate) async fn mark_sent(conn: &mut sqlx::SqliteConnection, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+    sqlx::query("UPDATE collar_config SET sent_at = ? WHERE collar_id = ?").bind(to_db(&at)).bind(collar_id).execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// A collar that says it holds config version `reported` holds our current
+/// one: its `wrong_herd` and `bad_sig` refusals from before that config last
+/// went out came from before it checked our signature on it and knew its
+/// herd, so they go (and those versions are offered again). Returns them.
+pub(crate) async fn clear_stale_refusals(conn: &mut sqlx::SqliteConnection, collar_id: &str, reported: Option<u32>) -> anyhow::Result<Vec<u32>> {
+    let Some(r) = reported else { return Ok(vec![]) };
+    let gone: Vec<i64> = sqlx::query_scalar(
+        "DELETE FROM collar_slots WHERE collar_id = ?1 AND status = 'rejected' AND code IN ('wrong_herd', 'bad_sig')
+             AND reported_at <= (SELECT sent_at FROM collar_config WHERE collar_id = ?1 AND version <= ?2)
+         RETURNING version",
+    )
+    .bind(collar_id)
+    .bind(i64::from(r))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(gone.into_iter().map(|v| v as u32).collect())
+}
+
 /// What a set of collars should hold: shared inputs read once.
 pub(crate) struct Inputs {
     cadence: CollarsConfig,

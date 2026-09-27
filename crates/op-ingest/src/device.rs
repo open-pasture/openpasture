@@ -5,7 +5,11 @@
 //! - `POST /collar/v1/report`: fixes, cues, episodes, health, what the collar
 //!   is (`device`) and holds (`slots`). The reply names the highest boundary
 //!   version for it and, for a collar with the `config` cap, carries its
-//!   signed config when it holds an older one.
+//!   signed config when it holds an older one. A collar whose slots show it
+//!   can't get some boundary it should hold (another herd's versions, a lost
+//!   record) is handed copies of its herd's boundaries above what it holds.
+//!   Once it holds its current config, its `wrong_herd` and `bad_sig`
+//!   refusals from before that config went out are offered again.
 //! - `GET /collar/v1/boundary?have=&free=&free_bytes=`: the boundary in effect
 //!   when it is newer than `have`, else the lowest staged one above `have`
 //!   while the collar has a free slot and room for it; versions it refused
@@ -124,7 +128,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     let split = db::herd_boundaries(ctx.db(), &herd_id, received).await?;
     let held = escapes::collar_boundaries(ctx.db(), &collar, received).await?;
     let rejected = db::rejected_versions(ctx.db(), &collar.id).await?;
-    let latest_version = held.active.iter().chain(&held.staged).map(|b| b.version).filter(|v| !rejected.contains(v)).max();
+    let mut latest_version = held.active.iter().chain(&held.staged).map(|b| b.version).filter(|v| !rejected.contains(v)).max();
     let paddocks = ctx.store().list_paddocks().await?;
     let health = rep.health.clone().unwrap_or_default();
     let desired = if caps.has(caps::CONFIG) { Some(config::desired(&ctx, &collar.id, &herd_id, received).await?) } else { None };
@@ -158,6 +162,34 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         Some(d) => config::sync(&mut tx, &ctx, d, config_version, config_reject.as_ref(), received).await?,
         None => None,
     };
+    if config.is_some() {
+        config::mark_sent(&mut tx, &collar.id, received).await?;
+    }
+    let mut rejected = rejected;
+    if desired.is_some() {
+        let gone = config::clear_stale_refusals(&mut tx, &collar.id, config_version).await?;
+        if !gone.is_empty() {
+            tracing::info!(collar = %collar.id, versions = ?gone, "refusals from before its config offered again");
+            rejected.retain(|v| !gone.contains(v));
+        }
+    }
+    // What it holds is out of step with what it should (another herd's
+    // versions, a record it lost): it gets its herd's boundaries again above
+    // everything it holds.
+    if rep.slots.is_some() {
+        let holds: Vec<u32> = sqlx::query_scalar::<_, i64>("SELECT version FROM collar_slots WHERE collar_id = ? AND status != 'rejected'")
+            .bind(&collar.id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        if escapes::out_of_step(&held, &holds, &rejected) && !escapes::on_escape(&mut tx, &collar.id).await? {
+            let copies = escapes::hand_copies(&mut tx, &collar, received).await?;
+            tracing::info!(collar = %collar.id, holds = ?holds, copies = ?copies.iter().map(|b| b.version).collect::<Vec<_>>(), "collar out of step: its herd's boundaries again");
+            latest_version = copies.iter().map(|b| b.version).max().or(latest_version);
+        }
+    }
     // A parked collar (charging, on the shelf, in repair) says nothing about
     // grazing: only who it is, what it holds, its battery, health and last
     // contact are kept.
@@ -179,12 +211,19 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     }
     // Fixes newer than the collar's last fix move its state and position;
     // late or backfilled ones are stored with their own fence state only.
-    let mut fence = fence_for(split.active.as_ref(), &caps, collar.state);
-    let mut late_fence = fence_for(split.active.as_ref(), &caps, collar.state);
     let last_at = collar.last_fix.as_ref().map(|f| f.at);
+    // A collar starts each new boundary from scratch (it rearms), so the
+    // state carried over is only the last report's while the herd's boundary
+    // is the one it was worked out against.
+    let carried = match &split.active {
+        Some(a) if collar.last_seen.is_some_and(|seen| a.effective_at.unwrap_or(a.created_at) <= seen) => collar.state,
+        _ => FenceState::Unknown,
+    };
+    let mut fence = fence_for(split.active.as_ref(), &caps, carried);
+    let mut late_fence = fence_for(split.active.as_ref(), &caps, collar.state);
 
     let mut events = Vec::with_capacity(rep.cues.len() + 2);
-    let mut state = if fence.is_some() { collar.state } else { FenceState::Unknown };
+    let mut state = if fence.is_some() { carried } else { FenceState::Unknown };
     // Since the first fix outside after the last one in (as escapes count it).
     let mut outside_since = if collar.state == FenceState::Outside { collar.outside_since } else { None };
     let mut latest_fix = collar.last_fix.clone();

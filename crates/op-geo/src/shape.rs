@@ -447,6 +447,111 @@ mod metric {
     }
 }
 
+/// Whether somewhere in the shape is at least `room_m` from every edge (the
+/// outer ring and the holes). With `room_m` = `warn_m + hysteresis_m` that is
+/// where a warned animal goes quiet again: a shape without such a place (a
+/// strip narrower than two warning zones) is warning zone all through, and
+/// every animal in it is cued whatever it does. Not one of the collar's rules
+/// ([`check`]); the server holds boundaries to it before they are stored.
+///
+/// The pole-of-inaccessibility search (cells split while they could still
+/// hold a point farther in than the best so far) in local metres, to 5 cm,
+/// stopping as soon as it finds one far enough in or no cell can hold one.
+pub fn has_room(p: &Polygon, room_m: f64) -> bool {
+    let Some(&origin) = p.coordinates.first().and_then(|r| r.first()) else { return false };
+    let proj = Projection::new(origin);
+    let rings: Vec<Vec<[f64; 2]>> = p.coordinates.iter().map(|r| clean_ring(r).iter().map(|q| proj.forward(*q)).collect()).collect();
+    if rings.first().is_none_or(|r| r.len() < 3) {
+        return false;
+    }
+    if room_m <= 0.0 {
+        return true;
+    }
+    // Signed distance to the nearest edge of any ring, positive inside (even-odd).
+    let margin = |q: [f64; 2]| {
+        let (mut inside, mut d) = (false, f64::INFINITY);
+        for r in &rings {
+            let n = r.len();
+            let mut j = n - 1;
+            for i in 0..n {
+                let (a, b) = (r[i], r[j]);
+                if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0] {
+                    inside = !inside;
+                }
+                d = d.min(crate::ring::distance_to_segment(q, a, b));
+                j = i;
+            }
+        }
+        if inside { d } else { -d }
+    };
+    let (x0, y0, x1, y1) = rings[0]
+        .iter()
+        .fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |b, q| (b.0.min(q[0]), b.1.min(q[1]), b.2.max(q[0]), b.3.max(q[1])));
+    if (x1 - x0).min(y1 - y0) < 2.0 * room_m {
+        return false;
+    }
+    /// A square cell: its centre, half its side, and the centre's margin.
+    struct Cell {
+        c: [f64; 2],
+        h: f64,
+        d: f64,
+    }
+    impl Cell {
+        /// The most margin any point in it can have.
+        fn most(&self) -> f64 {
+            self.d + self.h * std::f64::consts::SQRT_2
+        }
+    }
+    impl PartialEq for Cell {
+        fn eq(&self, o: &Self) -> bool {
+            self.most().total_cmp(&o.most()).is_eq()
+        }
+    }
+    impl Eq for Cell {}
+    impl PartialOrd for Cell {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Cell {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            self.most().total_cmp(&o.most())
+        }
+    }
+    let cell = |c: [f64; 2], h: f64| Cell { c, h, d: margin(c) };
+    let size = (x1 - x0).min(y1 - y0);
+    let mut open = std::collections::BinaryHeap::new();
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            open.push(cell([x + size / 2.0, y + size / 2.0], size / 2.0));
+            x += size;
+        }
+        y += size;
+    }
+    const PRECISION_M: f64 = 0.05;
+    let mut seen = 0usize;
+    while let Some(c) = open.pop() {
+        if c.d >= room_m {
+            return true;
+        }
+        if c.most() < room_m {
+            // The best any cell left could hold.
+            return false;
+        }
+        seen += 1;
+        if c.h <= PRECISION_M || seen > 20_000 {
+            continue;
+        }
+        let h = c.h / 2.0;
+        for (dx, dy) in [(-h, -h), (h, -h), (-h, h), (h, h)] {
+            open.push(cell([c.c[0] + dx, c.c[1] + dy], h));
+        }
+    }
+    false
+}
+
 /// Fit a shape to a collar's limits, keeping rings at least 12.5 m apart where
 /// they were (the firmware default warning distance plus the server slack).
 /// See [`fit_gap`].
@@ -1209,6 +1314,39 @@ mod tests {
     fn field() -> Vec<LonLat> {
         // First vertex at O so the check's projection matches the offsets.
         rect(0.0, 0.0, 200.0, 200.0)
+    }
+
+    #[test]
+    fn a_shape_narrower_than_two_warning_zones_has_no_room() {
+        // 15 m wide: 7.5 m from the edges at its middle.
+        let strip = poly(vec![rect(0.0, 0.0, 15.0, 200.0)]);
+        assert!(has_room(&strip, 6.0), "warn 5 + hysteresis 1");
+        assert!(!has_room(&strip, 11.0), "warn 10 + hysteresis 1");
+        assert!(!has_room(&strip, 7.6));
+        // Holes are edges too: a field with a hole leaving a 10 m ring round it.
+        let ringed = poly(vec![field(), rect(10.0, 10.0, 180.0, 180.0)]);
+        assert!(!has_room(&ringed, 6.0));
+        assert!(has_room(&poly(vec![field(), rect(80.0, 80.0, 40.0, 40.0)]), 30.0));
+        // A narrow neck between two wide ends still has room at the ends.
+        let dumbbell = poly(vec![ring(&[
+            [0.0, 0.0],
+            [60.0, 0.0],
+            [60.0, 25.0],
+            [140.0, 25.0],
+            [140.0, 0.0],
+            [200.0, 0.0],
+            [200.0, 60.0],
+            [140.0, 60.0],
+            [140.0, 35.0],
+            [60.0, 35.0],
+            [60.0, 60.0],
+            [0.0, 60.0],
+        ])]);
+        assert!(has_room(&dumbbell, 20.0));
+        assert!(!has_room(&dumbbell, 31.0));
+        // A circle's room is its radius.
+        let round = poly(vec![circle(100.0, 100.0, 40.0, 64)]);
+        assert!(has_room(&round, 39.5) && !has_room(&round, 40.5));
     }
 
     #[test]

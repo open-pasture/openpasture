@@ -31,6 +31,19 @@ pub const STEP_EVERY: Duration = Duration::seconds(30);
 pub const STRAGGLER_AFTER: Duration = Duration::minutes(5);
 /// Fixes older than this don't count as a position.
 pub const FRESH_FIX: Duration = Duration::minutes(10);
+/// A collar heard within this long before a move started is with the herd:
+/// its silence holds the sweep (see [`advance`]). One quiet for longer is
+/// gone (a flat battery, a lost collar) and holds nothing.
+pub const WITH_HERD: Duration = Duration::hours(24);
+/// A collar with the herd this long without a fix (not counting time the
+/// sweep was held for an outage) is taken as gone, a flat battery or a lost
+/// collar, and listed as a straggler; until then the sweep waits for it
+/// where it was last fixed.
+pub const SILENT_DROP: Duration = Duration::minutes(15);
+/// A sweep held for silent collars goes on this long after the silence ends,
+/// so the collars that report back later (each on its own report timer)
+/// rejoin it before it moves.
+pub const RESUME_AFTER: Duration = Duration::minutes(2);
 /// `BoundaryStatus.move` keeps showing an ended move this long.
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
 /// Counts as moving up.
@@ -58,6 +71,17 @@ pub struct Sweep {
     /// Per collar: best progress so far and when the stuck clock started.
     #[serde(default)]
     pub animals: BTreeMap<String, Track>,
+    /// The farmer's time for the move when its first step hasn't gone yet
+    /// (it waits for the collars): that step is staged for then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
+    /// Held for silent collars: it goes on no sooner than this
+    /// ([`RESUME_AFTER`] after the silence ended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_until: Option<DateTime<Utc>>,
+    /// When the last such hold ended: silence before it doesn't count toward [`SILENT_DROP`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,13 +101,20 @@ pub struct Situation {
     pub paddock: Option<Polygon>,
     /// Fresh positions per collar.
     pub positions: Vec<(String, LonLat)>,
+    /// When each of `positions` was fixed (the collar's own clock); a
+    /// collar not here counts as fixed now.
+    pub heard: HashMap<String, DateTime<Utc>>,
+    /// Collars with the herd when the move started (heard within
+    /// [`WITH_HERD`] before it) that have no fresh fix now (last fix older
+    /// than [`FRESH_FIX`]): where and when each was last fixed.
+    pub silent: Vec<(String, LonLat, DateTime<Utc>)>,
     /// What the herd's collars hold (the strictest limits among those that hold holes).
     pub limits: CollarLimits,
 }
 
 impl Default for Situation {
     fn default() -> Self {
-        Self { active: None, pending: false, paddock: None, positions: vec![], limits: CollarLimits::V0 }
+        Self { active: None, pending: false, paddock: None, positions: vec![], heard: HashMap::new(), silent: vec![], limits: CollarLimits::V0 }
     }
 }
 
@@ -117,15 +148,50 @@ pub struct MoveState<'a> {
 /// Decide the move's next action. The first call (step 0) sends at once:
 /// the target when the herd is already in it, else the first step. Later
 /// steps wait for the herd to move a stride up and for 30 s since the last.
-/// Animals holding the sweep up for 5 minutes without moving up become
-/// stragglers; at step 0, animals already outside the active boundary do.
+/// Animals whose own fixes show them holding the sweep up for 5 minutes
+/// without moving up become stragglers; at step 0, animals already outside
+/// the active boundary do.
+///
+/// A sweep only moves on what the collars say. While half or more of the
+/// collars with the herd are silent (no fix for [`FRESH_FIX`]: the farm's
+/// link or the cell is down), it holds, from its first step on: no step, no
+/// target, nobody dropped, and it goes on [`RESUME_AFTER`] after the silence
+/// ends, with the stuck clocks started over. Fewer silent ones hold it up
+/// where they were last fixed, never stepped past unseen, and are never
+/// dropped for being stuck (their fixes don't say so). Only one silent for
+/// [`SILENT_DROP`] outside such a hold is taken as gone and listed. An
+/// outage reaches the collars one report at a time, and so does the link
+/// coming back, so nobody is dropped on the way in or out of one.
 pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
     let mut sweep = m.sweep.clone();
     let mut stragglers = m.stragglers.to_vec();
+    let silent: Vec<&(String, LonLat, DateTime<Utc>)> = sit.silent.iter().filter(|(c, _, _)| !stragglers.contains(c)).collect();
+    let with_it = sit.positions.iter().filter(|(c, _)| !stragglers.contains(c)).count() + silent.len();
+    let outage = !silent.is_empty() && silent.len() * 2 >= with_it;
+    if outage {
+        sweep.held_until = Some(now + RESUME_AFTER);
+    }
+    if outage || sweep.held_until.is_some_and(|t| now < t) {
+        for t in sweep.animals.values_mut() {
+            t.since = now;
+        }
+        return Outcome { next: Next::Wait, sweep, stragglers };
+    }
+    if let Some(t) = sweep.held_until.take() {
+        sweep.resumed_at = Some(t);
+    }
+    let quiet_since = |at: DateTime<Utc>| sweep.resumed_at.map_or(at, |r| r.max(at));
+    let (gone, waited): (Vec<_>, Vec<_>) = silent.into_iter().partition(|(_, _, at)| now - quiet_since(*at) >= SILENT_DROP);
+    stragglers.extend(gone.into_iter().map(|(c, _, _)| c.clone()));
+    // The rest are with the herd where they were last fixed.
+    let mut positions = sit.positions.clone();
+    positions.extend(waited.iter().map(|(c, p, _)| (c.clone(), *p)));
+    let last_fix: HashMap<&str, DateTime<Utc>> = waited.iter().map(|(c, _, at)| (c.as_str(), *at)).collect();
+    let fixed_at = |c: &str| sit.heard.get(c).or_else(|| last_fix.get(c)).copied().unwrap_or(now);
     let space = Space::new(m.target);
     let stride = stride(m.warn_m);
     for _ in 0..8 {
-        let herd: Vec<&(String, LonLat)> = sit.positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
+        let herd: Vec<&(String, LonLat)> = positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
         let animals: Vec<LonLat> = herd.iter().map(|(_, p)| *p).collect();
         let input = PlanInput {
             target: m.target,
@@ -201,7 +267,8 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
             if !blocking || prog > t.best + MOVED_UP_M {
                 t.best = t.best.max(prog);
                 t.since = now;
-            } else if now - t.since >= STRAGGLER_AFTER {
+            } else if fixed_at(c) - t.since >= STRAGGLER_AFTER {
+                // Its fixes, not its silence, say it stayed put.
                 dropped.push(c.clone());
             }
         }
@@ -260,7 +327,15 @@ async fn sweeping_row(db: &sqlx::SqlitePool, herd_id: &str) -> anyhow::Result<Op
 
 /// Everything [`advance`] reads, gathered before any write lock is taken.
 /// `decision_id` is the move's: only its own staged step holds it up.
-pub(crate) async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>, decision_id: Option<&str>) -> anyhow::Result<Situation> {
+/// `since`: when the move started; collars heard within [`WITH_HERD`]
+/// before then and silent now are [`Situation::silent`] (`None`: nobody is).
+pub(crate) async fn situation(
+    ctx: &Ctx,
+    herd_id: &str,
+    at: DateTime<Utc>,
+    decision_id: Option<&str>,
+    since: Option<DateTime<Utc>>,
+) -> anyhow::Result<Situation> {
     let split = db::herd_boundaries(ctx.db(), herd_id, at).await?;
     let paddock = match ctx.store().get_herd(herd_id).await?.and_then(|h| h.paddock_id) {
         Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),
@@ -268,19 +343,21 @@ pub(crate) async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>, decis
     };
     // Animals out on their own boundary are walked back by their escape.
     let escaped = crate::escapes::escaped_collars(ctx.db(), herd_id).await?;
-    let positions = db::list_collars(ctx.db(), Some(herd_id))
-        .await?
-        .into_iter()
-        .filter(|c| !escaped.contains(&c.id))
-        .filter_map(|c| {
-            let f = c.last_fix?;
-            (at - f.at <= FRESH_FIX).then_some((c.id, f.point))
-        })
-        .collect();
+    let (mut positions, mut heard, mut silent) = (Vec::new(), HashMap::new(), Vec::new());
+    // Parked collars are off duty; animals out on their own boundary are walked back by their escape.
+    for c in db::list_collars(ctx.db(), Some(herd_id)).await?.into_iter().filter(|c| c.parked_at.is_none() && !escaped.contains(&c.id)) {
+        let Some(f) = c.last_fix else { continue };
+        if at - f.at <= FRESH_FIX {
+            heard.insert(c.id.clone(), f.at);
+            positions.push((c.id, f.point));
+        } else if since.is_some_and(|s| f.at >= s - WITH_HERD) {
+            silent.push((c.id, f.point, f.at));
+        }
+    }
     let limits = crate::shape::herd_limits(ctx, herd_id).await?;
     // @S: the freeze covers the move's own staged step only.
     let pending = split.staged.iter().any(|b| decision_id.is_some_and(|d| b.decision_id == d));
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, limits })
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, silent, limits })
 }
 
 /// A sweep step on its way to the collars, like every herd boundary.
@@ -339,10 +416,13 @@ pub(crate) async fn begin(
     let _guard = herd_lock(herd_id).await;
     let at = now();
     let effective_at = effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
-    let sit = situation(ctx, herd_id, at, None).await?;
+    let sit = situation(ctx, herd_id, at, None, Some(at)).await?;
     let mut out = advance(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, &sit, at);
-    if let Next::Send { polygon, last: false, .. } = &mut out.next {
-        *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?;
+    match &mut out.next {
+        Next::Send { polygon, last: false, .. } => *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?,
+        Next::Send { .. } => {}
+        // Nothing goes yet (the collars are silent): the first step keeps the farmer's time.
+        Next::Wait => out.sweep.not_before = effective_at,
     }
 
     let mut m = Move {
@@ -484,7 +564,7 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
             .await?;
         return Ok(None);
     }
-    let sit = situation(ctx, herd_id, at, Some(&row.m.decision_id)).await?;
+    let sit = situation(ctx, herd_id, at, Some(&row.m.decision_id), Some(row.m.started_at)).await?;
     if sit.pending {
         return Ok(None);
     }
@@ -518,12 +598,14 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
         if *last {
             m.status = MoveStatus::Done;
         }
+        // A first step held for the collars keeps the farmer's time if it is still ahead.
+        let effective_at = out.sweep.not_before.take().filter(|t| *t > at);
         let nb = NewBoundary {
             herd_id,
             geometry: polygon,
             warn_m: row.warn_m,
             hysteresis_m: row.hysteresis_m,
-            effective_at: None,
+            effective_at,
             decision_id: &m.decision_id,
             created_at: at,
             collar_id: None,
@@ -778,5 +860,102 @@ mod tests {
     fn no_positions_sends_the_target() {
         let mut r = Run::new(&[]);
         assert!(matches!(r.tick(t0()), Next::Send { last: true, .. }));
+    }
+
+    #[test]
+    fn a_collar_outage_holds_the_sweep_and_drops_nobody() {
+        let mut r = Run::new(&[[50.0, 50.0], [80.0, 60.0], [100.0, 90.0]]);
+        assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
+        // The farm's link goes down: every collar's last fix goes stale.
+        let herd = std::mem::take(&mut r.sit.positions);
+        r.sit.silent = herd.iter().map(|(c, p)| (c.clone(), *p, t0())).collect();
+        for m in [1, 5, 11, 30, 90] {
+            assert_eq!(r.tick(t0() + Duration::minutes(m)), Next::Wait, "at {m} min");
+            assert!(r.stragglers.is_empty(), "at {m} min");
+        }
+        // Back, where they were: nobody is dropped for the time the link was down.
+        r.sit.silent.clear();
+        r.sit.positions = herd;
+        let back = t0() + Duration::minutes(91);
+        r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), back)).collect();
+        assert_eq!(r.tick(back), Next::Wait);
+        assert!(r.stragglers.is_empty());
+        // Walking up, the sweep goes on once the rest have had time to report.
+        r.shift(20.0, 12.0);
+        assert_eq!(r.tick(back + Duration::seconds(40)), Next::Wait);
+        assert!(matches!(r.tick(back + RESUME_AFTER), Next::Send { .. }));
+        assert!(r.stragglers.is_empty());
+    }
+
+    #[test]
+    fn a_silent_collar_is_not_stuck_for_its_silence() {
+        let mut r = Run::new(&[[20.0, 20.0], [120.0, 90.0]]);
+        assert!(matches!(r.tick(t0()), Next::Send { .. }));
+        // Its last fix is from the step: no fix says it stayed put for five minutes.
+        r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), t0())).collect();
+        assert_eq!(r.tick(t0() + Duration::minutes(6)), Next::Wait);
+        assert!(r.stragglers.is_empty());
+        // Its fixes say so: it is.
+        r.sit.heard.insert("col_0".into(), t0() + Duration::minutes(6));
+        r.tick(t0() + Duration::minutes(6) + Duration::seconds(5));
+        assert_eq!(r.stragglers, vec!["col_0".to_owned()]);
+    }
+
+    #[test]
+    fn a_lone_silent_collar_holds_the_sweep_where_it_was_until_it_is_gone() {
+        let mut r = Run::new(&[[50.0, 50.0], [80.0, 60.0], [100.0, 90.0], [60.0, 70.0]]);
+        assert!(matches!(r.tick(t0()), Next::Send { .. }));
+        // One of four goes quiet at the back: the sweep isn't stepped past it unseen.
+        let (c, p) = r.sit.positions.remove(0);
+        r.sit.silent = vec![(c.clone(), p, t0())];
+        r.shift(20.0, 12.0);
+        for m in [1, 5, 14] {
+            let t = t0() + Duration::minutes(m);
+            r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), t)).collect();
+            assert_eq!(r.tick(t), Next::Wait, "at {m} min");
+            assert!(r.stragglers.is_empty(), "at {m} min: its silence isn't being stuck");
+        }
+        // Quiet for a quarter of an hour: gone (a flat battery). Listed, and the sweep goes on.
+        let t = t0() + SILENT_DROP + Duration::seconds(1);
+        r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), t)).collect();
+        let Next::Send { polygon, .. } = r.tick(t) else { panic!("goes on without it") };
+        assert_eq!(r.stragglers, vec![c]);
+        assert!(!polygon.contains(p), "it is left behind only now");
+    }
+
+    /// An outage reaches the collars one report at a time, and so does the
+    /// link coming back: at no point is anyone dropped for it.
+    #[test]
+    fn an_outage_that_comes_and_goes_collar_by_collar_drops_nobody() {
+        let pts: Vec<[f64; 2]> = (0..10).map(|i| [40.0 + 6.0 * i as f64, 40.0 + 5.0 * (i % 3) as f64]).collect();
+        let mut r = Run::new(&pts);
+        assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
+        let herd = r.sit.positions.clone();
+        let mut t = t0() + Duration::minutes(10);
+        // Their last fixes pass ten minutes old a few seconds apart.
+        for c in &herd {
+            r.sit.positions.retain(|(id, _)| id != &c.0);
+            r.sit.silent.push((c.0.clone(), c.1, t - FRESH_FIX));
+            t += Duration::seconds(6);
+            assert_eq!(r.tick(t), Next::Wait, "{} silent", r.sit.silent.len());
+            assert!(r.stragglers.is_empty(), "{} silent: {:?}", r.sit.silent.len(), r.stragglers);
+        }
+        t += Duration::minutes(30);
+        assert_eq!(r.tick(t), Next::Wait);
+        // Back, walked up a little, one report at a time.
+        for c in &herd {
+            r.sit.silent.retain(|(id, _, _)| id != &c.0);
+            r.sit.positions.push(c.clone());
+            r.sit.heard.insert(c.0.clone(), t);
+            t += Duration::seconds(6);
+            assert_eq!(r.tick(t), Next::Wait, "{} back", r.sit.positions.len());
+            assert!(r.stragglers.is_empty(), "{} back: {:?}", r.sit.positions.len(), r.stragglers);
+        }
+        // Once everyone has had time to report, the sweep goes on with all of them.
+        r.shift(20.0, 12.0);
+        let later = t + RESUME_AFTER;
+        r.sit.heard.values_mut().for_each(|h| *h = later);
+        assert!(matches!(r.tick(later), Next::Send { .. }));
+        assert!(r.stragglers.is_empty());
     }
 }

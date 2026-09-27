@@ -391,7 +391,7 @@ pub async fn has_legacy_collars(ctx: &Ctx, herd_id: &str) -> anyhow::Result<bool
 /// What the move driver sees for the herd at `at` when a new move starts
 /// (its active boundary, paddock, fresh positions and limits), for previewing a sweep.
 pub async fn situation(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Result<moves::Situation> {
-    moves::situation(ctx, herd_id, at, None).await
+    moves::situation(ctx, herd_id, at, None, None).await
 }
 
 /// Squares (`[west, south, east, north]`) clipped to `shape`, as one GeoJSON
@@ -414,6 +414,17 @@ fn multipoint(points: impl Iterator<Item = LonLat>) -> Option<Value> {
 }
 
 /// Local metres about a shape's first corner, for areas, overlaps and clipping.
+/// How much of `of` (0 to 1) lies inside `within`, holes counted.
+pub(crate) fn share_inside(of: &Polygon, within: &Polygon) -> f64 {
+    let Some(loc) = Local::new(of) else { return 0.0 };
+    let a = loc.poly(of);
+    let area = a.unsigned_area();
+    if area <= 0.0 {
+        return 0.0;
+    }
+    a.intersection(&loc.poly(within)).unsigned_area() / area
+}
+
 struct Local {
     proj: Projection,
 }

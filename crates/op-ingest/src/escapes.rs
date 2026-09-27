@@ -11,8 +11,13 @@
 //! herd's boundary with a new version, since it never goes back to an older
 //! one.
 //!
-//! Pens keep the herd boundary's holes. A collar out on an escape reports
-//! and polls fast (its config gets a fast window). When the escape ends, the
+//! Pens keep the herd boundary's holes, and keep out the exclusions in
+//! effect that their own ground would take in (cut or made holes, as on any
+//! herd boundary). When that leaves the animal or the herd's ground out of
+//! the pen (a creek between them), or the animal is out of reach
+//! ([`REACH_M`]), no pen goes: the animal stays outside, uncued, for the
+//! farmer. A collar out on an escape reports and polls fast (its config gets
+//! a fast window). When the escape ends, the
 //! herd boundaries staged at that moment are copied for that collar alone
 //! (`collar_id` + `copy_of`), so the rest of the herd downloads nothing.
 //!
@@ -42,6 +47,15 @@ use op_geo::CollarLimits;
 /// (its outside tone stops after 10 s), and the animal gets a boundary of
 /// its own.
 pub const ESCAPE_AFTER: Duration = Duration::seconds(60);
+/// Farthest from the herd's boundary an animal is walked back on a boundary
+/// of its own when it isn't on the herd's own ground (its paddock, or ground
+/// the herd was fenced to in the last day: left behind by a back fence or a
+/// sweep). Beyond that (it went far, or its collar was moved to a herd
+/// across the farm) a pen would reach over ground nobody drew for it: it
+/// gets none, and the farmer sees it outside (the `outside` alert).
+pub const REACH_M: f64 = 100.0;
+/// How far back the herd's own ground goes, for [`REACH_M`].
+const OWN_GROUND: Duration = Duration::hours(24);
 /// `BoundaryStatus.escapes` keeps showing an ended escape this long.
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
 
@@ -204,6 +218,11 @@ pub async fn collar_boundaries(db: &sqlx::SqlitePool, collar: &Collar, at: DateT
     Ok(db::split_boundaries(all, at))
 }
 
+/// Whether the collar is out on an escape.
+pub(crate) async fn on_escape(conn: &mut sqlx::SqliteConnection, collar_id: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM escapes WHERE collar_id = ? AND status = 'returning')").bind(collar_id).fetch_one(conn).await?)
+}
+
 /// Collars that are out on an escape, for the herd's sweep to leave alone.
 pub async fn escaped_collars(db: &sqlx::SqlitePool, herd_id: &str) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query("SELECT collar_id FROM escapes WHERE herd_id = ? AND status = 'returning'").bind(herd_id).fetch_all(db).await?;
@@ -267,9 +286,17 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         return Ok(None);
     }
     let Some(active) = db::herd_boundaries(ctx.db(), &collar.herd_id, at).await?.active else { return Ok(None) };
+    if !in_reach(ctx, &collar.herd_id, &active, point, at).await? {
+        tracing::debug!(collar = %collar_id, "escape: out of reach, no pen");
+        return Ok(None);
+    }
     let limits = crate::shape::herd_limits(ctx, &collar.herd_id).await?;
     let state = EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: None, pen: &Pen::default(), limits };
     let (Next::Send { polygon, remaining_m }, pen) = advance(&state, point, at) else { return Ok(None) };
+    let Some(polygon) = fenced(ctx, &active, &polygon, point, &limits, at).await? else {
+        tracing::info!(collar = %collar_id, "escape: an exclusion lies between the animal and the herd, no pen");
+        return Ok(None);
+    };
 
     let mut e = Escape {
         id: id::new_id(id::ESCAPE),
@@ -309,6 +336,59 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
     // It reports and polls fast while it is walked back.
     config::refresh_quietly(ctx, config::Scope::Collar(collar_id)).await;
     Ok(Some(e))
+}
+
+/// Whether an animal at `point` outside `herd`'s boundary is in reach of a
+/// pen: on the herd's own ground (its paddock, or a herd boundary of the
+/// last day, back to the one in effect a day ago), or within [`REACH_M`] of
+/// the boundary.
+async fn in_reach(ctx: &Ctx, herd_id: &str, herd: &Boundary, point: LonLat, at: DateTime<Utc>) -> anyhow::Result<bool> {
+    let proj = op_geo::Projection::new(point);
+    let outside_by = -planner::signed_distance([0.0, 0.0], &proj.forward_ring(&herd.geometry.outer_ring()));
+    if outside_by <= REACH_M {
+        return Ok(true);
+    }
+    let paddock = match ctx.store().get_herd(herd_id).await?.and_then(|h| h.paddock_id) {
+        Some(p) => ctx.store().get_paddock(&p).await?.map(|p| p.geometry),
+        None => None,
+    };
+    if paddock.is_some_and(|p| p.contains(point)) {
+        return Ok(true);
+    }
+    // The day's boundaries, and the one in effect when it began (a bounded read: this runs on every try).
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT geometry FROM (SELECT geometry, version FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL AND created_at >= ?2 ORDER BY version DESC LIMIT 400)
+         UNION ALL
+         SELECT geometry FROM (SELECT geometry FROM boundaries WHERE herd_id = ?1 AND collar_id IS NULL AND created_at < ?2 ORDER BY version DESC LIMIT 1)",
+    )
+    .bind(herd_id)
+    .bind(to_db(&(at - OWN_GROUND)))
+    .fetch_all(ctx.db())
+    .await?;
+    for g in &rows {
+        let g: Polygon = serde_json::from_str(g)?;
+        if Polygon::from_ring(g.outer_ring()).contains(point) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A pen as it goes to the collar: the exclusions in effect that it takes
+/// in are kept out of it, as on any herd boundary. `None` when that leaves
+/// the animal out of it, or most of the herd's ground (an exclusion between
+/// them): there is no pen to walk it back on.
+async fn fenced(ctx: &Ctx, herd: &Boundary, pen: &Polygon, animal: LonLat, limits: &CollarLimits, at: DateTime<Utc>) -> anyhow::Result<Option<Polygon>> {
+    let gap = op_geo::shape::min_gap_m(herd.warn_m) + op_geo::shape::SERVER_SLACK_M;
+    let ex = crate::prepare::exclude(ctx, pen, limits, herd.warn_m, gap, at).await?;
+    if ex.placed.iter().all(|p| p.placement == op_geo::exclude::Placement::Drop) {
+        return Ok(Some(pen.clone()));
+    }
+    let shaped = ex.fitted;
+    let ok = shaped.contains(animal)
+        && crate::prepare::share_inside(&herd.geometry, &shaped) >= 0.5
+        && op_geo::shape::check(&shaped, limits, herd.warn_m, herd.hysteresis_m, op_geo::shape::SERVER_SLACK_M).is_ok();
+    Ok(ok.then_some(shaped))
 }
 
 /// A boundary for one collar under the decision its herd is on: a pen, or
@@ -369,6 +449,8 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
         }
         (Next::Back, _) => end(ctx, row, Some(&collar), EscapeStatus::Back, at).await,
         (Next::Send { polygon, remaining_m }, pen) => {
+            // The pen it has stays while the next one can't keep the exclusions out.
+            let Some(polygon) = fenced(ctx, &active, &polygon, point, &limits, at).await? else { return Ok(()) };
             let mut e = row.e.clone();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
             let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
@@ -401,23 +483,47 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
     }
 }
 
-/// End an escape. A collar still in the herd gets a copy of the herd's
-/// boundary, and a copy of each boundary the herd has staged (same shape and
-/// `effective_at`, for this collar alone): the pen dropped its staged slots,
-/// and a staged herd version below the copy's would never be asked for.
+/// Copies of the herd's boundary in effect and of each one it has staged,
+/// for one collar alone (`collar_id` + `copy_of`: same shape, margins and
+/// `effective_at`, new versions above anything the collar can hold). A
+/// collar only ever asks for versions above the highest it holds, so this is
+/// how it gets its herd's boundaries back when what it holds is at or above
+/// them: at the end of an escape (the pen dropped its staged slots), when it
+/// joins a herd holding another herd's versions, and when what it holds has
+/// fallen out of step ([`out_of_step`]). Read under the caller's write
+/// transaction, so the copies are of the herd's newest boundaries. The copy
+/// of the one in effect comes first.
+pub(crate) async fn hand_copies(tx: &mut sqlx::SqliteConnection, collar: &Collar, at: DateTime<Utc>) -> anyhow::Result<Vec<Boundary>> {
+    let split = db::herd_boundaries_in(tx, &collar.herd_id, at).await?;
+    let mut out = Vec::with_capacity(1 + split.staged.len());
+    if let Some(active) = &split.active {
+        out.push(insert_own(tx, collar, active, &active.geometry, Some(active.version), None, at).await?);
+    }
+    for b in &split.staged {
+        out.push(insert_own(tx, collar, b, &b.geometry, Some(b.version), b.effective_at, at).await?);
+    }
+    Ok(out)
+}
+
+/// Whether a collar holding `held` (versions, applied or staged) can't get
+/// some boundary of `set` (what it should hold, [`collar_boundaries`]) the
+/// usual way: one it doesn't hold sits at or below the highest it holds, and
+/// it only asks for versions above that. Versions it refused for good
+/// (`rejected`) don't count: a copy would be refused too.
+pub(crate) fn out_of_step(set: &db::HerdBoundaries, held: &[u32], rejected: &[u32]) -> bool {
+    let Some(&top) = held.iter().max() else { return false };
+    set.active.iter().chain(&set.staged).any(|b| b.version <= top && !held.contains(&b.version) && !rejected.contains(&b.version))
+}
+
+/// End an escape. A collar still in the herd gets copies of the herd's
+/// boundaries ([`hand_copies`]).
 async fn end(ctx: &Ctx, row: EscapeRow, collar: Option<&Collar>, status: EscapeStatus, at: DateTime<Utc>) -> anyhow::Result<()> {
     let mut e = row.e;
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let mut copy = None;
     if let Some(c) = collar {
-        // Read under the write lock, so the copies are of the herd's newest boundaries.
-        let split = db::herd_boundaries_in(&mut tx, &c.herd_id, at).await?;
-        if let Some(active) = split.active {
-            copy = Some(insert_own(&mut tx, c, &active, &active.geometry, Some(active.version), None, at).await?);
-        }
-        for b in &split.staged {
-            insert_own(&mut tx, c, b, &b.geometry, Some(b.version), b.effective_at, at).await?;
-        }
+        let copies = hand_copies(&mut tx, c, at).await?;
+        copy = copies.into_iter().next().filter(|b| b.effective_at.is_none());
     }
     e.status = status;
     e.updated_at = at;

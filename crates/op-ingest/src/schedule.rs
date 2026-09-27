@@ -33,6 +33,16 @@
 //!   moves go ahead. A move is `done` once it took effect by the collars'
 //!   rule; `applied_at` is the first collar's own apply time from its ack.
 //!
+//! **The ground under the herd.** An open never takes ground away: it is the
+//! ground the herd has joined to the new strip ([`opening`]); only back-fence
+//! steps take ground, and only ground behind the strip, from the far side
+//! (ground ahead, where the herd was moved on further, stays until its strips
+//! open). Each open is planned from what the
+//! move before it leaves. When the boundary in effect isn't that move (one
+//! was late or couldn't be sent, a boundary came from elsewhere, move now),
+//! what is still to come is planned again from the ground the herd is on
+//! (`rechain`) before anything more is sent or staged.
+//!
 //! **Edits** (skip, hold, move now, edit time, pause, end) that change what
 //! is already staged reissue the herd's current strip as a new immediate
 //! version, so collars drop the staged moves, then restage.
@@ -401,37 +411,137 @@ pub fn union_of(strips: &[Polygon]) -> Option<Polygon> {
     s.local.one(&union_geo(&s.polys))
 }
 
+/// A shape a collar takes as a boundary, as far as its rings go (the margins
+/// and limits are `prepare`'s): boolean ops can leave a ring pinched at a vertex.
+fn sound(p: &Polygon) -> bool {
+    const ANY: CollarLimits = CollarLimits { outer: 1 << 20, holes: 1 << 12, hole_vertices: 1 << 20, total: 1 << 22, slots: 1, slot_bytes: 0 };
+    op_geo::shape::check(p, &ANY, 0.0, 0.0, 0.0).is_ok()
+}
+
 /// Where a back fence stands part way through closing: `region` (the whole
-/// open ground) less the far `1 - keep` of `old`'s depth, measured from the
-/// side away from `toward`. One intersection with a band just bigger than
-/// the region, so the result keeps the region's own edges.
-fn part_toward(region: &GeoPolygon, old: &GeoPolygon, from: [f64; 2], toward: [f64; 2], keep: f64) -> MultiPolygon {
+/// open ground) less the far `1 - keep` of the depth of the old ground
+/// `behind` the strips kept, measured along `axis` (from, toward). One
+/// intersection with a band just bigger than the region, so the result keeps
+/// the region's own edges.
+fn part_toward(region: &GeoPolygon, behind: &MultiPolygon, axis: ([f64; 2], [f64; 2]), keep: f64) -> MultiPolygon {
+    let (from, toward) = axis;
     let (dx, dy) = (toward[0] - from[0], toward[1] - from[1]);
     let len = dx.hypot(dy).max(1e-9);
     let (ux, uy) = (dx / len, dy / len);
     let (px, py) = (-uy, ux);
     let span =
-        |g: &GeoPolygon, f: &dyn Fn(&Coord) -> f64| g.exterior().0.iter().map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        |cs: &mut dyn Iterator<Item = &Coord>, f: &dyn Fn(&Coord) -> f64| cs.map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
     let along = |c: &Coord| c.x * ux + c.y * uy;
     let across = |c: &Coord| c.x * px + c.y * py;
-    let (lo, hi) = span(old, &along);
-    let cut = hi - keep.clamp(0.0, 1.0) * (hi - lo);
-    let (_, far) = span(region, &along);
-    let (a0, a1) = span(region, &across);
-    let (a0, a1, far) = (a0 - 10.0, a1 + 10.0, far + 10.0);
+    let old: Vec<Coord> = behind.0.iter().flat_map(|p| p.exterior().0.iter()).copied().collect();
+    let keep = keep.clamp(0.0, 1.0);
+    let (_, far) = span(&mut region.exterior().0.iter(), &along);
+    let (a0, a1) = span(&mut region.exterior().0.iter(), &across);
+    let (a0, a1) = (a0 - 10.0, a1 + 10.0);
+    let (lo, hi) = span(&mut old.iter(), &along);
+    let lower = hi - keep * (hi - lo);
+    let upper = far + 10.0;
     let at = |t: f64, s: f64| (ux * t + px * s, uy * t + py * s);
-    let band = GeoPolygon::new(LineString::from(vec![at(cut, a0), at(far, a0), at(far, a1), at(cut, a1), at(cut, a0)]), vec![]);
+    let band = GeoPolygon::new(LineString::from(vec![at(lower, a0), at(upper, a0), at(upper, a1), at(lower, a1), at(lower, a0)]), vec![]);
     MultiPolygon(vec![region.clone()]).intersection(&MultiPolygon(vec![band]))
 }
 
-/// What opening strip `k` stages, then each back-fence close step, when the
-/// strip opened before it is `prev` (the one the herd is on).
+/// The ground a herd has before an open.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ground {
+    /// `strips[a ..= b]`.
+    Strips(usize, usize),
+    /// Any other shape (a boundary drawn or swept to, a back fence part way
+    /// closed), by its outer ring: every send applies exclusions again.
+    Shape(Polygon),
+}
+
+/// What opening a strip stages, then each back-fence close step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opening {
+    pub open: Polygon,
+    pub closes: Vec<Polygon>,
+    /// The ground the herd has once the last of them is in.
+    pub after: Ground,
+}
+
+/// Most back-fence steps one open takes (old ground several strips deep).
+pub const MAX_CLOSE_STEPS: usize = 48;
+
+/// Strips with at least this share of their ground inside a shape are ground it covers.
+const TOUCHES: f64 = 0.01;
+
+/// Each strip's share of its ground inside `g` (a bounding-box test first).
+fn shares(strips: &[Polygon], g: &Polygon) -> Vec<f64> {
+    use geo::BoundingRect;
+    let outer = Polygon::from_ring(g.outer_ring());
+    let (Some(local), true) = (Local::new(&outer), outer.outer_ring().len() >= 3) else { return vec![0.0; strips.len()] };
+    let Some(a) = local.to_geo(&outer) else { return vec![0.0; strips.len()] };
+    let abox = a.bounding_rect();
+    let a = MultiPolygon(vec![a]);
+    strips
+        .iter()
+        .map(|s| {
+            let Some(p) = local.to_geo(s) else { return 0.0 };
+            let (Some(pb), Some(ab)) = (p.bounding_rect(), abox) else { return 0.0 };
+            if pb.max().x <= ab.min().x || ab.max().x <= pb.min().x || pb.max().y <= ab.min().y || ab.max().y <= pb.min().y {
+                return 0.0;
+            }
+            let area = p.unsigned_area();
+            if area <= 0.0 { 0.0 } else { MultiPolygon(vec![p]).intersection(&a).unsigned_area() / area }
+        })
+        .collect()
+}
+
+/// `g` as ground: the strips it covers when it is just those strips (more
+/// than half of each inside it, one run, the same area to 1 %), else its shape.
+pub fn ground_of(strips: &[Polygon], g: &Polygon) -> Ground {
+    let outer = Polygon::from_ring(g.outer_ring());
+    let full: Vec<usize> = shares(strips, &outer).iter().enumerate().filter(|(_, f)| **f > 0.5).map(|(i, _)| i).collect();
+    if let (Some(&a), Some(&b)) = (full.first(), full.last())
+        && b - a + 1 == full.len()
+    {
+        let theirs: f64 = strips[a..=b].iter().map(Polygon::area_ha).sum();
+        let mine = outer.area_ha();
+        if theirs > 0.0 && (mine - theirs).abs() <= 0.01 * theirs {
+            return Ground::Strips(a, b);
+        }
+    }
+    Ground::Shape(outer)
+}
+
+/// How much of `g` lies on the strips (0 to 1).
+fn on_strips(strips: &[Polygon], g: &Polygon) -> f64 {
+    let area = Polygon::from_ring(g.outer_ring()).area_ha();
+    if area <= 0.0 {
+        return 0.0;
+    }
+    shares(strips, g).iter().zip(strips).map(|(f, s)| f * s.area_ha()).sum::<f64>() / area
+}
+
+/// How much of `g` lies in the schedule's paddock (0 to 1); on its strips
+/// when the paddock is gone from the map.
+async fn on_paddock(ctx: &Ctx, s: &Schedule, g: &Polygon) -> anyhow::Result<f64> {
+    Ok(match ctx.store().get_paddock(&s.paddock_id).await? {
+        Some(p) => shares(&[Polygon::from_ring(g.outer_ring())], &p.geometry)[0],
+        None => on_strips(&s.strips, g),
+    })
+}
+
+/// What opening strip `k` stages when the herd has `ground`, then each
+/// back-fence close step.
 ///
-/// Without a back fence: `strips[0 ..= k]`. With one: `strips[prev-lag ..= k]`
-/// (the animals keep the ground they stand on), then `close_steps` steps that
-/// sweep the old ground from the far side, the last being `strips[k-lag ..= k]`.
-/// Skipped strips between `prev` and `k` are part of the old ground.
-pub fn stage_shapes(strips: &[Polygon], prev: Option<usize>, k: usize, bf: &BackFence) -> Result<(Polygon, Vec<Polygon>), String> {
+/// An open never takes ground away: it is the ground the herd has joined to
+/// the strips up to `k` and to the strips between (the herd walks through
+/// them; skipped strips are such ground). Without a back fence that is all:
+/// `strips[0 ..= k]` and the ground. With one, the steps then close the old
+/// ground behind `strips[k-lag ..= k]` from its far side, `close_steps` steps
+/// for each strip of it, the last leaving `strips[k-lag ..= k]`. Ground ahead
+/// of strip `k` (a herd that had more than the strips before it, or was moved
+/// on further by hand) isn't closed: the herd stands on ground it has no
+/// reason to leave, and a timed step would leave it outside, uncued. Its
+/// strips open in their turn. `None`: nothing known, the strip alone.
+pub fn opening(strips: &[Polygon], ground: Option<&Ground>, k: usize, bf: &BackFence) -> Result<Opening, String> {
     let n = strips.len();
     if k >= n {
         return Err(format!("There is no strip {}.", k + 1));
@@ -443,51 +553,251 @@ pub fn stage_shapes(strips: &[Polygon], prev: Option<usize>, k: usize, bf: &Back
             format!("Strips {} to {} don't join into one boundary.", a + 1, b + 1)
         }
     };
-    if !bf.enabled {
-        let open = union_of(&strips[..=k]).ok_or_else(|| apart(0, k))?;
-        return Ok((open, vec![]));
-    }
-    let lag = bf.lag_strips as usize;
-    let start = prev.map_or(k, |p| p.min(k).saturating_sub(lag));
-    let end = k.saturating_sub(lag);
-    // Every shape below comes from the same snapped strips.
-    let sn = snapped(&strips[start..=k]).ok_or_else(|| apart(start, k))?;
-    let at = |i: usize| i - start;
-    let whole = union_geo(&sn.polys);
-    let open = sn.local.one(&whole).ok_or_else(|| apart(start, k))?;
-    if start >= end {
-        return Ok((open, vec![]));
-    }
-    let last = sn.local.one(&union_geo(&sn.polys[at(end)..])).ok_or_else(|| apart(end, k))?;
-    let one_of = |m: &MultiPolygon| {
-        let big: Vec<&GeoPolygon> = m.0.iter().filter(|p| p.unsigned_area() >= 1.0).collect();
-        (big.len() == 1).then(|| big[0].clone())
+    let lag = if bf.enabled { bf.lag_strips as usize } else { 0 };
+    let end = if bf.enabled { k.saturating_sub(lag) } else { 0 };
+    // The strips taken in, and the drawn ground joined to them.
+    let (lo, hi, shape, touched) = match ground {
+        None => (if bf.enabled { k } else { 0 }, k, None, vec![]),
+        Some(Ground::Strips(a, b)) => ((*a).min(end), (*b).max(k), None, vec![]),
+        Some(Ground::Shape(g)) => {
+            let touched: Vec<usize> = shares(strips, g).iter().enumerate().filter(|(_, f)| **f >= TOUCHES).map(|(i, _)| i).collect();
+            let below = touched.iter().copied().filter(|&i| i <= k).max();
+            let above = touched.iter().copied().filter(|&i| i > k).min();
+            // The strips it touches are taken in whole, so the ground joins up.
+            let lo = if bf.enabled { below.map_or(end, |b| b.min(end)) } else { 0 };
+            let hi = above.map_or(k, |a| a.max(k));
+            (lo, hi, Some(Polygon::from_ring(g.outer_ring())), touched)
+        }
     };
-    let (Some(region), Some(old)) = (one_of(&whole), one_of(&union_geo(&sn.polys[..at(end)]))) else { return Err(apart(start, end - 1)) };
+    let mut polys: Vec<Polygon> = strips[lo..=hi].to_vec();
+    if let Some(g) = &shape {
+        polys.push(g.clone());
+    }
+    // Every shape below comes from the same snapped polygons.
+    let mut sn = snapped(&polys).ok_or_else(|| apart(lo, hi))?;
+    // The drawn ground overlaps the strips: joined in an op of its own (one op
+    // over overlapping shapes fills even-odd and would cut the overlap out).
+    let drawn = shape.as_ref().and_then(|_| sn.polys.pop());
+    let at = |i: usize| i - lo;
+    let mut whole = union_geo(&sn.polys);
+    if let Some(g) = drawn {
+        whole = whole.union(&MultiPolygon(vec![g]));
+    }
+    let open = sn.local.one(&whole).filter(sound).ok_or_else(|| apart(lo.min(k), hi.max(k)))?;
+    let unclosed = |open: &Polygon| match &shape {
+        Some(_) => ground_of(strips, open),
+        None => Ground::Strips(lo, hi),
+    };
+    if !bf.enabled {
+        return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+    }
+    // Old ground: what the herd has besides strips[end ..= k], behind them or ahead.
+    let kept = union_geo(&sn.polys[at(end)..=at(k)]);
     use geo::Centroid;
-    let (Some(from), Some(toward)) = (old.centroid(), sn.polys[at(end)].centroid()) else { return Err(apart(start, k)) };
-    let steps = bf.close_steps.max(1);
-    let mut closes = Vec::with_capacity(steps as usize);
-    for s in 1..steps {
-        let keep = 1.0 - s as f64 / steps as f64;
-        let part = part_toward(&region, &old, [from.x(), from.y()], [toward.x(), toward.y()], keep);
-        closes.push(sn.local.one(&part).ok_or_else(|| format!("Strip {}'s back fence can't close in {steps} steps. Close it in one.", k + 1))?);
+    let centre = |p: &GeoPolygon| p.centroid().map(|c| [c.x(), c.y()]);
+    let Some(first) = centre(&sn.polys[at(end)]) else { return Err(apart(end, k)) };
+    // Which way the strips advance: from one strip to the next.
+    let centre_of = |i: usize| sn.local.to_geo(&strips[i]).as_ref().and_then(centre);
+    let (a, b) = if k >= 1 { (k - 1, k) } else { (0, 1.min(n - 1)) };
+    let step_dir = match (centre_of(a), centre_of(b)) {
+        (Some(p), Some(q)) if a != b => [q[0] - p[0], q[1] - p[1]],
+        _ => [0.0, 0.0],
+    };
+    let old = whole.difference(&kept);
+    let (mut behind, mut ahead) = (Vec::new(), Vec::new());
+    for p in old.0.iter().filter(|p| p.unsigned_area() >= 1.0) {
+        let Some(c) = centre(p) else { continue };
+        let side = (c[0] - first[0]) * step_dir[0] + (c[1] - first[1]) * step_dir[1];
+        if side < 0.0 || step_dir == [0.0, 0.0] { behind.push(p.clone()) } else { ahead.push(p.clone()) }
+    }
+    if behind.is_empty() {
+        return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+    }
+    let region = {
+        let big: Vec<&GeoPolygon> = whole.0.iter().filter(|p| p.unsigned_area() >= 1.0).collect();
+        if big.len() != 1 {
+            return Err(apart(lo, hi));
+        }
+        big[0].clone()
+    };
+    let behind_strips = (lo..=hi).chain(touched.iter().copied()).filter(|&i| i < end).collect::<std::collections::BTreeSet<_>>().len();
+    let steps = (bf.close_steps.max(1) as usize * behind_strips.max(1)).min(MAX_CLOSE_STEPS);
+    let behind = MultiPolygon(behind);
+    // What is left once the back fence has closed: the strips kept, and any ground ahead.
+    let (last, after) = if ahead.is_empty() {
+        (sn.local.one(&kept).filter(sound).ok_or_else(|| apart(end, k))?, Ground::Strips(end, k))
+    } else {
+        // Ground that won't come apart cleanly (a sliver behind drawn ground) stays open.
+        let Some(rest) = sn.local.one(&whole.difference(&behind)).filter(sound) else {
+            return Ok(Opening { after: unclosed(&open), open, closes: vec![] });
+        };
+        let after = ground_of(strips, &rest);
+        (rest, after)
+    };
+    let mut closes = Vec::with_capacity(steps);
+    if let Some(axis) = behind.centroid().map(|c| ([c.x(), c.y()], first)).filter(|_| steps > 1) {
+        for s in 1..steps {
+            let keep = 1.0 - s as f64 / steps as f64;
+            // A step that would fall apart (ground that bends round) is left
+            // out: the next one takes its ground too.
+            if let Some(p) = sn.local.one(&part_toward(&region, &behind, axis, keep)).filter(sound) {
+                closes.push(p);
+            }
+        }
     }
     closes.push(last);
-    Ok((open, closes))
+    Ok(Opening { open, closes, after })
 }
 
-/// The rows opening strip `k` at `at`, with its back-fence steps.
-fn plan_strip(s: &Schedule, prev: Option<usize>, k: usize, at: DateTime<Utc>, occurrence: Option<u32>) -> Result<Vec<Row>, String> {
-    let (open, closes) = stage_shapes(&s.strips, prev, k, &s.back_fence)?;
+/// What opening strip `k` stages, then each back-fence close step, when the
+/// strip opened before it is `prev` (the herd is on `strips[prev-lag ..= prev]`
+/// once its back fence closed): [`opening`] from that ground.
+pub fn stage_shapes(strips: &[Polygon], prev: Option<usize>, k: usize, bf: &BackFence) -> Result<(Polygon, Vec<Polygon>), String> {
+    let lag = if bf.enabled { bf.lag_strips as usize } else { 0 };
+    let ground = prev.map(|p| if bf.enabled { Ground::Strips(p.saturating_sub(lag), p) } else { Ground::Strips(0, p) });
+    let o = opening(strips, ground.as_ref(), k, bf)?;
+    Ok((o.open, o.closes))
+}
+
+/// Times for `n` back-fence steps from `first`, `every` apart; pressed evenly
+/// into the time before a minute ahead of `next` when they'd run into it and
+/// `press` allows (never closer than a second apart).
+fn spaced(first: DateTime<Utc>, n: usize, every: Duration, next: Option<DateTime<Utc>>, press: bool) -> Vec<DateTime<Utc>> {
+    let mut step = every;
+    if press
+        && n > 1
+        && let Some(next) = next
+    {
+        let limit = next - Duration::minutes(1);
+        let room = (limit - first).num_seconds();
+        if first + every * (n as i32 - 1) >= limit && room >= n as i64 - 1 {
+            step = Duration::seconds(room / (n as i64 - 1));
+        }
+    }
+    (0..n).map(|i| trunc_secs(first + step * i as i32)).collect()
+}
+
+/// The rows opening strip `k` at `at` from `ground`, with its back-fence steps.
+/// Steps beyond the back fence's own count (old ground several strips deep)
+/// are pressed in before `next` (the next open) when they'd run into it.
+fn plan_strip(
+    s: &Schedule,
+    ground: Option<&Ground>,
+    k: usize,
+    at: DateTime<Utc>,
+    occurrence: Option<u32>,
+    next: Option<DateTime<Utc>>,
+) -> Result<(Vec<Row>, Ground), String> {
+    let o = opening(&s.strips, ground, k, &s.back_fence)?;
     let at = trunc_secs(at);
-    let mut rows = vec![Row::planned(k as u32, 0, occurrence, at, open)];
+    let mut rows = vec![Row::planned(k as u32, 0, occurrence, at, o.open)];
     let bf = &s.back_fence;
-    for (i, g) in closes.into_iter().enumerate() {
-        let t = at + Duration::minutes(i64::from(bf.close_after_min) + i64::from(bf.close_every_min) * i as i64);
+    let press = o.closes.len() > bf.close_steps.max(1) as usize;
+    let times = spaced(at + Duration::minutes(i64::from(bf.close_after_min)), o.closes.len(), Duration::minutes(i64::from(bf.close_every_min)), next, press);
+    for (i, (g, t)) in o.closes.into_iter().zip(times).enumerate() {
         rows.push(Row::planned(k as u32, i as u32 + 1, None, t, g));
     }
-    Ok(rows)
+    Ok((rows, o.after))
+}
+
+/// Give strip `k`'s back-fence steps still to come these shapes: in place,
+/// keeping their times, when there are as many; else as new rows at
+/// `times(n)`. Rows whose shape changes are unstaged. Whether anything changed.
+fn set_closes(rows: &mut Vec<Row>, gone: &mut Vec<i64>, k: u32, shapes: Vec<Polygon>, times: &dyn Fn(usize) -> Vec<DateTime<Utc>>) -> bool {
+    let mut mine: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].strip == k && rows[i].step > 0 && rows[i].pending()).collect();
+    mine.sort_by_key(|&i| rows[i].step);
+    if mine.len() == shapes.len() {
+        let mut changed = false;
+        for (i, g) in mine.into_iter().zip(shapes) {
+            if rows[i].geometry != g {
+                rows[i].geometry = g;
+                rows[i].unstage();
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    let first_step = mine.first().map_or(1, |&i| rows[i].step);
+    for i in mine.into_iter().rev() {
+        let r = rows.remove(i);
+        if r.id != 0 {
+            gone.push(r.id);
+        }
+    }
+    let n = shapes.len();
+    for (j, (g, t)) in shapes.into_iter().zip(times(n)).enumerate() {
+        rows.push(Row::planned(k, first_step + j as u32, None, t, g));
+    }
+    true
+}
+
+/// The ground the herd is on with `active` in effect: the shape planned for
+/// it when it is one of this schedule's moves, else its own shape.
+fn ground_now(s: &Schedule, rows: &[Row], active: &Boundary) -> Ground {
+    let g = rows.iter().find(|r| r.version == Some(active.version)).map_or(&active.geometry, |r| &r.geometry);
+    ground_of(&s.strips, g)
+}
+
+/// Bring the moves still to come in line with the ground the herd is on
+/// (`active` in effect). Nothing to do when the move before the next one
+/// took effect and is what is in effect: the rest was planned from it. When
+/// it isn't (a move marked late or not sent, a boundary from elsewhere), each
+/// strip still to come is planned again from the ground the one before
+/// leaves, until one comes out as it was: an open keeps the ground under the
+/// herd and its back fence closes it; the strip the herd is on closes from
+/// where it is; an open that never happened takes its back-fence steps with
+/// it. Rows that change are unstaged. Whether any did.
+fn rechain(s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec<i64>, active: &Boundary) -> Result<bool, String> {
+    rows.sort_by_key(|r| (r.at, r.strip, r.step, r.id));
+    let Some(first) = rows.iter().position(Row::pending) else { return Ok(false) };
+    let before = rows[..first].iter().rev().find(|r| r.skipped.as_deref() != Some("held"));
+    if before.is_some_and(|b| b.state == MoveState::Done && b.version == Some(active.version)) {
+        return Ok(false);
+    }
+    let mut ground = ground_now(s, rows, active);
+    let mut order: Vec<u32> = Vec::new();
+    for r in rows.iter().filter(|r| r.pending()) {
+        if !order.contains(&r.strip) {
+            order.push(r.strip);
+        }
+    }
+    let bf = s.back_fence;
+    let every = Duration::minutes(i64::from(bf.close_every_min));
+    let mut changed = false;
+    for k in order {
+        let Some(oi) = rows.iter().position(|r| r.strip == k && r.open()) else { continue };
+        if rows[oi].state == MoveState::Skipped {
+            for r in rows.iter_mut().filter(|r| r.strip == k && r.step > 0 && r.pending()) {
+                r.skip("skipped");
+                changed = true;
+            }
+            continue;
+        }
+        let o = opening(&s.strips, Some(&ground), k as usize, &bf)?;
+        let open_at = rows[oi].at;
+        let next = rows.iter().filter(|r| r.open() && r.pending() && r.strip != k && r.at > open_at).map(|r| r.at).min();
+        let mut this = false;
+        if rows[oi].pending() {
+            if rows[oi].geometry != o.open {
+                rows[oi].geometry = o.open.clone();
+                rows[oi].unstage();
+                this = true;
+            }
+            let first = open_at + Duration::minutes(i64::from(bf.close_after_min));
+            this |= set_closes(rows, gone, k, o.closes, &|n| spaced(first, n, every, next, true));
+        } else {
+            // The strip the herd is on: what is left of its back fence closes from where the herd is.
+            let Some(first) = rows.iter().filter(|r| r.strip == k && r.step > 0 && r.pending()).map(|r| r.at).min() else { continue };
+            this |= set_closes(rows, gone, k, o.closes, &|n| spaced(first, n, every, next, true));
+        }
+        ground = o.after;
+        changed |= this;
+        if !this {
+            break;
+        }
+    }
+    rows.sort_by_key(|r| (r.at, r.strip, r.step, r.id));
+    Ok(changed)
 }
 
 /// Every open must come after the back fence before it has closed.
@@ -649,9 +959,15 @@ async fn planned(ctx: &Ctx, n: NewSchedule, occ: Occurrences<'_>) -> ApiResult<(
     };
     let first = |o: u32| if o == 0 { starts_at } else { trunc_secs(occ(o)) };
     let mut rows = Vec::new();
+    // The first open keeps the ground the herd is fenced to now; each later one
+    // the ground the open before it leaves.
+    let mut ground = Some(ground_of(&s.strips, &active.geometry));
+    let count = s.strips.len() - next;
     for (o, k) in (next..s.strips.len()).enumerate() {
-        let prev = k.checked_sub(1);
-        rows.extend(plan_strip(&s, prev, k, first(o as u32), Some(o as u32)).map_err(ApiError::bad_request)?);
+        let then = (o + 1 < count).then(|| first(o as u32 + 1));
+        let (planned, after) = plan_strip(&s, ground.as_ref(), k, first(o as u32), Some(o as u32), then).map_err(ApiError::bad_request)?;
+        rows.extend(planned);
+        ground = Some(after);
     }
     check_order(&rows).map_err(ApiError::bad_request)?;
     s.planned_end = Some(first((s.strips.len() - next) as u32));
@@ -717,28 +1033,17 @@ impl Plan {
         done.or_else(|| self.s.next_index.checked_sub(1))
     }
 
-    /// The strip opened before `before` (done or still to open, not skipped);
-    /// before the schedule's first open, the strip the herd was on.
-    fn prev_open_strip(&self, before: DateTime<Utc>) -> Option<usize> {
-        let opened = self.rows.iter().filter(|r| r.open() && r.state != MoveState::Skipped && r.at < before).max_by_key(|r| r.at).map(|r| r.strip as usize);
-        opened.or_else(|| self.rows.iter().filter(|r| r.open()).map(|r| r.strip as usize).min().and_then(|f| f.checked_sub(1)))
-    }
-
-    /// Re-plan strip `k`'s open shape and back-fence steps from its open (its
-    /// old ground changes when a strip before it is skipped).
-    fn replan(&mut self, k: u32) -> Result<(), String> {
+    /// Re-plan strip `k`'s open shape and back-fence steps from its open, the
+    /// herd having `ground` before it (it changes when a strip before is skipped).
+    fn replan(&mut self, k: u32, ground: &Ground) -> Result<(), String> {
         let Some(oi) = self.pending_open(k) else { return Ok(()) };
         let open_at = self.rows[oi].at;
-        let prev = self.prev_open_strip(open_at);
-        let planned = plan_strip(&self.s, prev, k as usize, open_at, self.rows[oi].occurrence)?;
+        let next = self.pending_opens().into_iter().map(|i| self.rows[i].at).find(|t| *t > open_at);
+        let (planned, _) = plan_strip(&self.s, Some(ground), k as usize, open_at, self.rows[oi].occurrence, next)?;
         self.rows[oi].geometry = planned[0].geometry.clone();
-        for i in self.closes(k).into_iter().rev() {
-            let r = self.rows.remove(i);
-            if r.id != 0 {
-                self.gone.push(r.id);
-            }
-        }
-        self.rows.extend(planned.into_iter().skip(1));
+        let closes: Vec<Row> = planned.into_iter().skip(1).collect();
+        let times: Vec<DateTime<Utc>> = closes.iter().map(|r| r.at).collect();
+        set_closes(&mut self.rows, &mut self.gone, k, closes.into_iter().map(|r| r.geometry).collect(), &|_| times.clone());
         Ok(())
     }
 
@@ -780,13 +1085,16 @@ async fn alive_staged(ctx: &Ctx, herd_id: &str, rows: &[Row], now: DateTime<Utc>
 /// the herd is on when that is what's in effect (it goes through `prepare`
 /// again), else the boundary in effect as it is.
 async fn reissue(ctx: &Ctx, p: &Plan) -> ApiResult<Option<Boundary>> {
-    let split = db::herd_boundaries(ctx.db(), &p.s.herd_id, now()).await?;
+    reissue_current(ctx, &p.s, &p.rows).await
+}
+
+async fn reissue_current(ctx: &Ctx, s: &Schedule, rows: &[Row]) -> ApiResult<Option<Boundary>> {
+    let split = db::herd_boundaries(ctx.db(), &s.herd_id, now()).await?;
     let Some(a) = split.active else { return Ok(None) };
-    let geometry =
-        p.rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
+    let geometry = rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
     let opts = SendOpts { warn_m: Some(a.warn_m), hysteresis_m: Some(a.hysteresis_m), effective_at: None };
-    let b = send_boundary(ctx, &p.s.herd_id, geometry, opts, &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
-    tracing::info!(schedule = %p.s.id, herd = %p.s.herd_id, version = b.version, "current strip reissued");
+    let b = send_boundary(ctx, &s.herd_id, geometry, opts, &s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    tracing::info!(schedule = %s.id, herd = %s.herd_id, version = b.version, "current strip reissued");
     Ok(Some(b))
 }
 
@@ -860,7 +1168,17 @@ pub async fn skip(ctx: &Ctx, schedule_id: &str, strip: u32) -> ApiResult<Schedul
     p.rows[oi].skip("skipped");
     if let Some(&first) = later.first() {
         let k = p.rows[first].strip;
-        p.replan(k).map_err(ApiError::bad_request)?;
+        // The herd walks through the skipped ground: the open after it keeps
+        // what the move before it leaves (or the ground the herd is on now).
+        let at = p.rows[first].at;
+        let before = p.rows.iter().filter(|r| r.pending() && r.at < at).max_by_key(|r| (r.at, r.step)).map(|r| ground_of(&p.s.strips, &r.geometry));
+        let ground = match before {
+            Some(g) => Some(g),
+            None => db::herd_boundaries(ctx.db(), &p.s.herd_id, now()).await?.active.map(|a| ground_now(&p.s, &p.rows, &a)),
+        };
+        if let Some(g) = ground {
+            p.replan(k, &g).map_err(ApiError::bad_request)?;
+        }
     }
     tracing::info!(schedule = %schedule_id, strip, "strip skipped");
     finish_edit(ctx, p, Some(from)).await
@@ -901,26 +1219,44 @@ pub async fn move_now(ctx: &Ctx, schedule_id: &str) -> ApiResult<Schedule> {
     let oi = p.first_pending_open().ok_or_else(|| ApiError::conflict("Every strip has opened."))?;
     let at = trunc_secs(now());
     let k = p.rows[oi].strip;
-    let next_at = p.pending_opens().into_iter().map(|i| p.rows[i].at).find(|t| *t > p.rows[oi].at);
-    let b =
-        send_boundary(ctx, &p.s.herd_id, p.rows[oi].geometry.clone(), SendOpts::default(), &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let open_at = p.rows[oi].at;
+    let next_at = p.pending_opens().into_iter().map(|i| p.rows[i].at).find(|t| *t > open_at);
+    // What is left of the back fence before it would cut the herd off the
+    // strip it moves into: the open keeps that ground and its own back fence closes it.
+    for r in p.rows.iter_mut().filter(|r| r.pending() && r.step > 0 && r.strip != k && r.at <= open_at) {
+        r.skip("skipped");
+    }
+    let bf = p.s.back_fence;
+    let ground = db::herd_boundaries(ctx.db(), &p.s.herd_id, now()).await?.active.map(|a| ground_now(&p.s, &p.rows, &a));
+    let o = opening(&p.s.strips, ground.as_ref(), k as usize, &bf).map_err(ApiError::bad_request)?;
+    let b = send_boundary(ctx, &p.s.herd_id, o.open.clone(), SendOpts::default(), &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
     let r = &mut p.rows[oi];
     r.at = at;
+    r.geometry = o.open;
     r.state = MoveState::Done;
     r.boundary_id = Some(b.id.clone());
     r.version = Some(b.version);
-    let mut closes = p.closes(k);
-    closes.sort_by_key(|&i| p.rows[i].step);
-    let bf = p.s.back_fence;
-    let n = closes.len() as i64;
-    let squeeze = next_at.filter(|next| at + Duration::minutes(i64::from(bf.span_min())) >= *next - Duration::minutes(1));
-    for (j, i) in closes.into_iter().enumerate() {
-        let t = match squeeze {
+    let times = |n: usize| -> Vec<DateTime<Utc>> {
+        let span = Duration::minutes(i64::from(bf.close_after_min) + i64::from(bf.close_every_min) * (n as i64 - 1).max(0));
+        match next_at.filter(|next| at + span >= *next - Duration::minutes(1)) {
             // Evenly between now and a minute before the next open.
-            Some(next) => at + Duration::seconds((next - Duration::minutes(1) - at).num_seconds() * (j as i64 + 1) / (n + 1)),
-            None => at + Duration::minutes(i64::from(bf.close_after_min) + i64::from(bf.close_every_min) * j as i64),
-        };
-        p.rows[i].at = trunc_secs(t);
+            Some(next) => {
+                (0..n).map(|j| trunc_secs(at + Duration::seconds((next - Duration::minutes(1) - at).num_seconds() * (j as i64 + 1) / (n as i64 + 1)))).collect()
+            }
+            None => (0..n).map(|j| trunc_secs(at + Duration::minutes(i64::from(bf.close_after_min) + i64::from(bf.close_every_min) * j as i64))).collect(),
+        }
+    };
+    // Its back fence follows from now.
+    let shapes: Vec<Polygon> = o.closes;
+    let n = shapes.len();
+    for i in p.closes(k).into_iter().rev() {
+        let r = p.rows.remove(i);
+        if r.id != 0 {
+            p.gone.push(r.id);
+        }
+    }
+    for (j, (g, t)) in shapes.into_iter().zip(times(n)).enumerate() {
+        p.rows.push(Row::planned(k, j as u32 + 1, None, t, g));
     }
     tracing::info!(schedule = %schedule_id, strip = k, version = b.version, "strip opened now");
     finish_edit(ctx, p, None).await
@@ -1002,23 +1338,23 @@ async fn end_plan(ctx: &Ctx, mut p: Plan, reissue_staged: bool) -> ApiResult<Sch
     Ok(s)
 }
 
-/// A MOVE to another paddock ends the herd's schedule when it applies (the
-/// move's own boundaries replace the staged strips). Idempotent.
+/// A MOVE off the schedule's paddock ends the herd's schedule when it
+/// applies (the move's own boundaries replace the staged strips): to another
+/// paddock, or to ground in no mapped paddock (`to_paddock_id` none). Idempotent.
 pub async fn on_decision(ctx: &Ctx, d: &Decision) -> anyhow::Result<Option<Schedule>> {
     if d.status != DecisionStatus::Applied || d.action != Some(DecisionAction::Move) {
         return Ok(None);
     }
     let Some(s) = running(ctx, &d.herd_id).await? else { return Ok(None) };
-    match d.to_paddock_id.as_deref() {
-        Some(p) if p != s.paddock_id => {}
-        _ => return Ok(None),
+    if d.to_paddock_id.as_deref() == Some(s.paddock_id.as_str()) {
+        return Ok(None);
     }
     let _g = lock(&s.id).await;
     let p = load_plan(ctx, &s.id).await.map_err(|e| anyhow::anyhow!(e.message))?;
     if p.s.status == ScheduleStatus::Done {
         return Ok(None);
     }
-    tracing::info!(schedule = %s.id, decision = %d.id, "a move to another paddock ends the schedule");
+    tracing::info!(schedule = %s.id, decision = %d.id, to = ?d.to_paddock_id, "a move off the paddock ends the schedule");
     Ok(Some(end_plan(ctx, p, false).await.map_err(|e| anyhow::anyhow!(e.message))?))
 }
 
@@ -1176,11 +1512,27 @@ pub async fn drive(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow::R
 async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow::Result<bool> {
     let Some(mut s) = get(ctx, schedule_id).await? else { return Ok(false) };
     let mut rows = load_rows(ctx, schedule_id).await?;
-    let before = rows.clone();
+    let before: HashMap<i64, Row> = rows.iter().map(|r| (r.id, r.clone())).collect();
+    let mut gone = Vec::new();
     let mut changed = false;
     if s.status == ScheduleStatus::Active {
         if settled(ctx, &s, at).await? {
-            settle_due(ctx, &s, &mut rows, at).await?;
+            settle_due(ctx, &s, &mut rows, &mut gone, at).await?;
+            // What is still to come starts from the ground the herd is on. A
+            // herd moved mostly off the paddock since the schedule was made (a
+            // draw or MOVE elsewhere whose decision this schedule never saw)
+            // isn't dragged back onto its strips.
+            if let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active {
+                if active.decision_id != s.id && active.created_at > s.created_at && on_paddock(ctx, &s, &active.geometry).await? < 0.5 {
+                    tracing::warn!(schedule = %s.id, version = active.version, "the herd was moved off the schedule's paddock");
+                    return give_up(ctx, s, rows, gone, &active).await;
+                }
+                if let Err(e) = rechain(&s, &mut rows, &mut gone, &active) {
+                    tracing::warn!(schedule = %s.id, "the herd's ground doesn't join the strips still to open: {e}");
+                    return give_up(ctx, s, rows, gone, &active).await;
+                }
+            }
+            restage_for_exclusions(ctx, &s, &mut rows, at).await?;
             stage(ctx, &s, &mut rows, at).await?;
             if !rows.iter().any(Row::pending) {
                 s.status = ScheduleStatus::Done;
@@ -1202,16 +1554,46 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
         s.next_index = next;
         changed = true;
     }
-    let dirty: Vec<usize> = (0..rows.len()).filter(|&i| before.get(i) != Some(&rows[i])).collect();
-    if dirty.is_empty() && !changed {
+    let mut write: Vec<Row> = rows.iter().filter(|r| r.id == 0 || before.get(&r.id) != Some(*r)).cloned().collect();
+    if write.is_empty() && gone.is_empty() && !changed {
         return Ok(false);
     }
     s.updated_at = now();
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let mut write: Vec<Row> = dirty.iter().map(|&i| rows[i].clone()).collect();
+    for id in &gone {
+        sqlx::query("DELETE FROM schedule_moves WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    }
     write_rows(&mut tx, &s.id, &mut write, s.updated_at).await?;
     write_schedule(&mut tx, &s).await?;
     tx.commit().await?;
+    ctx.publish(Event::Schedule { schedule: s });
+    Ok(true)
+}
+
+/// The herd is on ground the strips still to open don't join (it was moved
+/// off them): nothing more opens. The boundary it is on goes again as a new
+/// immediate version, so collars drop the strips staged above it.
+async fn give_up(ctx: &Ctx, mut s: Schedule, mut rows: Vec<Row>, gone: Vec<i64>, active: &Boundary) -> anyhow::Result<bool> {
+    if rows.iter().any(|r| r.state == MoveState::Staged) {
+        let opts = SendOpts { warn_m: Some(active.warn_m), hysteresis_m: Some(active.hysteresis_m), effective_at: None };
+        send_boundary(ctx, &s.herd_id, active.geometry.clone(), opts, &s.id).await?;
+    }
+    for r in rows.iter_mut().filter(|r| r.pending()) {
+        r.skip("skipped");
+    }
+    let at = now();
+    s.status = ScheduleStatus::Done;
+    s.ended_at = Some(at);
+    s.next_index = next_index(&s, &rows);
+    s.updated_at = at;
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    for id in &gone {
+        sqlx::query("DELETE FROM schedule_moves WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    }
+    write_rows(&mut tx, &s.id, &mut rows, at).await?;
+    write_schedule(&mut tx, &s).await?;
+    tx.commit().await?;
+    tracing::info!(schedule = %s.id, herd = %s.herd_id, "schedule ended: the herd is off its strips");
     ctx.publish(Event::Schedule { schedule: s });
     Ok(true)
 }
@@ -1231,62 +1613,121 @@ async fn fill_applied(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Ut
     Ok(())
 }
 
-/// Moves whose time has come: done when they took effect, else applied at
-/// once when at most 30 minutes late, else `late` (with the back-fence steps
-/// of an open that never happened).
-async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
-    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].pending() && rows[i].at <= at).collect();
-    order.sort_by_key(|&i| (rows[i].at, rows[i].strip, rows[i].step));
-    for i in order {
-        if !rows[i].pending() {
-            continue;
-        }
+/// Moves whose time has come, in time order: done when they took effect,
+/// else applied at once when at most 30 minutes late, else `late`. An open
+/// that is late or can't be sent takes its back-fence steps with it. What is
+/// sent late is first brought in line with the ground the herd is on
+/// ([`rechain`]): the move before it may never have happened.
+async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec<i64>, at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mut lined_up = false;
+    loop {
+        rows.sort_by_key(|r| (r.at, r.strip, r.step, r.id));
+        let Some(i) = rows.iter().position(|r| r.pending() && r.at <= at) else { break };
         if let Some(v) = rows[i].version.filter(|_| rows[i].state == MoveState::Staged)
             && took_effect(ctx, &s.herd_id, v, rows[i].at).await?
         {
             rows[i].state = MoveState::Done;
+            lined_up = false;
             tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = v, "scheduled move took effect");
             continue;
         }
-        if at - rows[i].at <= Duration::minutes(LATE_AFTER_MIN) {
-            match send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), SendOpts::default(), &s.id).await {
-                Ok(b) => {
-                    tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = b.version, late_s = (at - rows[i].at).num_seconds(), "late move applied now");
-                    let r = &mut rows[i];
-                    r.state = MoveState::Done;
-                    r.boundary_id = Some(b.id);
-                    r.version = Some(b.version);
-                }
-                // It can't go to the collars as it stands (an exclusion, the herd's collars changed).
-                Err(e) => {
-                    tracing::warn!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move not sent: {e:#}");
-                    rows[i].skip("skipped");
-                }
-            }
-        } else {
-            let (strip, open) = (rows[i].strip, rows[i].step == 0);
-            tracing::info!(schedule = %s.id, strip, step = rows[i].step, "move too late; not applied");
-            rows[i].skip("late");
+        let (strip, open) = (rows[i].strip, rows[i].step == 0);
+        let skip_with_steps = |rows: &mut Vec<Row>, i: usize, why: &str| {
+            rows[i].skip(why);
             if open {
                 for r in rows.iter_mut().filter(|r| r.strip == strip && r.step > 0 && r.pending()) {
-                    r.skip("late");
+                    r.skip(why);
                 }
+            }
+        };
+        if at - rows[i].at > Duration::minutes(LATE_AFTER_MIN) {
+            tracing::info!(schedule = %s.id, strip, step = rows[i].step, "move too late; not applied");
+            skip_with_steps(rows, i, "late");
+            lined_up = false;
+            continue;
+        }
+        if !lined_up {
+            lined_up = true;
+            if let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active {
+                match rechain(s, rows, gone, &active) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(schedule = %s.id, strip, step = rows[i].step, "scheduled move doesn't join the herd's ground: {e}");
+                        skip_with_steps(rows, i, "skipped");
+                        continue;
+                    }
+                }
+            }
+        }
+        lined_up = false;
+        match send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), SendOpts::default(), &s.id).await {
+            Ok(b) => {
+                tracing::info!(schedule = %s.id, strip, step = rows[i].step, version = b.version, late_s = (at - rows[i].at).num_seconds(), "late move applied now");
+                let r = &mut rows[i];
+                r.state = MoveState::Done;
+                r.boundary_id = Some(b.id);
+                r.version = Some(b.version);
+            }
+            // It can't go to the collars as it stands (an exclusion, the herd's collars changed).
+            Err(e) => {
+                tracing::warn!(schedule = %s.id, strip, step = rows[i].step, "scheduled move not sent: {e:#}");
+                skip_with_steps(rows, i, "skipped");
             }
         }
     }
     Ok(())
 }
 
-/// Stage pending moves ahead, in time order, as far as the collars have room.
-async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
-    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].pending() && rows[i].at > at).collect();
-    if order.is_empty() {
+/// What the farm's exclusions are now, to see one drawn, changed or removed
+/// (they are deleted outright, hence the count).
+async fn exclusions_mark(ctx: &Ctx) -> anyhow::Result<String> {
+    let (n, last): (i64, Option<String>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM features WHERE kind = 'exclusion'").fetch_one(ctx.db()).await?;
+    Ok(format!("{n} {}", last.unwrap_or_default()))
+}
+
+/// Per schedule, the exclusions its staged moves were last checked against.
+static EXCLUSIONS_SEEN: LazyLock<std::sync::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// A staged move was prepared with the exclusions of the time it was staged.
+/// When they have changed since (or nothing is known: the server started),
+/// each staged move goes through `prepare` again as it was staged, and the
+/// first whose shape now comes out otherwise is unstaged, so [`stage`] sends
+/// the current strip again and stages everything afresh. So an exclusion
+/// drawn tonight is kept out of tomorrow's strip, and one removed no longer
+/// is. Nothing is sent when no staged move changes.
+async fn restage_for_exclusions(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mark = exclusions_mark(ctx).await?;
+    if EXCLUSIONS_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&s.id) == Some(&mark) {
         return Ok(());
     }
+    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].state == MoveState::Staged && rows[i].at > at).collect();
+    if !order.is_empty() {
+        order.sort_by_key(|&i| (rows[i].at, rows[i].strip, rows[i].step));
+        let split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+        let stored: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
+        for i in order {
+            let Some(b) = rows[i].version.and_then(|v| stored.get(&v)) else { continue };
+            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: Some(rows[i].at) };
+            let now_shape = shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts).await.ok().map(|p| p.geometry);
+            if now_shape.as_ref() != Some(&b.geometry) {
+                tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = b.version, "exclusions changed: staged again from here");
+                rows[i].unstage();
+                break;
+            }
+        }
+    }
+    EXCLUSIONS_SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(s.id.clone(), mark);
+    Ok(())
+}
+
+/// The pending moves after `at` in time order, and how many of them lead the
+/// way still staged alive, in rising versions and at the times planned.
+fn staged_prefix(rows: &[Row], at: DateTime<Utc>, split: &HerdBoundaries) -> (Vec<usize>, usize) {
+    let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].pending() && rows[i].at > at).collect();
     order.sort_by_key(|&i| (rows[i].at, rows[i].strip, rows[i].step));
-    let split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
     let alive: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
-    // The prefix still staged alive, in rising versions and at the times planned.
     let mut prefix = 0;
     let mut last_version = split.active.as_ref().map_or(0, |b| b.version);
     for &i in &order {
@@ -1298,6 +1739,67 @@ async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> 
         last_version = rows[i].version.unwrap_or(last_version);
         prefix += 1;
     }
+    (order, prefix)
+}
+
+/// Stage pending moves ahead, in time order, as far as the collars have room.
+///
+/// A staged move is never replaced in place. A collar holding the old
+/// version with no free slot is never offered the new one (it has no room
+/// until the new one kills the old), so its own clock would still apply the
+/// old shape. So when a version of this schedule is still alive that the
+/// moves staged ahead don't stand for (a move planned again from the ground
+/// the herd is on, shaped again for an exclusion drawn since, or staged
+/// half-way when a pass failed), the current strip goes again first as a new
+/// immediate version, which drops every staged slot on the collars, and the
+/// moves are staged afresh above it.
+async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mut split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+    let (order, prefix) = staged_prefix(rows, at, &split);
+    let standing: HashSet<u32> = order[..prefix].iter().filter_map(|&i| rows[i].version).collect();
+    let stale: Vec<u32> = split.staged.iter().filter(|b| b.decision_id == s.id && !standing.contains(&b.version)).map(|b| b.version).collect();
+    if !stale.is_empty() {
+        tracing::info!(schedule = %s.id, versions = ?stale, "staged moves out of date: the current strip goes again, then staged afresh");
+        if let Err(e) = reissue_current(ctx, s, rows).await {
+            // It can't be prepared again as it stands (an exclusion drawn over
+            // all of it): the boundary in effect goes again exactly as it is.
+            tracing::warn!(schedule = %s.id, "current strip not reissued ({}): sent again as it is", e.message);
+            resend_as_is(ctx, s, &split).await?;
+        }
+        for r in rows.iter_mut() {
+            r.unstage();
+        }
+        split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
+    }
+    stage_ahead(ctx, s, rows, at, &split).await
+}
+
+/// The herd's boundary in effect again, unchanged, as a new immediate
+/// version: collars drop every staged slot below it.
+async fn resend_as_is(ctx: &Ctx, s: &Schedule, split: &HerdBoundaries) -> anyhow::Result<()> {
+    let Some(a) = &split.active else { return Ok(()) };
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let nb = crate::boundary::NewBoundary {
+        herd_id: &s.herd_id,
+        geometry: &a.geometry,
+        warn_m: a.warn_m,
+        hysteresis_m: a.hysteresis_m,
+        effective_at: None,
+        decision_id: &s.id,
+        created_at: now(),
+        collar_id: None,
+        copy_of: None,
+    };
+    let b = crate::boundary::insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?;
+    tx.commit().await?;
+    crate::boundary::announce(ctx, &b).await;
+    Ok(())
+}
+
+/// [`stage`]'s staging, above what is still staged alive.
+async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>, split: &HerdBoundaries) -> anyhow::Result<()> {
+    let (order, prefix) = staged_prefix(rows, at, split);
+    let alive: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
     for &i in &order[prefix..] {
         rows[i].unstage();
     }
@@ -1305,7 +1807,7 @@ async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> 
         return Ok(());
     }
     let ours: HashSet<u32> = split.staged.iter().filter(|b| b.decision_id == s.id).map(|b| b.version).collect();
-    let room = budget(ctx, &s.herd_id, &split, &ours, at).await?;
+    let room = budget(ctx, &s.herd_id, split, &ours, at).await?;
     let (warn, hyst) = crate::margins::default_margins(ctx, &s.herd_id).await?;
     let mut used = vec![0usize; room.groups.len()];
     for &i in &order[..prefix] {

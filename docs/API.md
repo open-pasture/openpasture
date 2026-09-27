@@ -91,8 +91,12 @@ SlotCount { version, effective_at?, applied, stored, rejected, collars }
 
 Boundary versions come from one sequence shared by every herd (herd A may hold v1, v3, v4 and
 herd B v2); `active`/`pending` are still per herd. A collar moved to another herd starts over
-(`boundary_version` cleared, state `unknown`); if the new herd's boundaries are all at or below
-the version the collar held, they are stored again as new versions so the collar picks them up.
+(`boundary_version` cleared, state `unknown`). It still holds its old herd's versions, applied
+and staged, and asks only for versions above the highest; so when any of the new herd's
+boundaries sits at or below what it holds (applied or staged), or what it holds isn't known, it
+is handed copies of the new herd's boundary in effect and of each staged one, its own
+(`collar_id` + `copy_of`, new versions): the copy in effect drops the old herd's strips, and the
+rest of the new herd downloads nothing.
 `POST /api/herds/:id/boundary` writes the farmer decision, the move and its first boundary
 together, then supersedes the herd's open proposals and moves the herd to the paddock under the
 target.
@@ -121,9 +125,18 @@ boundary. The server never sends an active boundary that leaves an animal outsid
   toward the target. Sides tighten around the herd as it bunches. The next step goes out only
   once the collars report every animal in the sweep ahead of the next back line, and at most one
   step every 30 s. The last step is the target itself.
-- An animal that doesn't move up for 5 minutes becomes a **straggler**. It's dropped from the
-  sweep (the next step may leave it outside, and it is never cued there; see the collar rule)
-  and listed on the move for the farmer.
+- An animal whose fixes show it not moving up for 5 minutes becomes a **straggler**. It's dropped
+  from the sweep (the next step may leave it outside, and it is never cued there; see the collar
+  rule) and listed on the move for the farmer.
+- A sweep only moves on what the collars say. While half or more of the collars with the herd
+  (heard in the day before the move started, not parked) have sent no fix for 10 minutes (the
+  farm's link or the cell is down), it holds, from its first step on: no step, no target, nobody
+  dropped. It goes on 2 minutes after the silence ends (collars come back one report at a time),
+  with the straggler clocks started over. A move started then sends nothing until they report
+  (`step` 0), and its first step keeps a future `effective_at`. Fewer silent collars hold the
+  sweep where they were last fixed (it never steps past an animal it can't see) and are never
+  taken as stuck; one silent for 15 minutes outside such a hold is taken as gone (a flat battery,
+  a lost collar), listed as a straggler, and the sweep goes on without it.
 - A new target replaces the running move. Stop keeps the current active boundary and ends the move.
 
 Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. The sweep
@@ -133,8 +146,9 @@ instead (the hull of the herd, buffered by `0.6 × warn_m`). A step goes out whe
 is at least `max(2 m, 0.3 × warn_m)` ahead of the last. The last step is sent when every animal in
 the sweep is inside the target by `warn_m + 2` m, or when the back line has reached the target's
 rear edge and every animal is at least 1.5 m inside it. Only animals holding the sweep up (behind
-the next back line, or not held by the next step) run the 5-minute straggler clock; moving up 1 m
-restarts it, and so does every step. Animals already outside the active boundary when a move
+the next back line, or not held by the next step) run the 5-minute straggler clock, timed by
+their own fixes (silence never counts as being stuck); moving up 1 m restarts it, and so does
+every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
 starts are listed as stragglers at once. When the old active boundary and the target don't touch
 (paddocks drawn with a gap), the first step spans the convex hull of both, so the herd has a way
 across. Every step is a new boundary version under the move's decision (`decision_id`), signed
@@ -168,6 +182,13 @@ cued back without opening the paddock for the rest of the herd to follow it out.
   boundary joined to a pen around the animal: the sweep planner's step for that one animal with
   the herd's boundary as the target. The animal sits in the pen's warning band at the back, so
   it is cued toward the herd; the pen reaches no further out than the animal.
+- A pen keeps out the exclusions in effect that its own ground would take in (cut or made holes,
+  as on any herd boundary). When that leaves the animal, or most of the herd's boundary, out of
+  it (a creek between them), no pen goes. Nor does one for an animal off the herd's own ground
+  (its paddock, or ground it was fenced to in the last day) and more than 100 m outside its
+  boundary: it went far, or its collar was moved to a herd across the farm. Such an animal stays
+  outside, uncued, and the farmer sees it (the `outside` alert); a later pen is tried as its
+  fixes come in.
 - The pen closes in behind the animal like a sweep step: at most every 30 s, and only once the
   animal is `max(2 m, 0.3 × warn_m)` further along. It never gives up on its own; an animal that
   doesn't move stays held where it is.
@@ -509,11 +530,15 @@ BoundaryStatus.acks[].code?         // the reject code of a collar's latest ack
 ```
 
 **Every herd boundary is prepared** before it is stored (farmer draw, applied decision, each
-sweep step, reissue for a moved collar): the shape is validated and fitted to the strictest limits
+sweep step, schedule stage): the shape is validated and fitted to the strictest limits
 among the herd's collars that hold holes (V0 when none report caps). Outer rings only shrink and
 holes only grow. An invalid shape is 400 with a sentence, e.g. "Holes need 13 m between them and
-from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). Missing
-`warn_m`/`hysteresis_m` default to 5 m and 1 m. Holes are allowed: `POST /api/herds/:id/boundary`
+from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). A shape
+with nowhere at least `warn_m + hysteresis_m` from every edge and hole (narrower than two warning
+zones) is 400 too, "Nowhere in it is clear of the warning zone. Make it at least 22 m across.":
+every animal in it would be cued whatever it did. Missing
+`warn_m`/`hysteresis_m` default to 5 m and 1 m (a training herd's `warn_m` while training is on,
+so schedule strips are checked at the margins they go out with). Holes are allowed: `POST /api/herds/:id/boundary`
 takes a Polygon with inner rings. Sweep steps carry the target's holes, and holes of the previous
 boundary that still lie whole inside the step with the gap.
 
@@ -524,11 +549,21 @@ ring, so `state` matches what the collar enforces. Selection (§3.3): its bounda
 with its own copies after an escape; only its pen while out on one) split at now by the
 activation rule (the highest version whose `effective_at`, or receipt, has passed is in effect; a
 staged version is dead once a higher one takes effect at or before it); versions it refused for
-good are dropped (every code except `slots_full`, and a rejection without a code); then the
+good are dropped (every code except `slots_full`, and a rejection without a code; `wrong_herd`
+and `bad_sig` refusals made before the collar's current config last went out are offered again
+once it reports holding that config, since it has then checked the server's signature and knows
+its herd); then the
 version in effect if newer than `have`, else the lowest staged one above `have` when `free` > 0
 and its record (`192 + 8 × vertices` bytes) fits `free_bytes`. A collar that sends no `free`
 (firmware 0.1) has its slots less what its acks say it holds. `latest_version` in report replies is
 the highest version of that set it hasn't refused.
+
+**Out of step.** When a report's `slots` show a collar can't get some version of its set the
+usual way (one it doesn't hold, hasn't refused, sits at or below the highest it holds: its record
+of the boundary in effect was lost, it holds another herd's versions), it is handed copies of its
+herd's boundary in effect and of each staged one, as after an escape, and `latest_version` names
+them. The server-side fence starts from `unknown` when the herd's boundary took effect after the
+collar's last report, as the collar rearms on a new boundary.
 
 **Reports** (§3.8) may carry `device { fw, caps, limits, config_version, config_reject }` (stored
 on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`), `slots` (the complete
@@ -560,7 +595,7 @@ comes.
 Tables: `collar_slots(collar_id, version, status, effective_at, reported_at, code)`,
 `episodes(id epi_…, collar_id, herd_id, animal_id, start_t, end_t, start_at, end_at,
 boundary_version, ring, cues, max_level, min_margin_m, outcome)`, `collar_config(collar_id,
-version, body, updated_at, reject_version, reject_code)`; boundary indexes `(herd_id, collar_id,
+version, body, updated_at, reject_version, reject_code, sent_at)`; boundary indexes `(herd_id, collar_id,
 version)`, `(effective_at)`, `(version)`.
 <!-- @J -->
 
@@ -1322,7 +1357,9 @@ one closer to the edge than the collars' gap is joined to it by a notch, close o
 hole, one covering the whole shape is left alone. This happens on every path (a farmer's draw, an
 applied decision, each sweep step, a staged boundary, a reissue), so an exclusion that starts later
 takes effect on the first send at or after it starts, and one that has ended no longer shapes
-sends. An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
+sends. Drawing an exclusion doesn't by itself send the boundary in effect again; when it changes
+a strip schedule's staged moves, those are staged again and the current strip goes again with them
+(see Schedules). An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
 doesn't change. Hazards, roads, neighbour lines, water and the farm boundary are only checked.
 
 `sent` is what sending the same shape now stores, byte for byte (holes and cuts from exclusions,
@@ -1414,12 +1451,18 @@ ScheduledMove { schedule_id, index /* strip */, step /* 0 open, 1.. back-fence s
 `layout_id` and no `strips` they come from the layout, and the paddock from the layout, else the
 herd's. The first strip to open (`next_index`) defaults to the one after the strip the herd's
 boundary covers now, so the usual start is: send strip 1 (`POST /api/herds/:id/boundary`), then
-schedule. Without a back fence, opening strip k stages `strips[0..=k]`. With one it stages
-`strips[p-lag..=k]` (p = the strip opened before, so the animals keep the ground they stand on;
-skipped strips in between are old ground too), then `close_steps` steps `close_after_min` after
-the open and `close_every_min` apart sweep the old ground from the far side, the last being
-`strips[k-lag..=k]`. Every shape goes through `prepare` when it is staged (exclusions active at
-its time, fitting).
+schedule. An open never takes ground away: opening strip k stages the ground the herd has before
+it (the boundary in effect for the first open, else what the move before leaves) joined to the
+strips up to k and those between (skipped strips are walked through). Without a back fence that
+is `strips[0..=k]` and whatever ground the herd had. With one, `close_steps` steps per strip of old
+ground behind strip k, `close_after_min` after the open and `close_every_min` apart (pressed
+closer when they would reach the next open), close that ground from its far side, the last leaving
+`strips[k-lag..=k]`. Ground ahead of strip k (a herd that had more than the strips before it, or
+was moved on further) is never closed: the herd stands on it with no reason to leave, and a timed
+step would leave it outside, uncued; those strips open in their turn. So with the herd on strip
+k-1 the open is `strips[k-1-lag..=k]`, and a schedule made while the herd has the whole paddock
+opens strip 1 as the whole paddock, then each later open's back fence takes the strip behind it.
+Every shape goes through `prepare` when it is staged (exclusions active at its time, fitting).
 
 **Times.** Occurrence 0 is `starts_at`; occurrence n is `cadence.at` on the farm-local date
 n × `every_days` days later, so "daily 07:00" opens at 07:00 local on both sides of a DST change
@@ -1437,8 +1480,19 @@ three back-fence steps a day, about 3.75 days. A schedule's boundaries carry its
 **Immediates.** A sweep step, a farmer's draw or any immediate herd boundary drops the staged
 moves on the collars. The schedule stages again above it when the sequence settles: at the end of
 the move, or 60 s after a lone boundary. A move whose time passed without taking effect is
-applied at once if at most 30 minutes late, else marked `late` and never applied (with the
-back-fence steps of an open that never happened); later moves go ahead. Queue edits that change
+applied at once if at most 30 minutes late, else marked `late` and never applied (an open that is
+late or can't be sent takes its back-fence steps with it); later moves go ahead. Whenever the
+boundary in effect isn't the move before the next one (a move marked late or skipped, a boundary
+from elsewhere, move now), the moves still to come are planned again from the ground the herd is
+on, so no open or back-fence step leaves it outside. Move now skips what is left of the strip
+before's back fence: the open keeps that ground and its own back fence closes it. A staged move is
+never replaced in place (a collar with no free slot is never offered the new version, so its own
+clock would apply the old one): whenever a staged move no longer stands (planned again from the
+ground the herd is on, or shaped again, below), the current strip goes again first as a new
+immediate version and the moves are staged afresh above it. When an exclusion is drawn, changed or
+removed, each staged move goes through `prepare` again, and if any now comes out otherwise the
+moves are staged afresh that way, so tonight's exclusion is kept out of tomorrow's strip (the
+current strip, sent again, takes it too). Queue edits that change
 what is staged (skip, hold, edit time, pause, end) send the herd's current strip again as a new
 immediate version so collars drop the staged moves, then stage the new plan. Move now sends the
 strip itself. An escape's pen drops only that collar's staged slots; when it ends the collar gets
@@ -1446,8 +1500,9 @@ copies at the same times (see "Protocol v1 on the server").
 
 **Decisions.** While a schedule is active the daily decision is about it: the context has
 `schedule` (below). `STAY` keeps it (the next strip opens on time), `HOLD` (new action) repeats
-today's strip (as `/hold`), and a `MOVE` to another paddock ends the schedule when it applies (a
-farmer's draw included). `HOLD` without an active schedule fails the decision. `respond` with
+today's strip (as `/hold`), and a `MOVE` off the schedule's paddock ends the schedule when it applies
+(to another paddock or to ground in no mapped paddock; a farmer's draw included, ended as it is
+drawn). A boundary in effect that lies mostly off the strips ends it too on the driver's next pass. `HOLD` without an active schedule fails the decision. `respond` with
 `reject` on a proposed `STAY` while the herd's schedule is active holds: the decision becomes
 `action: "HOLD"`, `status: "applied"`, `inputs.proposed_action: "STAY"`. The approval text reads
 `Cows: strip 4 of 12 opens 07:00. Reply Y to keep, N to hold. Code 4821`. HOLD follows the herd's

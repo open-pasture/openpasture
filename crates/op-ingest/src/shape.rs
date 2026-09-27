@@ -70,6 +70,14 @@ pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts
         };
         return Err(ApiError::bad_request(msg));
     }
+    // Somewhere in it an animal is clear of the warning zone: else every animal is cued whatever it does.
+    if !shape::has_room(&fitted, warn_m + hysteresis_m) {
+        let fmt = op_core::units::Fmt::of(ctx).await?;
+        return Err(ApiError::bad_request(format!(
+            "Nowhere in it is clear of the warning zone. Make it at least {} across.",
+            fmt.len(2.0 * (warn_m + hysteresis_m))
+        )));
+    }
     let mut findings = Vec::new();
     if excluded.simplified {
         findings.push(Finding {
