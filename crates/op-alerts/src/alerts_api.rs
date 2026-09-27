@@ -1,5 +1,6 @@
 //! `/api/alerts*` and the alert MCP tools (`list_alerts`, `ack_alert`,
-//! `resolve_alert`). docs/API.md "Alerts".
+//! `resolve_alert`). docs/API.md "Alerts". Alerts go out as
+//! [`store::public`] shows them: never with the approval code.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -56,7 +57,7 @@ pub async fn list_alerts(ctx: &Ctx, p: &ListParams) -> ApiResult<Vec<Alert>> {
         to: time_param("to", p.to.as_deref())?,
         limit,
     };
-    Ok(store::list(ctx, &q).await?)
+    Ok(store::list(ctx, &q).await?.into_iter().map(store::public).collect())
 }
 
 async fn list(State(ctx): State<Ctx>, Query(p): Query<ListParams>) -> ApiResult<Json<Vec<Alert>>> {
@@ -64,17 +65,17 @@ async fn list(State(ctx): State<Ctx>, Query(p): Query<ListParams>) -> ApiResult<
 }
 
 async fn get_one(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<Alert>> {
-    store::get(&ctx, &id).await?.map(Json).ok_or_else(|| ApiError::not_found("No such alert."))
+    store::get(&ctx, &id).await?.map(|a| Json(store::public(a))).ok_or_else(|| ApiError::not_found("No such alert."))
 }
 
 async fn post_ack(State(ctx): State<Ctx>, id: Identity, Path(alert): Path<String>) -> ApiResult<Json<Alert>> {
     id.require(Role::Hand)?;
-    Ok(Json(store::ack(&ctx, &alert, &id.actor(), now()).await?))
+    Ok(Json(store::public(store::ack(&ctx, &alert, &id.actor(), now()).await?)))
 }
 
 async fn post_resolve(State(ctx): State<Ctx>, id: Identity, Path(alert): Path<String>) -> ApiResult<Json<Alert>> {
     id.require(Role::Hand)?;
-    Ok(Json(store::resolve_by(&ctx, &alert, &id.actor(), now()).await?))
+    Ok(Json(store::public(store::resolve_by(&ctx, &alert, &id.actor(), now()).await?)))
 }
 
 // ---- rules and policy -----------------------------------------------------------------
@@ -209,7 +210,7 @@ pub fn ack_alert_tool() -> ToolSpec {
         min_role: Role::Hand,
         run: ToolSpec::run_fn(|c: ToolCall| async move {
             let id = id_arg(&c)?;
-            Ok(json!(store::ack(&c.ctx, &id, &c.identity.actor(), now()).await?))
+            Ok(json!(store::public(store::ack(&c.ctx, &id, &c.identity.actor(), now()).await?)))
         }),
     }
 }
@@ -224,7 +225,7 @@ pub fn resolve_alert_tool() -> ToolSpec {
         min_role: Role::Hand,
         run: ToolSpec::run_fn(|c: ToolCall| async move {
             let id = id_arg(&c)?;
-            Ok(json!(store::resolve_by(&c.ctx, &id, &c.identity.actor(), now()).await?))
+            Ok(json!(store::public(store::resolve_by(&c.ctx, &id, &c.identity.actor(), now()).await?)))
         }),
     }
 }

@@ -4,13 +4,20 @@
 //! state, so a restart or a lagged bus loses nothing.
 //!
 //! Lifecycle: a new key opens an alert; a changed title, place, severity or
-//! targets updates it; a key gone for `clear_after_min` resolves it (back
-//! inside that time, it keeps its row); ack stops re-notification; resolve
-//! closes it (it stays closed while its condition lasts); a key back after
-//! it resolved opens a new row. `rollup_min` or more collar alerts of one
-//! kind in one herd are one alert `<kind>:herd:<herd id>`, which keeps taking
-//! members until the last one clears. `herd_silent` takes in its herd's
-//! `silent` alerts the same way.
+//! targets updates it; a key gone for `clear_after_min` (and at least two of
+//! its rule's own runs) resolves it (back inside that time, it keeps its
+//! row); ack stops re-notification; resolve closes it (it stays closed while
+//! its condition lasts); a key back after it resolved opens a new row.
+//! `rollup_min` or more collar alerts of one kind in one herd are one alert
+//! `<kind>:herd:<herd id>`, which keeps taking members until the last one
+//! clears (`herd_silent` takes in its herd's `silent` alerts the same way).
+//! Once people were told about a rollup (a text, an ack), members that join
+//! it are a new breakout when they are at least as many as the told ones
+//! still in it: it opens again as a new alert with every member, sent like
+//! any new alert, and the old one resolves into it. Closed by hand, it keeps
+//! only the members it was closed with while they stay out; new ones alert
+//! on their own, or as a new rollup of every member once there are
+//! `rollup_min` of them.
 
 pub mod config;
 pub mod store;
@@ -169,7 +176,7 @@ impl Engine {
         let policy = config::policy(ctx).await?;
         let configs = config::rule_configs(ctx).await?;
         let grace = in_grace(ctx, now).await?;
-        let mut found: Vec<(&'static str, RuleConfig, Vec<Candidate>)> = Vec::new();
+        let mut found: Vec<(&'static str, u32, RuleConfig, Vec<Candidate>)> = Vec::new();
         for r in &self.rules {
             let d = r.descriptor();
             if !kinds.contains(d.kind) {
@@ -192,13 +199,13 @@ impl Engine {
             } else {
                 vec![]
             };
-            found.push((d.kind, cfg, candidates));
+            found.push((d.kind, d.cadence_s, cfg, candidates));
         }
         // Absorbers first, so what they take in is known.
-        found.sort_by_key(|(k, _, _)| !ABSORBS.iter().any(|(a, _)| a == k));
+        found.sort_by_key(|(k, ..)| !ABSORBS.iter().any(|(a, _)| a == k));
         let mut changes = Changes::default();
-        for (kind, cfg, candidates) in found {
-            changes.extend(reconcile(ctx, kind, &cfg, candidates, &policy, now).await?);
+        for (kind, cadence_s, cfg, candidates) in found {
+            changes.extend(reconcile(ctx, kind, cadence_s, &cfg, candidates, &policy, now).await?);
         }
         Ok(changes)
     }
@@ -283,15 +290,21 @@ fn member_facts(d: &Value) -> Value {
 }
 
 /// When a new alert's first send is due: with a pending batch of its kind,
-/// herd and severity if one is still open, else after its window.
+/// herd and severity if one is still open, else after its window. A prompt
+/// with a deadline ([`routing::deadline`]) goes after the critical window, on
+/// its own.
 async fn batch_at(
     ctx: &Ctx,
     kind: &str,
     herd_id: Option<&str>,
     severity: Severity,
+    urgent: bool,
     policy: &config::Policy,
     now: DateTime<Utc>,
 ) -> anyhow::Result<DateTime<Utc>> {
+    if urgent {
+        return Ok(now + Duration::seconds(policy.critical_window_s as i64));
+    }
     let pending: Option<String> = sqlx::query_scalar(
         "SELECT MIN(batch_at) FROM alerts WHERE kind = ? AND herd_id IS ? AND severity = ? AND status != 'resolved' AND notify = 1
            AND routed_at IS NULL AND batch_at > ?",
@@ -309,15 +322,45 @@ async fn batch_at(
     Ok(now + Duration::seconds(window as i64))
 }
 
+/// How long a key must be gone before its alert resolves: `clear_after_min`,
+/// and never less than two runs of its rule (a 300 s rule that misses one
+/// run keeps its alert). `clear_after_min` 0 resolves at once.
+fn clear_after(policy: &config::Policy, cadence_s: u32) -> Duration {
+    if policy.clear_after_min == 0 {
+        return Duration::zero();
+    }
+    Duration::minutes(policy.clear_after_min as i64).max(Duration::seconds(2 * cadence_s.max(1) as i64))
+}
+
+/// The newest row of a key when someone closed it by hand and its cause was
+/// seen within `clear_after` since: it stays closed.
+async fn closed_by_hand(ctx: &Ctx, key: &str, clear_after: Duration, now: DateTime<Utc>) -> anyhow::Result<Option<Row>> {
+    Ok(store::last_resolved(ctx, key)
+        .await?
+        .filter(|last| last.alert.resolved_by.is_some() && last.alert.rolled_into.is_none() && now - last.seen_at < clear_after))
+}
+
+/// The collars people were told about in this rollup: when it was texted,
+/// acked or closed (`announced`; an acked or closed row from before that
+/// column, its targets). `None` while nobody was told.
+fn told_of(r: &Row) -> Option<HashSet<String>> {
+    if let Some(a) = &r.announced {
+        return Some(a.iter().cloned().collect());
+    }
+    (r.alert.status != AlertStatus::Open).then(|| r.alert.targets.iter().filter(|(k, _)| k == "collar").map(|(_, id)| id.clone()).collect())
+}
+
 /// Bring one kind's alerts in step with its candidates.
 async fn reconcile(
     ctx: &Ctx,
     kind: &str,
+    cadence_s: u32,
     cfg: &RuleConfig,
     candidates: Vec<Candidate>,
     policy: &config::Policy,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Changes> {
+    let clear_after = clear_after(policy, cadence_s);
     let mut changes = Changes::default();
     let mut existing: HashMap<String, Row> = store::unresolved(ctx, kind).await?.into_iter().map(|r| (r.alert.key.clone(), r)).collect();
 
@@ -346,23 +389,67 @@ async fn reconcile(
     herds.sort();
     let mut finals = singles;
     let mut new_ids: HashMap<String, String> = HashMap::new();
+    let mut touched = Vec::new();
+    let rollup_min = policy.rollup_min as usize;
     for h in herds {
         let members = by_herd.remove(&h).unwrap_or_default();
         let key = format!("{kind}:herd:{h}");
-        if members.len() >= policy.rollup_min as usize || existing.contains_key(&key) {
-            let sev = members.iter().map(|m| effective_severity(cfg, m)).max().unwrap_or(cfg.severity);
-            let id = existing.get(&key).map(|r| r.alert.id.clone()).unwrap_or_else(|| id::new_id(store::ALERT));
-            for m in &members {
-                rolled.insert(m.key.clone(), id.clone());
+        // The row that holds this herd's rollup: open or acked, else closed by
+        // hand while members it was closed with stay out.
+        let closed = if existing.contains_key(&key) { None } else { closed_by_hand(ctx, &key, clear_after, now).await? };
+        let current = existing.get(&key).or(closed.as_ref());
+        let renew = match current {
+            None if members.len() < rollup_min => {
+                finals.extend(members);
+                continue;
             }
-            new_ids.insert(key, id);
-            finals.push(rollup(kind, &h, &members, sev));
-        } else {
-            finals.extend(members);
+            None => false,
+            Some(r) => match told_of(r) {
+                None => false,
+                Some(told) => {
+                    // Members new since people were told are a new breakout:
+                    // after a close, `rollup_min` of them; else as many as it
+                    // still has of the told ones (so it texts again when it
+                    // doubles, and a straggler left out doesn't hide the next).
+                    let (fresh, kept): (Vec<Candidate>, Vec<Candidate>) = members.iter().cloned().partition(|m| !told.contains(&m.subject.1));
+                    match &closed {
+                        Some(c) if fresh.len() < rollup_min => {
+                            // The ones it was closed with stay closed; new ones alert on their own.
+                            if !kept.is_empty() {
+                                touched.push(c.alert.id.clone());
+                            }
+                            for m in &kept {
+                                rolled.insert(m.key.clone(), c.alert.id.clone());
+                            }
+                            finals.extend(fresh);
+                            continue;
+                        }
+                        Some(_) => true,
+                        None => fresh.len() >= kept.len().max(1),
+                    }
+                }
+            },
+        };
+        let id = match current {
+            Some(r) if !renew => r.alert.id.clone(),
+            _ => id::new_id(store::ALERT),
+        };
+        for m in &members {
+            rolled.insert(m.key.clone(), id.clone());
         }
+        // A new alert for all of them; the one people were told about goes into it.
+        if renew
+            && let Some(old) = existing.remove(&key)
+            && let Some(a) = store::resolve(ctx, &old.alert.id, None, Some(&id), now).await?
+        {
+            tracing::info!(kind, key = %a.key, into = %id, "rollup opened again for a new breakout");
+            changes.resolved.push(a);
+        }
+        let sev = members.iter().map(|m| effective_severity(cfg, m)).max().unwrap_or(cfg.severity);
+        new_ids.insert(key, id);
+        finals.push(rollup(kind, &h, &members, sev));
     }
 
-    let mut touched = Vec::new();
     for c in finals {
         let severity = effective_severity(cfg, &c);
         if let Some(row) = existing.remove(&c.key) {
@@ -381,7 +468,7 @@ async fn reconcile(
                 }
                 a.updated_at = now;
                 if let Some(a) = store::update(ctx, &a, now).await? {
-                    ctx.publish(Event::Alert { alert: a.clone() });
+                    ctx.publish(Event::Alert { alert: store::public(a.clone()) });
                     changes.updated.push(a);
                 }
             } else {
@@ -389,17 +476,17 @@ async fn reconcile(
             }
             continue;
         }
-        // Closed by hand while the condition lasted: stays closed.
-        if let Some(last) = store::last_resolved(ctx, &c.key).await?
-            && last.alert.resolved_by.is_some()
-            && last.alert.rolled_into.is_none()
-            && now - last.seen_at < Duration::minutes(policy.clear_after_min as i64)
+        // Closed by hand while the condition lasted: stays closed (rollups were
+        // settled above).
+        if !new_ids.contains_key(&c.key)
+            && let Some(last) = closed_by_hand(ctx, &c.key, clear_after, now).await?
         {
             touched.push(last.alert.id.clone());
             continue;
         }
         let notify = cfg.notify && severity >= Severity::Warning;
-        let batch = if notify { Some(batch_at(ctx, kind, c.herd_id.as_deref(), severity, policy, now).await?) } else { None };
+        let urgent = routing::deadline(kind, &c.data).is_some();
+        let batch = if notify { Some(batch_at(ctx, kind, c.herd_id.as_deref(), severity, urgent, policy, now).await?) } else { None };
         let row = Row {
             alert: Alert {
                 id: new_ids.get(&c.key).cloned().unwrap_or_else(|| id::new_id(store::ALERT)),
@@ -429,17 +516,17 @@ async fn reconcile(
             escalated_at: None,
             renotified: 0,
             renotified_at: None,
+            announced: None,
         };
         if store::insert(ctx, &row).await? {
             tracing::info!(kind, key = %row.alert.key, severity = ?row.alert.severity, "alert opened");
-            ctx.publish(Event::Alert { alert: row.alert.clone() });
+            ctx.publish(Event::Alert { alert: store::public(row.alert.clone()) });
             changes.opened.push(row.alert);
         }
     }
     store::touch(ctx, &touched, now).await?;
 
     // Keys that are gone: into a rollup or an absorber at once, else after a while.
-    let clear_after = Duration::minutes(policy.clear_after_min as i64);
     for (key, row) in existing {
         let into = rolled.get(&key).cloned().or_else(|| row.alert.herd_id.as_ref().and_then(|h| absorbers.get(h).cloned()));
         let resolved = if let Some(into) = into {

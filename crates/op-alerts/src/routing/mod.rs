@@ -2,16 +2,21 @@
 //! (`op_core::messages::enqueue`); the sender delivers them.
 //!
 //! - A person matches an alert when its severity is at least theirs, its herd
-//!   is one of theirs and its kind isn't muted, and they can be reached over a
-//!   configured channel: sms and whatsapp only to a verified phone that hasn't
-//!   texted STOP; sms and email go through the relay when the farm has no
-//!   Twilio or SMTP of its own.
-//! - When anyone matching is on duty, the first send goes only to them.
+//!   is one of theirs and its kind isn't muted, they may answer it (the
+//!   approval prompt is for managers and up, [`answered_by`]), and they can
+//!   be reached over a configured channel: sms and whatsapp only to a
+//!   verified phone that hasn't texted STOP; sms and email go through the
+//!   relay when the farm has no Twilio or SMTP of its own.
+//! - When anyone matching is on duty and can be reached now (not held by
+//!   quiet hours), the first send goes only to them.
 //! - Warnings wait `group_window_s` and go out as one text for every alert of
 //!   that kind in that herd opened in the window; critical alerts wait only
 //!   `critical_window_s` (so a breakout is one rollup text). Info never pushes.
 //! - Quiet hours (the person's, else the farm's, farm time) hold a send until
-//!   they end; critical passes unless the person turned that off.
+//!   they end; critical passes unless the person turned that off. The prompt
+//!   of a timer decision ([`deadline`]) goes like a critical alert unless
+//!   quiet hours end [`PROMPT_LEAD`] before the timer applies.
+//! - A prompt whose decision was answered before it went out closes instead.
 //! - Unacked critical alerts are sent again every `renotify_every_min` (up to
 //!   `renotify_max` times) and escalate every `escalate_after_min` to matching
 //!   people of the next role up not yet notified (hand → manager → owner).
@@ -21,13 +26,13 @@ pub mod prefs;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::{DateTime, Duration, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use op_core::alert::Alert;
 use op_core::messages::{Outbound, enqueue};
 use op_core::time::to_db;
 use op_core::users::User;
-use op_core::{Ctx, Role, Severity};
+use op_core::{Ctx, DbEnum, DecisionStatus, Role, Severity};
 use serde_json::Value;
 use sqlx::Row as _;
 
@@ -88,9 +93,36 @@ pub fn deliveries(p: &Person, configured: &[&str]) -> Vec<(&'static str, String)
     out
 }
 
+/// The role a kind's text is for. The approval prompt ("Reply Y or N. Code
+/// 4821") asks for an answer only a manager or the owner may give (A3 refuses
+/// anyone else), so it goes to nobody below; everything else to anyone.
+pub fn answered_by(kind: &str) -> Role {
+    match kind {
+        "decision_waiting" => Role::Manager,
+        _ => Role::Viewer,
+    }
+}
+
+/// When a prompt's answer is due: a timer decision applies at `apply_at`
+/// unless someone says no, so its text can't wait for the grouping window,
+/// nor for quiet hours that end less than [`PROMPT_LEAD`] before it applies.
+/// It goes like a critical alert then (the short window, through quiet hours
+/// unless the person turned that off), though it stays a warning.
+pub fn deadline(kind: &str, data: &Value) -> Option<DateTime<Utc>> {
+    if kind != "decision_waiting" {
+        return None;
+    }
+    data.get("apply_at").and_then(Value::as_str).and_then(|t| op_core::time::from_db(t).ok())
+}
+
+/// How long before a timer applies its prompt must have gone out: quiet
+/// hours ending later than this hold it no longer.
+pub const PROMPT_LEAD: Duration = Duration::minutes(30);
+
 /// Whether a person wants this alert at all.
 pub fn matches(p: &Person, severity: Severity, herd_id: Option<&str>, kind: &str) -> bool {
-    severity >= p.prefs.min_severity
+    p.user.role >= answered_by(kind)
+        && severity >= p.prefs.min_severity
         && severity >= Severity::Warning
         && !p.prefs.muted_kinds.iter().any(|k| k == kind)
         && match (&p.prefs.herds, herd_id) {
@@ -106,27 +138,49 @@ fn hhmm(s: &str) -> Option<NaiveTime> {
 
 /// Within the person's quiet hours (theirs, else the farm's) at `now`.
 pub fn in_quiet(p: &Person, policy: &Policy, tz: Tz, now: DateTime<Utc>) -> bool {
+    quiet_until(p, policy, tz, now).is_some()
+}
+
+/// When the quiet hours `now` falls in end (the person's, else the farm's,
+/// in farm time); `None` outside them.
+pub fn quiet_until(p: &Person, policy: &Policy, tz: Tz, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let (start, end) = match (&p.prefs.quiet_start, &p.prefs.quiet_end) {
         (Some(a), Some(b)) => (a.as_str(), b.as_str()),
         _ => match (&policy.quiet_start, &policy.quiet_end) {
             (Some(a), Some(b)) => (a.as_str(), b.as_str()),
-            _ => return false,
+            _ => return None,
         },
     };
-    let (Some(a), Some(b)) = (hhmm(start), hhmm(end)) else { return false };
-    let t = now.with_timezone(&tz).time();
-    if a == b {
+    let (a, b) = (hhmm(start)?, hhmm(end)?);
+    let local = now.with_timezone(&tz);
+    let t = local.time();
+    let quiet = if a == b {
         false
     } else if a < b {
         t >= a && t < b
     } else {
         t >= a || t < b
+    };
+    if !quiet {
+        return None;
     }
+    // Today's end, or tomorrow's when the quiet hours began this evening.
+    let day = if t < b { local.date_naive() } else { local.date_naive().succ_opt()? };
+    let end = day.and_time(b);
+    // Clocks going forward can skip the end; an hour later is past the gap.
+    let at = tz.from_local_datetime(&end).earliest().or_else(|| tz.from_local_datetime(&(end + Duration::hours(1))).earliest())?;
+    Some(at.with_timezone(&Utc))
 }
 
 /// A send to this person waits: quiet hours, unless critical and they let critical through.
 pub fn holds(p: &Person, severity: Severity, policy: &Policy, tz: Tz, now: DateTime<Utc>) -> bool {
     in_quiet(p, policy, tz, now) && !(severity == Severity::Critical && p.prefs.critical_in_quiet)
+}
+
+/// A timer's prompt waits for the end of quiet hours only when that leaves
+/// [`PROMPT_LEAD`] before the timer applies (or they hold critical too).
+pub fn holds_prompt(p: &Person, due: DateTime<Utc>, policy: &Policy, tz: Tz, now: DateTime<Utc>) -> bool {
+    quiet_until(p, policy, tz, now).is_some_and(|end| !p.prefs.critical_in_quiet || end + PROMPT_LEAD <= due)
 }
 
 /// What one routing pass sent.
@@ -154,6 +208,7 @@ pub async fn route(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Report> {
         .iter()
         .map(store::row_from)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let due = drop_answered(ctx, due, now).await?;
     let follow =
         sqlx::query("SELECT * FROM alerts WHERE status = 'open' AND notify = 1 AND severity = 'critical' AND escalated_at IS NOT NULL ORDER BY opened_at, id")
             .fetch_all(ctx.db())
@@ -161,6 +216,7 @@ pub async fn route(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Report> {
             .iter()
             .map(store::row_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
+    let follow = drop_answered(ctx, follow, now).await?;
     if due.is_empty() && follow.is_empty() {
         return Ok(report);
     }
@@ -202,6 +258,29 @@ async fn farm(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Farm> {
         None
     };
     Ok(Farm { tz: tctx.tz, policy: policy(ctx).await?, configured, webhook_url, tctx })
+}
+
+/// Approval prompts whose decision isn't waiting any more (answered in the
+/// app or by text, applied by its timer) close now instead of going out. The
+/// engine closes them too, but only at its next look, which can come after
+/// the text.
+async fn drop_answered(ctx: &Ctx, rows: Vec<Row>, now: DateTime<Utc>) -> anyhow::Result<Vec<Row>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.alert.kind == "decision_waiting"
+            && let Some(d) = decision_of(&r.alert)
+        {
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?").bind(&d).fetch_optional(ctx.db()).await?;
+            if status.as_deref() != Some(DecisionStatus::Proposed.as_db().as_str()) {
+                if store::resolve(ctx, &r.alert.id, None, None, now).await?.is_some() {
+                    tracing::info!(alert = %r.alert.id, decision = %d, "approval prompt closed: the decision was answered before it went out");
+                }
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    Ok(out)
 }
 
 fn severity_of(rows: &[Row]) -> Severity {
@@ -294,11 +373,19 @@ async fn record(ctx: &Ctx, alert_id: &str, user_id: Option<&str>, channel: &str,
 async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now: DateTime<Utc>, report: &mut Report) -> anyhow::Result<()> {
     let head = &rows[0].alert;
     let severity = severity_of(rows);
+    // A timer's prompt: quiet hours hold it only while that leaves time to answer.
+    let due = rows.iter().filter_map(|r| deadline(&r.alert.kind, &r.alert.data)).min();
+    let waits = |p: &Person| match due {
+        Some(t) => holds_prompt(p, t, &farm.policy, farm.tz, now),
+        None => holds(p, severity, &farm.policy, farm.tz, now),
+    };
     let ids: Vec<String> = rows.iter().map(|r| r.alert.id.clone()).collect();
     let told: HashSet<(String, String)> = notified(ctx, &ids).await?.into_iter().filter_map(|(a, u, _, _)| Some((a, u?))).collect();
     let matching: Vec<&Person> =
         people.iter().filter(|p| matches(p, severity, head.herd_id.as_deref(), &head.kind) && !deliveries(p, &farm.configured).is_empty()).collect();
-    let on_duty: Vec<&Person> = matching.iter().copied().filter(|p| p.prefs.on_duty).collect();
+    // On duty and reachable now; when nobody on duty is, everyone matching
+    // (those held get it when their quiet hours end).
+    let on_duty: Vec<&Person> = matching.iter().copied().filter(|p| p.prefs.on_duty && !waits(p)).collect();
     let first = if on_duty.is_empty() { matching } else { on_duty };
     let mut held = false;
     let mut sent = false;
@@ -307,7 +394,7 @@ async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now
         if todo.is_empty() {
             continue;
         }
-        if holds(p, severity, &farm.policy, farm.tz, now) {
+        if waits(p) {
             held = true;
             continue;
         }
@@ -336,19 +423,17 @@ async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now
             report.messages.push(m);
         }
     }
+    // Routed (or told to someone): its collars count as announced.
+    let sql = format!(
+        "UPDATE alerts SET routed_at = CASE WHEN ?1 THEN routed_at ELSE ?2 END,
+             escalated_at = CASE WHEN ?3 THEN COALESCE(escalated_at, ?2) ELSE escalated_at END,
+             renotified_at = CASE WHEN ?3 THEN COALESCE(renotified_at, ?2) ELSE renotified_at END,
+             announced = CASE WHEN ?3 OR NOT ?1 THEN {} ELSE announced END
+         WHERE id = ?4",
+        store::TARGET_COLLARS
+    );
     for id in &ids {
-        sqlx::query(
-            "UPDATE alerts SET routed_at = CASE WHEN ?1 THEN routed_at ELSE ?2 END,
-                 escalated_at = CASE WHEN ?3 THEN COALESCE(escalated_at, ?2) ELSE escalated_at END,
-                 renotified_at = CASE WHEN ?3 THEN COALESCE(renotified_at, ?2) ELSE renotified_at END
-             WHERE id = ?4",
-        )
-        .bind(held)
-        .bind(to_db(&now))
-        .bind(sent)
-        .bind(id)
-        .execute(ctx.db())
-        .await?;
+        sqlx::query(&sql).bind(held).bind(to_db(&now)).bind(sent).bind(id).execute(ctx.db()).await?;
     }
     Ok(())
 }
@@ -375,16 +460,22 @@ async fn renotify(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now: 
         }
     }
     let round = due.iter().map(|r| r.renotified).max().unwrap_or(0) + 1;
+    let mut sent = false;
     for person in people {
         let Some((tier, alert_ids)) = by_user.get(&person.user.id) else { continue };
         if holds(person, Severity::Critical, &farm.policy, farm.tz, now) {
             continue;
         }
         let alerts: Vec<&Alert> = due.iter().map(|r| &r.alert).filter(|a| alert_ids.contains(&a.id)).collect();
-        send(ctx, farm, person, &alerts, *tier, &format!("r{round}"), now, report).await?;
+        sent |= send(ctx, farm, person, &alerts, *tier, &format!("r{round}"), now, report).await?;
     }
+    // Sent again with its members now: they count as announced.
+    let sql = format!(
+        "UPDATE alerts SET renotified = renotified + 1, renotified_at = ?1, announced = CASE WHEN ?2 THEN {} ELSE announced END WHERE id = ?3",
+        store::TARGET_COLLARS
+    );
     for id in &ids {
-        sqlx::query("UPDATE alerts SET renotified = renotified + 1, renotified_at = ? WHERE id = ?").bind(to_db(&now)).bind(id).execute(ctx.db()).await?;
+        sqlx::query(&sql).bind(to_db(&now)).bind(sent).bind(id).execute(ctx.db()).await?;
     }
     Ok(())
 }

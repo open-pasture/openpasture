@@ -326,3 +326,154 @@ async fn the_brief_lists_what_doesnt_text() {
     let none = f.ctx.brief_lines().collect(&f.ctx, "herd_other", t).await;
     assert!(none.is_empty());
 }
+
+#[tokio::test]
+async fn approval_prompts_go_to_managers_and_up_even_with_a_hand_on_duty() {
+    let f = Farm::new().await;
+    f.sms().await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    let mgr = f.person("Mia", Role::Manager, Some("+15155550102"), true, None).await;
+    let hand = f.person("Sam", Role::Hand, Some("+15155550103"), true, None).await;
+    let viewer = f.person("Vera", Role::Viewer, Some("+15155550104"), true, None).await;
+    f.prefs(&hand, json!({"on_duty": true})).await;
+    // A timer MOVE: it applies in an hour unless someone says no.
+    f.decision("MOVE", "proposed", t0(), Some(t0() + mins(60))).await;
+    f.eval(t0()).await;
+    for k in 0..=6 {
+        f.route(t0() + secs(10) + mins(10 * k)).await;
+    }
+    for p in [&owner, &mgr] {
+        let m = f.messages_to(p).await;
+        assert_eq!(m.len(), 1, "{m:#?}");
+        assert!(m[0].text.contains("Reply Y or N. Code "), "{}", m[0].text);
+    }
+    assert!(f.messages_to(&hand).await.is_empty(), "a hand can't answer it, on duty or not");
+    assert!(f.messages_to(&viewer).await.is_empty(), "nor a viewer, and neither gets the code");
+    // The hand on duty still gets first word of what they can act on.
+    escaped(&f).await;
+    f.route(t0() + mins(61)).await;
+    assert_eq!(f.messages_to(&hand).await.len(), 1);
+    assert_eq!(f.messages_to(&owner).await.len(), 1, "on duty: the breakout goes to the hand first");
+}
+
+#[tokio::test]
+async fn on_duty_narrows_an_approval_prompt_among_the_people_who_can_answer() {
+    let f = Farm::new().await;
+    f.sms().await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    let duty = f.person("Mia", Role::Manager, Some("+15155550102"), true, None).await;
+    let off = f.person("Max", Role::Manager, Some("+15155550103"), true, None).await;
+    let hand = f.person("Sam", Role::Hand, Some("+15155550104"), true, None).await;
+    f.prefs(&duty, json!({"on_duty": true})).await;
+    f.prefs(&hand, json!({"on_duty": true})).await;
+    f.decision("MOVE", "proposed", t0() - mins(31), None).await;
+    f.eval(t0()).await;
+    f.route(t0() + secs(60)).await;
+    assert_eq!(f.messages_to(&duty).await.len(), 1);
+    for p in [&owner, &off, &hand] {
+        assert!(f.messages_to(p).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_timer_prompt_goes_out_at_once_through_quiet_hours() {
+    let five = t("2026-09-28T10:00:00.000Z"); // 05:00 on the farm
+    let f = Farm::new().await;
+    f.sms().await;
+    f.policy(json!({"quiet_start": "21:00", "quiet_end": "06:00"})).await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    let strict = f.person("Mia", Role::Manager, Some("+15155550102"), true, None).await;
+    f.prefs(&strict, json!({"critical_in_quiet": false})).await;
+    // The herd's timer applies it at 05:30: the prompt can't wait for the window or for 06:00.
+    f.decision("MOVE", "proposed", five, Some(five + mins(30))).await;
+    f.eval(five).await;
+    f.route(five + secs(10)).await;
+    let m = f.messages_to(&owner).await;
+    assert_eq!(m.len(), 1, "before the timer applies, not after quiet hours");
+    assert!(m[0].text.contains("Reply Y or N"), "{}", m[0].text);
+    assert!(f.messages_to(&strict).await.is_empty(), "held like a critical alert for someone who turned that off");
+
+    // A proposal that waits for an answer still waits for the morning.
+    let g = Farm::new().await;
+    g.sms().await;
+    g.policy(json!({"quiet_start": "21:00", "quiet_end": "06:00"})).await;
+    let owner = g.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    g.decision("MOVE", "proposed", five - mins(31), None).await;
+    g.eval(five).await;
+    g.route(five + secs(60)).await;
+    assert!(g.messages_to(&owner).await.is_empty());
+    g.route(t("2026-09-28T11:00:00.000Z")).await;
+    assert_eq!(g.messages_to(&owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_timer_prompt_waits_for_the_morning_only_when_that_leaves_time_to_answer() {
+    let f = Farm::new().await;
+    f.sms().await;
+    f.policy(json!({"quiet_start": "21:00", "quiet_end": "06:00"})).await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    // 22:00 on the farm: one timer applies at 23:00 (before the quiet hours end), another herd's at 09:00.
+    let ten = t("2026-09-28T03:00:00.000Z");
+    let night = f.decision("MOVE", "proposed", ten, Some(ten + mins(60))).await;
+    let (_, h) = f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 40, "paddock_id": f.paddocks[1]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    let morning = f.decision("MOVE", "proposed", ten, Some(t("2026-09-28T14:00:00.000Z"))).await;
+    f.exec(&format!("UPDATE decisions SET herd_id = '{heifers}' WHERE id = '{morning}'")).await;
+    f.eval(ten).await;
+    f.route(ten + secs(10)).await;
+    let m = f.messages_to(&owner).await;
+    assert_eq!(m.len(), 1, "{m:#?}");
+    assert_eq!(m[0].decision_id.as_deref(), Some(night.as_str()));
+    // Through the night nothing more; at 06:00 the 09:00 one, three hours ahead.
+    for k in 1..=7 {
+        f.route(ten + mins(60 * k)).await;
+    }
+    assert_eq!(f.messages_to(&owner).await.len(), 1);
+    f.route(t("2026-09-28T11:00:00.000Z")).await;
+    let m = f.messages_to(&owner).await;
+    assert_eq!(m.len(), 2, "{m:#?}");
+    assert_eq!(m[1].decision_id.as_deref(), Some(morning.as_str()));
+    assert!(m[1].text.starts_with("Heifers: move to"), "{}", m[1].text);
+}
+
+#[tokio::test]
+async fn a_prompt_answered_inside_its_window_is_closed_not_sent() {
+    let f = Farm::new().await;
+    f.sms().await;
+    let p = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
+    let d = f.decision("MOVE", "proposed", t0() - mins(31), None).await;
+    f.eval(t0()).await;
+    let a = f.open_kind("decision_waiting").await.remove(0);
+    // Answered by text 59 s in, before the engine looks again.
+    f.decision_status(&d, "applied").await;
+    f.route(t0() + secs(60)).await;
+    assert!(f.messages_to(&p).await.is_empty(), "{:#?}", f.messages().await);
+    let a = f.alert(&a.id).await;
+    assert_eq!((a.status, a.resolved_by), (op_core::alert::AlertStatus::Resolved, None));
+    f.route(t0() + mins(5)).await;
+    assert!(f.messages().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_critical_goes_past_an_on_duty_person_whose_quiet_hours_hold_it() {
+    let f = Farm::new().await;
+    f.sms().await;
+    f.policy(json!({"quiet_start": "22:00", "quiet_end": "06:00", "renotify_max": 0})).await;
+    let duty = f.person("Sam", Role::Hand, Some("+15155550101"), true, None).await;
+    f.prefs(&duty, json!({"on_duty": true, "critical_in_quiet": false})).await;
+    let mgr = f.person("Mia", Role::Manager, Some("+15155550102"), true, None).await;
+    let owner = f.person("Cody", Role::Owner, Some("+15155550103"), true, None).await;
+    // 02:00 on the farm: a breakout.
+    let night = t("2026-09-28T07:00:00.000Z");
+    let c = f.collar(Some("214"), night).await;
+    f.outside(&c, night - mins(2), night).await;
+    f.escape(&c, "returning", night - mins(1), None).await;
+    f.eval(night).await;
+    f.route(night + secs(10)).await;
+    assert_eq!(f.messages_to(&mgr).await.len(), 1, "the one on duty can't be reached now, so everyone matching is told");
+    assert_eq!(f.messages_to(&owner).await.len(), 1);
+    assert!(f.messages_to(&duty).await.is_empty());
+    // At 06:00 the person on duty gets it too.
+    f.route(t("2026-09-28T11:00:00.000Z")).await;
+    assert_eq!(f.messages_to(&duty).await.len(), 1);
+}

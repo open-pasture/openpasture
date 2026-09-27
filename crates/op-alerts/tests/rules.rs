@@ -192,6 +192,46 @@ async fn herd_silent_takes_in_the_silent_alerts_above_half() {
 }
 
 #[tokio::test]
+async fn herd_silent_holds_until_well_under_its_share() {
+    let f = Farm::new().await;
+    f.sms().await;
+    let p = f.person("Cody", op_core::Role::Owner, Some("+15155550101"), true, None).await;
+    let t = t0();
+    let cs = f.collars(10, t).await;
+    let silent = |n: usize, now: chrono::DateTime<chrono::Utc>| {
+        let f = &f;
+        let cs = &cs;
+        async move {
+            for (i, c) in cs.iter().enumerate() {
+                f.seen(c, if i < n { now - mins(25) } else { now }).await;
+            }
+        }
+    };
+    // Six then five of ten silent, back and forth every three minutes for half an hour.
+    let mut now = t;
+    while now < t + mins(30) {
+        silent(if (now - t).num_minutes() / 3 % 2 == 0 { 6 } else { 5 }, now).await;
+        f.eval(now).await;
+        f.route(now).await;
+        now += secs(10);
+    }
+    let rows: Vec<_> = f.every_alert().await.into_iter().filter(|a| a.kind == "herd_silent" || a.kind == "silent").collect();
+    assert_eq!(rows.iter().filter(|a| a.kind == "herd_silent").count(), 1, "one alert while it hovers at half");
+    assert!(rows.iter().filter(|a| a.kind == "silent").all(|a| a.rolled_into.is_some()), "{rows:#?}");
+    let texts = f.messages_to(&p).await;
+    assert_eq!(texts.len(), 1, "{texts:#?}");
+    assert!(texts[0].text.starts_with("Cows: 6 of 10 collars silent"), "{}", texts[0].text);
+    // Four of ten (well under half) for longer than clear_after_min: it clears.
+    let end = now + mins(3);
+    while now <= end {
+        silent(4, now).await;
+        f.eval(now).await;
+        now += secs(10);
+    }
+    assert!(f.open_kind("herd_silent").await.is_empty());
+}
+
+#[tokio::test]
 async fn low_battery_opens_below_twenty_percent_without_notifying() {
     let f = Farm::new().await;
     let c = f.collar(Some("031"), t0()).await;
