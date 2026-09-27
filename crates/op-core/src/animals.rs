@@ -226,9 +226,15 @@ pub async fn sync_after_leaving<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -
 }
 
 /// After an animal of `herd_id` was marked removed as of `at`: the count
-/// drops now, and a removal dated earlier takes the head off the herd's
-/// history from that date too ([`backdate_removal`]), so reports stop
+/// drops by it now, and a removal dated earlier takes the head off the
+/// herd's history from that date too ([`backdate_removal`]), so reports stop
 /// counting it then. One write transaction.
+///
+/// The count still holds every animal marked removed since it was last
+/// counted, so it drops by this one only: two removals whose animals were
+/// both marked before either count ran each take their own head off from
+/// their own date. A count that holds no removed animal is left to
+/// [`sync_herd_count`].
 pub async fn count_removal(ctx: &Ctx, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
     let mut tx = store::begin_immediate(ctx.db()).await?;
     let counts: Option<(i64, i64)> =
@@ -236,11 +242,12 @@ pub async fn count_removal(ctx: &Ctx, herd_id: &str, animal_id: &str, at: DateTi
             .bind(herd_id)
             .fetch_optional(&mut *tx)
             .await?;
-    // Only when this animal is the one the count is about to lose.
-    if counts.is_some_and(|(count, active)| count == active + 1) {
+    if counts.is_some_and(|(count, active)| count > active) {
         backdate_removal(&mut tx, herd_id, animal_id, at).await?;
+        sqlx::query("UPDATE herds SET count = count - 1 WHERE id = ?").bind(herd_id).execute(&mut *tx).await?;
+    } else {
+        sync_herd_count(&mut *tx, herd_id).await?;
     }
-    sync_herd_count(&mut *tx, herd_id).await?;
     tx.commit().await?;
     Ok(())
 }

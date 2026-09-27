@@ -284,6 +284,45 @@ async fn a_removal_dated_earlier_takes_the_head_off_the_history_from_then() {
 }
 
 #[tokio::test]
+async fn two_removals_marked_before_either_is_counted_both_count_from_their_dates() {
+    // Two removals racing: both animals are marked removed before either
+    // one's count runs. Each still takes its head off the history from its date.
+    let app = App::new().await;
+    let cows = app.herd("Cows", 0).await;
+    let (a, b) = (app.animal(&cows, "214").await, app.animal(&cows, "215").await);
+    app.animal(&cows, "216").await;
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? ORDER BY id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    for (i, id) in rows.iter().enumerate() {
+        sqlx::query("UPDATE herd_history SET at = ? WHERE id = ?").bind(format!("2026-09-01T12:00:00.00{i}Z")).bind(id).execute(app.ctx.db()).await.unwrap();
+    }
+    sqlx::query("UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&cows).execute(app.ctx.db()).await.unwrap();
+
+    let (at_a, at_b) = (time::from_db("2026-09-05T17:00:00.000Z").unwrap(), time::from_db("2026-09-12T17:00:00.000Z").unwrap());
+    for (id, at) in [(&a, at_a), (&b, at_b)] {
+        let row = app.ctx.store().get_animal(id).await.unwrap().unwrap();
+        app.ctx.store().update_animal(&Animal { removed_at: Some(at), removed_reason: Some(RemovedReason::Sold), ..row }).await.unwrap();
+    }
+    animals::count_removal(&app.ctx, &cows, &a, at_a).await.unwrap();
+    animals::count_removal(&app.ctx, &cows, &b, at_b).await.unwrap();
+    assert_eq!(app.count(&cows).await, 1);
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&cows).fetch_all(app.ctx.db()).await.unwrap();
+    let rows: Vec<(&str, i64)> = rows.iter().map(|(t, c)| (t.get(..10).unwrap(), *c)).collect();
+    let today = time::to_db(&time::now());
+    let today = today.get(..10).unwrap();
+    // 3 head from Sep 1, 2 from Sep 5 (214 sold), 1 from Sep 12 (215 sold),
+    // and the two count changes as they were entered, both at 1 by now.
+    assert_eq!(
+        rows,
+        [("2026-09-01", 0), ("2026-09-01", 1), ("2026-09-01", 2), ("2026-09-01", 3), ("2026-09-05", 2), ("2026-09-12", 1), (today, 1), (today, 1)]
+    );
+    // A third count for an animal already taken off changes nothing.
+    animals::count_removal(&app.ctx, &cows, &b, at_b).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM herd_history WHERE herd_id = ?").bind(&cows).fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!((n, app.count(&cows).await), (8, 1));
+}
+
+#[tokio::test]
 async fn list_animals_shows_each_animal_with_its_collar() {
     let app = App::new().await;
     let cows = app.herd("Cows", 30).await;
