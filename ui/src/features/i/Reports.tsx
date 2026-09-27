@@ -133,6 +133,14 @@ function NrcsInputs() {
   const [inputs, save, err] = useInputs();
   const can = useCan("manager");
   if (!inputs) return err ? <span className="mono err">{err}</span> : null;
+  // Below manager: what is set, as facts.
+  if (!can)
+    return (inputs.operator || inputs.fsa_farm) ? (
+      <div className="rline wrap">
+        {inputs.operator && <span className="rfield"><span className="dim">Operator</span><span>{inputs.operator}</span></span>}
+        {inputs.fsa_farm && <span className="rfield"><span className="dim">FSA farm</span><span className="mono">{inputs.fsa_farm}</span></span>}
+      </div>
+    ) : null;
   return (
     <div className="rline wrap">
       <label className="rfield"><span className="dim">Operator</span>
@@ -150,10 +158,36 @@ function OrganicInputs() {
   const herds = useStore((s) => s.state?.herds ?? []);
   const [inputs, save, err] = useInputs();
   const can = useCan("manager");
+  const u = useUnits();
   if (!inputs) return err ? <span className="mono err">{err}</span> : null;
   const herdSave = (id: string, p: Partial<HerdReport>) => save({ herds: { [id]: p } });
   const mixed = herds.some((h) => h.species === "cattle" && inputs.herds[h.id]?.mix);
   const au = inputs.au;
+  // Below manager: each herd's weight, intake and mix as facts (only what is set), then the feed log.
+  if (!can)
+    return (
+      <>
+        {herds.map((h) => {
+          const r = inputs.herds[h.id] ?? { intake_pct: 2.5 };
+          const m = h.species === "cattle" ? r.mix : undefined;
+          const words = [
+            r.mean_weight_kg !== undefined ? u.mass(r.mean_weight_kg) : undefined,
+            `${num(r.intake_pct, 1)}%`,
+            m && m.cows ? `${m.cows} ${m.pairs ? "pairs" : "cows"}` : undefined,
+            m && m.bulls ? `${m.bulls} bulls` : undefined,
+            m && !m.pairs && m.calves ? `${m.calves} calves` : undefined,
+          ].filter(Boolean);
+          return <div className="rline" key={h.id}><span className="rherd">{h.name}</span><span className="mono rfacts">{words.join("  ")}</span></div>;
+        })}
+        {mixed && (
+          <div className="rline">
+            <span className="rherd dim">AU</span>
+            <span className="mono rfacts">{`${num(au.cow, 2)} cow  ${num(au.bull, 2)} bull  ${num(au.pair, 2)} pair  ${num(au.weaned_calf, 2)} weaned calf`}</span>
+          </div>
+        )}
+        <FeedLog />
+      </>
+    );
   return (
     <>
       {herds.map((h) => {

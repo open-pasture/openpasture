@@ -68,11 +68,14 @@ async fn api_me_says_who_is_asking() {
 #[tokio::test]
 async fn hooks_paths_are_json_404s() {
     let (_dir, _ctx, app) = app().await;
-    for path in ["/hooks/x", "/hooks", "/hooks/twilio/sms"] {
+    for path in ["/hooks/x", "/hooks", "/hooks/twilio/nope"] {
         let (s, v) = send(&app, "GET", path, LAN, &[("host", "192.168.1.2:7878")], None).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{path}");
         assert!(v["error"].is_string(), "{path}: {v}");
     }
+    // A3's Twilio hook exists and takes only POST.
+    let (s, _) = send(&app, "GET", "/hooks/twilio/sms", LAN, &[("host", "192.168.1.2:7878")], None).await;
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 async fn mcp(app: &Router, uri: &str, auth: &str, id: u64, method: &str, params: Value) -> (StatusCode, Value) {

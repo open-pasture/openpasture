@@ -4,7 +4,7 @@ import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
-import { summarize } from "../store/live";
+import { summarize, undrawn } from "../store/live";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { useUnits } from "../units";
 import { age, clock, useNow } from "../util";
@@ -48,7 +48,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   if (!herd) return <aside className="panel" />;
   const all = store.get().collars;
   const names = collarLabels(all, animals);
-  const collars = all.filter((c) => c.herd_id === herd.id)
+  // Parked collars and removed animals' are off duty: not on the map, not counted here.
+  const off = undrawn(all, animals);
+  const collars = all.filter((c) => c.herd_id === herd.id && !off.has(c.id))
     .map((c) => ({ ...c, label: names.get(c.id) ?? c.name }));
   const byId = new Map(collars.map((c) => [c.id, c] as const));
   const latest = decisions[0];
@@ -62,10 +64,18 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const behindSet = new Set([...behind, ...out.map((e) => e.collar_id)]);
   // Where the move goes: the paddock the target mostly covers, if any.
   const moveTo = move && targetPaddock(move.target, state.paddocks);
+  // S: a call about a strip schedule names the next strip; N holds today's strip.
+  const onSchedule = (d: Decision) => {
+    const sc = (d.inputs as { schedule?: { status?: string; next?: { strip: number; of: number; opens: string } } } | undefined)?.schedule;
+    return sc?.status === "active" ? sc.next : undefined;
+  };
   const sentence = (d: Decision) =>
     d.action === "MOVE" ? `Move to ${pad(d.to_paddock_id) ?? "the new boundary"}.`
-      : d.action === "STAY" ? `Stay in ${pad(herd.paddock_id) ?? "place"}.`
-        : d.need ?? "Needs more information.";
+      : d.action === "STAY" && onSchedule(d) ? `Strip ${onSchedule(d)!.strip} of ${onSchedule(d)!.of} opens ${onSchedule(d)!.opens}.`
+        : d.action === "STAY" ? `Stay in ${pad(herd.paddock_id) ?? "place"}.`
+          : d.action === "HOLD" ? "Hold today's strip."
+            : d.need ?? "Needs more information.";
+  const keeps = !!live && live.action === "STAY" && !!onSchedule(live);
 
   const act = async (f: () => Promise<unknown>) => {
     setBusy(true);
@@ -91,7 +101,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
 
   // The ack count for whatever went out last: pending if one is in flight, else active.
   const b = bstat?.pending ?? bstat?.active;
-  const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied").length : 0;
+  const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied" && byId.has(a.collar_id)).length : 0;
   const done = collars.length > 0 && applied >= collars.length;
   const item = menu.find((m) => m.id === openItem);
 
@@ -156,10 +166,10 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             {live.reasoning && <Why key={live.id} text={live.reasoning} />}
             {live.apply_at && <p className="clock">{clock(Date.parse(live.apply_at) - now)}</p>}
             {manage && <div className="acts">
-              <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>Reject</Button>
+              <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>{keeps ? "Hold" : "Reject"}</Button>
               {live.geometry && <Button small disabled={busy || changing} onClick={onChange}>Change</Button>}
               <Button small kind="primary" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "approve" }))}>
-                {live.apply_at ? "Send now" : "Approve"}
+                {live.apply_at ? "Send now" : keeps ? "Keep" : "Approve"}
               </Button>
             </div>}
           </>

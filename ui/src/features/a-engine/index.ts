@@ -9,7 +9,7 @@ import "../../styles/a-engine.css";
 import { AlertHistory } from "./History";
 import { alertOverlay } from "./overlay";
 import { HerdAlerts } from "./Panel";
-import { PersonAlerts } from "./Person";
+import { MyAlerts, PersonAlerts } from "./Person";
 import { AlertSettings } from "./Settings";
 import { AlertsTopbar } from "./Topbar";
 
@@ -26,4 +26,5 @@ herdPanel.register({ id: "alerts", order: 10, Section: HerdAlerts });
 overlays.register(alertOverlay);
 settingsSections.register({ id: "alerts", group: "Alerts", label: "Alerts", order: 60, minRole: "manager", Section: AlertSettings });
 peopleRow.register({ id: "alerts", order: 20, minRole: "owner", Section: PersonAlerts });
+settingsSections.register({ id: "alerts-mine", group: "You", label: "Alerts", order: 46, minRole: "hand", Section: MyAlerts });
 dataSections.register({ id: "alerts", label: "Alerts", order: 35, Section: AlertHistory });

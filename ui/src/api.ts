@@ -2,6 +2,7 @@
 // HTTP plumbing lives in ./api/http; each stream adds its own ./api/<id>.ts.
 
 import { del, get, getToken, patch, post, put, qs } from "./api/http";
+import { liveEvents } from "./api/x1";
 export { ApiError, authHeaders, downloadBlob, getToken, onUnauthorized, qs, setToken, type Query } from "./api/http";
 
 export type LonLat = [number, number];
@@ -108,7 +109,7 @@ export interface NewCollar { collar: Collar; key: string; endpoint: string; publ
 export type DecisionStatus = "running" | "proposed" | "approved" | "applied" | "rejected" | "failed" | "superseded";
 export interface Decision {
   id: string; herd_id: string; source: "brain" | "farmer" | "heuristic"; brain?: BrainId; model?: string;
-  status: DecisionStatus; action?: "STAY" | "MOVE" | "NEEDS_INFO"; to_paddock_id?: string; geometry?: Polygon;
+  status: DecisionStatus; action?: "STAY" | "MOVE" | "NEEDS_INFO" | "HOLD" /* HOLD: strip schedules (S) */; to_paddock_id?: string; geometry?: Polygon;
   reasoning?: string; confidence?: number; need?: string; inputs: unknown; apply_at?: string; boundary_id?: string;
   error?: string; created_at: string; responded_at?: string; outcome?: unknown;
 }
@@ -323,10 +324,18 @@ export function live(onEvent: (e: LiveEvent) => void, onStatus?: (up: boolean) =
       onStatus?.(true);
     };
     ws.onmessage = (m) => {
+      let msg: unknown;
       try {
-        onEvent(JSON.parse(typeof m.data === "string" ? m.data : "") as LiveEvent);
+        msg = JSON.parse(typeof m.data === "string" ? m.data : "");
       } catch {
-        /* ignore malformed */
+        return; /* ignore malformed */
+      }
+      for (const e of liveEvents(msg)) {
+        try {
+          onEvent(e);
+        } catch {
+          /* one bad event doesn't drop the rest of its batch */
+        }
       }
     };
     ws.onclose = () => {

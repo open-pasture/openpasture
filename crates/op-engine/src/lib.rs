@@ -36,6 +36,7 @@ pub mod strips;
 // @F
 pub mod presend;
 // @S
+pub mod schedules;
 // @A3
 // @H
 // @L
@@ -76,6 +77,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @F
         presend::router(),
         // @S
+        schedules::router(),
         // @A3
         // @H
         // @L
@@ -114,6 +116,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @C
     // @F
     // @S
+    schedules::register_brief(&ctx);
     // @A3
     // @H
     // @L

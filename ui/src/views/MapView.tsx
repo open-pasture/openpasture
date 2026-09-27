@@ -9,7 +9,7 @@ import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscap
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
 import { inside } from "../geo";
 import { Animals } from "../map/animals";
-import { createDraw, current, editPolygon, type Draw } from "../map/draw";
+import { createDraw, current, currentGeometry, editPolygon, editShape, type Draw, type DrawGeometry, type DrawKind } from "../map/draw";
 import { mountOverlay, overlayCtx, overlays, Rings, type MapHost, type OverlayHandle } from "../map/overlays";
 import { DRAW_ORDER, tools, type ToolCtx, type ToolItem } from "../map/tools";
 import { LayersMenu } from "../map/LayersMenu";
@@ -23,7 +23,8 @@ type Mode =
   | { k: "idle" }
   | { k: "tool"; id: string }
   | { k: "change"; decisionId: string }
-  | { k: "reshape"; paddockId: string };
+  // A paddock's shape, or one an overlay handed over (a map feature), saved by `save`.
+  | { k: "reshape"; save: (g: DrawGeometry) => Promise<unknown> };
 
 // The side sheet: a paddock's, or content an overlay opened.
 type SheetState = { k: "paddock"; id: string } | { k: "node"; node: ReactNode };
@@ -50,6 +51,7 @@ export function MapView() {
   modeRef.current = mode;
   const [sheet, setSheet] = useState<SheetState>();
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string>();
 
   const herd = state.herds.find((h) => h.id === herdId);
   const proposed = decisions.find((d) => d.status === "proposed");
@@ -85,6 +87,7 @@ export function MapView() {
         rings,
         herdId: () => store.get().herdId,
         openSheet: (node) => setSheet(node === null ? undefined : { k: "node", node }),
+        reshape: (g, kind, save) => startReshape.current(g, kind, save),
       };
       mounted.current = overlays.list().map((o) => mountOverlay(host.current!, o));
       fitPolys(m, store.get().state?.paddocks.map((p) => p.geometry) ?? [], 96);
@@ -246,6 +249,7 @@ export function MapView() {
     if (cur.k === "tool") host.current?.rings.set(`tool:${cur.id}`, []);
     draw.current?.clear();
     draw.current?.setMode("static");
+    setErr(undefined);
     setMode({ k: "idle" });
   }, []);
 
@@ -262,23 +266,30 @@ export function MapView() {
     setMode({ k: "change", decisionId: d.id });
   }, []);
 
-  const reshape = (p: Paddock) => {
-    if (!draw.current) return;
+  const reshapeShape = (g: DrawGeometry, kind: DrawKind, save: (g: DrawGeometry) => Promise<unknown>) => {
+    if (!draw.current || modeRef.current.k !== "idle") return;
     setSheet(undefined);
-    editPolygon(draw.current, p.geometry, "paddock");
-    setMode({ k: "reshape", paddockId: p.id });
+    setErr(undefined);
+    editShape(draw.current, g, kind);
+    setMode({ k: "reshape", save });
   };
+  const startReshape = useRef(reshapeShape);
+  startReshape.current = reshapeShape;
+  const reshape = (p: Paddock) => reshapeShape(p.geometry, "paddock", (g) => api.updatePaddock(p.id, { geometry: g as Polygon }));
 
   // Saving an edited shape: a changed proposal or a reshaped paddock. Tools save their own.
   const commit = async () => {
-    const g: Polygon | undefined = draw.current ? current(draw.current) : undefined;
+    const g = draw.current ? (mode.k === "reshape" ? currentGeometry(draw.current) : current(draw.current)) : undefined;
     if (!g) return;
     setBusy(true);
+    setErr(undefined);
     try {
-      if (mode.k === "change") await api.respond(mode.decisionId, { action: "modify", geometry: g });
-      else if (mode.k === "reshape") await api.updatePaddock(mode.paddockId, { geometry: g });
+      if (mode.k === "change") await api.respond(mode.decisionId, { action: "modify", geometry: g as Polygon });
+      else if (mode.k === "reshape") await mode.save(g);
       cancel();
       await store.refresh();
+    } catch (e) {
+      setErr((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -318,6 +329,7 @@ export function MapView() {
             <form className="toolform" onSubmit={(e) => { e.preventDefault(); void commit(); }}>
               <Button small kind="plain" onClick={cancel}>Cancel</Button>
               <Button small kind="primary" type="submit" disabled={busy}>{mode.k === "reshape" ? "Save" : "Send"}</Button>
+              {err && <span className="mono err ferr">{err}</span>}
             </form>
           )}
         </div>

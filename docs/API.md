@@ -246,13 +246,13 @@ other than its own. Commands without `herd_id` (older servers) are accepted.
 ```ts
 Decision { id, herd_id, source: "brain"|"farmer"|"heuristic", brain?: BrainId, model?,
            status: "running"|"proposed"|"approved"|"applied"|"rejected"|"failed"|"superseded",
-           action?: "STAY"|"MOVE"|"NEEDS_INFO", to_paddock_id?, geometry?: Polygon,
+           action?: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD" /* HOLD: strip schedules (S) */, to_paddock_id?, geometry?: Polygon,
            reasoning?, confidence?, need?, inputs, apply_at?, boundary_id?, error?,
            created_at, responded_at?, outcome? }
 Brain    { id: BrainId, name, available: boolean, signed_in: boolean, needs: string[] /* secret names */,
            models: string[], detail?: string }
 HostedKey { id, label, created_at, last_used? }
-DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO", to_paddock_id, geometry, reasoning, confidence, need, model }
+DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need, model }
 Signals  { as_of, herd_id, current_paddock_id, position_source, herd_animal_units, feed_budget_days_current,
            behavior, risk_flags, assumptions,
            paddocks: { paddock_id, name, status, area_ha, current, rest_days, grazing_pressure, forage, recovery, risk_flags }[] }
@@ -308,7 +308,8 @@ What the engine hands a brain (`DecisionRequest.context`, also the `context` of
                   | "paddock-note" /* the paddock's standing notes */ }[],
   history: { id, created_at, source, status, action, from_paddock_id, to_paddock_id,
              reasoning, confidence, need, farmer_response?, outcome? }[] /* last 10, newest first */,
-  units }
+  units,
+  schedule /* S: the herd's strip schedule while it runs, see "Strip schedules" */ }
 ```
 
 "Where the herd is": the paddock holding at least half of the herd's collar fixes from the
@@ -364,7 +365,7 @@ GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
 Event =
   | { type: "fix", collar_id, animal_id?, herd_id, fix: Fix, state }
   | { type: "cue", collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }
-  | { type: "ack", collar_id, herd_id, version, status, reason? }
+  | { type: "ack", collar_id, herd_id, version, status, reason?, code? }   // code: protocol v1 reject code, only with rejected
   | { type: "collar", collar: Collar }
   | { type: "boundary", herd_id, boundary: Boundary }
   | { type: "decision", decision: Decision }
@@ -397,11 +398,14 @@ Event =
   // @C
   // @F
   // @S
+  | { type: "schedule", schedule: Schedule }   // made, changed (staged, opened, skipped, held, retimed), paused, resumed or ended
   // @A3
   // @H
   // @L
   // @M
   // @Z
+  // @X1  (/api/live only: one farm window's batches together, see "Seams between streams")
+  | { type: "batch", events: Event[] }
 ```
 
 Each socket gets only the events its identity may see: `message` events go to managers and up
@@ -1091,10 +1095,11 @@ MCP (read, viewers): `get_coverage` `{metric?, from?, to?, cell_m?, herd_id?}` r
 
 ## Live feed at herd scale (op-server, P)
 
-`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd: 500 ms after the
-first of them for a herd, one `positions`, one `ack_batch` and one `cue_batch` message (each
-only when it has items). At 250 collars that is about one message a second, two during a sweep,
-instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
+`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd into one
+`positions`, one `ack_batch` and one `cue_batch` (each only when it has items), gathered for the
+whole farm: 500 ms after the first of them for any herd they go out together, as one message (a
+`batch` when there is more than one, see "Seams between streams"). At 250 collars that is about
+one message a second, at most two batched ones however many herds are live, instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
 
 ```ts
 PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
@@ -1259,8 +1264,8 @@ Facts (SI): `area_ha` of `sent`; `head` the herd's count; `m2_per_head`; forage 
 holding the shape's centre (a height measured in the last 21 days, else imagery; nothing while snow
 or dormancy withholds imagery): `forage_kg_dm` above the residual over the shape and `grazing_days`
 = 60 % of it at 11.8 kg DM per animal unit a day; `rest_days` since that paddock was last grazed
-(0 while a herd is in it; from the record: `grazed_until`, applied moves out of it, and the days
-collars spent in it); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
+(0 while a herd is in it; else the latest of `grazed_until`, an applied move out of it, the
+newest collar fix in it and the days collars spent in it, any herd); `vertices` and `holes` of `sent`; `sweep_minutes` when previewed.
 
 Findings, most severe first:
 
@@ -1298,8 +1303,246 @@ MCP `check_boundary` (read) `{ herd_id?, geometry, warn_m?, effective_at?, sweep
 same `CheckResult`.
 
 <!-- @S -->
+
+## Strip schedules (op-ingest, op-engine)
+
+A herd walked across a paddock's strips on a cadence. Each open and each back-fence step is
+**staged on the collars ahead of time** (a boundary with `effective_at`), so strips open on the
+collars' own clocks when the server or the network is away.
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/schedules` | `?herd_id&status=active\|paused\|done\|running` | `Schedule[]` newest first (`running` = active or paused) |
+| POST | `/api/schedules` | `NewSchedule` | 201 `Schedule`; 400 bad strips/times, 409 the herd runs one already or has no boundary yet |
+| POST | `/api/schedules/preview` | `NewSchedule` | `{ schedule: Schedule, moves: ScheduledMove[] }`, checked the same way, nothing stored |
+| GET | `/api/schedules/:id` | | `Schedule` |
+| GET | `/api/schedules/:id/moves` | | `ScheduledMove[]` in time order: history, held and skipped places, the queue |
+| POST | `/api/schedules/:id/skip` | `{ index }` | `Schedule`: strip `index` (0-based) doesn't open; later strips move up one occurrence each |
+| POST | `/api/schedules/:id/hold` | | `Schedule`: today's strip again; the next open and everything after move one occurrence later |
+| POST | `/api/schedules/:id/move-now` | | `Schedule`: the next strip opens now (immediate); later opens keep their times |
+| POST | `/api/schedules/:id/time` | `{ index, at }` | `Schedule`: that open (and its back-fence steps) at `at`; 400 when it would fall before the move before it or past the next open |
+| POST | `/api/schedules/:id/pause` | | `Schedule`: nothing staged or opened until resumed |
+| POST | `/api/schedules/:id/resume` | | `Schedule`; opens that passed meanwhile move on by whole occurrences |
+| POST | `/api/schedules/:id/end` | | `Schedule` (`done`); 409 once ended |
+
+Reads are any role's; every other method is a manager's.
+
+```ts
+NewSchedule { herd_id, layout_id?, paddock_id?, strips?: Polygon[], next_index?,
+              cadence?: Cadence /* daily 07:00 */, starts_at? /* the next time the farm's clock reads cadence.at */,
+              back_fence?: BackFence }
+Cadence   { every_days /* 1-60 */, at: "HH:MM" /* farm time */ }
+BackFence { enabled: true, lag_strips: 0, close_after_min: 240, close_steps: 3, close_every_min: 10 }  // defaults
+Schedule  { id /* sch_… */, herd_id, paddock_id, layout_id?, strips: Polygon[], next_index /* next strip to open, 0-based */,
+            cadence, starts_at, back_fence, status: "active"|"paused"|"done", created_by: Actor,
+            created_at, updated_at, planned_end? /* when the last strip was planned to be done, as made */, ended_at? }
+ScheduledMove { schedule_id, index /* strip */, step /* 0 open, 1.. back-fence steps */, at, geometry /* as planned, before prepare */,
+                boundary_version?, skipped?: "late"|"skipped"|"held", state: "planned"|"staged"|"done"|"skipped",
+                applied_at? /* the first collar's own apply time */ }
+```
+
+**Strips and shapes.** `strips` are copied (a layout re-cuts when its paddock is reshaped); with
+`layout_id` and no `strips` they come from the layout, and the paddock from the layout, else the
+herd's. The first strip to open (`next_index`) defaults to the one after the strip the herd's
+boundary covers now, so the usual start is: send strip 1 (`POST /api/herds/:id/boundary`), then
+schedule. Without a back fence, opening strip k stages `strips[0..=k]`. With one it stages
+`strips[p-lag..=k]` (p = the strip opened before, so the animals keep the ground they stand on;
+skipped strips in between are old ground too), then `close_steps` steps `close_after_min` after
+the open and `close_every_min` apart sweep the old ground from the far side, the last being
+`strips[k-lag..=k]`. Every shape goes through `prepare` when it is staged (exclusions active at
+its time, fitting).
+
+**Times.** Occurrence 0 is `starts_at`; occurrence n is `cadence.at` on the farm-local date
+n × `every_days` days later, so "daily 07:00" opens at 07:00 local on both sides of a DST change
+(a time the clocks skip opens just after the gap; in a repeated hour, the first).
+
+**Staging.** Staged versions must rise with their times, so the staged moves are always a prefix
+of the queue in time order. How far ahead: what the smallest `free` and `free_bytes` among the
+herd's reporting collars allow (parked collars, and collars silent 20 minutes, are left out; they
+are restaged when they report), never more than `limits.slots - 1`. The server works `free` out
+from what each collar holds (`collar_slots`): its slots less the alive herd versions it holds that
+aren't this schedule's, counting the herd's active version whether or not it holds it yet; bytes
+the same way with `CollarLimits::record_bytes`. A V0 collar takes 15 moves ahead: at an open and
+three back-fence steps a day, about 3.75 days. A schedule's boundaries carry its id as `decision_id`.
+
+**Immediates.** A sweep step, a farmer's draw or any immediate herd boundary drops the staged
+moves on the collars. The schedule stages again above it when the sequence settles: at the end of
+the move, or 60 s after a lone boundary. A move whose time passed without taking effect is
+applied at once if at most 30 minutes late, else marked `late` and never applied (with the
+back-fence steps of an open that never happened); later moves go ahead. Queue edits that change
+what is staged (skip, hold, edit time, pause, end) send the herd's current strip again as a new
+immediate version so collars drop the staged moves, then stage the new plan. Move now sends the
+strip itself. An escape's pen drops only that collar's staged slots; when it ends the collar gets
+copies at the same times (see "Protocol v1 on the server").
+
+**Decisions.** While a schedule is active the daily decision is about it: the context has
+`schedule` (below). `STAY` keeps it (the next strip opens on time), `HOLD` (new action) repeats
+today's strip (as `/hold`), and a `MOVE` to another paddock ends the schedule when it applies (a
+farmer's draw included). `HOLD` without an active schedule fails the decision. `respond` with
+`reject` on a proposed `STAY` while the herd's schedule is active holds: the decision becomes
+`action: "HOLD"`, `status: "applied"`, `inputs.proposed_action: "STAY"`. The approval text reads
+`Cows: strip 4 of 12 opens 07:00. Reply Y to keep, N to hold. Code 4821`. HOLD follows the herd's
+autonomy like a MOVE (timer, auto).
+
+```ts
+// Decision context, while a schedule runs (null otherwise)
+schedule: { id, status, paddock_id, strips /* count */, strip? /* the one the herd is on, 1-based */,
+            cadence, back_fence: boolean,
+            next: { strip, of, opens_at, opens /* "07:00" | "Wed 07:00" farm time */, stored?, collars? } | null,
+            today?: { area_ha, forage_kg_dm?, days? },   // what today's strip holds for the herd
+            rule: string }
+```
+
+**Alert** `schedule_not_stored` (warning, "Next strip not on every collar [120] min before it
+opens"): the next move of an active schedule is due within `after_min` and some collar expected to
+hold it doesn't (collars on duty that report, not out on an escape, five minutes after it was
+staged). One alert per schedule, targets `("schedule", id)` and the collars that lack it:
+`Cows: 12 of 250 collars missing strip 4 (opens 07:00). Check coverage`.
+
+**Brief** line `schedule` (order 20): `Strip 4 of 12 opens 07:00, 248/250 stored`, or
+`Schedule paused before strip 4 of 12.`
+
+**MCP.** `get_schedule { herd_id? }` (read): `{ herd_id, schedule | null, moves, next? }`.
+`schedule_strips { herd_id?, layout_id? | orientation_deg + count | width_m | days, every_days?,
+at?, starts_at?, back_fence?: boolean, next_index? }` (manager): makes one; strips come from the
+layout or are cut across the herd's paddock. Neither is a decision-brain tool.
+
+**Reports.** `paddock_record` and `nrcs_528` gain "Planned days" (a schedule's `planned_end` less
+the stay's start) and "Residual at exit" (the measured height nearest the day out, within two
+days; `residual_cm`, else `height_cm`), each only when some row has a value.
+
+**Moves.** A sweep now waits only on its own staged first step (a farmer's target sent for
+later), not on a schedule's staged boundaries; `move_stalled`'s "waiting on a staged boundary"
+reads the same way.
+
 <!-- @A3 -->
+
+## Texts in and the morning brief (op-alerts)
+
+People on the farm answer and ask by text. `/api/texting*` is the owner's.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/texting` | `Texting` |
+| PUT | `/api/texting` | merge patch over `TextingConfig` → `Texting`; 400 `poll_s` 5–300 · `approve_window_h` 1–72 · `brief.time` HH:MM. The read-only parts may be sent back and are ignored |
+| PUT | `/api/texting/people/{id}` | `{ brief: bool }` → `PersonTexting`; 404 no such person |
+| POST | `/hooks/twilio/sms`, `/hooks/twilio/whatsapp` | Twilio's webhook (form) → 204; 403 bad or missing signature, another Twilio account, no public URL, or texting in off |
+| GET | `/v1/notify/inbox` | relay host: `?since=<cursor>&wait=<s ≤ 25>` → `Inbox`; 401 unknown key · 403 hosting off · 400 bad cursor |
+
+```ts
+TextingConfig = { inbound /* true */, poll_s /* 10 */, approve_window_h /* 12 */, brief: { enabled /* false */, time /* "06:30", farm time */ } }
+Texting = TextingConfig & {
+  inbound_mode: "webhook" | "polling" | "relay" | "off",   // read-only
+  hooks?: { sms?, whatsapp? },                              // webhook mode: the URLs to give Twilio
+  checked?: { at?, ok_at?, error? },                        // polling / relay: the last check
+  people: PersonTexting[],
+}
+PersonTexting = { user_id, brief /* gets the brief by text */, sms_opt_out /* texted STOP */ }
+Inbox = { messages: [{ id /* rin_… */, channel: "sms"|"whatsapp", from /* E.164 */, text, at }], cursor }
+```
+
+**How texts come in.** The farm's own Twilio decides: with `server.public_url` set, Twilio posts
+each text to `{public_url}/hooks/twilio/sms` (or `/whatsapp`); set that URL as the number's
+"A message comes in" webhook. The request must carry `X-Twilio-Signature` = base64(HMAC-SHA1(auth
+token, URL + every POST parameter name and value, sorted by name)); the URL is always
+`public_url` + path + query string, never the Host a proxy passes on (the default port may be
+there or not). Without a public URL (a farm behind NAT) the server reads
+`GET {twilio_api_base}/2010-04-01/Accounts/{sid}/Messages.json?To=<number>&DateSent>=<yesterday>`
+every `poll_s` seconds instead (a Messaging Service sender is read whole, inbound only). Without
+its own Twilio, a farm with the relay on long-polls the relay's inbox. Each text is taken once (by
+`MessageSid`, or the relay's id) and stored in `messages` (`direction: "in"`, `kind: "inbound"`,
+status `received`, or `ignored` with the reason in `error`). Texts that arrived before polling
+began for a number are never acted on. Replies are queued with `kind: "reply"` on the channel the
+text came in on.
+
+**Who.** Only a verified phone of an enabled person counts; unknown numbers, unverified phones and
+anyone who texted STOP get no reply (`ignored`). A 6-digit code texted back confirms a pending
+verification ("Phone verified. Reply STATUS any time.").
+
+**Texts** (case-insensitive; a command is the whole text, so "no thanks" is a question):
+
+| Text | Needs | Does |
+| --- | --- | --- |
+| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers the waiting decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`); several waiting → a numbered list, `Y 2` picks |
+| `LATER` [code \| number] | manager | the approval prompt again in an hour (the decision's own timer is unchanged) |
+| `OK` | hand | acks the alerts the last alert text to that person covered |
+| `STATUS` | anyone | each herd: head, paddock, a running move, open alerts, what waits for an answer |
+| `WHERE IS <tag>`, `WHERE <tag>` | anyone | the last fix in words, its age and `https://maps.google.com/?q=<lat>,<lon>` |
+| `STOP MOVE` [code \| number] | manager | stops the running move where it is |
+| `STOP` / `START` | anyone | opts out / in (Twilio's words mirrored: STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, OPTOUT; UNSTOP, and YES for a number that opted out). No reply on SMS, where Twilio confirms |
+| `HELP`, `INFO` | | Twilio answers; nothing from us |
+| anything else | anyone | the farm's brain answers with read tools (never `run_sql`), ≤ 320 characters on SMS, 1,000 on WhatsApp; a brain that doesn't answer questions → the list of texts |
+
+A Y, N or STOP MOVE without the decision's 4-digit code counts only within `approve_window_h` of
+our last alert or brief to that number (replies don't count, so texting us can't open the window);
+after that the code from the approval text is needed ("Y 4821"). Five wrong codes in an hour from
+one number and codes from it stop counting for the hour.
+
+**The morning brief.** At `brief.time` farm time (while `brief.enabled`), everyone with the brief on
+gets each of their herds' brief (`GET /api/brief`'s `text`, ≤ 480 characters) on every way their
+alerts reach them. Once a farm day; a server that was down then sends it within two hours, not
+later. A brief opens the reply window like an alert.
+
+**The relay's inbox** (host side). A text to the relay's number from a verified recipient goes to
+the key whose text to that number was the host's last; STOP and START go to every key that has the
+number (Twilio opts a phone out per sender number, so STOP to the shared number stops every farm on
+it); a code from a recipient being verified verifies it and goes on to the key that asked. The
+long-poll waits up to `wait` seconds for a text; rows up to the `since` a farm sends back are
+delivered and deleted. **Dead-man**: a key that polled before and has been quiet for more than
+`notify.hosting.deadman_after_min` texts its `deadman` recipients once per outage ("openpasture:
+Test farm hasn't checked in for 16 min. Its power or internet may be down.").
+
 <!-- @H -->
 <!-- @L -->
 <!-- @M -->
 <!-- @Z -->
+<!-- @X1 -->
+
+## Seams between streams (X1)
+
+**Live feed, one message per farm window.** Every 500 ms window gathers the whole farm's
+batches. A window holding only one of them sends it as itself (`positions`, `ack_batch` or
+`cue_batch`, as above); a window holding more sends one message:
+
+```ts
+{ type: "batch", events: Event[] }   // each herd's positions, ack_batch, cue_batch, in herd id order
+```
+
+So several herds live at once still make at most two batched messages a second for the farm
+(before: up to three per herd). Clients read a `batch` as its events in order. Every batched
+event is for any role, so viewers get the same message; `message` events never ride in a batch.
+
+**Reject codes on the feed.** A collar's `rejected` ack with a protocol v1 code
+(`hole_too_close`, `slots_full`, …) carries it on the bus (`ack.code`) and in `AckItem.code`.
+
+**Someone else's alert prefs.** `PUT /api/alerts/prefs/{id}` is the owner's at the guard (people
+ids are `usr_…`), so a manager is refused before the body is read; `PUT /api/alerts/prefs/me`
+stays a hand's.
+
+**The brief after a stopped move.** When today's decision is a MOVE (or HOLD) whose move someone
+stopped before the target, where it stands reads `Stopped 610 ft short, 250/250 collars
+confirmed.` (the distance through the farm's units), also the next morning.
+
+**Imported history and collar data.** Committing a position import leaves out points the
+animal's collar already recorded, so an animal-hour's dwell is counted once, from the collar.
+`POST /api/import/positions/{id}/commit` gains:
+
+```ts
+{ …, collar_covered: number }   // points left out because the animal's collar recorded that time
+```
+
+"Recorded" is read at the dwell rule's resolution: for hot fixes, the 30-minute buckets
+holding a fix of that collar and animal; for days already rolled to Parquet, the stretch the
+collar day's dwell covers, ending 30 minutes after its last fix, credited to the animal the
+collar is on now. A file with nothing new left is 409.
+
+**Paddock areas stored before op-geo measured rings whichever way they wind** (a clockwise
+outer ring, or a hole wound like its outer ring) are measured again from their geometry when
+the data dir opens, in `paddocks` and in the geometry history reports use. Rows that are
+right are left alone.
+
+**Rest days at 250 collars.** "Last grazed" for signals, the decision context and
+`GET /api/layers/paddocks` reads the newest fix per herd and paddock from `fix_paddock_last`
+(kept by a trigger as fixes land), not the herd's hot fixes; the herd's position over the last
+day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
+holds more. No response shape changes.

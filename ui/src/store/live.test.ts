@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Animal, Collar, PositionItem } from "../api";
-import { applyAcks, applyPositions, drawable, indexById, labels, summarize, undrawn } from "./live";
+import { applyAcks, applyCollar, applyPositions, drawable, indexById, labels, summarize, undrawn } from "./live";
 
 const fix = (at: string, x = 0) => ({ at, point: [-93.62 + x, 42.03] as [number, number], accuracy_m: 3, sats: 9 });
 const collar = (id: string, extra: Partial<Collar> = {}): Collar => ({ id, name: `n${id}`, herd_id: "h", state: "inside", ...extra });
@@ -46,4 +46,23 @@ test("labels, what the map draws, and the big-herd summary", () => {
   expect([...undrawn(collars, animals)].sort()).toEqual(["b", "c"]);
   expect(drawable(collars, animals).map((c) => c.id)).toEqual(["a"]);
   expect(summarize(collars)).toEqual({ total: 4, outside: ["a"], warning: ["c"], low: ["a"] });
+});
+
+test("a collar event replaces the row, so an unparked or unlinked collar comes back to the map", () => {
+  const animals: Animal[] = [{ id: "an1", tag: "214", herd_id: "h", collar_id: "a" }];
+  const parked = collar("a", { animal_id: "an1", last_fix: fix("2026-09-27T10:00:00Z"), parked_at: "2026-09-27T10:01:00Z", parked_reason: "charging", state: "unknown" });
+  expect(drawable([parked], animals)).toEqual([]);
+  // The server leaves cleared fields out: no parked_at, no animal_id.
+  const back = applyCollar(parked, collar("a", { last_fix: fix("2026-09-27T10:00:00Z"), state: "unknown" }));
+  expect(back.parked_at).toBeUndefined();
+  expect(back.parked_reason).toBeUndefined();
+  expect(back.animal_id).toBeUndefined();
+  expect(drawable([back], animals).map((c) => c.id)).toEqual(["a"]);
+  // A newer fix from a positions batch isn't taken back by an older event.
+  const moved = collar("a", { last_fix: fix("2026-09-27T10:05:00Z", 1e-4), state: "warning", battery: 0.9 });
+  const late = applyCollar(moved, collar("a", { name: "renamed", last_fix: fix("2026-09-27T10:04:00Z"), state: "inside", battery: 0.8 }));
+  expect(late).toMatchObject({ name: "renamed", last_fix: moved.last_fix, state: "warning", battery: 0.8 });
+  // A newer fix on the event wins; a collar with no fix yet takes the event whole.
+  expect(applyCollar(moved, collar("a", { last_fix: fix("2026-09-27T10:06:00Z") })).last_fix?.at).toBe("2026-09-27T10:06:00Z");
+  expect(applyCollar(undefined, parked)).toBe(parked);
 });

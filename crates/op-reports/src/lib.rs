@@ -31,6 +31,7 @@ pub use report::{Column, Report, ReportDoc, ReportParams, ReportSection};
 // @C
 // @F
 // @S
+mod schedule_cols;
 // @A3
 // @H
 // @L

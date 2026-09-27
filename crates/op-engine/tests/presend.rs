@@ -312,6 +312,12 @@ async fn short_rest_is_found_for_ground_the_herd_isnt_on() {
     let c = t.check(json!({ "geometry": rect(-400.0, 0.0, -300.0, 400.0) })).await;
     assert_eq!(c["facts"]["rest_days"], 0.0);
     assert!(!codes(&c).contains(&"rested_short"));
+    // A collar in P2 a moment ago: grazed there, whatever the record says.
+    let keys = t.collars(1, true).await;
+    t.fix(&keys[0], at(200.0, 200.0)).await;
+    let c = t.check(json!({ "geometry": p2() })).await;
+    assert_eq!(c["facts"]["rest_days"], 0.0);
+    assert_eq!(finding(&c, "rested_short")["text"], "P2 grazed in the last day");
 }
 
 #[tokio::test]

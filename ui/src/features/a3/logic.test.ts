@@ -1,0 +1,60 @@
+import { describe, expect, test } from "bun:test";
+import type { User } from "../../api";
+import type { Texting } from "./api";
+import { canBrief, personOf, reachable, repliesLine, validTime, withPerson } from "./logic";
+
+const base: Texting = {
+  inbound: true, poll_s: 10, approve_window_h: 12, brief: { enabled: false, time: "06:30" },
+  inbound_mode: "polling", people: [],
+};
+const user = (u: Partial<User> = {}): User => ({ id: "usr_1", name: "Cody", role: "owner", created_at: "2026-09-27T00:00:00Z", ...u });
+
+describe("repliesLine", () => {
+  test("says how texts come in, in the mode's words", () => {
+    expect(repliesLine(base, ["sms"])).toEqual({ label: "Replies checked every 10 s", urls: [], error: undefined });
+    expect(repliesLine({ ...base, poll_s: 30, checked: { error: "Twilio can't be reached." } }, ["sms"])?.error).toBe("Twilio can't be reached.");
+    expect(repliesLine({ ...base, inbound_mode: "relay" }, ["relay"])?.label).toBe("Replies through the relay");
+    const hooked = repliesLine({ ...base, inbound_mode: "webhook", hooks: { sms: "https://farm.example/hooks/twilio/sms", whatsapp: "https://farm.example/hooks/twilio/whatsapp" } }, ["sms", "whatsapp"]);
+    expect(hooked).toEqual({
+      label: "Replies by webhook",
+      urls: [{ label: "SMS", url: "https://farm.example/hooks/twilio/sms" }, { label: "WhatsApp", url: "https://farm.example/hooks/twilio/whatsapp" }],
+    });
+  });
+
+  test("shows nothing when nothing can text the farm back, and an off switch when off", () => {
+    expect(repliesLine(base, [])).toBeNull();
+    expect(repliesLine(base, ["email", "webhook"])).toBeNull();
+    expect(repliesLine({ ...base, inbound: false, inbound_mode: "off" }, ["sms"])).toEqual({ label: "Replies", urls: [] });
+    expect(repliesLine({ ...base, inbound_mode: "off" }, ["sms"])).toBeNull();
+  });
+});
+
+describe("the brief", () => {
+  test("is offered once a channel can carry it", () => {
+    expect(canBrief([])).toBe(false);
+    expect(canBrief(["webhook"])).toBe(false);
+    for (const c of ["sms", "whatsapp", "email", "relay"]) expect(canBrief([c])).toBe(true);
+  });
+
+  test("reaches a verified phone or an email", () => {
+    expect(reachable(user({ phone: "+15155550123" }), ["sms"])).toBe(false);
+    expect(reachable(user({ phone: "+15155550123", phone_verified_at: "2026-09-27T00:00:00Z" }), ["sms"])).toBe(true);
+    expect(reachable(user({ phone: "+15155550123", phone_verified_at: "2026-09-27T00:00:00Z" }), ["email"])).toBe(false);
+    expect(reachable(user({ email: "cody@farm.example" }), ["email"])).toBe(true);
+    expect(reachable(user({ email: "cody@farm.example" }), ["relay"])).toBe(true);
+    expect(reachable(user({ email: "cody@farm.example", disabled_at: "2026-09-27T00:00:00Z" }), ["email"])).toBe(false);
+  });
+
+  test("times are HH:MM", () => {
+    expect(validTime("06:30")).toBe(true);
+    expect(validTime("23:59")).toBe(true);
+    for (const t of ["6:30", "24:00", "06:60", "", "06.30"]) expect(validTime(t)).toBe(false);
+  });
+
+  test("a person's state is kept per person", () => {
+    expect(personOf(base, "usr_1")).toEqual({ user_id: "usr_1", brief: false, sms_opt_out: false });
+    const t = withPerson(base, { user_id: "usr_1", brief: true, sms_opt_out: false });
+    expect(personOf(t, "usr_1").brief).toBe(true);
+    expect(withPerson(t, { user_id: "usr_1", brief: false, sms_opt_out: true }).people).toEqual([{ user_id: "usr_1", brief: false, sms_opt_out: true }]);
+  });
+});

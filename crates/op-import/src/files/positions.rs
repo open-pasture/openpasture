@@ -285,6 +285,9 @@ pub struct Committed {
     /// Points not stored because that animal already has one at that instant
     /// (an earlier import, or the file repeats itself).
     pub duplicates: usize,
+    /// Points left out because the animal's collar already recorded that
+    /// time (its dwell counts once, from the collar).
+    pub collar_covered: usize,
     /// Labels left out: no animal matched or chosen.
     pub skipped: Vec<String>,
     pub errors: Vec<String>,
@@ -327,6 +330,12 @@ pub async fn commit(
     // Store the points. The preview is taken first, so a second commit of it can't run alongside.
     let mut rows: Vec<(&Animal, Pt)> = parsed.points.iter().filter_map(|p| Some((chosen[p.label as usize].as_ref()?, *p))).collect();
     rows.sort_by(|a, b| a.0.id.cmp(&b.0.id).then(a.1.t.cmp(&b.1.t)));
+    // @X1 collar data wins: leave out what the animal's collar already recorded.
+    let span = rows.iter().fold((i64::MAX, i64::MIN), |(lo, hi), (_, p)| (lo.min(p.t), hi.max(p.t)));
+    let covered = super::overlap::collar_coverage(&ctx, span.0, span.1).await?;
+    let before = rows.len();
+    rows.retain(|(a, p)| !covered.contains(&a.id, p.t));
+    let collar_covered = before - rows.len();
     let held = pending::take(&id).ok_or_else(|| ApiError::not_found("That preview has expired. Import the file again."))?;
     let meta = Meta { file_name, source, zone: parsed.needs_zone.then(|| zone.name().to_owned()), by: identity.actor() };
     let stored = match store_import(&ctx, &id, &rows, &meta).await {
@@ -344,6 +353,9 @@ pub async fn commit(
     if import.fixes == 0 {
         // Nothing new: no empty import in the list.
         forget(&ctx, &id).await?;
+        if collar_covered > 0 {
+            return Err(ApiError::conflict("Nothing new: the collars and earlier imports already have every point in this file."));
+        }
         return Err(ApiError::conflict("Every point in this file is already imported."));
     }
     for h in &herds {
@@ -351,7 +363,7 @@ pub async fn commit(
     }
     tracing::info!(import_id = %id, fixes = import.fixes, animals = import.animals, "imported position history");
     let duplicates = rows.len() - import.fixes as usize;
-    Ok((StatusCode::CREATED, Json(Committed { import, duplicates, skipped, errors: parsed.errors })))
+    Ok((StatusCode::CREATED, Json(Committed { import, duplicates, collar_covered, skipped, errors: parsed.errors })))
 }
 
 struct Meta {

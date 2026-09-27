@@ -17,6 +17,7 @@ button.rname:hover,button.rname[aria-expanded=true]{color:var(--fg)}
 .rfield{display:inline-flex;align-items:center;gap:8px;font-size:12px}
 .rfield .dim{font-family:var(--mono);font-size:12px}
 .rherd{font-size:13px;min-width:88px}
+.rfacts{font-size:12px;white-space:pre}
 .rmore .check{font-size:12px}
 .feedlog{display:grid;gap:8px;justify-items:start}
 .feedlog .tbl{width:auto}

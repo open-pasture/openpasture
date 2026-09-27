@@ -49,11 +49,14 @@ pub mod live;
 // @C
 // @F
 // @S
+pub mod schedule;
 // @A3
 // @H
 // @L
 // @M
 // @Z
+// @X1
+pub mod area_repair;
 
 pub use ctx::{BrainToken, Ctx, default_data_dir};
 pub use domain::*;

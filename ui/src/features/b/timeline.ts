@@ -11,6 +11,8 @@ export function sentence(d: Decision, name: Named): string {
   if (d.action === "MOVE") return `Move to ${name(d.to_paddock_id) ?? "a new boundary"}.`;
   if (d.action === "STAY") return `Stay in ${name(inputs.from_paddock_id) ?? "place"}.`;
   if (d.action === "NEEDS_INFO") return d.need?.trim() || "Needs more information.";
+  // S: a strip schedule's hold.
+  if (d.action === "HOLD") return "Hold today's strip.";
   if (d.status === "running") return "Deciding.";
   return d.error ? "No decision." : "Decision.";
 }

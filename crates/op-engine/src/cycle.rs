@@ -191,6 +191,10 @@ async fn run(ctx: &Ctx, mut d: Decision, herd: Herd) -> anyhow::Result<()> {
         "collars": a.context["collars"],
         "signals": a.context["signals"],
     });
+    // @S: the schedule the call was about (its approval text names the next strip).
+    if !a.context["schedule"].is_null() {
+        d.inputs["schedule"] = a.context["schedule"].clone();
+    }
     let d = record(ctx, d, &herd).await?;
     log(format!("Decision: {}.", describe(&d)));
     Ok(())
@@ -253,20 +257,29 @@ pub async fn record(ctx: &Ctx, mut d: Decision, herd: &Herd) -> anyhow::Result<D
         d.to_paddock_id = None;
         d.geometry = None;
     }
+    // @S: HOLD repeats today's strip of an active schedule; without one it isn't a call.
+    if d.action == Some(DecisionAction::Hold) && crate::schedules::active(ctx, &d.herd_id).await?.is_none() {
+        return fail(d, "HOLD needs an active strip schedule for this herd.".into()).await;
+    }
 
     d.status = DecisionStatus::Proposed;
     d.error = None;
-    if d.action == Some(DecisionAction::Move) && herd.autonomy == Autonomy::Timer {
+    if acts(&d) && herd.autonomy == Autonomy::Timer {
         d.apply_at = Some(time::now() + chrono::Duration::minutes(herd.timer_minutes as i64));
     }
     db::update(ctx, &d).await?;
     supersede(ctx, &d.herd_id, &d.id).await?;
     activity(ctx, "decision.proposed", d.source.as_db().as_str(), format!("Decision: {}", d.action.map(|a| a.as_db()).unwrap_or_default()), &d, None).await;
 
-    if d.action == Some(DecisionAction::Move) && herd.autonomy == Autonomy::Auto {
+    if acts(&d) && herd.autonomy == Autonomy::Auto {
         return apply_claimed(ctx, &d.id, None, None).await;
     }
     Ok(d)
+}
+
+/// A call that changes what the collars get when applied: MOVE, or HOLD (S).
+fn acts(d: &Decision) -> bool {
+    matches!(d.action, Some(DecisionAction::Move | DecisionAction::Hold))
 }
 
 /// Older proposals for the herd give way to a newer decision. Conditional:
@@ -313,6 +326,26 @@ pub async fn apply(ctx: &Ctx, d: Decision) -> anyhow::Result<Decision> {
 
 /// [`apply`], for a farmer's answer: `payload.by` on the activity names them.
 async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Result<Decision> {
+    // @S: HOLD shifts the herd's schedule by one cadence.
+    if d.action == Some(DecisionAction::Hold) {
+        match crate::schedules::hold_herd(ctx, &d.herd_id).await {
+            Ok(_) => {
+                let row = sqlx::query("UPDATE decisions SET status = 'applied', apply_at = NULL, error = NULL WHERE id = ? RETURNING *")
+                    .bind(&d.id)
+                    .fetch_one(ctx.db())
+                    .await?;
+                d = op_core::store::decision_from_row(&row)?;
+                ctx.publish(Event::Decision { decision: d.clone() });
+                activity(ctx, "decision.applied", "system", "Held today's strip".into(), &d, by).await;
+            }
+            Err(e) => {
+                d.status = DecisionStatus::Failed;
+                d.error = Some(format!("The schedule was not held: {}", e.message));
+                db::update(ctx, &d).await?;
+            }
+        }
+        return Ok(d);
+    }
     let Some(geometry) = d.geometry.clone() else {
         d.status = DecisionStatus::Failed;
         d.error = Some("There is no boundary to send.".into());
@@ -330,6 +363,10 @@ async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Res
             ctx.publish(Event::Decision { decision: d.clone() });
             if let Err(e) = move_herd(ctx, &d).await {
                 tracing::warn!("updating herd position: {e:#}");
+            }
+            // @S: a MOVE to another paddock ends the herd's strip schedule.
+            if let Err(e) = op_ingest::schedule::on_decision(ctx, &d).await {
+                tracing::warn!("ending the schedule: {e:#}");
             }
             let m = &started.r#move;
             let title = match (&started.boundary, m.status) {
@@ -380,13 +417,27 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
     }
     resp["by"] = json!(actor);
 
+    // @S: N on a STAY while the herd's schedule runs holds today's strip.
+    let hold = action == Response::Reject && d.action == Some(DecisionAction::Stay) && crate::schedules::active(ctx, &d.herd_id).await?.is_some();
     let out = match action {
+        Response::Reject if hold => {
+            let n = sqlx::query(
+                "UPDATE decisions SET action = 'HOLD', inputs = json_set(inputs, '$.proposed_action', 'STAY') WHERE id = ? AND status = 'proposed'",
+            )
+            .bind(id)
+            .execute(ctx.db())
+            .await?;
+            if n.rows_affected() != 1 {
+                return Err(ApiError::conflict("This decision changed while you were answering."));
+            }
+            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?
+        }
         Response::Reject => {
             let d = answer(ctx, id, DecisionStatus::Rejected, &resp, at).await?;
             activity(ctx, "decision.rejected", "farmer", "Decision rejected".into(), &d, Some(&actor)).await;
             d
         }
-        Response::Approve if d.action != Some(DecisionAction::Move) => {
+        Response::Approve if !acts(&d) => {
             let d = answer(ctx, id, DecisionStatus::Approved, &resp, at).await?;
             activity(ctx, "decision.approved", "farmer", "Decision approved".into(), &d, Some(&actor)).await;
             d
@@ -463,7 +514,7 @@ async fn answer(ctx: &Ctx, id: &str, status: DecisionStatus, resp: &Value, at: D
 pub async fn apply_due(ctx: &Ctx) -> anyhow::Result<()> {
     let now = time::now();
     for d in db::with_status(ctx, DecisionStatus::Proposed).await? {
-        if d.action == Some(DecisionAction::Move) && d.apply_at.is_some_and(|t| t <= now) {
+        if acts(&d) && d.apply_at.is_some_and(|t| t <= now) {
             match apply_claimed(ctx, &d.id, None, None).await {
                 Ok(d) => tracing::info!(decision = %d.id, status = %d.status.as_db(), "timer decision applied"),
                 Err(e) => tracing::debug!("timer apply skipped: {e:#}"),

@@ -74,6 +74,7 @@ async fn test(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<
                 Action::Stay => "STAY",
                 Action::Move => "MOVE",
                 Action::NeedsInfo => "NEEDS_INFO",
+                Action::Hold => "HOLD",
             };
             let detail = match out.model {
                 Some(m) => format!("{action} ({m})"),

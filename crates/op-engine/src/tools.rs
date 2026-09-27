@@ -134,6 +134,8 @@ pub fn specs() -> Vec<ToolSpec> {
         // @F
         crate::presend::tool(),
         // @S
+        crate::schedules::get_schedule_spec(),
+        crate::schedules::schedule_strips_spec(),
         // @A3
         // @H
         // @L

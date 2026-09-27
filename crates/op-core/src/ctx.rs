@@ -79,6 +79,8 @@ impl Ctx {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
         let store = Store::open(&data_dir).await?;
+        // @X1 paddock areas stored before op-geo measured rings whichever way they wind.
+        crate::area_repair::repair_paddock_areas(store.pool()).await?;
         let signing_key = keys::load_or_create(&data_dir)?;
         let secrets = Secrets::new(&data_dir);
         let (events, _) = broadcast::channel(EVENT_BUS_CAPACITY);

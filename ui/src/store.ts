@@ -5,7 +5,7 @@ import { useSyncExternalStore } from "react";
 import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type LiveEventOf, type LiveEventType, type Move, type PositionItem } from "./api";
 import "./api/p";
 import { loadMe } from "./store/me";
-import { applyAcks, applyPositions, indexById, labels } from "./store/live";
+import { applyAcks, applyCollar, applyPositions, indexById, labels } from "./store/live";
 
 export interface Store {
   ready: boolean;
@@ -200,7 +200,7 @@ function onEvent(e: LiveEvent) {
     case "collar": {
       const i = collarIndex().get(e.collar.id) ?? -1;
       const collars = s.collars.slice();
-      if (i >= 0) collars[i] = { ...collars[i], ...e.collar };
+      if (i >= 0) collars[i] = applyCollar(collars[i], e.collar);
       else {
         collars.push(e.collar);
         refreshSoon(); // its animal is usually linked right after

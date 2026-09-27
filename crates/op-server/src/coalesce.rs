@@ -3,12 +3,19 @@
 //!
 //! At 250 collars the bus carries a fix, a collar and often a cue per report
 //! (about 100 events a second), and a sweep step adds two acks and two collar
-//! events per collar. Per herd, every 500 ms, the coalescer sends instead:
+//! events per collar. Every 500 ms the coalescer sends instead, per herd:
 //! - `positions`: the newest fix of each collar that fixed, plus telemetry-only
 //!   collar changes (battery, last contact, fence state);
 //! - `ack_batch`: each collar's latest ack, plus collar changes that only move
 //!   `boundary_version`;
 //! - `cue_batch`: every cue.
+//!
+//! The window is the farm's, not a herd's: it opens with the first event of
+//! any herd and closes 500 ms later, and everything it gathered goes out as
+//! one message. A window with one herd's `positions` only is that message; a
+//! window with more is one `{"type":"batch","events":[…]}` holding them in
+//! herd order. So several herds live at once still make at most two batched
+//! messages a second.
 //!
 //! A `collar` event is sent on its own only when the collar's JSON minus
 //! [`COLLAR_VOLATILE_KEYS`] changed (renamed, relinked, parked, new fields
@@ -24,6 +31,7 @@ use std::time::Duration;
 use axum::extract::ws::Utf8Bytes;
 use op_core::live::{AckItem, COLLAR_VOLATILE_KEYS, CueItem, PositionItem};
 use op_core::{AckStatus, Collar, Event, Role, Store};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::broadcast::{self, WeakSender, error::RecvError};
 use tokio::time::Instant;
@@ -63,10 +71,29 @@ impl Hub {
     }
 
     fn send(&self, ev: &Event) {
+        self.send_json(ev.min_role(), ev);
+    }
+
+    /// One window's batches as one message per role that may see them: a lone
+    /// event as itself, several as a `batch` envelope, in the order given.
+    fn send_window(&self, events: Vec<Event>) {
+        let mut roles: Vec<Role> = events.iter().map(Event::min_role).collect();
+        roles.sort();
+        roles.dedup();
+        for role in roles {
+            let group: Vec<&Event> = events.iter().filter(|e| e.min_role() == role).collect();
+            match group.as_slice() {
+                [one] => self.send(one),
+                many => self.send_json(role, &Envelope { kind: "batch", events: many }),
+            }
+        }
+    }
+
+    fn send_json(&self, role: Role, value: &impl Serialize) {
         if self.out.receiver_count() == 0 {
             return;
         }
-        let text = match serde_json::to_string(ev) {
+        let text = match serde_json::to_string(value) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("live event didn't serialize: {e}");
@@ -74,8 +101,16 @@ impl Hub {
             }
         };
         self.serialized.fetch_add(1, Ordering::Relaxed);
-        let _ = self.out.send(Out { role: ev.min_role(), text: text.into() });
+        let _ = self.out.send(Out { role, text: text.into() });
     }
+}
+
+/// Several batches from one window, as one WebSocket message.
+#[derive(Serialize)]
+struct Envelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    events: &'a [&'a Event],
 }
 
 /// One hub per event bus (per data dir the process has open). The registry
@@ -115,36 +150,32 @@ fn ident(c: &Collar) -> Value {
     v
 }
 
-/// What one herd gathered in its current window.
+/// What one herd gathered in the current window.
+#[derive(Default)]
 struct Batch {
-    due: Instant,
     positions: BTreeMap<String, PositionItem>,
     acks: BTreeMap<String, AckItem>,
     cues: Vec<CueItem>,
-}
-
-impl Batch {
-    fn new() -> Self {
-        Self { due: Instant::now() + WINDOW, positions: BTreeMap::new(), acks: BTreeMap::new(), cues: Vec::new() }
-    }
 }
 
 struct Coalescer {
     store: Store,
     hub: Arc<Hub>,
     collars: HashMap<String, Known>,
-    batches: HashMap<String, Batch>,
+    /// Per herd, in herd order.
+    batches: BTreeMap<String, Batch>,
+    /// When the farm's open window closes; none while nothing is gathered.
+    due: Option<Instant>,
     /// Cues of collars whose herd isn't known yet, placed from the database
-    /// when their window ends.
+    /// when the window ends.
     unplaced: Vec<CueItem>,
-    unplaced_due: Option<Instant>,
 }
 
 async fn run(mut rx: broadcast::Receiver<Event>, store: Store, hub: Arc<Hub>) {
-    let mut c = Coalescer { store, hub, collars: HashMap::new(), batches: HashMap::new(), unplaced: Vec::new(), unplaced_due: None };
+    let mut c = Coalescer { store, hub, collars: HashMap::new(), batches: BTreeMap::new(), due: None, unplaced: Vec::new() };
     c.seed().await;
     loop {
-        let due = c.batches.values().map(|b| b.due).chain(c.unplaced_due).min();
+        let due = c.due;
         tokio::select! {
             ev = rx.recv() => match ev {
                 Ok(ev) => c.on_event(ev),
@@ -155,7 +186,7 @@ async fn run(mut rx: broadcast::Receiver<Event>, store: Store, hub: Arc<Hub>) {
                 }
                 Err(RecvError::Closed) => break,
             },
-            _ = sleep_until(due), if due.is_some() => c.flush(Instant::now()).await,
+            _ = sleep_until(due), if due.is_some() => c.flush().await,
         }
     }
 }
@@ -179,8 +210,10 @@ impl Coalescer {
         }
     }
 
+    /// The herd's batch in the farm's window, opening the window if none is.
     fn batch(&mut self, herd_id: &str) -> &mut Batch {
-        self.batches.entry(herd_id.to_owned()).or_insert_with(Batch::new)
+        self.due.get_or_insert_with(|| Instant::now() + WINDOW);
+        self.batches.entry(herd_id.to_owned()).or_default()
     }
 
     fn on_event(&mut self, ev: Event) {
@@ -203,15 +236,15 @@ impl Coalescer {
                     }
                 }
             }
-            Event::Ack { collar_id, herd_id, version, status, reason, .. } => {
-                self.batch(&herd_id).acks.insert(collar_id.clone(), AckItem { collar_id, version, status, code: None, reason });
+            Event::Ack { collar_id, herd_id, version, status, reason, code } => {
+                self.batch(&herd_id).acks.insert(collar_id.clone(), AckItem { collar_id, version, status, code, reason });
             }
             Event::Cue { collar_id, at, level, margin_m, kind, ring } => {
                 let item = CueItem { collar_id, at, level, margin_m, kind, ring };
                 match self.collars.get(&item.collar_id).map(|k| k.collar.herd_id.clone()) {
                     Some(herd) => self.batch(&herd).cues.push(item),
                     None => {
-                        self.unplaced_due.get_or_insert_with(|| Instant::now() + WINDOW);
+                        self.due.get_or_insert_with(|| Instant::now() + WINDOW);
                         self.unplaced.push(item);
                     }
                 }
@@ -288,29 +321,32 @@ impl Coalescer {
         }
     }
 
-    async fn flush(&mut self, now: Instant) {
-        if let Some(due) = self.unplaced_due.filter(|d| *d <= now) {
-            self.unplaced_due = None;
-            self.place_cues(due).await;
+    /// The window closed: every herd's batches, as one message.
+    async fn flush(&mut self) {
+        self.due = None;
+        if !self.unplaced.is_empty() {
+            self.place_cues().await;
         }
-        let due: Vec<String> = self.batches.iter().filter(|(_, b)| b.due <= now).map(|(h, _)| h.clone()).collect();
-        for herd_id in due {
-            let Some(b) = self.batches.remove(&herd_id) else { continue };
+        let mut out = Vec::new();
+        for (herd_id, b) in std::mem::take(&mut self.batches) {
             if !b.positions.is_empty() {
-                self.hub.send(&Event::Positions { herd_id: herd_id.clone(), items: b.positions.into_values().collect() });
+                out.push(Event::Positions { herd_id: herd_id.clone(), items: b.positions.into_values().collect() });
             }
             if !b.acks.is_empty() {
-                self.hub.send(&Event::AckBatch { herd_id: herd_id.clone(), items: b.acks.into_values().collect() });
+                out.push(Event::AckBatch { herd_id: herd_id.clone(), items: b.acks.into_values().collect() });
             }
             if !b.cues.is_empty() {
-                self.hub.send(&Event::CueBatch { herd_id, items: b.cues });
+                out.push(Event::CueBatch { herd_id, items: b.cues });
             }
+        }
+        if !out.is_empty() {
+            self.hub.send_window(out);
         }
     }
 
     /// Cues from collars the coalescer hasn't seen: their herd from the
-    /// database. They go out with that herd's batch, or on their own at `due`.
-    async fn place_cues(&mut self, due: Instant) {
+    /// database. They go out with that herd's batch in this window.
+    async fn place_cues(&mut self) {
         let mut herds: HashMap<String, Option<String>> = HashMap::new();
         for item in std::mem::take(&mut self.unplaced) {
             if !herds.contains_key(&item.collar_id) {
@@ -325,7 +361,7 @@ impl Coalescer {
             }
             // A collar that no longer exists: its cue has nowhere to go.
             if let Some(Some(herd)) = herds.get(&item.collar_id).cloned() {
-                self.batches.entry(herd).or_insert_with(|| Batch { due, ..Batch::new() }).cues.push(item);
+                self.batches.entry(herd).or_default().cues.push(item);
             }
         }
     }

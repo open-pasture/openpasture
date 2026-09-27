@@ -29,6 +29,8 @@ pub mod notify;
 // @F
 // @S
 // @A3
+pub mod brief_send;
+pub mod inbound;
 // @H
 // @L
 // @M
@@ -64,6 +66,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @F
         // @S
         // @A3
+        inbound::router(),
         // @H
         // @L
         // @M
@@ -98,6 +101,9 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @F
     // @S
     // @A3
+    inbound::start(ctx.clone());
+    brief_send::start(ctx.clone());
+    hosting::inbox::start(ctx.clone());
     // @H
     // @L
     // @M

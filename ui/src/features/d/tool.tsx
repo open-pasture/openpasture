@@ -10,13 +10,8 @@ import { useStore } from "../../store";
 import { putFeature } from "../../store/d";
 import { Button, Input, Segmented } from "../../ui";
 import { NumberField } from "../../ui/NumberField";
-import type { DrawKind } from "../../map/draw";
 import { useDrawing, type ToolProps } from "../../map/tools";
-import { circle, endOfDay, HAZARD_RADIUS_M, localDate, scopePaddock, spec, type Shape } from "./model";
-
-// Which terra-draw mode draws each shape: exclusions in red, other areas in fg.
-const modeFor = (kind: FeatureKind, shape: Shape): DrawKind =>
-  shape === "Point" ? "point" : shape === "LineString" ? "line" : kind === "exclusion" ? "exclusion" : "paddock";
+import { circle, endOfDay, HAZARD_RADIUS_M, localDate, modeFor, scopePaddock, spec, type Shape } from "./model";
 
 const made = new Map<FeatureKind, ComponentType<ToolProps>>();
 
