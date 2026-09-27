@@ -1,6 +1,7 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Paddock, type Polygon } from "../api";
 import { areaHa, centroid, inside } from "../geo";
+import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabel, outOf, store, useStore } from "../store";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { age, clock, useNow } from "../util";
@@ -24,6 +25,12 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState("");
   const [err, setErr] = useState<string>();
+  // The herd menu entry open under the name, if any.
+  const [openItem, setOpenItem] = useState<string>();
+  const menu = herdMenu.use();
+  const panelProps = { herdId: herdId ?? "" };
+  const sections = useSections(herdPanel, panelProps);
+  useEffect(() => setOpenItem(undefined), [herdId]);
 
   // Fix ages step every five seconds, so twelve rows don't tick at once.
   const calm = Math.ceil(now / 5000) * 5000;
@@ -73,17 +80,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const b = bstat?.pending ?? bstat?.active;
   const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied").length : 0;
   const done = collars.length > 0 && applied >= collars.length;
+  const item = menu.find((m) => m.id === openItem);
 
-  return (
-    <aside className="panel" aria-label="Herd">
-      {state.herds.length > 1 && (
-        <div className="ph">
-          <Menu trigger={<span className="hname">{herd.name}</span>}
-            items={state.herds.map((h) => ({ label: h.name, current: h.id === herd.id, onSelect: () => store.setHerd(h.id) }))} />
-        </div>
-      )}
-
-      {collars.length > 0 && <>
+  const decision = collars.length > 0 && <>
       <div className="auto">
         <Segmented label="Autonomy" value={herd.autonomy} onChange={setAutonomy} options={[
           { value: "propose", label: "Propose" },
@@ -169,8 +168,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         )}
         </>}
       </section>
+      </>;
 
-      {out.length > 0 && (
+  const escapes = collars.length > 0 && out.length > 0 && (
         <section className="esc" aria-label="Out">
           {out.map((e) => (
             <div key={e.id} className="acts">
@@ -182,10 +182,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             </div>
           ))}
         </section>
-      )}
+      );
 
-      </>}
-
+  const list = (
       <ul className="collars" onMouseLeave={() => onHoverCollar(undefined)}>
         {b && collars.length > 0 && (
           <li className="acks mono" title={`Boundary v${b.version}: ${applied} of ${collars.length} collars applied`}>
@@ -203,7 +202,26 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
           </li>
         ))}
       </ul>
-      <AddCollar herdId={herd.id} />
+  );
+
+  return (
+    <aside className="panel" aria-label="Herd">
+      {(state.herds.length > 1 || menu.length > 0) && (
+        <div className="ph">
+          <Menu trigger={<span className="hname">{herd.name}</span>}
+            items={[
+              ...(state.herds.length > 1 ? state.herds.map((h) => ({ label: h.name, current: h.id === herd.id, onSelect: () => store.setHerd(h.id) })) : []),
+              ...menu.map((m) => ({ label: m.label, current: m.id === openItem, onSelect: () => setOpenItem(m.id === openItem ? undefined : m.id) })),
+            ]} />
+        </div>
+      )}
+      {item && <div className="hitem">{guarded(item.id, <item.Item herdId={herd.id} />)}</div>}
+      {interleave([
+        { key: "decision", order: HERD_PANEL.decision, node: decision },
+        { key: "escapes", order: HERD_PANEL.escapes, node: escapes },
+        { key: "collars", order: HERD_PANEL.collars, node: list },
+        { key: "addCollar", order: HERD_PANEL.addCollar, node: <AddCollar herdId={herd.id} /> },
+      ], sectionNodes(sections, panelProps))}
     </aside>
   );
 }

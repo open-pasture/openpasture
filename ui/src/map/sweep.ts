@@ -6,7 +6,8 @@ import { setBoundary } from "./layers";
 // The active boundary and, while a move sweeps, what explains it: the back line
 // lit, chevrons drifting toward the target, and the ground behind the back line
 // dimmed. A new step glides from the old shape to the new one over GLIDE ms:
-// both rings are resampled to N points, aligned, and interpolated.
+// both outer rings are resampled to N points, aligned, and interpolated; holes go
+// straight to their new place. A shape that gains or loses a hole switches at once.
 
 const N = 160;
 const GLIDE = 1500;
@@ -80,7 +81,9 @@ function align(a: Ring, b: Ring): Ring {
   return b.map((_, i) => b[(i + best) % N]);
 }
 
-const closed = (r: Ring): Polygon => ({ type: "Polygon", coordinates: [[...r, r[0]]] });
+// The outer ring on screen with the destination's holes.
+const closed = (r: Ring, exact?: Polygon): Polygon => ({ type: "Polygon", coordinates: [[...r, r[0]], ...(exact?.coordinates.slice(1) ?? [])] });
+const ringCount = (g?: Polygon) => g?.coordinates.length ?? 0;
 
 function centroidOf(r: Ring): LonLat {
   const s = r.reduce((a, p) => [a[0] + p[0], a[1] + p[1]], [0, 0]);
@@ -161,11 +164,12 @@ export class SweepView {
     this.s = next;
     setBoundary(this.map, "target", next.target);
     if (changed) {
+      const sameRings = ringCount(g) === ringCount(this.exact);
       this.exact = g;
       if (!g) this.shown = undefined;
       else {
         const to = resample(g);
-        if (glide && this.shown) {
+        if (glide && this.shown && sameRings) {
           this.from = this.shown;
           this.to = align(this.from, to);
           this.t0 = performance.now();
@@ -191,7 +195,7 @@ export class SweepView {
       this.shown = t < 1 ? a.map((p, i) => [p[0] + (b[i][0] - p[0]) * e, p[1] + (b[i][1] - p[1]) * e] as LonLat) : b;
     }
     // The last frame draws the exact polygon so corners stay sharp.
-    setBoundary(this.map, "active", this.shown ? (t < 1 ? closed(this.shown) : this.exact) : undefined);
+    setBoundary(this.map, "active", this.shown ? (t < 1 ? closed(this.shown, this.exact) : this.exact) : undefined);
     const live = this.drawCues(now);
     if (t < 1 || live) this.raf = requestAnimationFrame(this.frame);
   };

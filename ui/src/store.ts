@@ -2,7 +2,8 @@
 // kept fresh by /api/live.
 
 import { useSyncExternalStore } from "react";
-import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type Move } from "./api";
+import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type LiveEventOf, type LiveEventType, type Move } from "./api";
+import { loadMe } from "./store/me";
 
 export interface Store {
   ready: boolean;
@@ -21,6 +22,8 @@ export interface Store {
 let s: Store = { ready: false, needToken: false, up: false, state: null, collars: [], animals: [], boundary: {}, decisions: [], logs: {} };
 const subs = new Set<() => void>();
 const fixSubs = new Set<(e: Extract<LiveEvent, { type: "fix" }>) => void>();
+// Stream handlers per event type; they run before the core switch below.
+const handlers = new Map<string, Set<(e: LiveEvent) => void>>();
 
 function set(patch: Partial<Store>) {
   s = { ...s, ...patch };
@@ -37,6 +40,14 @@ export const store = {
   onFix(f: (e: Extract<LiveEvent, { type: "fix" }>) => void) {
     fixSubs.add(f);
     return () => void fixSubs.delete(f);
+  },
+  // Every live event of this type, before the store applies it. Returns unsubscribe.
+  on<K extends LiveEventType>(type: K, f: (e: LiveEventOf<K>) => void) {
+    let set = handlers.get(type);
+    if (!set) handlers.set(type, (set = new Set()));
+    const h = f as (e: LiveEvent) => void;
+    set.add(h);
+    return () => void set.delete(h);
   },
   setHerd(herdId: string) {
     set({ herdId });
@@ -77,7 +88,7 @@ export function useStore<T>(sel: (s: Store) => T): T {
 
 async function refresh() {
   try {
-    const state = await api.state();
+    const [state] = await Promise.all([api.state(), loadMe()]);
     const herdId = s.herdId && state.herds.some((h) => h.id === s.herdId) ? s.herdId : state.herds[0]?.id;
     set({ state, herdId, ready: true, error: undefined });
     await refreshHerd();
@@ -119,6 +130,13 @@ function refreshBoundarySoon(herd: string) {
 }
 
 function onEvent(e: LiveEvent) {
+  handlers.get(e.type)?.forEach((f) => {
+    try {
+      f(e);
+    } catch (err) {
+      console.error(`live ${e.type} handler failed`, err);
+    }
+  });
   switch (e.type) {
     case "fix": {
       fixSubs.forEach((f) => f(e));

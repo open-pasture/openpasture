@@ -1,0 +1,89 @@
+/* The shell's plug-in points and shared parts. Tokens and patterns from app.css and base.css. */
+
+/* top bar: registered items, then "offline" */
+.tright{margin-left:auto;display:flex;align-items:center;gap:16px}
+
+/* map: the Draw menu, a tool's footer box, the Layers menu */
+.tools .menuwrap .btn.quiet{background:rgba(11,12,9,.82);backdrop-filter:blur(6px)}
+.tools .menu kbd{float:right;margin-left:24px;font-size:11px;line-height:20px}
+.toolfoot:empty{display:none}
+.toolfoot{position:absolute;top:calc(100% + 8px);left:0;width:320px;display:grid;gap:8px;padding:12px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.88);backdrop-filter:blur(6px);animation:fade .15s both}
+.layersmenu{position:absolute;left:12px;bottom:12px;z-index:2}
+.layersmenu .btn.quiet{background:rgba(11,12,9,.82);backdrop-filter:blur(6px)}
+.layersmenu .menu{top:auto;bottom:calc(100% + 6px)}
+.layersmenu .menu button{display:flex;align-items:center;gap:10px}
+
+/* herd panel: a herd menu entry opened under the name */
+.hitem:empty{display:none}
+.hitem{padding-top:12px;padding-bottom:12px;border-bottom:1px solid var(--line);flex:none;animation:fade .2s both}
+
+/* data: a registered block under its label */
+.dsec{border-bottom:1px solid var(--line)}
+.dsec>h2{font-size:14px;font-weight:500;padding:16px 16px 4px}
+.dsec:has(>.dsec-body:empty){display:none}
+
+/* settings: sections sharing a group; an empty group hides, and so does a row holding only it */
+.sgroup{display:grid;gap:16px}
+.srow .sgroup:not(:first-child){margin-top:16px}
+.sgroup:empty{display:none}
+.srow:has(>div>.sgroup:only-child:empty){display:none}
+
+/* check */
+.check{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--fg2);line-height:20px}
+.check .box{width:14px;height:14px;border:1px solid var(--line2);border-radius:3px;display:grid;place-items:center;flex:none;background:var(--bg2);transition:background .15s,border-color .15s}
+.check[aria-checked=true] .box{background:var(--grass);border-color:var(--grass);color:var(--ink)}
+.check:hover:not(:disabled) .box{border-color:var(--fg3)}
+.check:disabled{opacity:.45}
+
+/* number with its unit */
+.numf{display:inline-flex;align-items:center;gap:6px}
+.numf .input{text-align:right;padding-left:8px;padding-right:8px}
+.numf .mono{font-size:12px}
+
+/* file button, drop target */
+.filepick{display:inline-flex}
+.filepick.over .btn{border-color:var(--grass);color:var(--grass)}
+
+/* sparkline */
+.spark{display:inline-block;vertical-align:middle;overflow:visible}
+.spark path{fill:none;stroke:var(--grass);stroke-width:1.25;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.spark rect{fill:var(--grass)}
+
+/* column mapping, one line */
+.maprow{display:flex;align-items:center;gap:16px;overflow-x:auto;padding:2px 0}
+.maprow label{display:flex;align-items:center;gap:8px;flex:none}
+.maprow .mono.dim{font-size:12px}
+.maprow select.input{padding-right:28px}
+
+/* table: windowed, sortable, selectable */
+.tblbox{display:flex;flex-direction:column;gap:8px;height:100%;min-height:0}
+.tblw{flex:1;overflow:auto;min-height:0}
+.tblw .tbl{table-layout:fixed}
+.tblw .tbl td{overflow:hidden;text-overflow:ellipsis}
+.tblw .tbl tr.gap td{padding:0;border:0}
+.tblw .tbl th.sel,.tblw .tbl td.sel{padding-right:0}
+.tblw .tbl tr[aria-selected=true] td{background:var(--bg2)}
+.tblw .tbl tr.click{cursor:pointer}
+.tblw .tbl tr.click:hover td{background:var(--bg2);color:var(--fg)}
+.sorth{color:inherit;font:inherit;display:inline-flex;align-items:center;gap:8px}
+.sorth:hover,.sorth[data-dir]{color:var(--fg)}
+.sorth[data-dir]::after{content:"";width:4px;height:4px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:translateY(-1px) rotate(45deg)}
+.sorth[data-dir=asc]::after{transform:translateY(1px) rotate(-135deg)}
+.tblfilter{max-width:240px}
+
+/* print: white paper, no chrome */
+html.paper,html.paper body{background:#fff;color:#111;overflow:auto}
+html.paper #root{height:auto}
+.print{background:#fff;color:#111;min-height:100vh;max-width:960px;margin:0 auto;padding:32px 40px 64px}
+.printbar{display:flex;justify-content:flex-end;margin-bottom:24px}
+.print .btn.quiet{color:#111;border-color:#bbb}
+.print .tbl th{background:#fff;color:#555;border-color:#ccc}
+.print .tbl td,.print .tbl td:first-child{color:#111;border-color:#ddd}
+.print .dim{color:#666}
+@media print{
+  @page{margin:14mm}
+  html,body,#root{background:#fff!important;color:#000!important;height:auto!important;overflow:visible!important}
+  .printbar{display:none!important}
+  .print{padding:0;max-width:none;min-height:0}
+  .print .tbl th{position:static}
+}

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Map as MLMap } from "maplibre-gl";
-import { api, ApiError, authHeaders, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
+import { api, ApiError, downloadBlob, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
+import { DATA, dataSections, guarded, interleave } from "../registry";
 import { useStore } from "../store";
 import { C, createMap, fc, fitPolys, onLoad, setData } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
@@ -22,6 +23,11 @@ export function DataView() {
     const t = Date.now();
     return { from: new Date(t - SPAN[range]).toISOString(), to: new Date(t).toISOString() };
   }, [range]);
+  const added = dataSections.use().map((d) => ({
+    key: `section:${d.id}`, order: d.order,
+    // A section with nothing to show renders nothing, and its label goes with it (CSS).
+    node: <section className="dsec" aria-label={d.label}><h2>{d.label}</h2><div className="dsec-body">{guarded(d.id, <d.Section herdId={herdId} from={from} to={to} />)}</div></section>,
+  }));
 
   return (
     <div className="data">
@@ -31,10 +37,12 @@ export function DataView() {
         {sqlOk && <Menu align="right" trigger={<span className="btn quiet sm">Export</span>}
           items={EXPORTS.map(([table, format]) => ({ label: <span className="mono">{table}.{format}</span>, onSelect: () => download(table, format, from, to) }))} />}
       </div>
-      <Health herdId={herdId} from={from} to={to} />
-      <Replay herdId={herdId} from={from} to={to} />
-      <Pasture herdId={herdId} />
-      {sqlOk && <Sql />}
+      {interleave([
+        { key: "health", order: DATA.health, node: <Health herdId={herdId} from={from} to={to} /> },
+        { key: "replay", order: DATA.replay, node: <Replay herdId={herdId} from={from} to={to} /> },
+        { key: "pasture", order: DATA.pasture, node: <Pasture herdId={herdId} /> },
+        { key: "sql", order: DATA.sql, node: sqlOk && <Sql /> },
+      ], added)}
     </div>
   );
 }
@@ -44,15 +52,8 @@ const EXPORTS: [string, "csv" | "geojson" | "parquet"][] = [
   ["decisions", "csv"], ["paddocks", "geojson"], ["boundaries", "geojson"],
 ];
 
-async function download(table: string, format: "csv" | "geojson" | "parquet", from: string, to: string) {
-  const res = await fetch(api.exportUrl(table, format, { from, to }), { headers: authHeaders() });
-  if (!res.ok) return;
-  const url = URL.createObjectURL(await res.blob());
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${table}.${format}`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+function download(table: string, format: "csv" | "geojson" | "parquet", from: string, to: string) {
+  downloadBlob(api.exportUrl(table, format, { from, to }), `${table}.${format}`).catch(() => {});
 }
 
 // ---- health ----------------------------------------------------------------

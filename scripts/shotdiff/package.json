@@ -1,0 +1,17 @@
+{
+  "name": "openpasture-shotdiff",
+  "private": true,
+  "type": "module",
+  "description": "Dev tool: screenshot diffs and frame times of the openpasture UI in the installed Chrome.",
+  "scripts": {
+    "shotdiff": "bun shotdiff.ts"
+  },
+  "dependencies": {
+    "pixelmatch": "^7.1.0",
+    "playwright-core": "^1.56.1",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/pngjs": "^6.0.5"
+  }
+}

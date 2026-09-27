@@ -41,12 +41,21 @@ export function useKey(handler: (e: KeyboardEvent) => void, deps: unknown[]) {
   }, deps);
 }
 
-export function useHash(): [string, (h: string) => void] {
-  const [h, setH] = useState(() => location.hash.slice(2) || "map");
+// "#/herd/214" → ["herd", "214"]; "#/" → ["map", ""]. go("herd/214") navigates.
+export function parseHash(hash: string): [string, string] {
+  const path = hash.replace(/^#\/?/, "");
+  const i = path.indexOf("/");
+  const view = i < 0 ? path : path.slice(0, i);
+  return [view || "map", i < 0 ? "" : path.slice(i + 1)];
+}
+
+export function useHash(): [string, string, (h: string) => void] {
+  const [h, setH] = useState(() => location.hash);
   useEffect(() => {
-    const f = () => setH(location.hash.slice(2) || "map");
+    const f = () => setH(location.hash);
     window.addEventListener("hashchange", f);
     return () => window.removeEventListener("hashchange", f);
   }, []);
-  return [h, (v) => (location.hash = "/" + v)];
+  const [view, rest] = parseHash(h);
+  return [view, rest, (v) => (location.hash = "/" + v)];
 }

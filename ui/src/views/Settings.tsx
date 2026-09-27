@@ -1,8 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { api, type Brain, type BrainTest, type HostedKey, type NewHostedKey, type SecretName, type SecretStatus, type Settings } from "../api";
+import { guarded, interleave, SETTINGS, settingsSections, type SettingsSection } from "../registry";
+import { useCan } from "../store/me";
 import { Button, Copy, Input } from "../ui";
 
 export function SettingsView() {
+  // The built-in rows write owner-only settings and secrets.
+  const owner = useCan("owner");
   const [settings, setSettings] = useState<Settings>();
   const [secrets, setSecrets] = useState<SecretStatus[]>([]);
   const reload = async () => {
@@ -11,20 +15,40 @@ export function SettingsView() {
     setSecrets(k);
   };
   useEffect(() => {
-    void reload();
-  }, []);
+    if (owner) void reload();
+  }, [owner]);
+  const groups = useGroups();
   const isSet = (n: SecretName) => secrets.some((s) => s.name === n && s.set);
-  if (!settings) return <div className="settings" />;
+  if (owner && !settings) return <div className="settings" />;
 
-  return (
-    <div className="settings">
-      <Brains settings={settings} isSet={isSet} onSaved={reload} />
-      <Row label="Daily"><Daily key={settings.decision_time} settings={settings} onSaved={setSettings} /></Row>
-      <HostedKeys />
-      <Row label="Land"><Secret name="firecrawl_api_key" placeholder="Firecrawl key" set={isSet("firecrawl_api_key")} onSaved={reload} /></Row>
-      <Row label="Server"><Server settings={settings} onSaved={setSettings} /></Row>
-    </div>
-  );
+  // A registered group named like a built-in row joins it; the others are rows of their own.
+  const joined = (label: keyof typeof SETTINGS) => groups.find((g) => g.group === label)?.node;
+  const core = owner && settings ? [
+    { key: "Brain", order: SETTINGS.Brain, node: <Brains settings={settings} isSet={isSet} onSaved={reload} extra={joined("Brain")} /> },
+    { key: "Daily", order: SETTINGS.Daily, node: <Row label="Daily"><Daily key={settings.decision_time} settings={settings} onSaved={setSettings} />{joined("Daily")}</Row> },
+    { key: "Hosting", order: SETTINGS.Hosting, node: <HostedKeys extra={joined("Hosting")} /> },
+    { key: "Land", order: SETTINGS.Land, node: <Row label="Land"><Secret name="firecrawl_api_key" placeholder="Firecrawl key" set={isSet("firecrawl_api_key")} onSaved={reload} />{joined("Land")}</Row> },
+    { key: "Server", order: SETTINGS.Server, node: <Row label="Server"><Server settings={settings} onSaved={setSettings} />{joined("Server")}</Row> },
+  ] : [];
+  const builtIn = new Set(core.map((c) => c.key));
+  const added = groups
+    .filter((g) => !builtIn.has(g.group))
+    .map((g) => ({ key: `group:${g.group}`, order: g.order, node: <Row label={g.group}>{g.node}</Row> }));
+
+  return <div className="settings">{interleave(core, added)}</div>;
+}
+
+// Registered sections by group, in order; a group sits at its first section's order.
+function useGroups(): { group: string; order: number; node: ReactNode }[] {
+  const byGroup = new Map<string, SettingsSection[]>();
+  for (const s of settingsSections.use()) byGroup.set(s.group, [...(byGroup.get(s.group) ?? []), s]);
+  return [...byGroup].map(([group, list]) => ({
+    group,
+    order: list[0].order,
+    // Sections render straight into the group, so one with nothing to show leaves no trace and a
+    // group with nothing at all hides its row (CSS).
+    node: <div className="sgroup">{list.map((s) => guarded(s.id, <s.Section />))}</div>,
+  }));
 }
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -40,7 +64,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 const SECRET_LABEL: Partial<Record<SecretName, string>> = { compatible_base_url: "Base URL", hosted_url: "URL" };
 
-function Brains({ settings, isSet, onSaved }: { settings: Settings; isSet: (n: SecretName) => boolean; onSaved: () => void }) {
+function Brains({ settings, isSet, onSaved, extra }: { settings: Settings; isSet: (n: SecretName) => boolean; onSaved: () => void; extra?: ReactNode }) {
   const [brains, setBrains] = useState<Brain[] | null>(null);
   const [test, setTest] = useState<BrainTest | "running">();
   const load = () => api.brains().then(setBrains).catch(() => setBrains(null));
@@ -101,12 +125,13 @@ function Brains({ settings, isSet, onSaved }: { settings: Settings; isSet: (n: S
         );
       })}
     </ul>
+    {extra}
     </Row>
   );
 }
 
 // Keys this server issues so other servers can use it as their brain.
-function HostedKeys() {
+function HostedKeys({ extra }: { extra?: ReactNode }) {
   const [keys, setKeys] = useState<HostedKey[] | null>(null);
   const [made, setMade] = useState<NewHostedKey>();
   const load = () => api.hostedKeys().then(setKeys).catch(() => setKeys(null));
@@ -129,6 +154,7 @@ function HostedKeys() {
           <Button small onClick={async () => { setMade(await api.createHostedKey()); void load(); }}>New key</Button>
         </div>
       </div>
+      {extra}
     </Row>
   );
 }
