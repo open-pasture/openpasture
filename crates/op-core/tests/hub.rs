@@ -424,6 +424,30 @@ async fn features_insert_per_kind_and_filter_by_time() {
     assert!(features::get_feature(&ctx, &far.id).await.unwrap().is_some());
 }
 
+#[tokio::test]
+async fn features_stored_in_one_millisecond_list_in_insertion_order() {
+    let (_dir, ctx) = ctx().await;
+    let (p1, _) = farm(&ctx).await;
+    let mut stored = Vec::new();
+    for i in 0..24 {
+        let paddock = (i % 2 == 0).then_some(p1.id.as_str());
+        let f = feature(FeatureKind::Exclusion, FeatureGeometry::Polygon(vec![ring(15.0 * i as f64, 10.0, 10.0)]), paddock);
+        stored.push(insert_feature(&ctx, f).await.unwrap().id);
+    }
+    // One timestamp for every row: ids are random within a millisecond, so
+    // only the insertion order can break the tie.
+    sqlx::query("UPDATE features SET created_at = (SELECT MIN(created_at) FROM features)").execute(ctx.db()).await.unwrap();
+
+    let ids = |fs: Vec<features::MapFeature>| fs.into_iter().map(|f| f.id).collect::<Vec<_>>();
+    assert_eq!(ids(list_features(&ctx, None, None, None).await.unwrap()), stored);
+    assert_eq!(
+        ids(list_features(&ctx, Some(FeatureKind::Exclusion), Some(&p1.id), Some(time::now())).await.unwrap()),
+        stored.iter().step_by(2).cloned().collect::<Vec<_>>()
+    );
+    // Farm-wide (odd) and P1's (even) exclusions, interleaved as stored.
+    assert_eq!(ids(exclusions_for(&ctx, &poly(10.0, 10.0, 200.0), time::now()).await.unwrap()), stored);
+}
+
 // Messages
 
 fn out(key: &str, channel: &str, to: &str) -> Outbound {

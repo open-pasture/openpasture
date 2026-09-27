@@ -128,10 +128,16 @@ pub fn feature_from_row(r: &SqliteRow) -> anyhow::Result<MapFeature> {
     })
 }
 
+/// Stored order. `created_at` has millisecond precision and ULIDs are random
+/// within one millisecond, so ties go to SQLite's rowid (insertion order).
+const ORDER: &str = " ORDER BY created_at, rowid";
+
 const ACTIVE_AT: &str = "(active_from IS NULL OR active_from <= ?) AND (active_until IS NULL OR active_until > ?)";
 
-/// Features, oldest first, optionally of one kind and one paddock. `at`: only
-/// those active at that time; `None`: all.
+/// Features in the order they were stored (`created_at`, then insertion order
+/// for rows stored in the same millisecond, where ids don't sort by time),
+/// optionally of one kind and one paddock. `at`: only those active at that
+/// time; `None`: all.
 pub async fn list_features(ctx: &Ctx, kind: Option<FeatureKind>, paddock_id: Option<&str>, at: Option<DateTime<Utc>>) -> anyhow::Result<Vec<MapFeature>> {
     let mut sql = "SELECT * FROM features WHERE 1 = 1".to_owned();
     if kind.is_some() {
@@ -144,7 +150,7 @@ pub async fn list_features(ctx: &Ctx, kind: Option<FeatureKind>, paddock_id: Opt
         sql.push_str(" AND ");
         sql.push_str(ACTIVE_AT);
     }
-    sql.push_str(" ORDER BY created_at, id");
+    sql.push_str(ORDER);
     let mut q = sqlx::query(&sql);
     if let Some(k) = kind {
         q = q.bind(k.as_db());
@@ -165,12 +171,13 @@ pub async fn get_feature(ctx: &Ctx, id: &str) -> anyhow::Result<Option<MapFeatur
 }
 
 /// Farm-wide exclusions plus those of every paddock `area` touches, active at `at`.
+/// Same order as [`list_features`].
 pub async fn exclusions_for(ctx: &Ctx, area: &Polygon, at: DateTime<Utc>) -> anyhow::Result<Vec<MapFeature>> {
     let target = to_geo(area);
     let touched: Vec<String> = ctx.store().list_paddocks().await?.into_iter().filter(|p| to_geo(&p.geometry).intersects(&target)).map(|p| p.id).collect();
     let marks = vec!["?"; touched.len()].join(", ");
     let scope = if touched.is_empty() { "paddock_id IS NULL".to_owned() } else { format!("(paddock_id IS NULL OR paddock_id IN ({marks}))") };
-    let sql = format!("SELECT * FROM features WHERE kind = 'exclusion' AND {scope} AND {ACTIVE_AT} ORDER BY created_at, id");
+    let sql = format!("SELECT * FROM features WHERE kind = 'exclusion' AND {scope} AND {ACTIVE_AT}{ORDER}");
     let mut q = sqlx::query(&sql);
     for p in &touched {
         q = q.bind(p);
