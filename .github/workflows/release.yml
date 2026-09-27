@@ -209,6 +209,9 @@ jobs:
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
+        env:
+          # No build-record artifact; the release job has no use for it.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -271,9 +274,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Only the release files: the Docker jobs also leave digest files and
+      # build-record artifacts in this run, and the build records can't be
+      # extracted by download-artifact.
       - uses: actions/download-artifact@v4
         with:
           path: assets
+          pattern: '{macos-desktop,server-*}'
           merge-multiple: true
       - name: Checksums
         working-directory: assets
