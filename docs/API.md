@@ -923,6 +923,76 @@ touches either table. Points are written in transactions of 5,000 so a large fil
 database long. After a commit or a delete: `animals_changed` for each herd concerned.
 
 <!-- @I -->
+
+## Reports (op-reports)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/reports` | | `{ id, title }[]` |
+| GET | `/api/reports/:id` | `from?&to?&herd_id?&format=json\|csv` | `ReportDoc`, or one CSV file |
+| GET PUT | `/api/reports/settings` | merge patch of `ReportInputs` | `ReportInputs` |
+| GET POST | `/api/feed-log` | `herd_id?&from?&to?` / `{ herd_id, date, kg_dm, kind?, note? }` | `FeedEntry[]` (newest first) / `FeedEntry` |
+| PATCH DELETE | `/api/feed-log/:id` | partial | `FeedEntry` / 204 |
+| GET | `/api/leases` | | `Lease[]` (leases of existing paddocks) |
+| GET PUT DELETE | `/api/leases/:paddock_id` | `{ landowner, rate_per, rate_amount, currency?, season_from?, season_to?, notes? }` | `Lease` / `Lease` / 204 |
+
+```ts
+ReportDoc     { id, title, farm, from: "YYYY-MM-DD", to: "YYYY-MM-DD", herd_id?, generated_at,
+                header: [label, value][],          // Farm, Operator, FSA farm, Dates, Herd: only those known
+                sections: ReportSection[], notes: string[] /* method lines */, signatures: string[] /* signature-line labels */ }
+ReportSection { title, columns: { key, label, unit?, decimals? /* places a number column prints with */ }[],
+                rows: (string|number|null)[][], totals?: (string|number|null)[] }
+ReportInputs  { operator?, fsa_farm?, au: { cow: 1.0, bull: 1.35, pair: 1.3, weaned_calf: 0.5 },
+                herds: Record<herd_id, { mean_weight_kg?, intake_pct: 2.5, mix?: { cows, bulls, calves, pairs: bool } }> }
+FeedEntry     { id /* fed_… */, herd_id, date: "YYYY-MM-DD", kg_dm, kind /* default "hay" */, note?, created_by?: Actor, created_at }
+Lease         { paddock_id, landowner, rate_per: "acre_season"|"head_day"|"au_day"|"aum"|"pair_month", rate_amount,
+                currency /* ISO 4217, default "USD" */, season_from?, season_to?, notes?, updated_at }
+```
+
+Report ids: `paddock_record` (Paddock grazing record), `nrcs_528` (NRCS 528 grazing record),
+`organic_season` (Organic grazing season), `lease_head_days` (Lease head-days). `from`/`to` are
+farm-local days, both included; the default is January 1 of `to`'s year to today. A report never
+counts past now. Values are in the farm's units (`settings.units`), rounded; each column's `unit`
+names it (`ac`/`ha`, `AU/ac`/`AU/ha`, `lb`/`kg`, `%`, or a currency). `null` is an empty cell.
+
+CSV (`format=csv`, `text/csv`, attachment `<id>-<from>-<to>.csv`): the title row and the header
+rows (`label,value`), a blank row (one empty cell), then each section: its title row, the column row (`Label (unit)`),
+the rows, the totals row (first cell `Total`), a blank row; then `Notes` and one note per row.
+Numbers have no thousands separators and keep their column's `decimals`.
+
+History comes from triggers, not the API: `herd_history` records each herd's count and paddock
+whenever either changes (and its creation and deletion), `paddock_geometry_history` each paddock's
+shape, area and name. On upgrade both are backfilled once: occupancy from applied MOVE decisions
+(the time the activity log says the move was applied, else the response or creation time; where a
+herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
+that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
+one paddock; head is the count on the day in and head-days follow every count change inside it.
+Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
+any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
+exists. Animal units per head: the herd's mix with the `au` factors when a cattle herd has one
+(with `pairs` a cow and her calf are one head at the pair factor), else `cattle 1.0`, `sheep 0.2`,
+`goats 0.15`.
+
+- `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
+  head-days, AU-days, stocking density, rest before in), then a line per paddock.
+- `nrcs_528`: field, FSA farm/tract/field (only those present; one shared FSA farm goes in the
+  header), area, dates in and out, kind and number, AU, days, AUD, rest period; signature lines
+  Operator and NRCS planner. Columns openpasture doesn't measure are left out.
+- `organic_season`: days on pasture (farm days the herd was in a paddock) against 120; dry matter
+  from pasture against 30 % only for herds with `mean_weight_kg` whose feed log has entries in the
+  season's first and last week (a 0 kg entry counts): needed = head-days × weight × `intake_pct`,
+  from pasture = needed − the feed log's dry matter.
+- `lease_head_days`: a section per landowner, a row per leased paddock: dates (the lease season
+  inside the report's dates), head-days, AU-days, AUM (AU-days ÷ 30.4), pair-months (pairs × days ÷
+  30.4, when a herd's mix has pairs), rate and amount. `acre_season` is a flat rent per area for the
+  season, owed when the season meets the report's dates; its `rate_amount` is per hectare, like
+  every area in the API (the UI shows and takes it per acre on imperial farms). Signature lines:
+  Operator and each landowner.
+
+The feed log's `kg_dm` is dry matter in kg; `date` is the farm-local day. `POST /api/feed-log` is
+open to hands; editing and deleting entries, leases and report settings need a manager.
+MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
+
 <!-- @B -->
 <!-- @G -->
 <!-- @P -->

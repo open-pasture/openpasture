@@ -20,6 +20,7 @@ import "./k-animals";
 // @K-files
 import "./k-files";
 // @I
+import "./i";
 // @B
 // @G
 // @P

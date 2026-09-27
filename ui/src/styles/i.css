@@ -1,0 +1,68 @@
+/* Reports (stream I): Data > Reports rows, the landowner line on the paddock sheet, the
+   printed report. Tokens and patterns from base.css and app.css. */
+
+/* Data > Reports: one sentence row per report */
+.reports{display:grid;padding:4px 0 12px}
+.rrow{padding:4px 16px}
+.rline{display:flex;align-items:center;gap:12px;min-height:36px}
+.rline.wrap{flex-wrap:wrap;row-gap:8px}
+.rname{font-size:14px;color:var(--fg);min-width:220px;text-align:left;line-height:20px}
+button.rname{color:var(--fg2)}
+button.rname:hover,button.rname[aria-expanded=true]{color:var(--fg)}
+.rdates{display:inline-flex;align-items:center;gap:8px}
+.rdates .input{width:150px}
+.racts{display:inline-flex;align-items:center;gap:4px}
+.rline .err{font-size:11.5px}
+.rmore{display:grid;gap:10px;padding:8px 0 16px 232px;animation:fade .2s both}
+.rfield{display:inline-flex;align-items:center;gap:8px;font-size:12px}
+.rfield .dim{font-family:var(--mono);font-size:12px}
+.rherd{font-size:13px;min-width:88px}
+.rmore .check{font-size:12px}
+.feedlog{display:grid;gap:8px;justify-items:start}
+.feedlog .tbl{width:auto}
+.feedlog .tbl th,.feedlog .tbl td{padding:6px 24px 6px 0;position:static}
+.feedlog .tbl td.note{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.feedlog .tbl td.del{padding-right:0}
+.feedlog .tbl .num,.report .tbl .num{text-align:right}
+
+/* paddock sheet: landowner, rate, season (fits the 232 px inside the sheet) */
+.lease{display:grid;gap:8px;min-width:0}
+.lease .lrow{display:flex;align-items:center;gap:6px;min-width:0}
+.lease .lrow .input{font-size:12px;padding:5px 8px;min-width:0}
+.lease .rate{width:64px;flex:none;text-align:right}
+.lease .cur{width:44px;flex:none;padding-left:6px;padding-right:6px;text-transform:uppercase}
+.lease select.input{flex:1 1 0;width:0;padding-right:22px;background-position:calc(100% - 12px) 55%,calc(100% - 8px) 55%}
+.lease .lrow .input[type=date]{flex:1 1 0;width:0;padding:5px 4px 5px 6px;font-size:11.5px}
+.lease input[type=date]::-webkit-calendar-picker-indicator{margin:0;padding:0;width:10px}
+.lease .err{font-size:11.5px}
+.kv.lease li b{white-space:normal;text-align:right}
+
+/* printed report: white paper */
+.report{font-size:13px}
+.report h1{font-size:20px;font-weight:600;line-height:28px;margin-bottom:16px}
+.report .rhead{display:grid;grid-template-columns:max-content 1fr;gap:4px 24px;margin:0 0 8px}
+.report .rhead>div{display:contents}
+.report .rhead dt{color:#666}
+.report .rhead dd{margin:0}
+.report .rsec{margin-top:28px;overflow-x:auto}
+.report h2{font-size:14px;font-weight:600;margin-bottom:8px}
+.report .tbl th,.report .tbl td{padding:6px 12px 6px 0;white-space:nowrap}
+.report .tbl th{white-space:normal;vertical-align:bottom;line-height:14px;min-width:3.5em}
+.report .tbl th:last-child,.report .tbl td:last-child{padding-right:0}
+.report .tbl th .unit{color:#999}
+.report .tbl tfoot td{font-weight:600;border-top:1px solid #999;border-bottom:0}
+.report .rnotes{margin-top:28px;display:grid;gap:4px;font-size:11.5px;line-height:17px;color:#555}
+.report .sigs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:48px 56px;margin-top:56px;break-inside:avoid}
+.report .sig{display:grid;grid-template-columns:1fr 132px;column-gap:16px;row-gap:6px;font-size:12px;color:#555}
+.report .sig i{display:block;height:28px;border-bottom:1px solid #111}
+/* Reports print across the page: the grazing tables are wide. Only these pages (named page),
+   so other print pages keep the printer's orientation. */
+@page report{size:landscape;margin:12mm}
+@media print{
+  .report{page:report}
+  .report .rsec{overflow:visible;break-inside:auto}
+  .report h2{break-after:avoid}
+  .report .tbl{font-size:10.5px}
+  .report .tbl th,.report .tbl td{padding:4px 8px 4px 0}
+  .report .tbl tr{break-inside:avoid}
+}
