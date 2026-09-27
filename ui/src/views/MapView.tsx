@@ -14,6 +14,7 @@ import { DRAW_ORDER, tools, type ToolCtx, type ToolItem } from "../map/tools";
 import { LayersMenu } from "../map/LayersMenu";
 import { interleave, PADDOCK_SHEET, paddockSheet, sectionNodes, useSections, views } from "../registry";
 import { Button, Input, Menu, Sheet } from "../ui";
+import { useUnits } from "../units";
 import { typing, useKey } from "../util";
 import { HerdPanel } from "./HerdPanel";
 
@@ -321,6 +322,7 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
   const manage = useCan("manager");
   const props = { paddock: p, herdId };
   const added = sectionNodes(useSections(paddockSheet, props), props);
+  const u = useUnits();
   const [name, setName] = useState(p.name);
   const [notes, setNotes] = useState(p.notes ?? "");
   const save = async () => {
@@ -347,7 +349,7 @@ function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: 
         <Input className="title" value={name} onChange={(e) => setName(e.target.value)} onBlur={save} aria-label="Name" readOnly={!manage} tabIndex={manage ? undefined : -1} />
       </form>
     ) },
-    { key: "facts", order: PADDOCK_SHEET.facts, node: <p className="facts mono">{p.area_ha.toFixed(1)} ha  {p.status}</p> },
+    { key: "facts", order: PADDOCK_SHEET.facts, node: <p className="facts mono">{u.area(p.area_ha)}  {p.status}</p> },
     { key: "notes", order: PADDOCK_SHEET.notes, node: (manage || notes) && <AutoText value={notes} onChange={setNotes} onBlur={saveNotes} placeholder="Notes" aria-label="Notes" readOnly={!manage} /> },
     { key: "actions", order: PADDOCK_SHEET.actions, node: manage && (
       <div className="acts">

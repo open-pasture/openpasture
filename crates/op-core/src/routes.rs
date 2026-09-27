@@ -86,6 +86,9 @@ async fn create_farm(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewFarm>) ->
         crate::tz::at(body.center).or_else(|| body.timezone.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())).unwrap_or_else(|| "UTC".to_owned());
     let farm = Farm { id: id::new_id(id::FARM), name: clean_name(&body.name, "The farm")?, timezone, center: body.center, created_at: time::now() };
     ctx.store().insert_farm(&farm).await?;
+    // A farm in a US zone reads acres, feet and pounds from the start. Only here:
+    // a farm's saved units never change on their own afterwards.
+    ctx.update_settings(&serde_json::json!({ "units": crate::units::units_for_timezone(&farm.timezone) })).await?;
     Ok((StatusCode::CREATED, Json(farm)))
 }
 
