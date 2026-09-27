@@ -397,6 +397,34 @@ mod tests {
     }
 
     #[test]
+    fn cuts_and_unions_do_not_depend_on_winding() {
+        let rev = |r: &[LonLat]| r.iter().rev().copied().collect::<Vec<_>>();
+        let area = |r: &[LonLat]| crate::Polygon::from_ring(r.to_vec()).area_ha();
+        let pond_edge = vec![[-92.392, 38.124], [-92.389, 38.124], [-92.389, 38.126], [-92.392, 38.126]];
+        let pond = vec![[-92.396, 38.124], [-92.394, 38.124], [-92.394, 38.126]];
+        let cut = area(&subtract_ring(&north(), &pond_edge).unwrap().unwrap());
+        let merged = area(&union_rings(&[home(), north()]).unwrap());
+        // The shared fence line makes the union grow the clip ring by 0.5 m.
+        let both = area(&home()) + area(&north());
+        assert!(merged >= both && merged < both + 0.5, "{merged} vs {both}");
+        for b in [north(), rev(&north())] {
+            for e in [pond_edge.clone(), rev(&pond_edge)] {
+                let c = subtract_ring(&b, &e).unwrap().unwrap();
+                assert!((area(&c) - cut).abs() < 1e-6, "{} vs {cut} ha", area(&c));
+                assert!(!point_in_ring([-92.3905, 38.125], &c));
+                assert!(point_in_ring([-92.395, 38.125], &c));
+            }
+            for h in [pond.clone(), rev(&pond)] {
+                assert_eq!(subtract_ring(&b, &h), Err(RingError::Hole));
+            }
+            for a in [home(), rev(&home())] {
+                let m = union_rings(&[a, b.clone()]).unwrap();
+                assert!((area(&m) - merged).abs() < 1e-6, "{} vs {merged} ha", area(&m));
+            }
+        }
+    }
+
+    #[test]
     fn exclusion_covering_everything_fails() {
         let big = vec![[-93.0, 38.0], [-92.0, 38.0], [-92.0, 39.0], [-93.0, 39.0]];
         assert!(subtract_ring(&north(), &big).is_err());

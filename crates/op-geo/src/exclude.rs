@@ -308,6 +308,44 @@ mod tests {
     }
 
     #[test]
+    fn placements_and_area_do_not_depend_on_winding() {
+        // Reversed about the first vertex, so the projection origin stays put.
+        let rev = |r: &[LonLat]| -> Vec<LonLat> { std::iter::once(r[0]).chain(r[1..].iter().rev().copied()).collect() };
+        let outer = ring(&[[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]]);
+        let own_hole = ring(&[[20.0, 20.0], [50.0, 20.0], [50.0, 50.0], [20.0, 50.0]]);
+        // Inside (a hole), across the east edge (a cut), 8 m from the north edge (a join).
+        let ex = [rect(100.0, 100.0, 30.0, 30.0), rect(180.0, 20.0, 40.0, 40.0), rect(60.0, 172.0, 20.0, 20.0)];
+        let want = vec![Placement::Hole, Placement::Cut, Placement::Join];
+        let base = shape_target(&Polygon::from_rings(outer.clone(), [own_hole.clone()]), &ex, &CollarLimits::V0, 5.0);
+        assert_eq!(base.placements, want);
+        for flip_outer in [false, true] {
+            for flip_hole in [false, true] {
+                for flip_ex in [false, true] {
+                    let target =
+                        Polygon::from_rings(if flip_outer { rev(&outer) } else { outer.clone() }, [if flip_hole { rev(&own_hole) } else { own_hole.clone() }]);
+                    let ex: Vec<Polygon> = ex.iter().map(|e| if flip_ex { Polygon::from_ring(rev(&e.outer_ring())) } else { e.clone() }).collect();
+                    let s = shape_target(&target, &ex, &CollarLimits::V0, 5.0);
+                    let label = format!("outer flipped {flip_outer}, hole {flip_hole}, exclusions {flip_ex}");
+                    assert_eq!(s.placements, want, "{label}");
+                    valid(&s, &CollarLimits::V0);
+                    assert_eq!(s.geometry.coordinates.len(), 3, "{label}: own hole and the new one");
+                    assert!(
+                        (s.geometry.area_ha() - base.geometry.area_ha()).abs() < 1e-4,
+                        "{label}: {} vs {} ha",
+                        s.geometry.area_ha(),
+                        base.geometry.area_ha()
+                    );
+                    assert!(s.geometry.area_ha() < target.area_ha() && s.geometry.area_ha() > 3.0, "{label}: {} ha", s.geometry.area_ha());
+                    for p in [at(35.0, 35.0), at(115.0, 115.0), at(190.0, 40.0), at(70.0, 196.0)] {
+                        assert!(!s.geometry.contains(p), "{label}: {p:?} excluded");
+                    }
+                    assert!(s.geometry.contains(at(150.0, 150.0)), "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn misses_and_covers_are_dropped() {
         let s = shape_target(&field(), &[rect(400.0, 400.0, 20.0, 20.0), rect(-50.0, -50.0, 400.0, 400.0)], &CollarLimits::V0, 5.0);
         assert_eq!(s.placements, vec![Placement::Drop, Placement::Drop]);

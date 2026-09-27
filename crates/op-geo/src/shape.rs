@@ -1377,6 +1377,37 @@ mod tests {
     }
 
     #[test]
+    fn fit_shrinks_and_grows_the_right_rings_in_every_winding() {
+        // Reversed about the first vertex, so the projection origin stays put.
+        let rev = |r: &[LonLat]| -> Vec<LonLat> { std::iter::once(r[0]).chain(r[1..].iter().rev().copied()).collect() };
+        let outer = circle(100.0, 100.0, 95.0, 200);
+        let holes = [circle(100.0, 100.0, 30.0, 90), circle(40.0, 100.0, 12.0, 60)];
+        let probe = grid(80, 240.0);
+        let mut areas = Vec::new();
+        for flip_outer in [false, true] {
+            for flips in [[false, false], [true, false], [false, true], [true, true]] {
+                let mut rings = vec![if flip_outer { rev(&outer) } else { outer.clone() }];
+                rings.extend(holes.iter().zip(flips).map(|(h, f)| if f { rev(h) } else { h.clone() }));
+                let p = poly(rings);
+                let f = fit(&p, &CollarLimits::V0);
+                v0(&f).unwrap();
+                assert_eq!(f.coordinates.len(), 3);
+                assert!(covered_by(&f, &p, &probe), "fenced area only shrinks (outer flipped {flip_outer}, holes {flips:?})");
+                for k in 1..3 {
+                    assert!(
+                        covered_by(&Polygon::from_ring(p.coordinates[k].clone()), &Polygon::from_ring(f.coordinates[k].clone()), &probe),
+                        "hole {k} only grows"
+                    );
+                }
+                assert!(f.area_ha() <= p.area_ha() && f.area_ha() > p.area_ha() * 0.97, "{} of {} ha", f.area_ha(), p.area_ha());
+                areas.push(f.area_ha());
+            }
+        }
+        let (lo, hi) = areas.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), a| (lo.min(*a), hi.max(*a)));
+        assert!(hi - lo < 0.01 * hi, "fitted areas agree across windings: {areas:?}");
+    }
+
+    #[test]
     fn fit_for_legacy_drops_holes() {
         let p = poly(vec![field(), rect(80.0, 80.0, 40.0, 40.0)]);
         let f = fit(&p, &CollarLimits::LEGACY);
