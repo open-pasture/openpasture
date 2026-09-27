@@ -69,8 +69,9 @@ append-only and large: one collar at 1 Hz is 86,400 fixes a day.
   by farm and day. A researcher can open them directly in Python, R or DuckDB.
 - **DataFusion** runs analytics across both, and backs an SQL console in the
   app. It is pure Rust, so the single binary stays small and builds fast.
-- The domain model follows `openpasture-agent-kit/docs/domain.md`: explicit
-  entities plus an append-only activity event log with targets.
+- The domain model follows the kit's
+  [`docs/domain.md`](https://github.com/open-pasture/openpasture-agent-kit/blob/archive/decision-layer/docs/domain.md):
+  explicit entities plus an append-only activity event log with targets.
 - The Convex store in the kit is not carried over. The hosted product uses the
   same SQLite and Parquet layout per farm.
 
