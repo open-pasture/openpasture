@@ -234,6 +234,14 @@ async fn backfill_rebuilds_moves_from_applied_decisions() {
         // Not moves: a rejected proposal and a STAY.
         "INSERT INTO decisions (id, herd_id, source, status, action, to_paddock_id, created_at) VALUES ('dec_3', 'herd_1', 'brain', 'rejected', 'MOVE', 'pad_1', '2025-06-25T12:00:00.000Z')",
         "INSERT INTO decisions (id, herd_id, source, status, action, created_at) VALUES ('dec_4', 'herd_1', 'brain', 'applied', 'STAY', '2025-06-26T12:00:00.000Z')",
+        // Heifers: one farmer-drawn move from P4 into P2. The farmer's move says nothing about
+        // where the herd came from; P4's grazed_until was set by that move.
+        "INSERT INTO paddocks (id, name, geometry, area_ha, grazed_until, created_at) VALUES
+            ('pad_4', 'P4', '{\"type\":\"Polygon\",\"coordinates\":[[[-93.62,42.0336],[-93.615,42.0336],[-93.615,42.0372],[-93.62,42.0372],[-93.62,42.0336]]]}', 16.5,
+             '2025-06-15T12:00:00.004Z', '2025-01-01T00:00:00.000Z')",
+        "INSERT INTO herds (id, name, species, count, paddock_id, created_at) VALUES ('herd_2', 'Heifers', 'cattle', 40, 'pad_2', '2025-06-02T12:00:00.000Z')",
+        "INSERT INTO decisions (id, herd_id, source, status, action, to_paddock_id, inputs, created_at, responded_at)
+            VALUES ('dec_5', 'herd_2', 'farmer', 'applied', 'MOVE', 'pad_2', '{}', '2025-06-15T12:00:00.000Z', '2025-06-15T12:00:00.000Z')",
     ];
     for s in sql {
         sqlx::query(s).execute(&pool).await.unwrap();
@@ -242,17 +250,21 @@ async fn backfill_rebuilds_moves_from_applied_decisions() {
 
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let rows: Vec<(String, i64, Option<String>, String)> =
-        sqlx::query_as("SELECT at, count, paddock_id, source FROM herd_history ORDER BY id").fetch_all(ctx.db()).await.unwrap();
+        sqlx::query_as("SELECT at, count, paddock_id, source FROM herd_history WHERE herd_id = 'herd_1' ORDER BY id").fetch_all(ctx.db()).await.unwrap();
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert_eq!(rows[0], ("2025-06-01T12:00:00.000Z".into(), 250, Some("pad_1".into()), "backfill".into()));
     assert_eq!(rows[1], ("2025-06-10T12:00:00.000Z".into(), 250, Some("pad_2".into()), "backfill".into()));
     assert_eq!(rows[2], ("2025-06-20T12:00:00.000Z".into(), 250, Some("pad_3".into()), "backfill".into()));
     assert_eq!((rows[3].1, rows[3].2.as_deref(), rows[3].3.as_str()), (250, Some("pad_3"), "install"));
+    let heifers: Vec<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT at, paddock_id, source FROM herd_history WHERE herd_id = 'herd_2' ORDER BY id").fetch_all(ctx.db()).await.unwrap();
+    assert_eq!(heifers[0], ("2025-06-02T12:00:00.000Z".into(), Some("pad_4".into()), "backfill".into()), "{heifers:?}");
+    assert_eq!(heifers[1], ("2025-06-15T12:00:00.000Z".into(), Some("pad_2".into()), "backfill".into()));
     let shapes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paddock_geometry_history WHERE source = 'backfill'").fetch_one(ctx.db()).await.unwrap();
-    assert_eq!(shapes, 3);
+    assert_eq!(shapes, 4);
 
     let app = App::with(dir, ctx);
-    let doc = app.report("paddock_record", "from=2025-06-01&to=2025-06-30").await;
+    let doc = app.report("paddock_record", "from=2025-06-01&to=2025-06-30&herd_id=herd_1").await;
     let events = &doc["sections"][0];
     assert_eq!(column(events, "paddock"), [json!("P1"), json!("P2"), json!("P3")]);
     assert_eq!(column(events, "days"), [json!(9.0), json!(10.0), json!(10.7)]);
@@ -260,6 +272,9 @@ async fn backfill_rebuilds_moves_from_applied_decisions() {
     let today = chrono::Utc::now().with_timezone(&chrono_tz::America::Chicago).date_naive();
     let note = format!("Head counts before {today} are the count on that day; herd history starts then.");
     assert!(doc["notes"].as_array().unwrap().contains(&json!(note)), "{}", doc["notes"]);
+    let doc = app.report("paddock_record", "from=2025-06-01&to=2025-06-30&herd_id=herd_2").await;
+    assert_eq!(column(&doc["sections"][0], "paddock"), [json!("P4"), json!("P2")]);
+    assert_eq!(column(&doc["sections"][0], "days")[0], json!(13.0));
 }
 
 #[tokio::test]

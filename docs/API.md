@@ -510,15 +510,16 @@ counts past now. Values are in the farm's units (`settings.units`), rounded; eac
 names it (`ac`/`ha`, `AU/ac`/`AU/ha`, `lb`/`kg`, `%`, or a currency). `null` is an empty cell.
 
 CSV (`format=csv`, `text/csv`, attachment `<id>-<from>-<to>.csv`): the title row and the header
-rows (`label,value`), a blank line, then each section: its title row, the column row (`Label (unit)`),
-the rows, the totals row (first cell `Total`), a blank line; then `Notes` and one note per row.
+rows (`label,value`), a blank row (one empty cell), then each section: its title row, the column row (`Label (unit)`),
+the rows, the totals row (first cell `Total`), a blank row; then `Notes` and one note per row.
 Numbers have no thousands separators and keep their column's `decimals`.
 
 History comes from triggers, not the API: `herd_history` records each herd's count and paddock
 whenever either changes (and its creation and deletion), `paddock_geometry_history` each paddock's
 shape, area and name. On upgrade both are backfilled once: occupancy from applied MOVE decisions
-(the time the activity log says the move was applied, else the response or creation time), head
-counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
+(the time the activity log says the move was applied, else the response or creation time; where a
+herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
+that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
 one paddock; head is the count on the day in and head-days follow every count change inside it.
 Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
