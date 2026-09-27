@@ -6,6 +6,7 @@ import { createElement, lazy, Suspense, type ComponentType } from "react";
 import { overlays, type OverlayHandle } from "../../map/overlays";
 import { herdPanel, HERD_PANEL, toolFooter, type ToolFooterProps } from "../../registry";
 import { store } from "../../store";
+import { fenced } from "../../store/boundary";
 import { reloadSoon, sState } from "../../store/s";
 import "../../styles/s.css";
 
@@ -34,7 +35,12 @@ const Footer = lazy(() => import("./Footer").then((m) => ({ default: m.ScheduleF
 
 // Right under the decision: the schedule is what the day's call is about.
 herdPanel.register({ id: "s-schedule", order: HERD_PANEL.decision + 5, Section: later(Panel) });
-toolFooter.register({ id: "s-schedule", order: 50, minRole: "manager", when: (p: ToolFooterProps) => p.tool === "strip", Section: later(Footer) });
+toolFooter.register({
+  id: "s-schedule", order: 50, minRole: "manager",
+  // A schedule starts from where the herd is fenced now.
+  when: (p: ToolFooterProps) => p.tool === "strip" && fenced(store.get().boundary[p.herdId]),
+  Section: later(Footer),
+});
 
 overlays.register({
   id: "s-rail",

@@ -7,6 +7,10 @@ import type { AckStatus, Boundary, BoundaryStatus } from "../api";
 // servers without `staged` have only that.
 export const nextStaged = (b?: BoundaryStatus): Boundary | undefined => b?.staged?.[0] ?? b?.pending;
 
+// The herd has a boundary in effect (not only one staged for later): what a strip schedule
+// starts from, so the Schedule footer shows only then (the server refuses one before).
+export const fenced = (b?: BoundaryStatus) => !!b?.active;
+
 export interface AckLine {
   version: number;
   // Collars of `of` that apply it (hold it, when `held`).

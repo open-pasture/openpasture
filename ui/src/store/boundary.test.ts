@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Ack, Boundary, BoundaryStatus, Polygon, SlotCount } from "../api";
-import { ackLine, nextStaged } from "./boundary";
+import { ackLine, fenced, nextStaged } from "./boundary";
 
 const square = (x: number): Polygon => ({ type: "Polygon", coordinates: [[[x, 0], [x + 1, 0], [x + 1, 1], [x, 1], [x, 0]]] });
 const bnd = (version: number, effective_at?: string): Boundary => ({
@@ -58,4 +58,11 @@ describe("a herd's boundaries on the map and in the panel", () => {
     expect(ackLine({ active: bnd(3), acks: [] }, new Set())).toBeUndefined();
   });
 
+  test("a schedule can start once the herd is fenced, not before and not from a boundary only staged", () => {
+    const later = bnd(1, "2026-09-28T12:00:00Z");
+    expect(fenced(undefined)).toBe(false);
+    expect(fenced({ acks: [] })).toBe(false);
+    expect(fenced({ pending: later, staged: [later], acks: [] })).toBe(false);
+    expect(fenced(schedule)).toBe(true);
+  });
 });
