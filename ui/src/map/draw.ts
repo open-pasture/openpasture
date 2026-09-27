@@ -1,21 +1,40 @@
 import type { Map as MLMap } from "maplibre-gl";
-import { TerraDraw, TerraDrawPolygonMode, TerraDrawSelectMode, type GeoJSONStoreFeatures } from "terra-draw";
+import {
+  TerraDraw,
+  TerraDrawFreehandMode,
+  TerraDrawLineStringMode,
+  TerraDrawPointMode,
+  TerraDrawPolygonMode,
+  TerraDrawRectangleMode,
+  TerraDrawSelectMode,
+  type GeoJSONStoreFeatures,
+} from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
-import type { LonLat, Polygon } from "../api";
+import type { Polygon } from "../api";
 import { C } from "./base";
 
-// Two polygon modes that differ only in colour: "paddock" in fg, "boundary" in grass.
-// "edit" is the select mode, with vertices draggable and midpoints to add more.
+export { current, currentGeometry, polygonOf, type DrawGeometry } from "./drawn";
 
-export type DrawKind = "paddock" | "boundary";
+// Drawing modes. Polygons: "paddock" in fg, "boundary" in grass, "exclusion" in red,
+// "rect" a dragged rectangle. "point" and "line" for map features, "lasso" a freehand
+// shape dragged around animals. "edit" is the select mode, with vertices draggable and
+// midpoints to add more. A mode only shows when a tool uses it.
 
-const polyStyles = (c: `#${string}`) => ({
+export type DrawKind = "paddock" | "boundary" | "exclusion" | "rect" | "point" | "line" | "lasso";
+
+type Hex = `#${string}`;
+
+const polyStyles = (c: Hex) => ({
   fillColor: c, fillOpacity: 0.08, outlineColor: c, outlineWidth: 1.5,
-  closingPointColor: c, closingPointWidth: 4, closingPointOutlineColor: C.ink as `#${string}`, closingPointOutlineWidth: 1,
-  coordinatePointColor: c, coordinatePointWidth: 3, coordinatePointOutlineColor: C.ink as `#${string}`, coordinatePointOutlineWidth: 1,
+  closingPointColor: c, closingPointWidth: 4, closingPointOutlineColor: C.ink as Hex, closingPointOutlineWidth: 1,
+  coordinatePointColor: c, coordinatePointWidth: 3, coordinatePointOutlineColor: C.ink as Hex, coordinatePointOutlineWidth: 1,
   snappingPointColor: c, snappingPointWidth: 4,
   editedPointColor: c, editedPointWidth: 4,
 });
+
+// The colour a finished shape keeps while it is edited.
+const EDIT_COLOR: Partial<Record<DrawKind, Hex>> = { exclusion: C.red, point: C.fg, line: C.fg };
+const editColor = (f: GeoJSONStoreFeatures): Hex => EDIT_COLOR[f.properties.mode as DrawKind] ?? C.grass;
 
 export function createDraw(map: MLMap) {
   const flags = {
@@ -26,12 +45,40 @@ export function createDraw(map: MLMap) {
     modes: [
       new TerraDrawPolygonMode({ modeName: "paddock", styles: polyStyles(C.fg) }),
       new TerraDrawPolygonMode({ modeName: "boundary", styles: polyStyles(C.grass) }),
+      new TerraDrawPolygonMode({ modeName: "exclusion", styles: polyStyles(C.red) }),
+      new TerraDrawRectangleMode({
+        modeName: "rect",
+        styles: { fillColor: C.fg, fillOpacity: 0.08, outlineColor: C.fg, outlineWidth: 1.5 },
+      }),
+      new TerraDrawPointMode({
+        modeName: "point",
+        styles: { pointColor: C.fg, pointWidth: 5, pointOutlineColor: C.ink, pointOutlineWidth: 1 },
+      }),
+      new TerraDrawLineStringMode({
+        modeName: "line",
+        styles: {
+          lineStringColor: C.fg, lineStringWidth: 1.5,
+          closingPointColor: C.fg, closingPointWidth: 4, closingPointOutlineColor: C.ink, closingPointOutlineWidth: 1,
+          snappingPointColor: C.fg, snappingPointWidth: 4,
+        },
+      }),
+      new TerraDrawFreehandMode({
+        modeName: "lasso",
+        drawInteraction: "click-drag",
+        autoClose: true,
+        styles: {
+          fillColor: C.fg, fillOpacity: 0.06, outlineColor: C.fg, outlineWidth: 1,
+          closingPointColor: C.fg, closingPointWidth: 0, closingPointOutlineWidth: 0,
+        },
+      }),
       new TerraDrawSelectMode({
         modeName: "edit",
         allowManualDeselection: false,
-        flags: { paddock: flags, boundary: flags },
+        flags: { paddock: flags, boundary: flags, exclusion: flags, rect: flags, line: flags, point: { feature: { draggable: true } } },
         styles: {
-          selectedPolygonColor: C.grass, selectedPolygonFillOpacity: 0.08, selectedPolygonOutlineColor: C.grass, selectedPolygonOutlineWidth: 1.5,
+          selectedPolygonColor: editColor, selectedPolygonFillOpacity: 0.08, selectedPolygonOutlineColor: editColor, selectedPolygonOutlineWidth: 1.5,
+          selectedLineStringColor: editColor, selectedLineStringWidth: 1.5,
+          selectedPointColor: editColor, selectedPointWidth: 5, selectedPointOutlineColor: C.ink, selectedPointOutlineWidth: 1,
           selectionPointColor: C.grass, selectionPointWidth: 4, selectionPointOutlineColor: C.ink, selectionPointOutlineWidth: 1,
           midPointColor: C.fg, midPointWidth: 2.5, midPointOutlineColor: C.ink, midPointOutlineWidth: 1,
         },
@@ -44,11 +91,6 @@ export function createDraw(map: MLMap) {
 
 export type Draw = ReturnType<typeof createDraw>;
 
-export function polygonOf(f?: GeoJSONStoreFeatures): Polygon | undefined {
-  if (!f || f.geometry.type !== "Polygon") return undefined;
-  return { type: "Polygon", coordinates: f.geometry.coordinates as LonLat[][] };
-}
-
 // Put an existing polygon into the draw store and select it for editing.
 export function editPolygon(draw: Draw, g: Polygon, kind: DrawKind) {
   draw.clear();
@@ -56,9 +98,4 @@ export function editPolygon(draw: Draw, g: Polygon, kind: DrawKind) {
   const [res] = draw.addFeatures([{ type: "Feature", geometry: g, properties: { mode: kind } } as GeoJSONStoreFeatures]);
   if (res?.valid && res.id !== undefined) draw.selectFeature(res.id);
   return res?.id;
-}
-
-export function current(draw: Draw): Polygon | undefined {
-  const f = draw.getSnapshot().find((x) => x.geometry.type === "Polygon" && x.properties.mode !== "edit");
-  return polygonOf(f);
 }

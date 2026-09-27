@@ -1,23 +1,29 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type TextareaHTMLAttributes } from "react";
 import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
 import { behindOf, outOf, store, useStore } from "../store";
 import { createMap, fitPolys, onLoad } from "../map/base";
-import { addFarmLayers, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
+import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
 import { inside } from "../geo";
 import { Animals } from "../map/animals";
-import { createDraw, current, editPolygon, type Draw, type DrawKind } from "../map/draw";
-import { Button, Input, Sheet } from "../ui";
+import { createDraw, current, editPolygon, type Draw } from "../map/draw";
+import { mountOverlay, overlayCtx, overlays, Rings, type MapHost, type OverlayHandle } from "../map/overlays";
+import { DRAW_ORDER, tools, type ToolCtx, type ToolItem } from "../map/tools";
+import { LayersMenu } from "../map/LayersMenu";
+import { interleave, PADDOCK_SHEET, paddockSheet, sectionNodes, useSections, views } from "../registry";
+import { Button, Input, Menu, Sheet } from "../ui";
 import { typing, useKey } from "../util";
 import { HerdPanel } from "./HerdPanel";
 
 type Mode =
   | { k: "idle" }
-  | { k: "draw"; what: DrawKind }
-  | { k: "drawn"; what: DrawKind }
+  | { k: "tool"; id: string }
   | { k: "change"; decisionId: string }
   | { k: "reshape"; paddockId: string };
+
+// The side sheet: a paddock's, or content an overlay opened.
+type SheetState = { k: "paddock"; id: string } | { k: "node"; node: ReactNode };
 
 export function MapView() {
   const state = useStore((s) => s.state)!;
@@ -34,18 +40,29 @@ export function MapView() {
   // Per move: the rough axis and the ground held, fixed when the move is first seen.
   const moveSeen = useRef<{ id: string; rough?: [number, number]; ground: Polygon[] }>(undefined);
   const draw = useRef<Draw>(null);
+  const host = useRef<MapHost>(null);
   const [mode, setMode] = useState<Mode>({ k: "idle" });
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const [sheet, setSheet] = useState<string>();
-  const [name, setName] = useState("");
+  const [sheet, setSheet] = useState<SheetState>();
   const [busy, setBusy] = useState(false);
 
   const herd = state.herds.find((h) => h.id === herdId);
-  // Boundaries go to collars, so a herd without any has nothing to send one to.
-  const hasCollars = collars.some((c) => c.herd_id === herdId);
   const proposed = decisions.find((d) => d.status === "proposed");
   const proposedPad = proposed?.to_paddock_id;
+
+  // Tools this reader may use for this herd, bar tools and the draw group.
+  const allTools = tools.use();
+  const herdCollars = useMemo(() => collars.filter((c) => c.herd_id === herdId), [collars, herdId]);
+  const tctx: ToolCtx = { state, herdId, herd, collars: herdCollars };
+  const shown = allTools.filter((t) => !t.when || t.when(tctx));
+  const shownKey = shown.map((t) => t.id).join();
+
+  const mounted = useRef<OverlayHandle[]>([]);
+  // Overlays hear about a new herd or farm record.
+  useEffect(() => {
+    mounted.current.forEach((h) => h.update?.());
+  }, [map, herdId, state]);
 
   // the map, once
   useEffect(() => {
@@ -54,18 +71,37 @@ export function MapView() {
       addFarmLayers(m);
       sweep.current = new SweepView(m);
       animals.current = new Animals(m);
+      addTopSlot(m);
       labels.current = new Labels(m);
       draw.current = createDraw(m);
-      draw.current.on("finish", (id, ctx) => {
-        const cur = modeRef.current;
-        if (ctx.action === "draw" && cur.k === "draw") {
-          draw.current!.setMode("edit");
-          draw.current!.selectFeature(id);
-          setMode({ k: "drawn", what: cur.what });
-        }
-      });
+      host.current = {
+        map: m,
+        rings: new Rings(m),
+        herdId: () => store.get().herdId,
+        openSheet: (node) => setSheet(node === null ? undefined : { k: "node", node }),
+      };
+      mounted.current = overlays.list().map((o) => mountOverlay(host.current!, o));
       fitPolys(m, store.get().state?.paddocks.map((p) => p.geometry) ?? [], 96);
       setMap(m);
+    });
+    // An animal opens its page once there is a Herd view to open it in.
+    const animalAt = (e: MapMouseEvent) =>
+      views.has("herd") && m.getLayer("animals") ? m.queryRenderedFeatures(e.point, { layers: ["animals"] })[0] : undefined;
+    m.on("click", (e) => {
+      if (modeRef.current.k !== "idle") return;
+      const id = animalAt(e)?.properties?.id as string | undefined;
+      const c = id ? store.get().collars.find((x) => x.id === id) : undefined;
+      if (!c) return;
+      const tag = store.get().animals.find((a) => a.id === c.animal_id || a.collar_id === c.id)?.tag;
+      location.hash = `/herd/${encodeURIComponent(tag ?? c.id)}`;
+    });
+    let overAnimal = false;
+    m.on("mousemove", (e) => {
+      if (!views.has("herd") || modeRef.current.k !== "idle") return;
+      const was = overAnimal;
+      overAnimal = !!animalAt(e);
+      if (overAnimal) m.getCanvas().style.cursor = "pointer";
+      else if (was) m.getCanvas().style.cursor = ""; // a paddock under it sets its own, after this
     });
     let hover: number | undefined;
     m.on("mousemove", "paddocks-fill", (e: MapMouseEvent & { features?: GeoJSON.Feature[] }) => {
@@ -82,11 +118,13 @@ export function MapView() {
       m.getCanvas().style.cursor = "";
     });
     m.on("click", "paddocks-fill", (e: MapMouseEvent & { features?: GeoJSON.Feature[] }) => {
-      if (modeRef.current.k !== "idle") return;
+      if (modeRef.current.k !== "idle" || animalAt(e)) return;
       const id = e.features?.[0]?.properties?.id as string | undefined;
-      if (id) setSheet(id);
+      if (id) setSheet({ k: "paddock", id });
     });
     return () => {
+      mounted.current.forEach((h) => h.destroy());
+      mounted.current = [];
       animals.current?.destroy();
       sweep.current?.destroy();
       m.remove();
@@ -172,18 +210,17 @@ export function MapView() {
   useEffect(() => store.onFix((e) => animals.current?.move(e.collar_id, e.fix.point, e.state)), []);
 
   const cancel = useCallback(() => {
+    const cur = modeRef.current;
+    if (cur.k === "tool") host.current?.rings.set(`tool:${cur.id}`, []);
     draw.current?.clear();
     draw.current?.setMode("static");
     setMode({ k: "idle" });
   }, []);
 
-  const begin = useCallback((what: DrawKind) => {
+  const begin = useCallback((t: ToolItem) => {
     if (!draw.current) return;
     setSheet(undefined);
-    draw.current.clear();
-    draw.current.setMode(what);
-    if (what === "paddock") setName(nextName(store.get().state?.paddocks ?? []));
-    setMode({ k: "draw", what });
+    setMode({ k: "tool", id: t.id });
   }, []);
 
   const change = useCallback(() => {
@@ -200,14 +237,13 @@ export function MapView() {
     setMode({ k: "reshape", paddockId: p.id });
   };
 
+  // Saving an edited shape: a changed proposal or a reshaped paddock. Tools save their own.
   const commit = async () => {
     const g: Polygon | undefined = draw.current ? current(draw.current) : undefined;
     if (!g) return;
     setBusy(true);
     try {
-      if (mode.k === "drawn" && mode.what === "paddock") await api.createPaddock({ name: name.trim() || nextName(state.paddocks), geometry: g });
-      else if (mode.k === "drawn" && mode.what === "boundary" && herdId) await api.sendBoundary(herdId, { geometry: g });
-      else if (mode.k === "change") await api.respond(mode.decisionId, { action: "modify", geometry: g });
+      if (mode.k === "change") await api.respond(mode.decisionId, { action: "modify", geometry: g });
       else if (mode.k === "reshape") await api.updatePaddock(mode.paddockId, { geometry: g });
       cancel();
       await store.refresh();
@@ -219,43 +255,44 @@ export function MapView() {
   useKey((e) => {
     if (e.key === "Escape" && modeRef.current.k !== "idle") return cancel();
     if (typing(e) || modeRef.current.k !== "idle") return;
-    if (e.key === "p") begin("paddock");
-    if (e.key === "b" && hasCollars) begin("boundary");
-  }, [hasCollars, begin, cancel]);
+    const t = shown.find((t) => t.key === e.key);
+    if (t) begin(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shownKey, begin, cancel]);
 
-  const sheetPad = state.paddocks.find((p) => p.id === sheet);
-  const sendLabel = mode.k === "reshape" || (mode.k === "drawn" && mode.what === "paddock") ? "Save" : "Send";
-  const hint = mode.k === "draw" ? (mode.what === "paddock" ? "Paddock" : "Boundary") : undefined;
+  const sheetPad = sheet?.k === "paddock" ? state.paddocks.find((p) => p.id === sheet.id) : undefined;
+  const active = mode.k === "tool" ? shown.find((t) => t.id === mode.id) : undefined;
+  // One context per tool run, so a tool's effects don't re-run on every render.
+  const activeCtx = useMemo(() => (active && host.current ? overlayCtx(host.current, `tool:${active.id}`) : undefined), [active?.id, map]); // eslint-disable-line react-hooks/exhaustive-deps
+  const bar = shown.filter((t) => t.group === "bar");
+  const drawGroup = shown.filter((t) => t.group === "draw");
+  const barItems = [
+    ...bar.map((t) => ({ order: t.order, node: <Button key={t.id} small onClick={() => begin(t)} title={t.key ? `${t.label} (${t.key.toUpperCase()})` : t.label}>{t.label}</Button> })),
+    ...(drawGroup.length ? [{ order: DRAW_ORDER, node: <DrawGroup key="draw" items={drawGroup} onPick={begin} /> }] : []),
+  ].sort((a, b) => a.order - b.order);
 
   return (
     <div className="mapview">
       <div className="mapwrap">
         <div ref={el} className="map" />
         <div className="tools">
-          {mode.k === "idle" && (
-            <>
-              <Button small onClick={() => begin("paddock")} title="Draw a paddock (P)">Paddock</Button>
-              {hasCollars && <Button small onClick={() => begin("boundary")} title="Draw a boundary (B)">Boundary</Button>}
-            </>
+          {mode.k === "idle" && barItems.map((b) => b.node)}
+          {active && activeCtx && draw.current && map && (
+            <Suspense fallback={null}>
+              <active.Tool map={map} draw={draw.current} herdId={herdId} ctx={activeCtx} done={cancel} />
+            </Suspense>
           )}
-          {hint && (
-            <>
-              <span className="toolhint">{hint}</span>
-              <Button small kind="plain" onClick={cancel}>Cancel</Button>
-            </>
-          )}
-          {(mode.k === "drawn" || mode.k === "change" || mode.k === "reshape") && (
+          {(mode.k === "change" || mode.k === "reshape") && (
             <form className="toolform" onSubmit={(e) => { e.preventDefault(); void commit(); }}>
-              {mode.k === "drawn" && mode.what === "paddock" && (
-                <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} aria-label="Name" className="sm" />
-              )}
               <Button small kind="plain" onClick={cancel}>Cancel</Button>
-              <Button small kind="primary" type="submit" disabled={busy}>{sendLabel}</Button>
+              <Button small kind="primary" type="submit" disabled={busy}>{mode.k === "reshape" ? "Save" : "Send"}</Button>
             </form>
           )}
         </div>
-        <Sheet open={!!sheetPad} onClose={() => setSheet(undefined)} label="Paddock">
-          {sheetPad && <PaddockSheet key={sheetPad.id} p={sheetPad} onReshape={() => reshape(sheetPad)} onClose={() => setSheet(undefined)} />}
+        {map && host.current && <LayersMenu host={host.current} herdId={herdId} />}
+        <Sheet open={!!sheetPad || sheet?.k === "node"} onClose={() => setSheet(undefined)} label={sheetPad ? "Paddock" : "Details"}>
+          {sheetPad && <PaddockSheet key={sheetPad.id} p={sheetPad} herdId={herdId} onReshape={() => reshape(sheetPad)} onClose={() => setSheet(undefined)} />}
+          {sheet?.k === "node" && sheet.node}
         </Sheet>
       </div>
       <HerdPanel onChange={change} changing={mode.k === "change"} onFocusCollar={(id) => {
@@ -266,13 +303,21 @@ export function MapView() {
   );
 }
 
-function nextName(ps: Paddock[]) {
-  let n = ps.length + 1;
-  while (ps.some((p) => p.name === `P${n}`)) n++;
-  return `P${n}`;
+// One draw tool is a plain button; two or more are the Draw menu.
+function DrawGroup({ items, onPick }: { items: ToolItem[]; onPick: (t: ToolItem) => void }) {
+  if (items.length === 1) {
+    const t = items[0];
+    return <Button small onClick={() => onPick(t)} title={t.key ? `${t.label} (${t.key.toUpperCase()})` : t.label}>{t.label}</Button>;
+  }
+  return (
+    <Menu trigger={<span className="btn quiet sm">Draw</span>}
+      items={items.map((t) => ({ label: <>{t.label}{t.key && <kbd className="mono dim">{t.key.toUpperCase()}</kbd>}</>, onSelect: () => onPick(t) }))} />
+  );
 }
 
-function PaddockSheet({ p, onReshape, onClose }: { p: Paddock; onReshape: () => void; onClose: () => void }) {
+function PaddockSheet({ p, herdId, onReshape, onClose }: { p: Paddock; herdId?: string; onReshape: () => void; onClose: () => void }) {
+  const props = { paddock: p, herdId };
+  const added = sectionNodes(useSections(paddockSheet, props), props);
   const [name, setName] = useState(p.name);
   const [notes, setNotes] = useState(p.notes ?? "");
   const save = async () => {
@@ -293,19 +338,21 @@ function PaddockSheet({ p, onReshape, onClose }: { p: Paddock; onReshape: () => 
     onClose();
     await store.refresh();
   };
-  return (
-    <>
+  return interleave([
+    { key: "name", order: PADDOCK_SHEET.name, node: (
       <form onSubmit={(e) => { e.preventDefault(); void save(); }}>
         <Input className="title" value={name} onChange={(e) => setName(e.target.value)} onBlur={save} aria-label="Name" />
       </form>
-      <p className="facts mono">{p.area_ha.toFixed(1)} ha  {p.status}</p>
-      <AutoText value={notes} onChange={setNotes} onBlur={saveNotes} placeholder="Notes" aria-label="Notes" />
+    ) },
+    { key: "facts", order: PADDOCK_SHEET.facts, node: <p className="facts mono">{p.area_ha.toFixed(1)} ha  {p.status}</p> },
+    { key: "notes", order: PADDOCK_SHEET.notes, node: <AutoText value={notes} onChange={setNotes} onBlur={saveNotes} placeholder="Notes" aria-label="Notes" /> },
+    { key: "actions", order: PADDOCK_SHEET.actions, node: (
       <div className="acts">
         <Button small onClick={onReshape}>Reshape</Button>
         <Button small kind="plain" className="danger" onClick={remove}>Delete</Button>
       </div>
-    </>
-  );
+    ) },
+  ], added);
 }
 
 // A textarea that grows with its text.
