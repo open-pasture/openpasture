@@ -208,7 +208,7 @@ impl Report for PaddockRecord {
         doc.notes.push("Rest before in: days since any herd last left the paddock.".into());
         doc.notes.extend(crate::schedule_cols::notes(shown));
         if collar {
-            doc.notes.push("Collar days: days on which collar positions place the herd in the paddock.".into());
+            doc.notes.push("Collar days: days on which collar positions place the herd in the paddock for at least an hour of its tracked day.".into());
         }
         Ok(doc)
     }

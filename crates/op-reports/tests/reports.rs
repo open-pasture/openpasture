@@ -719,6 +719,42 @@ async fn a_removal_dated_earlier_counts_from_its_date_in_every_report() {
 }
 
 #[tokio::test]
+async fn collar_days_are_days_the_herd_spent_real_time_in_the_paddock() {
+    // Cows in P2 on the record Sep 6 12:00 to Sep 11 12:00 UTC. Collars have
+    // them there 20 h a day on Sep 7-9 (4 h outside every paddock); on Sep 10
+    // they are in P3 next door all day but for three fixes (600 s) across the
+    // fence in P2. A day with a few fixes there isn't a collar day: 3, not 4.
+    let app = App::new().await;
+    let (f, h) = grazing(&app).await;
+    let row = |date: &str, paddock: &str, fixes: i64, dwell_s: f64| {
+        let (ctx, date, paddock, h) = (app.ctx.clone(), date.to_owned(), paddock.to_owned(), h.clone());
+        async move {
+            let last_t = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap().and_hms_opt(23, 0, 0).unwrap().and_utc().timestamp_millis();
+            sqlx::query("INSERT INTO analytics_paddock_days (date, herd_id, collar_id, paddock_id, fixes, dwell_s, last_t) VALUES (?, ?, 'col_1', ?, ?, ?, ?)")
+                .bind(date)
+                .bind(h)
+                .bind(paddock)
+                .bind(fixes)
+                .bind(dwell_s)
+                .bind(last_t)
+                .execute(ctx.db())
+                .await
+                .unwrap();
+        }
+    };
+    for d in ["2025-09-07", "2025-09-08", "2025-09-09"] {
+        row(d, &f.p2, 14_400, 72_000.0).await;
+        row(d, "", 2_880, 14_400.0).await;
+    }
+    row("2025-09-10", &f.p2, 3, 600.0).await;
+    row("2025-09-10", &f.p3, 17_277, 85_800.0).await;
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "paddock"), [json!("P1"), json!("P2"), json!("P3"), json!("P1"), json!("P2")]);
+    assert_eq!(column(ev, "collar_days"), [json!(0), json!(3), json!(0), json!(0), json!(0)]);
+}
+
+#[tokio::test]
 async fn csv_is_one_file_that_parses_back() {
     let app = App::new().await;
     grazing(&app).await;

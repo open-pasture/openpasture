@@ -390,15 +390,24 @@ pub fn days_in_paddocks(farm: &Farm, stays: &[&Stay], w0: DateTime<Utc>, w1: Dat
     seen.len()
 }
 
-/// Days collars place each herd in each paddock, from daily dwell
-/// (`paddock_days`, UTC dates): (herd, paddock) → dates.
+/// Days collars place each herd in each paddock (UTC dates): (herd,
+/// paddock) → dates. A day counts when the paddock held a real share of the
+/// herd's tracked day ([`op_engine::signals::GRAZING_DAY_SHARE`], an hour's
+/// worth: op-analytics' pasture rule and the engine's last grazed), from the
+/// rolled-up and imported collar days (`paddock_day_dwell`). A few fixes
+/// across a fence from the paddock the herd is really in don't make one.
 pub async fn collar_days(ctx: &Ctx, w0: DateTime<Utc>, w1: DateTime<Utc>) -> anyhow::Result<BTreeMap<(String, String), BTreeSet<NaiveDate>>> {
     let rows = sqlx::query(
-        "SELECT herd_id, paddock_id, date FROM paddock_days WHERE date >= ? AND date <= ? AND paddock_id != '' AND herd_id != '' AND fixes > 0
-         GROUP BY herd_id, paddock_id, date",
+        "SELECT d.herd_id, d.paddock_id, d.date FROM (
+             SELECT herd_id, date, paddock_id, SUM(dwell_s) AS dwell FROM paddock_day_dwell
+             WHERE date >= ?1 AND date <= ?2 AND herd_id != '' GROUP BY herd_id, date, paddock_id) d
+         JOIN (SELECT herd_id, date, SUM(dwell_s) AS total FROM paddock_day_dwell
+               WHERE date >= ?1 AND date <= ?2 AND herd_id != '' GROUP BY herd_id, date) t ON t.herd_id = d.herd_id AND t.date = d.date
+         WHERE d.paddock_id != '' AND d.dwell > 0 AND d.dwell >= ?3 * t.total",
     )
     .bind(w0.date_naive().to_string())
     .bind(w1.date_naive().to_string())
+    .bind(op_engine::signals::GRAZING_DAY_SHARE)
     .fetch_all(ctx.db())
     .await?;
     let mut out: BTreeMap<(String, String), BTreeSet<NaiveDate>> = BTreeMap::new();
