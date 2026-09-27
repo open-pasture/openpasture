@@ -1037,7 +1037,11 @@ they need the land provider key (open data has only weather), so without it they
 A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
 behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
 it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
-signals; older ones stay listed but no longer count.
+signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
+count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay on
+the farm record that ended after it, a later `grazed_until`, or collar fixes there): the grass it
+measured has been eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd
+is in now, `height_cm` is the grass ahead of it.
 
 Changes to existing shapes (all additive):
 - `Signals.paddocks[]` gains `grazing_days` (days this paddock's forage feeds the herd: 60 % of

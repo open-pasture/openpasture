@@ -255,7 +255,7 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     let mut forage = Map::new();
     let mut recovery = Map::new();
     let mut risks = Map::new();
-    let measured = heights::current(ctx, i.now).await?;
+    let measured = measured(ctx, i.paddocks, i.now).await?;
     for p in i.paddocks {
         let report = i.reports.get(&p.id);
         let (ndvi, hist) = ndvi_inputs(report);
@@ -310,17 +310,90 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     }))
 }
 
-/// A paddock's forage: a height measured in the last 21 days wins
-/// (`source: "measured"`, with `height_cm` and `measured_at`); otherwise NDVI,
-/// unless snow or dormant grass makes imagery meaningless, when the estimate is
-/// null and `reason` says why (`"snow"` or `"dormant"`).
-pub fn paddock_forage(ndvi: Option<f64>, measured: Option<&heights::Height>, withheld: Option<&'static str>) -> Value {
+/// A measured height that still says how tall a paddock's grass stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measured {
+    pub height: heights::Height,
+    /// What stands now: the height, or after grazing the residual left.
+    pub cm: f64,
+}
+
+/// A herd grazing a paddock this long after a height was taken there has
+/// eaten the grass it measured.
+const GRAZED_AFTER: Duration = Duration::hours(1);
+
+/// Per paddock, the measured height that still describes its grass: the
+/// newest of the last 21 days ([`heights::current`]), unless a herd grazed
+/// the paddock after it was taken. Grazing is any herd's: a stay on the farm
+/// record (`herd_history`) that ended after it, the farmer's `grazed_until`,
+/// or collar fixes there (hot, rolled-up or imported). In a paddock a herd is
+/// in now, the height stands for the grass ahead of it (`height_cm`);
+/// elsewhere a `residual_cm` is what the last grazing left, and stands instead.
+/// A few indexed reads per measured paddock, never a walk of the fixes.
+pub async fn measured(ctx: &Ctx, paddocks: &[Paddock], now: DateTime<Utc>) -> anyhow::Result<HashMap<String, Measured>> {
+    let heights = heights::current(ctx, now).await?;
+    if heights.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let occupied: Vec<String> = ctx.store().list_herds().await?.into_iter().filter_map(|h| h.paddock_id).collect();
+    let mut out = HashMap::new();
+    for p in paddocks {
+        let Some(h) = heights.get(&p.id) else { continue };
+        if occupied.contains(&p.id) {
+            out.insert(p.id.clone(), Measured { cm: h.height_cm, height: h.clone() });
+            continue;
+        }
+        if grazed_after(ctx, p, h.at + GRAZED_AFTER, now).await? {
+            continue;
+        }
+        out.insert(p.id.clone(), Measured { cm: h.residual_cm.unwrap_or(h.height_cm), height: h.clone() });
+    }
+    Ok(out)
+}
+
+/// Whether any herd grazed the paddock after `t` (up to `now`).
+async fn grazed_after(ctx: &Ctx, p: &Paddock, t: DateTime<Utc>, now: DateTime<Utc>) -> anyhow::Result<bool> {
+    if p.grazed_until.is_some_and(|g| g > t && g <= now) {
+        return Ok(true);
+    }
+    let after = |ms: Option<i64>| ms.map(time::from_unix_ms).is_some_and(|at| at > t);
+    let hot: Option<i64> = sqlx::query_scalar("SELECT MAX(last_t) FROM fix_paddock_last WHERE paddock_id = ?").bind(&p.id).fetch_one(ctx.db()).await?;
+    if after(hot) {
+        return Ok(true);
+    }
+    let days: Option<i64> = sqlx::query_scalar("SELECT MAX(last_t) FROM paddock_days WHERE paddock_id = ? AND date >= ? AND fixes > 0")
+        .bind(&p.id)
+        .bind(t.date_naive().to_string())
+        .fetch_one(ctx.db())
+        .await?;
+    if after(days) {
+        return Ok(true);
+    }
+    // A herd on record in the paddock that left it after `t`.
+    let left: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(n.at) FROM herd_history h JOIN herd_history n ON n.id = (
+             SELECT x.id FROM herd_history x WHERE x.herd_id = h.herd_id AND (x.at > h.at OR (x.at = h.at AND x.id > h.id)) ORDER BY x.at, x.id LIMIT 1)
+         WHERE h.paddock_id = ?1 AND (n.paddock_id IS NULL OR n.paddock_id != ?1) AND n.at > ?2",
+    )
+    .bind(&p.id)
+    .bind(time::to_db(&t))
+    .fetch_one(ctx.db())
+    .await?;
+    Ok(left.is_some())
+}
+
+/// A paddock's forage: a measured height that still describes its grass
+/// wins ([`measured`]; `source: "measured"`, with the `height_cm` it stands
+/// at and `measured_at`); otherwise NDVI, unless snow or dormant grass makes
+/// imagery meaningless, when the estimate is null and `reason` says why
+/// (`"snow"` or `"dormant"`).
+pub fn paddock_forage(ndvi: Option<f64>, measured: Option<&Measured>, withheld: Option<&'static str>) -> Value {
     let residual = calc::DEFAULT_RESIDUAL_INCHES;
-    if let Some(h) = measured {
-        let mut f = calc::forage_estimate(ndvi, Some(h.height_cm / 2.54), residual);
+    if let Some(m) = measured {
+        let mut f = calc::forage_estimate(ndvi, Some(m.cm / 2.54), residual);
         f["source"] = json!("measured");
-        f["height_cm"] = json!(h.height_cm);
-        f["measured_at"] = json!(time::to_db(&h.at));
+        f["height_cm"] = json!(m.cm);
+        f["measured_at"] = json!(time::to_db(&m.height.at));
         return f;
     }
     match withheld {
