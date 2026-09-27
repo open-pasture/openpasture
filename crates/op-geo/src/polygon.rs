@@ -26,6 +26,19 @@ impl Polygon {
         Self { kind: PolygonType::Polygon, coordinates: vec![close(ring.into())] }
     }
 
+    /// An outer ring and holes, each closed if it isn't already.
+    pub fn from_rings(outer: impl Into<Vec<LonLat>>, holes: impl IntoIterator<Item = Vec<LonLat>>) -> Self {
+        let mut coordinates = vec![close(outer.into())];
+        coordinates.extend(holes.into_iter().map(close));
+        Self { kind: PolygonType::Polygon, coordinates }
+    }
+
+    /// Vertices over every ring, closing vertices and consecutive duplicates
+    /// not counted: what a collar stores.
+    pub fn total_vertices(&self) -> usize {
+        self.coordinates.iter().map(|r| clean_ring(r).len()).sum()
+    }
+
     /// The outer ring, unclosed, without consecutive duplicates.
     pub fn outer_ring(&self) -> Vec<LonLat> {
         self.coordinates.first().map(|r| clean_ring(r)).unwrap_or_default()
@@ -155,6 +168,15 @@ mod tests {
         assert_eq!(v.coordinates[0][0], v.coordinates[0][3]);
         let empty = Polygon { kind: PolygonType::Polygon, coordinates: vec![] };
         assert_eq!(empty.validated(), Err(GeoError::Empty));
+    }
+
+    #[test]
+    fn from_rings_closes_and_counts() {
+        let p = Polygon::from_rings(vec![[0.0, 0.0], [0.01, 0.0], [0.01, 0.01], [0.0, 0.01]], [vec![[0.004, 0.004], [0.006, 0.004], [0.006, 0.006]]]);
+        assert_eq!(p.coordinates.len(), 2);
+        assert!(p.coordinates.iter().all(|r| r.first() == r.last()));
+        assert_eq!(p.total_vertices(), 7);
+        assert_eq!(p.holes().count(), 1);
     }
 
     #[test]

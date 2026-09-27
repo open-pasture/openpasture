@@ -1,0 +1,32 @@
+## Instructions
+
+Follow the skill.
+
+## Tools
+
+Read-only tools on the `openpasture` MCP server (get_farm, list_paddocks, get_herd, get_herd_positions, get_boundary_status, get_signals, get_land_report, search_knowledge, list_decisions, get_decision, run_sql) can fetch more detail. Before deciding, call search_knowledge once with this herd's situation in a few words; the context only carries general entries. Use the others for anything else the context leaves open, e.g. get_land_report for a candidate paddock or get_herd_positions for where each animal is now. If the tools are unavailable, decide from the context.
+
+## Farm context
+
+```json
+{
+  "herd": {
+    "id": "herd_1",
+    "name": "Cows"
+  },
+  "paddocks": [
+    {
+      "id": "pad_1",
+      "name": "P1"
+    }
+  ]
+}
+```
+
+## Output schema
+
+```json
+{"type":"object","additionalProperties":false,"required":["action","to_paddock_id","geometry","reasoning","confidence","need"],"properties":{"action":{"type":"string","enum":["STAY","MOVE","NEEDS_INFO"],"description":"STAY in the current paddock, MOVE to another, or NEEDS_INFO when the farmer must check something first."},"to_paddock_id":{"type":["string","null"],"description":"For MOVE: the id of the paddock to move to, from the context. Otherwise null."},"geometry":{"anyOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["type","coordinates"],"properties":{"type":{"type":"string","enum":["Polygon"]},"coordinates":{"type":"array","items":{"type":"array","items":{"type":"array","items":{"type":"number"}}}}}}],"description":"Only for MOVE with a custom boundary: a GeoJSON Polygon, [longitude, latitude], at most 64 corners. Null to use the paddock's own shape."},"reasoning":{"type":"string","description":"Two to five plain sentences for the farmer: what you saw and why."},"confidence":{"type":"number","description":"0 to 1."},"need":{"type":["string","null"],"description":"For NEEDS_INFO: the one thing the farmer should check or tell you. Otherwise null."}}}
+```
+
+Reply with only the JSON object.

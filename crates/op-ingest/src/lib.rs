@@ -11,6 +11,29 @@ mod device;
 pub mod escapes;
 pub mod moves;
 pub mod planner;
+// @HUB
+// @HUB-UI
+// @E-lib
+// @E-srv
+// @J
+// @A-engine
+// @A-notify
+// @D
+// @K-animals
+// @K-files
+// @I
+// @B
+// @G
+// @P
+// @Q
+// @C
+// @F
+// @S
+// @A3
+// @H
+// @L
+// @M
+// @Z
 
 use op_core::Ctx;
 
@@ -21,15 +44,106 @@ pub use moves::{Started, current_move, start_move, stop_move};
 
 /// Routes from docs/API.md, "Collars and boundaries (op-ingest)".
 pub fn router() -> axum::Router<Ctx> {
-    axum::Router::new().merge(collars::router()).merge(boundary::router()).merge(moves::router()).merge(escapes::router()).merge(device::router())
+    let mut app = axum::Router::new();
+    for part in [
+        collars::router(),
+        boundary::router(),
+        moves::router(),
+        escapes::router(),
+        device::router(),
+        // @HUB
+        // @HUB-UI
+        // @E-lib
+        // @E-srv
+        // @J
+        // @A-engine
+        // @A-notify
+        // @D
+        // @K-animals
+        // @K-files
+        // @I
+        // @B
+        // @G
+        // @P
+        // @Q
+        // @C
+        // @F
+        // @S
+        // @A3
+        // @H
+        // @L
+        // @M
+        // @Z
+    ] {
+        app = app.merge(part);
+    }
+    app
 }
 
 /// Background tasks. Returns once they are spawned: the watcher that
 /// announces staged boundaries when they take effect, the move driver and
 /// the escape driver.
 pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
+    register_tools(&ctx);
     boundary::spawn_activation_watcher(ctx.clone());
     moves::spawn_driver(ctx.clone());
-    escapes::spawn_driver(ctx);
+    escapes::spawn_driver(ctx.clone());
+    // @HUB
+    // @HUB-UI
+    // @E-lib
+    // @E-srv
+    // @J
+    // @A-engine
+    // @A-notify
+    // @D
+    // @K-animals
+    // @K-files
+    // @I
+    // @B
+    // @G
+    // @P
+    // @Q
+    // @C
+    // @F
+    // @S
+    // @A3
+    // @H
+    // @L
+    // @M
+    // @Z
     Ok(())
+}
+
+/// This crate's MCP tools, in registration order. Idempotent: a second call
+/// registers nothing.
+pub fn register_tools(ctx: &Ctx) {
+    ctx.tools().register_once(env!("CARGO_PKG_NAME"), tool_specs);
+}
+
+fn tool_specs() -> Vec<op_core::tools::ToolSpec> {
+    vec![
+        // @HUB
+        // @HUB-UI
+        // @E-lib
+        // @E-srv
+        // @J
+        // @A-engine
+        // @A-notify
+        // @D
+        // @K-animals
+        // @K-files
+        // @I
+        // @B
+        // @G
+        // @P
+        // @Q
+        // @C
+        // @F
+        // @S
+        // @A3
+        // @H
+        // @L
+        // @M
+        // @Z
+    ]
 }

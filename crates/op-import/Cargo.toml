@@ -1,0 +1,82 @@
+[package]
+name = "op-import"
+description = "Imports: animal CSV, paddock files (GeoJSON, KML/KMZ, Shapefile), position history, collar cards"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-geo.workspace = true
+op-ingest.workspace = true
+axum = { workspace = true, features = ["multipart"] }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+base64.workspace = true
+csv.workspace = true
+zip.workspace = true
+shapefile.workspace = true
+quick-xml.workspace = true
+gpx.workspace = true
+qrcode.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[lints]
+workspace = true

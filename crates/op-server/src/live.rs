@@ -1,16 +1,17 @@
-//! `/api/live`: every [`op_core::Event`] as a JSON text message.
+//! `/api/live`: every [`op_core::Event`] the socket's identity may see
+//! ([`op_core::Event::min_role`]), as a JSON text message.
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
-use op_core::Ctx;
+use op_core::{Ctx, Identity};
 use tokio::sync::broadcast::error::RecvError;
 
-pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>) -> Response {
-    ws.on_upgrade(move |socket| stream(socket, ctx))
+pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity) -> Response {
+    ws.on_upgrade(move |socket| stream(socket, ctx, identity))
 }
 
-async fn stream(mut socket: WebSocket, ctx: Ctx) {
+async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity) {
     let mut rx = ctx.subscribe();
     let shutdown = ctx.on_shutdown();
     tokio::pin!(shutdown);
@@ -22,6 +23,9 @@ async fn stream(mut socket: WebSocket, ctx: Ctx) {
             }
             ev = rx.recv() => match ev {
                 Ok(ev) => {
+                    if !identity.can(ev.min_role()) {
+                        continue;
+                    }
                     let Ok(text) = serde_json::to_string(&ev) else { continue };
                     if socket.send(Message::Text(text.into())).await.is_err() {
                         break;

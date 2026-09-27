@@ -26,6 +26,7 @@ async fn setup() -> T {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let app = Router::new().merge(op_core::router()).merge(op_ingest::router()).merge(op_engine::router()).with_state(ctx.clone());
+    let app = op_core::with_identity(app, op_core::Identity::owner(op_core::Via::Local));
     T { _dir: dir, ctx, app }
 }
 

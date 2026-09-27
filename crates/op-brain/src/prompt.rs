@@ -20,9 +20,10 @@ Geometry is a GeoJSON Polygon, [longitude, latitude], at most 64 corners, not cr
 - Do not change anything. You only decide; the farmer or the autonomy setting applies it.
 - Reply with only a JSON object that matches the output schema. No prose around it.";
 
-/// Build the user prompt: instructions, context and schema. `with_mcp`
-/// mentions the read tools on the openpasture MCP server.
-pub fn build_prompt(instructions: &str, context: &Value, schema: &Value, with_mcp: bool) -> String {
+/// Build the user prompt: instructions, context and schema. `tools` names
+/// the read tools on the openpasture MCP server the brain may call; empty
+/// leaves the Tools section out.
+pub fn build_prompt(instructions: &str, context: &Value, schema: &Value, tools: &[String]) -> String {
     let mut out = String::new();
     let instructions = instructions.trim();
     if !instructions.is_empty() {
@@ -30,11 +31,11 @@ pub fn build_prompt(instructions: &str, context: &Value, schema: &Value, with_mc
         out.push_str(instructions);
         out.push_str("\n\n");
     }
-    if with_mcp {
+    if !tools.is_empty() {
+        out.push_str("## Tools\n\nRead-only tools on the `openpasture` MCP server (");
+        out.push_str(&tools.join(", "));
         out.push_str(
-            "## Tools\n\nRead-only tools on the `openpasture` MCP server (get_farm, list_paddocks, get_herd, \
-get_herd_positions, get_boundary_status, get_signals, get_land_report, search_knowledge, list_decisions, \
-get_decision, run_sql) can fetch more detail. Before deciding, call search_knowledge once with this \
+            ") can fetch more detail. Before deciding, call search_knowledge once with this \
 herd's situation in a few words; the context only carries general entries. Use the others for anything else \
 the context leaves open, e.g. get_land_report for a candidate paddock or get_herd_positions for where each \
 animal is now. If the tools are unavailable, decide from the context.\n\n",
@@ -49,8 +50,8 @@ animal is now. If the tools are unavailable, decide from the context.\n\n",
 }
 
 /// System text and prompt in one string, for CLIs that take a single prompt.
-pub fn build_full_prompt(instructions: &str, context: &Value, schema: &Value, with_mcp: bool) -> String {
-    format!("{SYSTEM}\n\n{}", build_prompt(instructions, context, schema, with_mcp))
+pub fn build_full_prompt(instructions: &str, context: &Value, schema: &Value, tools: &[String]) -> String {
+    format!("{SYSTEM}\n\n{}", build_prompt(instructions, context, schema, tools))
 }
 
 #[cfg(test)]
@@ -60,14 +61,15 @@ mod tests {
     #[test]
     fn prompt_has_every_part() {
         let ctx = serde_json::json!({ "herd": { "id": "herd_1" } });
-        let p = build_full_prompt("Follow the skill.", &ctx, &crate::decision_schema(), true);
+        let tools: Vec<String> = crate::claude::MCP_TOOLS.iter().map(|t| t.to_string()).collect();
+        let p = build_full_prompt("Follow the skill.", &ctx, &crate::decision_schema(), &tools);
         assert!(p.starts_with("You are the grazing brain"));
         assert!(p.contains("Follow the skill."));
         assert!(p.contains("\"herd_1\""));
         assert!(p.contains("NEEDS_INFO"));
         assert!(p.contains("openpasture` MCP server"));
         assert!(p.contains("call search_knowledge once"));
-        let p = build_prompt("", &ctx, &crate::decision_schema(), false);
+        let p = build_prompt("", &ctx, &crate::decision_schema(), &[]);
         assert!(!p.contains("## Instructions"));
         assert!(!p.contains("MCP"));
     }

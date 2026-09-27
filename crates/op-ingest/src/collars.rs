@@ -93,7 +93,7 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
 /// report landing at the same time keeps its telemetry.
 async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
-    let immutable = ["id", "last_seen", "battery", "boundary_version", "state", "last_fix"];
+    let immutable = ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason"];
     let mut next: Collar = patch::apply(&current, &body, &immutable)?;
     next.name = clean_name(&next.name)?;
     if next.herd_id != current.herd_id {
@@ -107,7 +107,7 @@ async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): A
     }
     if next.herd_id != current.herd_id {
         // A new herd means a new fence: the collar starts over.
-        sqlx::query("UPDATE collars SET herd_id = ?, boundary_version = NULL, state = ? WHERE id = ?")
+        sqlx::query("UPDATE collars SET herd_id = ?, boundary_version = NULL, state = ?, outside_since = NULL WHERE id = ?")
             .bind(&next.herd_id)
             .bind(FenceState::Unknown.as_str())
             .bind(&id)

@@ -22,6 +22,32 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 futures.workspace = true
+# @HUB
+op-alerts.workspace = true
+op-import.workspace = true
+op-reports.workspace = true
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -29,6 +55,29 @@ reqwest.workspace = true
 tokio-tungstenite.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
 
 [lints]
 workspace = true

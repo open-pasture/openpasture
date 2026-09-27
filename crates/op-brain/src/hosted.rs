@@ -137,7 +137,7 @@ pub async fn decide(State(ctx): State<Ctx>, headers: HeaderMap, ApiJson(body): A
         }
     });
     tracing::info!(key = %key_id, brain = ?settings.brain.id, "serving a hosted decision");
-    let req = DecisionRequest { herd_id, context: body.context, instructions: body.instructions, mcp_url: String::new(), log: tx };
+    let req = DecisionRequest { herd_id, context: body.context, instructions: body.instructions, mcp_url: String::new(), tools: vec![], log: tx };
     let _ = body.schema;
     let out = brain.decide(req).await.map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(out))

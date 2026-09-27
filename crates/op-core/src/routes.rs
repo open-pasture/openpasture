@@ -145,6 +145,7 @@ async fn create_paddock(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewPaddoc
         notes: body.notes.filter(|n| !n.trim().is_empty()),
         grazed_until: body.grazed_until,
         created_at: time::now(),
+        props: Default::default(),
     };
     ctx.store().insert_paddock(&paddock).await?;
     Ok((StatusCode::CREATED, Json(paddock)))
@@ -334,6 +335,7 @@ async fn create_animal(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewAnimal>
         name: body.name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()),
         herd_id: body.herd_id,
         collar_id: body.collar_id.filter(|c| !c.is_empty()),
+        ..Default::default()
     };
     check_animal(&ctx, &animal).await?;
     ctx.store().insert_animal(&animal).await?;
@@ -342,7 +344,8 @@ async fn create_animal(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewAnimal>
 
 async fn update_animal(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Animal>> {
     let current = find_animal(&ctx, &id).await?;
-    let mut a: Animal = patch::apply(&current, &body, &["id"])?;
+    // Removal has its own route (it also unlinks and parks the collar).
+    let mut a: Animal = patch::apply(&current, &body, &["id", "removed_at", "removed_reason"])?;
     a.tag = a.tag.trim().to_owned();
     check_animal(&ctx, &a).await?;
     ctx.store().update_animal(&a).await?;

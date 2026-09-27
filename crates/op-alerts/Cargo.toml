@@ -1,0 +1,88 @@
+[package]
+name = "op-alerts"
+description = "Alerts and texting: rules, lifecycle, routing, templates, channels, sender, relay, inbound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+op-core.workspace = true
+op-geo.workspace = true
+op-ingest.workspace = true
+op-engine.workspace = true
+op-brain.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+futures.workspace = true
+rand.workspace = true
+base64.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+lettre.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+hex.workspace = true
+form_urlencoded.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true
+# @HUB
+# @HUB-UI
+# @E-lib
+# @E-srv
+# @J
+# @A-engine
+# @A-notify
+# @D
+# @K-animals
+# @K-files
+# @I
+# @B
+# @G
+# @P
+# @Q
+# @C
+# @F
+# @S
+# @A3
+# @H
+# @L
+# @M
+# @Z
+
+[lints]
+workspace = true
