@@ -9,7 +9,7 @@ import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscap
 import { roughAxis, snapAxis, SweepView } from "../map/sweep";
 import { inside } from "../geo";
 import { Animals } from "../map/animals";
-import { createDraw, current, currentGeometry, editPolygon, editShape, type Draw, type DrawGeometry, type DrawKind } from "../map/draw";
+import { createDraw, current, currentGeometry, editPolygon, editShape, shapeError, type Draw, type DrawGeometry, type DrawKind } from "../map/draw";
 import { mountOverlay, overlayCtx, overlays, Rings, type MapHost, type OverlayHandle } from "../map/overlays";
 import { DRAW_ORDER, tools, type ToolCtx, type ToolItem } from "../map/tools";
 import { LayersMenu } from "../map/LayersMenu";
@@ -262,15 +262,15 @@ export function MapView() {
   const change = useCallback(() => {
     const d = store.get().decisions.find((x) => x.status === "proposed");
     if (!d?.geometry || !draw.current) return;
-    editPolygon(draw.current, d.geometry, "boundary");
+    if (editPolygon(draw.current, d.geometry, "boundary") === undefined) return;
     setMode({ k: "change", decisionId: d.id });
   }, []);
 
   const reshapeShape = (g: DrawGeometry, kind: DrawKind, save: (g: DrawGeometry) => Promise<unknown>) => {
     if (!draw.current || modeRef.current.k !== "idle") return;
+    if (editShape(draw.current, g, kind) === undefined) return;
     setSheet(undefined);
     setErr(undefined);
-    editShape(draw.current, g, kind);
     setMode({ k: "reshape", save });
   };
   const startReshape = useRef(reshapeShape);
@@ -281,6 +281,8 @@ export function MapView() {
   const commit = async () => {
     const g = draw.current ? (mode.k === "reshape" ? currentGeometry(draw.current) : current(draw.current)) : undefined;
     if (!g) return;
+    const bad = g.type === "Polygon" ? shapeError(g as Polygon) : undefined;
+    if (bad) return setErr(bad);
     setBusy(true);
     setErr(undefined);
     try {

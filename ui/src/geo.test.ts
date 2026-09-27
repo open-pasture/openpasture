@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LonLat, Polygon } from "./api";
-import { areaHa, inside, offset, rect, signedDistance } from "./geo";
+import { areaHa, inside, offset, rect, ringAgainst, signedDistance } from "./geo";
 
 // A 100 m square near Ames with a 20 m square hole in its middle.
 const sw: LonLat = [-93.62, 42.03];
@@ -38,3 +38,16 @@ describe("polygon with a hole", () => {
     expect(inside(at(99, 99), outer)).toBe(true);
   });
 });
+
+describe("a ring against another", () => {
+  const r = (x: number, y: number, w: number, h: number) => rect(offset(sw, x, y), w, h).coordinates[0];
+  test("inside, outside, or cut by its edge; touching counts as cut", () => {
+    const big = outer.coordinates[0];
+    expect(ringAgainst(r(40, 40, 20, 20), big)).toBe("in");
+    expect(ringAgainst(r(140, 40, 20, 20), big)).toBe("out");
+    expect(ringAgainst(r(90, 40, 20, 20), big)).toBe("cut");
+    // Its west edge on the outer ring's east edge.
+    expect(ringAgainst([big[1], big[2], offset(big[2], 20, 0), offset(big[1], 20, 0), big[1]], big)).toBe("cut");
+  });
+});
+
