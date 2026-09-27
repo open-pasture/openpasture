@@ -141,12 +141,11 @@ async fn a_viewer_socket_never_receives_messages() {
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let viewer = Identity { role: Role::Viewer, user_id: Some("usr_v".into()), name: None, via: Via::UserToken };
     let manager = Identity { role: Role::Manager, ..viewer.clone() };
-    let before = ctx.events().receiver_count();
     let (mut v_ws, _) = tokio_tungstenite::connect_async(live_as(&ctx, viewer).await).await.unwrap();
     let (mut m_ws, _) = tokio_tungstenite::connect_async(live_as(&ctx, manager).await).await.unwrap();
-    // Each socket subscribes after its upgrade; wait until both have.
+    // Each socket subscribes to the live layer as it upgrades; wait until both have.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while ctx.events().receiver_count() < before + 2 {
+        while op_server::live::subscribers(&ctx) < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })

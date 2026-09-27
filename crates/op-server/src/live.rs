@@ -1,18 +1,31 @@
-//! `/api/live`: every [`op_core::Event`] the socket's identity may see
-//! ([`op_core::Event::min_role`]), as a JSON text message.
+//! `/api/live`: what the socket's identity may see ([`op_core::Event::min_role`]),
+//! as JSON text messages. Fixes, acks, cues and telemetry-only collar changes
+//! arrive coalesced per herd every 500 ms (`positions`, `ack_batch`,
+//! `cue_batch`, see [`crate::coalesce`]); every other event as it happens.
 
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use op_core::{Ctx, Identity};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
+
+use crate::coalesce::{self, Out};
+
+const RESYNC: &str = r#"{"type":"resync"}"#;
 
 pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity) -> Response {
-    ws.on_upgrade(move |socket| stream(socket, ctx, identity))
+    // Subscribed before the upgrade answers, so a client that just connected
+    // misses nothing published after that.
+    let rx = coalesce::hub(&ctx).subscribe();
+    ws.on_upgrade(move |socket| stream(socket, ctx, identity, rx))
 }
 
-async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity) {
-    let mut rx = ctx.subscribe();
+/// Sockets listening on this context's live feed.
+pub fn subscribers(ctx: &Ctx) -> usize {
+    coalesce::hub(ctx).subscribers()
+}
+
+async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity, mut rx: broadcast::Receiver<Out>) {
     let shutdown = ctx.on_shutdown();
     tokio::pin!(shutdown);
     loop {
@@ -21,28 +34,31 @@ async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity) {
                 let _ = socket.send(Message::Close(None)).await;
                 break;
             }
-            ev = rx.recv() => match ev {
-                Ok(ev) => {
-                    if !identity.can(ev.min_role()) {
+            out = rx.recv() => match out {
+                Ok(out) => {
+                    if !identity.can(out.role) {
                         continue;
                     }
-                    let Ok(text) = serde_json::to_string(&ev) else { continue };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    if socket.send(Message::Text(out.text)).await.is_err() {
                         break;
                     }
                 }
                 Err(RecvError::Lagged(n)) => {
-                    // The client missed events: tell it to refetch.
-                    tracing::warn!("live client lagged, dropped {n} events; sending resync");
-                    let Ok(text) = serde_json::to_string(&op_core::Event::Resync) else { continue };
-                    if socket.send(Message::Text(text.into())).await.is_err() {
+                    // The client missed messages: tell it to refetch.
+                    tracing::warn!("live client lagged, dropped {n} messages; sending resync");
+                    if socket.send(Message::Text(Utf8Bytes::from_static(RESYNC))).await.is_err() {
                         break;
                     }
                 }
                 Err(RecvError::Closed) => break,
             },
             msg = socket.recv() => match msg {
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Close(_))) => {
+                    // Answer the close so the client sees a clean one.
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                Some(Err(_)) | None => break,
                 _ => {}
             },
         }

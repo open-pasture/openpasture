@@ -19,6 +19,7 @@ mod ui;
 // @B
 // @G
 // @P
+pub mod coalesce;
 // @Q
 // @C
 // @F
