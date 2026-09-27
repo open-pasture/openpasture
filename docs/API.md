@@ -347,7 +347,7 @@ PaddockPasture { paddock_id, name, area_ha, status, grazing_days, rest_days, pre
 Battery history is op-ingest's `health` table (one row per report). `ndvi` is the latest
 imagery NDVI mean from the paddock's land reports (so only with the land provider key;
 open data has no imagery). SQL is one read-only `SELECT`/`WITH`/`EXPLAIN` over
-`fixes`, `cues`, `acks`, `boundaries`, `decisions`, `collars` (no `key_hash`), `animals`,
+`fixes`, `cues`, `health`, `acks`, `boundaries`, `decisions`, `collars` (no `key_hash`), `animals`,
 `paddocks`, `herds`, at most 10,000 rows, 20 s. A query loads at most 100,000 rows per record
 table and the newest 500,000 hot (SQLite) rows per telemetry table, plus the Parquet days. Export `table` is any of those or `tracks`;
 GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
@@ -389,7 +389,10 @@ Event =
   // @I
   // @B
   // @G
-  // @P
+  // @P  (/api/live only, never on the bus; they replace fix, ack and cue on the socket)
+  | { type: "positions", herd_id, items: PositionItem[] }   // per herd every 500 ms
+  | { type: "ack_batch", herd_id, items: AckItem[] }
+  | { type: "cue_batch", herd_id, items: CueItem[] }
   // @Q
   // @C
   // @F
@@ -404,7 +407,9 @@ Event =
 Each socket gets only the events its identity may see: `message` events go to managers and up
 (they carry phone numbers), everything else to every role.
 
-A report publishes one `fix` event per collar (its newest new fix), not one per fix.
+A report publishes one `fix` event per collar (its newest new fix), not one per fix. On the
+socket, `fix`, `ack` and `cue` arrive as `positions`, `ack_batch` and `cue_batch` (see "Live feed
+at herd scale").
 
 ## MCP tools (op-engine)
 
@@ -480,6 +485,47 @@ days plus imported position history.
 <!-- @B -->
 <!-- @G -->
 <!-- @P -->
+
+## Live feed at herd scale (op-server, P)
+
+`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd: 500 ms after the
+first of them for a herd, one `positions`, one `ack_batch` and one `cue_batch` message (each
+only when it has items). At 250 collars that is about one message a second, two during a sweep,
+instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
+
+```ts
+PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
+AckItem      { collar_id, version, status: "received"|"applied"|"rejected", code?, reason? }  // latest per collar
+CueItem      { collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }              // every cue, in order
+```
+
+A `collar` event goes out on its own only when the collar's JSON minus `last_seen`, `battery`,
+`last_fix`, `state`, `outside_since` and `boundary_version` changed (renamed, relinked, parked,
+moved herd, fields added later). A report's telemetry rides in `positions`; a reported boundary
+version with no ack rides in `ack_batch` as `applied`. A collar with no fix yet has no position
+to send, so its telemetry-only changes wait for a refetch. Every other event goes out at once,
+in bus order; batches can arrive after events published later in the same 500 ms. Each message
+is serialized once for all sockets; a socket drops what its identity may not see; a socket (or
+the coalescer) that falls behind gets `resync`.
+
+## Analytics at 250 collars (op-analytics, P)
+
+- The hourly rollup streams a day to Parquet per collar in `(collar_id, t)` order, 65,536 rows a
+  row group, merging an existing file for that day (a row in both is kept once), and sums pasture
+  dwell on the stream. Rows leave SQLite in write transactions of at most 5,000 rows with a pause
+  after each, so reports keep landing (a 4.3 M-fix day: memory under 50 MB, no report waits
+  250 ms). While those deletes run, a rolled day is in both places: the SQL console, exports and
+  health counts can count its rows twice until they finish; tracks and pasture don't.
+- `health` rolls up like `fixes` and `cues` and is a table for `/api/sql` and export; battery
+  history in `/api/analytics/health` reads both.
+- `/api/tracks` seeks each collar's first fix per time bucket by index in SQLite and reads only
+  the track columns of Parquet days (row groups outside the range or collar skipped). 250
+  collars over a 4.3 M-fix day, `max_points=300`: under a second from SQLite, about 2 s from
+  Parquet in a debug build.
+- `/api/analytics/pasture` is as of the end of the range (or now): no day or fix after it
+  counts, `last_grazed` is the last grazing day up to it (before `from` too, from the daily
+  summaries) and `rest_days` runs to it. A day the end falls inside counts whole once rolled.
+- `OPENPASTURE_DB_POOL` sets the SQLite pool (1-256, default 16).
 <!-- @Q -->
 <!-- @C -->
 <!-- @F -->
