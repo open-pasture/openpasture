@@ -318,14 +318,14 @@ async fn find_animal(ctx: &Ctx, id: &str) -> ApiResult<Animal> {
     ctx.store().get_animal(id).await?.ok_or_else(|| ApiError::not_found("No such animal."))
 }
 
-async fn check_animal(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
+async fn check_animal(ctx: &Ctx, a: &Animal, before: Option<&Animal>) -> ApiResult<()> {
     if a.tag.trim().is_empty() {
         return Err(ApiError::bad_request("The animal needs a tag."));
     }
     if ctx.store().get_herd(&a.herd_id).await?.is_none() {
         return Err(ApiError::bad_request("No such herd."));
     }
-    crate::animals::check_unique(ctx, a).await?;
+    crate::animals::check_unique(ctx, a, before).await?;
     if a.removed_at.is_some() && a.collar_id.is_some() {
         return Err(ApiError::bad_request(format!("{} is no longer on the farm.", a.tag)));
     }
@@ -357,7 +357,7 @@ async fn create_animal(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewAnimal>
         ..Default::default()
     };
     crate::animals::tidy(&mut animal)?;
-    check_animal(&ctx, &animal).await?;
+    check_animal(&ctx, &animal, None).await?;
     ctx.store().insert_animal(&animal).await?;
     animals_changed(&ctx, &[&animal.herd_id]).await?;
     Ok((StatusCode::CREATED, Json(animal)))
@@ -369,7 +369,7 @@ async fn update_animal(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(b
     let mut a: Animal = patch::apply(&current, &body, &["id", "removed_at", "removed_reason"])?;
     a.tag = a.tag.trim().to_owned();
     crate::animals::tidy(&mut a)?;
-    check_animal(&ctx, &a).await?;
+    check_animal(&ctx, &a, Some(&current)).await?;
     ctx.store().update_animal(&a).await?;
     animals_changed(&ctx, &[&current.herd_id, &a.herd_id]).await?;
     Ok(Json(a))

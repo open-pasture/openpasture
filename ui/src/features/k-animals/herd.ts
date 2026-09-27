@@ -100,11 +100,19 @@ export function sheets<T>(items: T[], per = 12): T[][] {
 // Cards print only from an https public URL: the endpoint goes into every collar.
 export const cardsPossible = (publicUrl?: string) => !!publicUrl && publicUrl.startsWith("https://");
 
-// Run f over items, a few at a time. Stops at the first error.
+// Run f over items, a few at a time. The first error stops every worker and is thrown.
 export async function each<T>(items: T[], f: (t: T) => Promise<unknown>, width = 6) {
   let i = 0;
+  let failed = false;
   const worker = async () => {
-    while (i < items.length) await f(items[i++]);
+    while (!failed && i < items.length) {
+      try {
+        await f(items[i++]);
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    }
   };
   await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker));
 }

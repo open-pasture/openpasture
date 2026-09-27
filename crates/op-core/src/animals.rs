@@ -133,9 +133,11 @@ pub fn tidy(a: &mut Animal) -> ApiResult<()> {
 
 /// A tag names one active animal per herd, and an EID one animal on the
 /// farm for good: 409 otherwise. Removed animals keep their EID but free
-/// their tag.
-pub async fn check_unique(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
-    if a.removed_at.is_none() {
+/// their tag. `before` is the stored record on an edit: only a tag, herd or
+/// EID that changes is checked, so rows stored before this rule stay editable.
+pub async fn check_unique(ctx: &Ctx, a: &Animal, before: Option<&Animal>) -> ApiResult<()> {
+    let moved = before.is_none_or(|b| b.tag != a.tag || b.herd_id != a.herd_id);
+    if a.removed_at.is_none() && moved {
         let taken: Option<(String,)> = sqlx::query_as("SELECT id FROM animals WHERE herd_id = ? AND tag = ? AND removed_at IS NULL AND id != ? LIMIT 1")
             .bind(&a.herd_id)
             .bind(&a.tag)
@@ -146,7 +148,7 @@ pub async fn check_unique(ctx: &Ctx, a: &Animal) -> ApiResult<()> {
             return Err(ApiError::conflict(format!("Tag {} is already in this herd.", a.tag)));
         }
     }
-    if let Some(eid) = &a.eid {
+    if let Some(eid) = a.eid.as_ref().filter(|e| before.is_none_or(|b| b.eid.as_ref() != Some(*e))) {
         let on: Option<(String,)> =
             sqlx::query_as("SELECT tag FROM animals WHERE eid = ? AND id != ? LIMIT 1").bind(eid).bind(&a.id).fetch_optional(ctx.db()).await?;
         if let Some((tag,)) = on {

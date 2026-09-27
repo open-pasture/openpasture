@@ -129,6 +129,12 @@ async fn a_tag_names_one_animal_per_herd_and_an_eid_one_animal() {
     assert_eq!(s, StatusCode::CREATED);
     let (s, _) = app.call("POST", "/api/animals", Some(json!({"tag": "216", "herd_id": cows, "eid": "982000123456789"}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
+
+    // Twins stored before the rule stay editable; only a changed tag is checked.
+    let twin = Animal { id: id::new_id(id::ANIMAL), tag: "214".into(), herd_id: cows.clone(), ..Default::default() };
+    app.ctx.store().insert_animal(&twin).await.unwrap();
+    let (s, v) = app.call("PATCH", &format!("/api/animals/{}", twin.id), Some(json!({"name": "Dot"}))).await;
+    assert_eq!((s, v["name"].as_str()), (StatusCode::OK, Some("Dot")));
 }
 
 #[tokio::test]

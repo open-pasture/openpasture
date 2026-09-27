@@ -120,4 +120,16 @@ describe("keys and cards", () => {
     expect(most).toBe(6);
     expect(seen.sort((a, b) => a - b)).toEqual(Array.from({ length: 40 }, (_, i) => i));
   });
+
+  test("each stops starting new work after the first error", async () => {
+    const started: number[] = [];
+    const run = each(Array.from({ length: 40 }, (_, i) => i), async (i) => {
+      started.push(i);
+      await new Promise((r) => setTimeout(r, 1));
+      if (i === 3) throw new Error("409");
+    }, 4);
+    await expect(run).rejects.toThrow("409");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(started.length).toBeLessThan(12);
+  });
 });

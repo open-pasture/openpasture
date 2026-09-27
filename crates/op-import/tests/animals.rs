@@ -176,6 +176,22 @@ async fn the_preview_shows_the_first_rows_and_what_would_be_skipped() {
 }
 
 #[tokio::test]
+async fn previews_take_files_up_to_five_megabytes() {
+    let app = App::new().await;
+    // Wider than the server's usual 2 MB body limit.
+    let mut csv = String::from("Tag,Notes\n");
+    let note = "x".repeat(300);
+    for i in 0..10_000 {
+        csv += &format!("{i},{note}\n");
+    }
+    assert!(csv.len() > 3_000_000);
+    let p = app.preview(csv.into_bytes()).await;
+    assert_eq!(p["total"], 10_000);
+    let (s, _) = app.csv("/api/animals/import/preview", "Tag\n".to_owned() + &"1\n".repeat(3_000_000)).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn a_commit_creates_or_updates_by_tag_and_twice_changes_nothing() {
     let app = App::new().await;
     let mut events = app.ctx.subscribe();
