@@ -6,6 +6,7 @@
 use axum::extract::State;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
+use futures::SinkExt;
 use op_core::{Ctx, Identity};
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -54,8 +55,8 @@ async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity, mut rx: bro
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) => {
-                    // Answer the close so the client sees a clean one.
-                    let _ = socket.send(Message::Close(None)).await;
+                    // The close reply is queued; write it out so the client sees a clean close.
+                    let _ = socket.flush().await;
                     break;
                 }
                 Some(Err(_)) | None => break,

@@ -317,3 +317,21 @@ async fn a_socket_that_falls_behind_is_told_to_resync() {
     let _ = ws.close(None).await;
     let _ = ws.flush().await;
 }
+
+#[tokio::test]
+async fn a_client_closing_gets_a_clean_close_back() {
+    let f = farm(1).await;
+    let mut ws = connect(&f.ctx, owner()).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Close(None)).await.unwrap();
+    let mut saw_close = false;
+    let end = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(end, ws.next()).await {
+            Ok(Some(Ok(m))) if m.is_close() => saw_close = true,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => panic!("{e}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(saw_close, "the server answered the close");
+}
