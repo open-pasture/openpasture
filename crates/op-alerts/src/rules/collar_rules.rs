@@ -182,8 +182,30 @@ impl Rule for Silent {
 
 /// More than `herd_silent_share` of a herd's collars silent (and at least
 /// two): one alert for the herd that takes in its `silent` alerts. Held after
-/// a server start like `silent`.
+/// a server start like `silent`. Once open (or closed by hand and still
+/// held closed) it lasts while more than `HERD_SILENT_HOLD` (80 %) of that
+/// share is silent, so a herd hovering at the share on patchy coverage is
+/// one alert, not a new one (and a text) every few minutes.
 pub struct HerdSilent;
+
+/// Share of `herd_silent_share` that keeps an open `herd_silent` going.
+const HERD_SILENT_HOLD: f64 = 0.8;
+
+/// Herds whose `herd_silent` is open or acked, or closed by hand and seen
+/// within `clear_after_min` (the engine keeps it closed while it lasts). A
+/// key range, so it reads `alerts_key` rather than every alert ever.
+async fn herd_silent_live(ctx: &Ctx, clear_after_min: u32, now: DateTime<Utc>) -> anyhow::Result<HashSet<String>> {
+    let since = ts(&(now - Duration::minutes(clear_after_min as i64)));
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT herd_id FROM alerts WHERE key >= 'herd_silent:herd:' AND key < 'herd_silent:herd;' AND herd_id IS NOT NULL
+           AND (status != 'resolved' OR (resolved_by IS NOT NULL AND rolled_into IS NULL AND seen_at >= ?))",
+    )
+    .bind(since)
+    .fetch_all(ctx.db())
+    .await?
+    .into_iter()
+    .collect())
+}
 
 #[async_trait]
 impl Rule for HerdSilent {
@@ -199,7 +221,9 @@ impl Rule for HerdSilent {
     }
 
     async fn evaluate(&self, ctx: &Ctx, _cfg: &RuleConfig, now: DateTime<Utc>) -> anyhow::Result<Vec<Candidate>> {
-        let share = engine::config::policy(ctx).await?.herd_silent_share;
+        let policy = engine::config::policy(ctx).await?;
+        let share = policy.herd_silent_share;
+        let live = herd_silent_live(ctx, policy.clear_after_min, now).await?;
         let f = fleet(ctx).await?;
         let limits = silence_limits(ctx, &f, now).await?;
         // Per herd: collars that have reported, and those silent now.
@@ -213,7 +237,8 @@ impl Rule for HerdSilent {
         }
         let mut out = Vec::new();
         for (herd_id, (all, silent)) in by_herd {
-            if silent.len() < 2 || (silent.len() as f64) <= share * all.len() as f64 {
+            let bar = if live.contains(herd_id) { share * HERD_SILENT_HOLD } else { share };
+            if silent.len() < 2 || (silent.len() as f64) <= bar * all.len() as f64 {
                 continue;
             }
             let herd = f.herd(herd_id);

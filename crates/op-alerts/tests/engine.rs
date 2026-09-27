@@ -467,3 +467,292 @@ async fn ten_second_rules_take_under_200_ms_and_drop_off_under_a_second_at_250_c
     let dropped = f.open_kind("drop_off").await;
     assert_eq!((dropped.len(), dropped[0].data["count"].as_u64()), (1, Some(5)), "the five collars that never moved, as one rollup");
 }
+
+/// These collars out on an open escape at `at`.
+async fn break_out(f: &Farm, cs: &[String], at: chrono::DateTime<chrono::Utc>) {
+    for c in cs {
+        f.outside(c, at - mins(2), at).await;
+        f.escape(c, "returning", at - mins(1), None).await;
+    }
+}
+
+/// These collars' escapes end: they're back in.
+async fn back_in(f: &Farm, cs: &[String], at: chrono::DateTime<chrono::Utc>) {
+    for c in cs {
+        f.exec(&format!("UPDATE escapes SET status = 'ended', ended_at = '{}' WHERE collar_id = '{c}'", to_db(&at))).await;
+        f.inside(c, at).await;
+    }
+}
+
+/// Evaluate and route every `step` from `from` to `to`, every collar reporting.
+async fn run(f: &Farm, from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>, step: chrono::Duration) {
+    let mut now = from;
+    while now <= to {
+        f.exec(&format!("UPDATE collars SET last_seen = '{}'", to_db(&now))).await;
+        f.eval(now).await;
+        f.route(now).await;
+        now += step;
+    }
+}
+
+#[tokio::test]
+async fn a_new_breakout_joining_an_acked_rollup_is_texted_again() {
+    let f = Farm::new().await;
+    let (a, b) = two_people(&f).await;
+    let t = t0();
+    let cs = f.collars(250, t).await;
+    break_out(&f, &cs[..6], t).await;
+    run(&f, t, t + secs(10), secs(10)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    let first = f.open_kind("escaped").await.remove(0);
+    let (s, _) = f.owner("POST", &format!("/api/alerts/{}/ack", first.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // Five come back; 101 stays out (its collar fell off outside).
+    back_in(&f, &cs[1..6], t + mins(1)).await;
+    run(&f, t + mins(1), t + mins(60), mins(1)).await;
+    let still = f.open_kind("escaped").await;
+    assert_eq!((still.len(), still[0].id.as_str(), still[0].title.as_str(), still[0].status), (1, first.id.as_str(), "1 outside P1", AlertStatus::Acked));
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    // 240 more get out: a new alert for all 241, texted to everyone.
+    let later = t + mins(120);
+    break_out(&f, &cs[6..246], later).await;
+    run(&f, later, later + mins(1), secs(10)).await;
+    let open = f.open_kind("escaped").await;
+    assert_eq!(open.len(), 1);
+    assert_ne!(open[0].id, first.id);
+    assert_eq!((open[0].title.as_str(), open[0].status, open[0].data["count"].as_u64()), ("241 outside P1", AlertStatus::Open, Some(241)));
+    let old = f.alert(&first.id).await;
+    assert_eq!((old.status, old.rolled_into.as_deref(), old.resolved_by), (AlertStatus::Resolved, Some(open[0].id.as_str()), None));
+    for p in [&a, &b] {
+        let m = f.messages_to(p).await;
+        assert_eq!(m.len(), 2, "{m:#?}");
+        assert!(m[1].text.starts_with("241 outside P1 since "), "{}", m[1].text);
+        assert_eq!(m[1].alert_id.as_deref(), Some(open[0].id.as_str()));
+    }
+    assert_eq!(f.messages_to(&a).await.len(), 2);
+    // It's unacked: it re-notifies like any other critical alert.
+    run(&f, later + mins(2), later + mins(31), mins(1)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 3, "renotified after 30 minutes");
+}
+
+#[tokio::test]
+async fn a_new_breakout_joining_a_rollup_closed_by_hand_is_texted_again() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let cs = f.collars(250, t).await;
+    break_out(&f, &cs[..6], t).await;
+    f.eval(t).await;
+    // Closed in the app before its text went out.
+    let first = f.open_kind("escaped").await.remove(0);
+    let (s, _) = f.owner("POST", &format!("/api/alerts/{}/resolve", first.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // They stay out, then three come back: still closed, and no alerts of their own.
+    run(&f, t + secs(10), t + mins(30), mins(1)).await;
+    back_in(&f, &cs[..3], t + mins(31)).await;
+    run(&f, t + mins(31), t + mins(60), mins(1)).await;
+    assert!(f.open_kind("escaped").await.is_empty(), "{:#?}", f.open().await);
+    assert_eq!(f.every_alert().await.iter().filter(|x| x.kind == "escaped").count(), 1);
+    assert!(f.messages_to(&a).await.is_empty());
+    // 240 more get out.
+    let later = t + mins(120);
+    break_out(&f, &cs[6..246], later).await;
+    run(&f, later, later + mins(1), secs(10)).await;
+    let open = f.open_kind("escaped").await;
+    assert_eq!((open.len(), open[0].title.as_str()), (1, "243 outside P1"));
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.len(), 1, "{m:#?}");
+    assert!(m[0].text.starts_with("243 outside P1"), "{}", m[0].text);
+}
+
+#[tokio::test]
+async fn a_straggler_left_in_an_acked_rollup_doesnt_hide_the_next_escape() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let cs = f.collars(20, t).await;
+    break_out(&f, &cs[..6], t).await;
+    run(&f, t, t + secs(10), secs(10)).await;
+    let first = f.open_kind("escaped").await.remove(0);
+    let (s, _) = f.owner("POST", &format!("/api/alerts/{}/ack", first.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // Five come back; one collar lies outside the fence.
+    back_in(&f, &cs[1..6], t + mins(1)).await;
+    run(&f, t + mins(1), t + mins(60), mins(1)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    // Hours later two more get out: as many new as the one it still had, so texted.
+    let later = t + mins(180);
+    break_out(&f, &cs[6..8], later).await;
+    run(&f, later, later + mins(1), secs(10)).await;
+    let open = f.open_kind("escaped").await;
+    assert_eq!((open.len(), open[0].title.as_str(), open[0].status), (1, "3 outside P1", AlertStatus::Open));
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.len(), 2, "{m:#?}");
+    assert!(m[1].text.starts_with("3 outside P1"), "{}", m[1].text);
+}
+
+#[tokio::test]
+async fn escapes_after_a_rollup_was_closed_by_hand_alert_on_their_own() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let cs = f.collars(20, t).await;
+    break_out(&f, &cs[..6], t).await;
+    run(&f, t, t + secs(10), secs(10)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    let first = f.open_kind("escaped").await.remove(0);
+    let (s, _) = f.owner("POST", &format!("/api/alerts/{}/resolve", first.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // The six stay out, closed; later two more get out: those two are alerts of their own.
+    run(&f, t + mins(1), t + mins(30), mins(1)).await;
+    let later = t + mins(31);
+    break_out(&f, &cs[6..8], later).await;
+    run(&f, later, later + mins(1), secs(10)).await;
+    let open = f.open_kind("escaped").await;
+    assert_eq!(open.len(), 2, "{open:#?}");
+    assert!(open.iter().all(|x| x.key != first.key && x.data.get("count").is_none()), "{open:#?}");
+    assert_eq!(f.alert(&first.id).await.status, AlertStatus::Resolved);
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.len(), 2, "{m:#?}");
+    assert!(m[1].text.starts_with("2 outside P1: "), "{}", m[1].text);
+    // Two more make four new since it was closed: one new rollup of all ten.
+    break_out(&f, &cs[8..10], later + mins(2)).await;
+    run(&f, later + mins(2), later + mins(3), secs(10)).await;
+    let open = f.open_kind("escaped").await;
+    assert_eq!(open.len(), 1, "{open:#?}");
+    assert_eq!((open[0].title.as_str(), open[0].key.as_str()), ("10 outside P1", first.key.as_str()));
+    assert_ne!(open[0].id, first.id);
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.len(), 3, "{m:#?}");
+    assert!(m[2].text.starts_with("10 outside P1"), "{}", m[2].text);
+}
+
+#[tokio::test]
+async fn a_growing_breakout_is_texted_again_each_time_it_doubles() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let cs = f.collars(40, t).await;
+    break_out(&f, &cs[..6], t).await;
+    run(&f, t, t + secs(10), secs(10)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    // Five more: not yet as many new as it had.
+    break_out(&f, &cs[6..11], t + mins(1)).await;
+    run(&f, t + mins(1), t + mins(2), secs(10)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    assert_eq!(f.open_kind("escaped").await[0].title, "11 outside P1");
+    // One more makes six new: texted again, one row open.
+    break_out(&f, &cs[11..12], t + mins(3)).await;
+    run(&f, t + mins(3), t + mins(4), secs(10)).await;
+    let m = f.messages_to(&a).await;
+    assert_eq!(m.len(), 2, "{m:#?}");
+    assert!(m[1].text.starts_with("12 outside P1"), "{}", m[1].text);
+    assert_eq!(f.open_kind("escaped").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_slow_rule_waits_two_of_its_own_runs_before_it_clears() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let c = f.collar(Some("214"), t).await;
+    let base = f.spot(100.0, 100.0);
+    let last_fix = |at: chrono::DateTime<chrono::Utc>| json!({"at": to_db(&at), "point": base, "accuracy_m": 3.0, "sats": 9}).to_string();
+    for i in 0..245 {
+        f.fix(&c, t - mins(245) + mins(i), base, 3.0).await;
+    }
+    f.set(&c, "last_fix = ?", &[&last_fix(t - mins(1))]).await;
+    let drop: HashSet<&str> = ["drop_off"].into();
+    let mut e = op_alerts::engine::Engine::new();
+    e.evaluate(&f.ctx, t, &drop).await.unwrap();
+    let first = f.open_kind("drop_off").await;
+    assert_eq!(first.len(), 1);
+    f.route(t + secs(61)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    // No fix in its last five minutes: one run (300 s later) misses it.
+    assert!(!e.due(t + mins(4)).contains("drop_off"));
+    e.evaluate(&f.ctx, t + mins(5), &drop).await.unwrap();
+    assert_eq!(f.open_kind("drop_off").await.len(), 1, "one missed run of a 300 s rule doesn't clear it");
+    // Fixes again: the same row, and no second text.
+    for i in 5..10 {
+        f.fix(&c, t + mins(i), base, 3.0).await;
+    }
+    f.set(&c, "last_fix = ?", &[&last_fix(t + mins(9))]).await;
+    e.evaluate(&f.ctx, t + mins(10), &drop).await.unwrap();
+    f.route(t + mins(11)).await;
+    let again = f.open_kind("drop_off").await;
+    assert_eq!((again.len(), again[0].id.as_str()), (1, first[0].id.as_str()));
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    // Two runs in a row without it: resolved by itself.
+    e.evaluate(&f.ctx, t + mins(15), &drop).await.unwrap();
+    assert_eq!(f.open_kind("drop_off").await.len(), 1);
+    e.evaluate(&f.ctx, t + mins(20), &drop).await.unwrap();
+    assert!(f.open_kind("drop_off").await.is_empty());
+    assert!(f.alert(&first[0].id).await.resolved_by.is_none());
+}
+
+#[tokio::test]
+async fn a_slow_rule_closed_by_hand_stays_closed_between_its_runs() {
+    let f = Farm::new().await;
+    let (a, _) = two_people(&f).await;
+    let t = t0();
+    let c = f.collar(Some("214"), t).await;
+    let base = f.spot(100.0, 100.0);
+    for i in 0..300 {
+        f.fix(&c, t - mins(245) + mins(i), base, 3.0).await;
+    }
+    let drop: HashSet<&str> = ["drop_off"].into();
+    let mut e = op_alerts::engine::Engine::new();
+    let fix_at = |at: chrono::DateTime<chrono::Utc>| json!({"at": to_db(&(at - mins(1))), "point": base, "accuracy_m": 3.0, "sats": 9}).to_string();
+    f.set(&c, "last_fix = ?", &[&fix_at(t)]).await;
+    e.evaluate(&f.ctx, t, &drop).await.unwrap();
+    f.route(t + secs(61)).await;
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+    let first = f.open_kind("drop_off").await.remove(0);
+    let (s, _) = f.owner("POST", &format!("/api/alerts/{}/resolve", first.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // Still lying there, run after run 300 s apart: it stays closed.
+    for k in 1..=6 {
+        let now = t + mins(5 * k);
+        f.set(&c, "last_fix = ?", &[&fix_at(now)]).await;
+        e.evaluate(&f.ctx, now, &drop).await.unwrap();
+        f.route(now + secs(61)).await;
+    }
+    assert!(f.open_kind("drop_off").await.is_empty(), "{:#?}", f.open().await);
+    assert_eq!(f.messages_to(&a).await.len(), 1);
+}
+
+#[tokio::test]
+async fn approval_codes_stay_out_of_the_api_and_live_events() {
+    let f = Farm::new().await;
+    let mut rx = f.ctx.subscribe();
+    f.decision("MOVE", "proposed", t0() - mins(31), None).await;
+    f.eval(t0()).await;
+    let a = f.open_kind("decision_waiting").await.remove(0);
+    assert!(a.data["code"].as_str().is_some_and(|c| c.len() == 4), "kept for the text and the replies");
+    let mut seen = 0;
+    while let Ok(e) = rx.try_recv() {
+        if let Event::Alert { alert } = e {
+            assert!(alert.data.get("code").is_none(), "live: {:?}", alert.data);
+            assert_eq!(alert.data["herd"], "Cows");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 1);
+    let viewer = Identity { role: Role::Viewer, user_id: None, name: None, via: Via::UserToken };
+    for id in [viewer.clone(), Identity::owner(Via::Local)] {
+        let (_, v) = f.api(id.clone(), "GET", "/api/alerts", None).await;
+        assert!(v[0]["data"].get("code").is_none(), "{v}");
+        assert_eq!(v[0]["data"]["herd"], "Cows");
+        let (_, v) = f.api(id.clone(), "GET", &format!("/api/alerts/{}", a.id), None).await;
+        assert!(v["data"].get("code").is_none(), "{v}");
+        let v = f.ctx.tools().call(&f.ctx, "list_alerts", json!({}), None, id, &ToolScope::Full).await.unwrap();
+        assert!(v["alerts"][0]["data"].get("code").is_none(), "{v}");
+    }
+    let (s, v) = f.owner("POST", &format!("/api/alerts/{}/ack", a.id), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v["data"].get("code").is_none(), "{v}");
+    assert!(rx.try_recv().is_ok_and(|e| matches!(e, Event::Alert { alert } if alert.data.get("code").is_none())));
+    // The texts still carry it.
+    assert_eq!(f.alert(&a.id).await.data["code"], a.data["code"]);
+}

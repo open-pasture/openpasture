@@ -23,6 +23,29 @@ pub struct Row {
     pub escalated_at: Option<DateTime<Utc>>,
     pub renotified: u32,
     pub renotified_at: Option<DateTime<Utc>>,
+    /// The collars it had when people were last told about it (a text went
+    /// out, or someone acked or closed it); `None` before that.
+    pub announced: Option<Vec<String>>,
+}
+
+/// SQL: the collar ids in the row's own targets, as a JSON array (what
+/// `announced` takes when people are told).
+pub const TARGET_COLLARS: &str =
+    "(SELECT json_group_array(json_extract(value, '$[1]')) FROM json_each(alerts.targets) WHERE json_extract(value, '$[0]') = 'collar')";
+
+/// `data` keys that never leave the server: the approval code goes out only
+/// in the approval text (and A3 reads it from the table).
+const PRIVATE_DATA: &[&str] = &["code"];
+
+/// An alert as the API, the MCP tools and live events show it: without the
+/// approval code.
+pub fn public(mut a: Alert) -> Alert {
+    if let Some(d) = a.data.as_object_mut() {
+        for k in PRIVATE_DATA {
+            d.remove(*k);
+        }
+    }
+    a
 }
 
 fn actor(v: Option<String>) -> anyhow::Result<Option<Actor>> {
@@ -65,6 +88,7 @@ pub fn row_from(r: &SqliteRow) -> anyhow::Result<Row> {
         escalated_at: opt_from_db(r.try_get("escalated_at")?)?,
         renotified: r.try_get::<i64, _>("renotified")?.max(0) as u32,
         renotified_at: opt_from_db(r.try_get("renotified_at")?)?,
+        announced: r.try_get::<Option<String>, _>("announced")?.map(|s| serde_json::from_str(&s)).transpose()?,
     })
 }
 
@@ -213,39 +237,34 @@ pub async fn touch(ctx: &Ctx, ids: &[String], at: DateTime<Utc>) -> anyhow::Resu
 }
 
 /// Resolve an unresolved alert: by someone, by itself (`by` None) or into a
-/// rollup. Publishes it. `None` when it was already resolved.
+/// rollup. Publishes it. `None` when it was already resolved. Closed by
+/// someone, its collars count as told (`announced`).
 pub async fn resolve(ctx: &Ctx, id: &str, by: Option<&Actor>, rolled_into: Option<&str>, at: DateTime<Utc>) -> anyhow::Result<Option<Alert>> {
-    let row = sqlx::query(
-        "UPDATE alerts SET status = 'resolved', resolved_at = ?, resolved_by = ?, rolled_into = ?, updated_at = ?
-         WHERE id = ? AND status != 'resolved' RETURNING *",
-    )
-    .bind(to_db(&at))
-    .bind(by.map(json).transpose()?)
-    .bind(rolled_into)
-    .bind(to_db(&at))
-    .bind(id)
-    .fetch_optional(ctx.db())
-    .await?;
+    let sql = format!(
+        "UPDATE alerts SET status = 'resolved', resolved_at = ?1, resolved_by = ?2, rolled_into = ?3, updated_at = ?1,
+             announced = CASE WHEN ?2 IS NULL THEN announced ELSE {TARGET_COLLARS} END
+         WHERE id = ?4 AND status != 'resolved' RETURNING *"
+    );
+    let row = sqlx::query(&sql).bind(to_db(&at)).bind(by.map(json).transpose()?).bind(rolled_into).bind(id).fetch_optional(ctx.db()).await?;
     let a = row.map(|r| alert_from_row(&r)).transpose()?;
     if let Some(a) = &a {
-        ctx.publish(Event::Alert { alert: a.clone() });
+        ctx.publish(Event::Alert { alert: public(a.clone()) });
     }
     Ok(a)
 }
 
-/// Someone saw it: no more re-notification or escalation. Acking an acked
-/// alert returns it unchanged; a resolved one is 409.
+/// Someone saw it: no more re-notification or escalation, and its collars
+/// count as told (`announced`). Acking an acked alert returns it unchanged;
+/// a resolved one is 409.
 pub async fn ack(ctx: &Ctx, id: &str, by: &Actor, at: DateTime<Utc>) -> ApiResult<Alert> {
-    let row = sqlx::query("UPDATE alerts SET status = 'acked', acked_at = ?, acked_by = ?, updated_at = ? WHERE id = ? AND status = 'open' RETURNING *")
-        .bind(to_db(&at))
-        .bind(json(by)?)
-        .bind(to_db(&at))
-        .bind(id)
-        .fetch_optional(ctx.db())
-        .await?;
+    let sql = format!(
+        "UPDATE alerts SET status = 'acked', acked_at = ?1, acked_by = ?2, updated_at = ?1, announced = {TARGET_COLLARS}
+         WHERE id = ?3 AND status = 'open' RETURNING *"
+    );
+    let row = sqlx::query(&sql).bind(to_db(&at)).bind(json(by)?).bind(id).fetch_optional(ctx.db()).await?;
     if let Some(r) = row {
         let a = alert_from_row(&r)?;
-        ctx.publish(Event::Alert { alert: a.clone() });
+        ctx.publish(Event::Alert { alert: public(a.clone()) });
         return Ok(a);
     }
     match get(ctx, id).await? {

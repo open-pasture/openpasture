@@ -664,21 +664,31 @@ the herd's boundary ≥ 5 min with no escape running and not let go on this trip
 when the collar is silent too) · `silent` no report for max(20 min, 3 × its median report interval
 over 24 h); held for `start_grace_min` after a server start (warning) · `herd_silent` more than
 `herd_silent_share` of a herd's reporting collars silent, at least two (critical; takes in that herd's
-`silent` alerts) · `low_battery` < 20 % (warning, no texts; in the brief) · `boundary_not_applied` the
-herd's boundary in effect ≥ 10 min and the collar holds an older one (or rejected it), not escaped and
-not silent (warning) · `decision_waiting` a proposal unanswered 30 min, or a timer decision at once
-(warning; `data.code` is the 4-digit approval code) · `move_stalled` a sweeping move with no step for
-15 min (warning; `data.staged` when it waits on a staged boundary) · `stragglers` a move left animals
-behind (info) · `drop_off` every fix (sampled every 5 min) within 4 m of their median for 240 min
-(warning) · `gps_degraded` median accuracy over the last 10 min worse than 10 m, or no fix for 10 min
-while reports arrive (info, no texts). Parked collars and removed animals never alert.
+`silent` alerts; once open it lasts while more than 80 % of that share is silent) · `low_battery`
+< 20 % (warning, no texts; in the brief) · `boundary_not_applied` the herd's boundary in effect
+≥ 10 min and the collar holds an older one (or rejected it), not escaped and not silent (warning) ·
+`decision_waiting` a proposal unanswered 30 min, or a timer decision at once (warning; the 4-digit
+approval code is only in its text, never in the API, the MCP tools or live events) · `move_stalled` a
+sweeping move with no step for 15 min (warning; `data.staged` when it waits on a staged boundary) ·
+`stragglers` a move left animals behind (info) · `drop_off` every fix (sampled every 5 min) within 4 m
+of their median for 240 min (warning) · `gps_degraded` median accuracy over the last 10 min worse than
+10 m, or no fix for 10 min while reports arrive (info, no texts). Parked collars and removed animals
+never alert.
 
 Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
 are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
-members until the last clears; members already open resolve with `rolled_into`. A key gone for
-`clear_after_min` resolves by itself (`resolved_at` without `resolved_by`); back within that time it
-keeps its row; back after it resolved it opens a new row. `decision_waiting` resolves as soon as the
-decision is answered. `data` carries what the texts need: `label`, `herd`, `paddock`, `since`, …
+members until the last clears; members already open resolve with `rolled_into`. Once people were told
+about a rollup (a text or an ack), animals that join it are a new breakout when they are at least as
+many as the told ones still in it: it opens again as a new alert with every member (the old one
+resolves with `rolled_into` the new one) and is sent like any new alert. So an acked "6 outside P3"
+with one animal still out texts "3 outside P3" when two more get out, and a breakout that keeps
+growing texts again each time it doubles. A rollup closed by hand stays closed while animals it was
+closed with stay out; animals out since then alert on their own, or as a new rollup of every member
+once there are `rollup_min` of them. A key gone for `clear_after_min`, and at least two runs of its
+rule (10 min for `drop_off`), resolves by itself (`resolved_at` without `resolved_by`); back within
+that time it keeps its row; back after it resolved it opens a new row. `decision_waiting` resolves as
+soon as the decision is answered. `data` carries what the texts need: `label`, `herd`, `paddock`,
+`since`, …
 
 Rules run on a 10 s tick (each on its `cadence_s`: `drop_off` 300 s, `low_battery` and `gps_degraded`
 60 s) and early, after 2 quiet seconds, on bus `escape`, `decision`, `move`, `ack` and `boundary`
@@ -689,11 +699,18 @@ sender to deliver. A person gets an alert when its severity is at least theirs, 
 theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
 that hasn't texted STOP; with no Twilio of the farm's own, sms goes over the relay (channel `relay`,
 address the phone); email only over the farm's own SMTP (the relay can't prove an address is the
-person's); WhatsApp only with an approved template. When anyone matching is on duty the first send goes
-only to them. Warnings wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214
-031 118"); critical waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet
-hours (the person's, else the farm's) hold warnings until they end and let critical through unless
-`critical_in_quiet` is off. Unacked critical alerts are sent again every `renotify_every_min` up to
+person's); WhatsApp only with an approved template. The approval prompt (`decision_waiting`) goes only to
+managers and the owner, who alone may answer it. When anyone matching is on duty, may answer it (OK
+is for hands and up, Y or N for managers and up) and is not held by quiet hours, the first send goes
+only to them; otherwise to everyone matching (those held get it when their quiet hours end). Warnings
+wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214 031 118"); critical
+waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet hours (the
+person's, else the farm's) hold warnings until they end and let critical through unless
+`critical_in_quiet` is off. A prompt with a deadline (a timer decision's `apply_at`, or the `opens_at`
+of the strip a schedule call is about) goes after `critical_window_s` and through quiet hours like a
+critical alert, unless those end at least 30 min before the deadline: then it waits for their end.
+Past the deadline it is a plain warning. A prompt whose decision was answered before it went out is
+resolved, not sent. Unacked critical alerts are sent again every `renotify_every_min` up to
 `renotify_max` times and escalate every `escalate_after_min` to matching people of the next role up not
 yet told (hand → manager → owner). The farm webhook (channel `webhook`) gets every notified alert once.
 
