@@ -408,3 +408,22 @@ async fn simplified_when_the_collars_hold_fewer_corners() {
     assert!(codes(&app.prepare(&many, None).await.findings).contains(&"simplified"));
     assert!(!codes(&app.prepare(&poly(0.0, 0.0, 300.0, 200.0), None).await.findings).contains(&"simplified"));
 }
+
+#[tokio::test]
+async fn a_boundary_with_nowhere_clear_of_the_warning_zone_is_refused() {
+    let app = App::new().await;
+    // 15 m across: 7.5 m from the edges at most.
+    let strip = poly(0.0, 0.0, 15.0, 200.0);
+    let (s, v) = app.req("POST", &format!("/api/herds/{}/boundary", app.herd), None, Some(json!({"geometry": strip, "warn_m": 10.0}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "Nowhere in it is clear of the warning zone. Make it at least 22 m across.", "{v}");
+    // At the firmware's 5 m it has a quiet middle.
+    app.send(&strip, json!({"warn_m": 5.0})).await;
+    // Training mode's wider warning zone counts when the send leaves margins out.
+    app.ctx.store().set_setting(op_ingest::margins::TRAINING_KEY, &json!({app.herd.clone(): {"enabled": true, "warn_m": 10.0}})).await.unwrap();
+    let e = op_ingest::prepare(&app.ctx, &app.herd, &strip, &SendOpts::default()).await.unwrap_err();
+    assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    // A hole leaving only a narrow ring is the same.
+    let ringed = Polygon::from_rings(rect(0.0, 0.0, 300.0, 200.0), [rect(8.0, 8.0, 292.0, 192.0)]);
+    assert!(op_ingest::prepare(&app.ctx, &app.herd, &ringed, &SendOpts { warn_m: Some(5.0), ..Default::default() }).await.is_err());
+}

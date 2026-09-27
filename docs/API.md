@@ -523,8 +523,12 @@ BoundaryStatus.acks[].code?         // the reject code of a collar's latest ack
 sweep step, schedule stage): the shape is validated and fitted to the strictest limits
 among the herd's collars that hold holes (V0 when none report caps). Outer rings only shrink and
 holes only grow. An invalid shape is 400 with a sentence, e.g. "Holes need 13 m between them and
-from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). Missing
-`warn_m`/`hysteresis_m` default to 5 m and 1 m. Holes are allowed: `POST /api/herds/:id/boundary`
+from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). A shape
+with nowhere at least `warn_m + hysteresis_m` from every edge and hole (narrower than two warning
+zones) is 400 too, "Nowhere in it is clear of the warning zone. Make it at least 22 m across.":
+every animal in it would be cued whatever it did. Missing
+`warn_m`/`hysteresis_m` default to 5 m and 1 m (a training herd's `warn_m` while training is on,
+so schedule strips are checked at the margins they go out with). Holes are allowed: `POST /api/herds/:id/boundary`
 takes a Polygon with inner rings. Sweep steps carry the target's holes, and holes of the previous
 boundary that still lie whole inside the step with the gap.
 

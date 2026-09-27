@@ -1017,3 +1017,26 @@ async fn a_schedule_over_part_of_the_paddock_starts_from_the_whole_of_it() {
     sched::drive(&app.ctx, &s.id, Utc::now() + Duration::seconds(61)).await.unwrap();
     assert_eq!(sched::get(&app.ctx, &s.id).await.unwrap().unwrap().status, ScheduleStatus::Active);
 }
+
+#[tokio::test]
+async fn strips_narrower_than_the_herds_two_warning_zones_are_refused() {
+    let app = App::new().await;
+    let (herd, pad) = app.herd("Heifers").await;
+    app.collar(&herd, CollarLimits::V0).await;
+    let narrow: Vec<Polygon> = (0..20).map(|i| rect(15.0 * i as f64, 0.0, 15.0 * (i + 1) as f64, 200.0)).collect();
+    let (st, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": narrow[0]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{m}");
+    let start = whole(Utc::now() + Duration::minutes(30));
+    // Each back fence closes onto one 15 m strip.
+    let bf = BackFence { enabled: true, lag_strips: 0, close_after_min: 2, close_steps: 1, close_every_min: 1 };
+    let mut n = new_schedule(&herd, &pad, start, bf);
+    n.strips = narrow.clone();
+    // Training mode: the herd's warning zone is 10 m, so a 15 m strip is warning zone all through.
+    app.ctx.store().set_setting(op_ingest::margins::TRAINING_KEY, &json!({herd.clone(): {"enabled": true, "warn_m": 10.0}})).await.unwrap();
+    let e = sched::create(&app.ctx, n.clone(), &every(start)).await.unwrap_err();
+    assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    assert!(e.message.contains("clear of the warning zone"), "{}", e.message);
+    // At the firmware's 5 m they go.
+    app.ctx.store().set_setting(op_ingest::margins::TRAINING_KEY, &json!({})).await.unwrap();
+    sched::create(&app.ctx, n, &every(start)).await.unwrap();
+}
