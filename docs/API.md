@@ -1225,6 +1225,82 @@ stay with the original.
 <!-- @F -->
 <!-- @S -->
 <!-- @A3 -->
+
+## Texts in and the morning brief (op-alerts)
+
+People on the farm answer and ask by text. `/api/texting*` is the owner's.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/texting` | `Texting` |
+| PUT | `/api/texting` | merge patch over `TextingConfig` → `Texting`; 400 `poll_s` 5–300 · `approve_window_h` 1–72 · `brief.time` HH:MM. The read-only parts may be sent back and are ignored |
+| PUT | `/api/texting/people/{id}` | `{ brief: bool }` → `PersonTexting`; 404 no such person |
+| POST | `/hooks/twilio/sms`, `/hooks/twilio/whatsapp` | Twilio's webhook (form) → 204; 403 bad or missing signature, another Twilio account, no public URL, or texting in off |
+| GET | `/v1/notify/inbox` | relay host: `?since=<cursor>&wait=<s ≤ 25>` → `Inbox`; 401 unknown key · 403 hosting off · 400 bad cursor |
+
+```ts
+TextingConfig = { inbound /* true */, poll_s /* 10 */, approve_window_h /* 12 */, brief: { enabled /* false */, time /* "06:30", farm time */ } }
+Texting = TextingConfig & {
+  inbound_mode: "webhook" | "polling" | "relay" | "off",   // read-only
+  hooks?: { sms?, whatsapp? },                              // webhook mode: the URLs to give Twilio
+  checked?: { at?, ok_at?, error? },                        // polling / relay: the last check
+  people: PersonTexting[],
+}
+PersonTexting = { user_id, brief /* gets the brief by text */, sms_opt_out /* texted STOP */ }
+Inbox = { messages: [{ id /* rin_… */, channel: "sms"|"whatsapp", from /* E.164 */, text, at }], cursor }
+```
+
+**How texts come in.** The farm's own Twilio decides: with `server.public_url` set, Twilio posts
+each text to `{public_url}/hooks/twilio/sms` (or `/whatsapp`); set that URL as the number's
+"A message comes in" webhook. The request must carry `X-Twilio-Signature` = base64(HMAC-SHA1(auth
+token, URL + every POST parameter name and value, sorted by name)); the URL is always
+`public_url` + path + query string, never the Host a proxy passes on (the default port may be
+there or not). Without a public URL (a farm behind NAT) the server reads
+`GET {twilio_api_base}/2010-04-01/Accounts/{sid}/Messages.json?To=<number>&DateSent>=<yesterday>`
+every `poll_s` seconds instead (a Messaging Service sender is read whole, inbound only). Without
+its own Twilio, a farm with the relay on long-polls the relay's inbox. Each text is taken once (by
+`MessageSid`, or the relay's id) and stored in `messages` (`direction: "in"`, `kind: "inbound"`,
+status `received`, or `ignored` with the reason in `error`). Texts that arrived before polling
+began for a number are never acted on. Replies are queued with `kind: "reply"` on the channel the
+text came in on.
+
+**Who.** Only a verified phone of an enabled person counts; unknown numbers, unverified phones and
+anyone who texted STOP get no reply (`ignored`). A 6-digit code texted back confirms a pending
+verification ("Phone verified. Reply STATUS any time.").
+
+**Texts** (case-insensitive; a command is the whole text, so "no thanks" is a question):
+
+| Text | Needs | Does |
+| --- | --- | --- |
+| `Y` `YES` `SI` `SÍ` `APPROVE` / `N` `NO` `REJECT` [code \| number] | manager | answers the waiting decision (`cycle::respond`, recorded as `{via: "text", user_id, name}`); several waiting → a numbered list, `Y 2` picks |
+| `LATER` [code \| number] | manager | the approval prompt again in an hour (the decision's own timer is unchanged) |
+| `OK` | hand | acks the alerts the last alert text to that person covered |
+| `STATUS` | anyone | each herd: head, paddock, a running move, open alerts, what waits for an answer |
+| `WHERE IS <tag>`, `WHERE <tag>` | anyone | the last fix in words, its age and `https://maps.google.com/?q=<lat>,<lon>` |
+| `STOP MOVE` [code \| number] | manager | stops the running move where it is |
+| `STOP` / `START` | anyone | opts out / in (Twilio's words mirrored: STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, REVOKE, OPTOUT; UNSTOP, and YES for a number that opted out). No reply on SMS, where Twilio confirms |
+| `HELP`, `INFO` | | Twilio answers; nothing from us |
+| anything else | anyone | the farm's brain answers with read tools (never `run_sql`), ≤ 320 characters on SMS, 1,000 on WhatsApp; a brain that doesn't answer questions → the list of texts |
+
+A Y, N or STOP MOVE without the decision's 4-digit code counts only within `approve_window_h` of
+our last alert or brief to that number (replies don't count, so texting us can't open the window);
+after that the code from the approval text is needed ("Y 4821"). Five wrong codes in an hour from
+one number and codes from it stop counting for the hour.
+
+**The morning brief.** At `brief.time` farm time (while `brief.enabled`), everyone with the brief on
+gets each of their herds' brief (`GET /api/brief`'s `text`, ≤ 480 characters) on every way their
+alerts reach them. Once a farm day; a server that was down then sends it within two hours, not
+later. A brief opens the reply window like an alert.
+
+**The relay's inbox** (host side). A text to the relay's number from a verified recipient goes to
+the key whose text to that number was the host's last; STOP and START go to every key that has the
+number (Twilio opts a phone out per sender number, so STOP to the shared number stops every farm on
+it); a code from a recipient being verified verifies it and goes on to the key that asked. The
+long-poll waits up to `wait` seconds for a text; rows up to the `since` a farm sends back are
+delivered and deleted. **Dead-man**: a key that polled before and has been quiet for more than
+`notify.hosting.deadman_after_min` texts its `deadman` recipients once per outage ("openpasture:
+Test farm hasn't checked in for 16 min. Its power or internet may be down.").
+
 <!-- @H -->
 <!-- @L -->
 <!-- @M -->
