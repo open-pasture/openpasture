@@ -29,6 +29,8 @@ describe("matching", () => {
     expect(hits.map((h) => h.label)).toEqual(["214  Bessie", "2140", "spare 214"]);
     expect(hits[0].collarId).toBe("c2");
     expect(hits[0].tag).toBe("214");
+    // The animal itself, so its page opens by a key that can't be another herd's (tags repeat).
+    expect(hits[0].animalId).toBe("a2");
     expect(findAnimals("98200012", animals, collars).map((h) => h.tag)).toEqual(["031"]);
     expect(findAnimals("bessie", animals, collars).map((h) => h.collarId)).toEqual(["c2"]);
     // A collar an animal wears is found through the animal, not twice.

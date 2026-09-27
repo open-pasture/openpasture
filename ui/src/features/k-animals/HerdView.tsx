@@ -11,7 +11,7 @@ import { MappingRow } from "../../ui/MappingRow";
 import { Table, type Column } from "../../ui/Table";
 import { age, useNow } from "../../util";
 import { Edit } from "./Edit";
-import { battery, by, cardsPossible, day, each, FIELDS, herdOfMost, herdRows, keysCsv, mappedRows, pickedFirst, pickRows, reasonWord, rowText, selectionOf, sexWord, type Shown } from "./herd";
+import { battery, by, cardsPossible, day, each, FIELDS, herdOfMost, herdRows, keysCsv, mappedRows, pageHash, pageKeys, pickedFirst, pickRows, reasonWord, rowText, selectionOf, sexWord, type Shown } from "./herd";
 
 const AnimalPage = lazy(() => import("./AnimalPage").then((m) => ({ default: m.AnimalPage })));
 
@@ -70,12 +70,14 @@ function HerdTable({ select }: { select: string[] }) {
   }, [rows, collars, herdId]);
   const listed = useMemo(() => (first?.size ? pickedFirst(rows, first) : rows), [rows, first]);
 
+  // A tag another herd (or a removed animal) shares links by the animal's id.
+  const pageKey = useMemo(() => pageKeys(animals), [animals]);
   const edit = (r: HerdRow, field: Parameters<typeof Edit>[0]["field"], placeholder?: string) =>
     r.animal ? <Edit a={r.animal} field={field} can={canEdit} onError={setMsg} placeholder={placeholder} /> : null;
   const columns: Column<HerdRow>[] = useMemo(() => {
     const core: (Column<HerdRow> & { order: number })[] = [
       { id: "tag", order: 10, label: "tag", width: 96, sort: by((r) => r.animal?.tag ?? ""), cell: (r) => (
-        <a className="tagl" href={`#/herd/${encodeURIComponent(r.animal?.tag ?? r.collar?.id ?? "")}`}>{r.animal?.tag ?? <span className="dim">–</span>}</a>
+        <a className="tagl" href={`#${pageHash(pageKey(r.animal, r.collar))}`}>{r.animal?.tag ?? <span className="dim">–</span>}</a>
       ) },
       { id: "name", order: 20, label: "name", width: 150, sort: by((r) => r.animal?.name), cell: (r) => edit(r, "name") },
       { id: "eid", order: 30, label: "EID", width: 160, sort: by((r) => r.animal?.eid), cell: (r) => edit(r, "eid") },
@@ -99,7 +101,7 @@ function HerdTable({ select }: { select: string[] }) {
     const added = extra.map((c) => ({ id: c.id, order: c.order, label: c.label, width: c.width, sort: c.sort, cell: (r: HerdRow) => guarded(c.id, <c.Cell row={r} />) }));
     return [...core, ...added].sort((a, b) => a.order - b.order).map((c, i, all) => (i === all.length - 1 ? { ...c, width: undefined } : c));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shown, extra, canEdit, now]);
+  }, [shown, extra, canEdit, now, pageKey]);
 
   const picked = rows.filter((r) => sel.has(r.id));
   const others = state.herds.filter((h) => h.id !== herdId);

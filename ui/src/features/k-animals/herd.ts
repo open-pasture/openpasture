@@ -96,6 +96,16 @@ export function resolve(rest: string, animals: Animal[], collars: Collar[], herd
   return { collar, animal: animals.find((a) => a.id === collar.animal_id) };
 }
 
+// What to put after #/herd/ so resolve() opens exactly this animal whichever herd is selected:
+// its tag while no other animal has it (tags repeat across herds, and a removed animal's can
+// come back), else its id. A collar on no animal goes by its id.
+export function pageKeys(animals: Animal[]): (animal?: Animal, collar?: Collar) => string {
+  const n = new Map<string, number>();
+  for (const a of animals) n.set(a.tag, (n.get(a.tag) ?? 0) + 1);
+  return (animal, collar) => (animal ? (n.get(animal.tag) === 1 ? animal.tag : animal.id) : (collar?.id ?? ""));
+}
+export const pageHash = (key: string) => `/herd/${encodeURIComponent(key)}`;
+
 export const FIELDS: { key: ImportField; label: string; required?: boolean }[] = [
   { key: "tag", label: "tag", required: true }, { key: "eid", label: "EID" }, { key: "name", label: "name" }, { key: "breed", label: "breed" },
   { key: "sex", label: "sex" }, { key: "born", label: "born" }, { key: "collar", label: "collar" }, { key: "notes", label: "notes" },

@@ -17,6 +17,7 @@ import { interleave, PADDOCK_SHEET, paddockSheet, sectionNodes, useSections, vie
 import { Button, Input, Menu, Sheet } from "../ui";
 import { useUnits } from "../units";
 import { typing, useKey } from "../util";
+import { pageHash, pageKeys } from "../features/k-animals/herd";
 import { HerdPanel } from "./HerdPanel";
 
 type Mode =
@@ -101,8 +102,9 @@ export function MapView() {
       const id = animalAt(e)?.properties?.id as string | undefined;
       const c = id ? store.get().collars.find((x) => x.id === id) : undefined;
       if (!c) return;
-      const tag = store.get().animals.find((a) => a.id === c.animal_id || a.collar_id === c.id)?.tag;
-      location.hash = `/herd/${encodeURIComponent(tag ?? c.id)}`;
+      // This animal's page, not another herd's with the same tag.
+      const animals = store.get().animals;
+      location.hash = pageHash(pageKeys(animals)(animals.find((a) => a.id === c.animal_id || a.collar_id === c.id), c));
     });
     // Hovering an animal rings it and shows its name; nothing is labelled otherwise.
     m.on("mousemove", (e) => {

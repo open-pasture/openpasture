@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Animal, Collar } from "../../api";
 import type { ImportPreview, LinkedCollar } from "../../api/k-animals";
-import { cardsPossible, each, herdOfMost, herdRows, keysCsv, mappedRows, pickedFirst, pickRows, resolve, rowLabel, rowText, selectionOf, selectUrl, sheets, spareCollars } from "./herd";
+import { cardsPossible, each, herdOfMost, herdRows, keysCsv, mappedRows, pageKeys, pickedFirst, pickRows, resolve, rowLabel, rowText, selectionOf, selectUrl, sheets, spareCollars } from "./herd";
 import { parseHash } from "../../util";
 
 const animal = (id: string, tag: string, more: Partial<Animal> = {}): Animal => ({ id, tag, herd_id: "h1", ...more });
@@ -67,6 +67,25 @@ describe("spare collars and pages", () => {
     expect(resolve("c2", animals, collars, "h1")).toEqual({ collar: collars[1], animal: undefined });
     expect(resolve("Spare", animals, collars, "h1").collar?.id).toBe("c2");
     expect(resolve("nope", animals, collars, "h1")).toEqual({});
+  });
+
+  test("a link to an animal's page opens that animal whichever herd is selected, tags repeating across herds", () => {
+    // collar-sim numbers every herd from 101; a removed 102 shares its tag with the herd's own.
+    const animals = [
+      animal("cows-101", "101", { collar_id: "c1" }),
+      animal("heif-101", "101", { herd_id: "h2", collar_id: "c2" }),
+      animal("cows-102-old", "102", { removed_at: "2026-01-01T00:00:00Z" }),
+      animal("cows-102", "102"),
+      animal("cows-103", "103", { collar_id: "c3" }),
+    ];
+    const collars = [collar("c1", "C-1", { animal_id: "cows-101" }), collar("c2", "C-2", { herd_id: "h2", animal_id: "heif-101" }), collar("c3", "C-3", { animal_id: "cows-103" }), collar("c4", "Spare")];
+    const key = pageKeys(animals);
+    for (const selected of ["h1", "h2", undefined])
+      for (const a of animals) expect(resolve(encodeURIComponent(key(a)), animals, collars, selected).animal?.id).toBe(a.id);
+    // A tag no other animal has stays the readable key; a collar on no animal goes by its id.
+    expect(key(animals[4])).toBe("103");
+    expect(key(undefined, collars[3])).toBe("c4");
+    expect(resolve(key(undefined, collars[3]), animals, collars, "h1").collar?.id).toBe("c4");
   });
 });
 
