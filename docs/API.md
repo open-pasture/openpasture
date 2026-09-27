@@ -470,6 +470,89 @@ days plus imported position history.
 <!-- @HUB-UI -->
 <!-- @E-lib -->
 <!-- @E-srv -->
+
+## Protocol v1 on the server (op-ingest)
+
+The collar protocol v1 (holes, slots, collar-scoped boundaries, cue kinds, episodes, signed
+configs) as the server speaks it. Firmware 0.1 collars (no `caps`) keep working: every new field
+is optional, and they get what they can hold.
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/herds/:id/slots` | | `HerdSlots` |
+| GET | `/api/collars/:id/slots` | | `CollarSlots` |
+| GET PUT | `/api/collars/config` | `CollarsConfig` (each 10-3600) | `CollarsConfig` (PUT gives every collar that takes configs a new version) |
+| POST | `/collar/v1/report` | position report, see below | `{ latest_version, config?: ConfigCommand }` |
+| GET | `/collar/v1/boundary?have=&free=&free_bytes=` | | 204, or the boundary command for this collar |
+| POST | `/collar/v1/ack` | `{ command_id, version, status, reason?, code?, at }` | 204 |
+
+```ts
+CollarLimits { outer, holes, hole_vertices, total, slots, slot_bytes }   // LEGACY 64/0/0/64/2/0, V0 128/16/32/384/16/24576, V1 … 32/262144
+HeldSlot     { version, copy_of? /* herd version it copies */, status: "applied"|"received"|"rejected", effective_at?, reported_at, code? }
+CollarSlots  { collar_id, fw?, caps?: string[], limits: CollarLimits, slots: HeldSlot[],
+               config?: { version, herd_id?, endpoint?, report_s, poll_s, fast_report_s?, fast_poll_s?, fast_until?, refused?: true },
+               parked?: true, escaped?: true }
+HerdSlots    { counts: SlotCount[] /* the herd's active and staged versions */, collars: CollarSlots[] }
+CollarsConfig { report_s: 60, poll_s: 60, fast_report_s: 10, fast_poll_s: 10 }   // setting `collars.config`
+BoundaryStatus.staged: Boundary[]   // every staged version still alive, version order
+BoundaryStatus.slots: SlotCount[]   // per active/staged version: applied, stored, rejected of `collars`
+BoundaryStatus.acks[].code?         // the reject code of a collar's latest ack
+```
+
+**Every herd boundary is prepared** before it is stored (farmer draw, applied decision, each
+sweep step, reissue for a moved collar): the shape is validated and fitted to the strictest limits
+among the herd's collars that hold holes (V0 when none report caps). Outer rings only shrink and
+holes only grow. An invalid shape is 400 with a sentence, e.g. "Holes need 13 m between them and
+from the edge." (gap `2·warn_m + 2 m` plus 0.5 m server slack, in the farm's units). Missing
+`warn_m`/`hysteresis_m` default to 5 m and 1 m. Holes are allowed: `POST /api/herds/:id/boundary`
+takes a Polygon with inner rings. Sweep steps carry the target's holes, and holes of the previous
+boundary that still lie whole inside the step with the gap.
+
+**Downloads are per collar.** The command for a collar is fitted to its caps and limits: `holes`,
+`collar_id` and `cue_mode` only when in its caps. A collar with no caps (firmware 0.1) gets the
+outer ring fitted to 64 vertices and no holes; the server-side fence for that collar uses the same
+ring, so `state` matches what the collar enforces. Selection (§3.3): its boundary set (the herd's,
+with its own copies after an escape; only its pen while out on one) split at now by the
+activation rule (the highest version whose `effective_at`, or receipt, has passed is in effect; a
+staged version is dead once a higher one takes effect at or before it); versions it refused for
+good are dropped (every code except `slots_full`, and a rejection without a code); then the
+version in effect if newer than `have`, else the lowest staged one above `have` when `free` > 0
+and its record (`192 + 8 × vertices` bytes) fits `free_bytes`. A collar that sends no `free`
+(firmware 0.1) has its slots less what its acks say it holds. `latest_version` in report replies is
+the highest version of that set it hasn't refused.
+
+**Reports** (§3.8) may carry `device { fw, caps, limits, config_version, config_reject }` (stored
+on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`), `slots` (the complete
+list; replaces the collar's applied/received rows), `episodes` (stored once per collar and start),
+cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, and health
+`fix_attempts`, `fix_ok`, `cell { rsrp_dbm, rsrq_db, snr_db, mode, band, cell_id, tac }`,
+`still_s`, `tilt_deg`, `temp_c`, `battery_v`, `charging`, `uptime_s`, `reset`. Cues without a kind
+(firmware 0.1) are stored with `kind` NULL; the live `cue` event carries `outside` when
+`margin_m` < 0, else `warn`. Acks store `code` on the ack and in `collar_boundary_state`; between
+reports (and for firmware 0.1) acks keep the collar's slot rows: `applied` drops every lower
+version, as the collar does.
+
+**Configs** (§3.4): each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,
+version per collar). It gets a new version when its herd changes (at once on the PATCH), when
+`server.public_url` changes (the `endpoint`, only when it is `https://`; seen on the collar's next
+report), when a move starts for its herd or an escape for it (a fast window: `fast_until` = the
+estimated end, at 4 m/min of `remaining_m` kept between 5 and 30 min, plus 10 min; extended while
+the move runs once under 5 min is left; never cut short), and when `collars.config` changes. A
+report whose `device.config_version` is lower (or absent) gets it in the reply; a version the
+collar refused (`config_reject`) isn't sent again, and one above the server's (a restored
+database) is overtaken by a new version.
+
+**Escapes** keep the herd boundary's holes in the pen, open a fast window for the collar, use
+`outside_since`, and end with copies for that collar alone: the herd's active boundary and each
+staged one (`collar_id` + `copy_of`, same `effective_at`), so the rest of the herd downloads
+nothing. The activation watcher announces a staged boundary only if it is in effect when its time
+comes.
+
+Tables: `collar_slots(collar_id, version, status, effective_at, reported_at, code)`,
+`episodes(id epi_…, collar_id, herd_id, animal_id, start_t, end_t, start_at, end_at,
+boundary_version, ring, cues, max_level, min_margin_m, outcome)`, `collar_config(collar_id,
+version, body, updated_at, reject_version, reject_code)`; boundary indexes `(herd_id, collar_id,
+version)`, `(effective_at)`, `(version)`.
 <!-- @J -->
 <!-- @A-engine -->
 <!-- @A-notify -->
