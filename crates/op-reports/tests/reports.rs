@@ -535,6 +535,55 @@ async fn lease_amounts_follow_each_rate_and_the_season() {
     assert_eq!(column(&doc["sections"][0], "head_days"), [json!(1040.0)]);
 }
 
+/// Cows in P2 from Sep 1 2025 07:00 (12:00 UTC) with 20 animals on record.
+/// Five are sold on Sep 11 07:00, but entered today with that date.
+async fn sold_late(app: &App) -> (Farm, String) {
+    let f = farm(app).await;
+    let h = herd(app, "Cows", 20, Some(&f.p2)).await;
+    app.date_history(&h, &["2025-09-01T12:00:00.000Z"]).await;
+    let mut ids = Vec::new();
+    for tag in 1..=20 {
+        let a = op_core::Animal { id: op_core::id::new_id(op_core::id::ANIMAL), tag: tag.to_string(), herd_id: h.clone(), ..Default::default() };
+        app.ctx.store().insert_animal(&a).await.unwrap();
+        ids.push(a.id);
+    }
+    sqlx::query("UPDATE animals SET created_at = '2025-09-01T12:00:00.000Z' WHERE herd_id = ?").bind(&h).execute(app.ctx.db()).await.unwrap();
+    let at = op_core::time::from_db("2025-09-11T12:00:00.000Z").unwrap();
+    for id in &ids[..5] {
+        let a = app.ctx.store().get_animal(id).await.unwrap().unwrap();
+        app.ctx.store().update_animal(&op_core::Animal { removed_at: Some(at), removed_reason: Some(op_core::RemovedReason::Sold), ..a }).await.unwrap();
+        // What POST /api/animals/{id}/remove {at} does to the count and its history.
+        op_core::animals::count_removal(&app.ctx, &h, id, at).await.unwrap();
+    }
+    assert_eq!(app.ctx.store().get_herd(&h).await.unwrap().unwrap().count, 15);
+    (f, h)
+}
+
+#[tokio::test]
+async fn a_removal_dated_earlier_counts_from_its_date_in_every_report() {
+    let app = App::new().await;
+    let (f, _) = sold_late(&app).await;
+    // 20 head Sep 1 12:00 UTC to Sep 11 12:00 UTC (10 days), then 15 head to
+    // the end of Sep 30 (Oct 1 05:00 UTC): 19 days 17 hours.
+    let hd = 20.0 * 10.0 + 15.0 * (19.0 + 17.0 / 24.0);
+    assert_eq!(hd, 495.625);
+    let doc = app.report("paddock_record", SEPT).await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "head"), [json!(20)]);
+    assert_eq!(column(ev, "days"), [json!(29.7)]);
+    assert_eq!(column(ev, "head_days"), [json!(495.6)]);
+    assert_eq!(column(ev, "au_days"), [json!(495.6)]);
+    let rec = &app.report("nrcs_528", SEPT).await["sections"][0];
+    assert_eq!((column(rec, "number"), column(rec, "aud")), (vec![json!(20)], vec![json!(495.6)]));
+
+    app.ok("PUT", &format!("/api/leases/{}", f.p2), json!({"landowner": "Jane Doe", "rate_per": "head_day", "rate_amount": 2.0})).await;
+    let s = &app.report("lease_head_days", SEPT).await["sections"][0];
+    assert_eq!(column(s, "head_days"), [json!(495.6)]);
+    // 495.625 / 30.4 = 16.30 AUM; billed at $2 a head-day: $991.25, not $1,188.33.
+    assert_eq!(column(s, "aum"), [json!(16.3)]);
+    assert_eq!(column(s, "amount"), [json!(991.25)]);
+}
+
 #[tokio::test]
 async fn csv_is_one_file_that_parses_back() {
     let app = App::new().await;

@@ -369,6 +369,13 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
     let app = App::new().await;
     let herd = app.herd_of(250).await;
     assert_eq!(app.count().await, 250);
+    // The herd and its animals on record since Sep 1.
+    for sql in [
+        "UPDATE herd_history SET at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+        "UPDATE animals SET created_at = '2026-09-01T12:00:00.000Z' WHERE herd_id = ?",
+    ] {
+        sqlx::query(sql).bind(&app.herd).execute(app.ctx.db()).await.unwrap();
+    }
     let mut events = app.ctx.subscribe();
     for (tag, collar, _) in &herd[..3] {
         let a = app.animal(tag).await;
@@ -381,6 +388,11 @@ async fn removing_animals_drops_the_count_unlinks_and_parks_their_collars() {
         assert!(c.parked_at.is_some());
     }
     assert_eq!(app.count().await, 247);
+    // Sold on Sep 20, entered now: the history drops to 247 on Sep 20.
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT at, count FROM herd_history WHERE herd_id = ? ORDER BY at, id").bind(&app.herd).fetch_all(app.ctx.db()).await.unwrap();
+    assert_eq!(&rows[..2], [("2026-09-01T12:00:00.000Z".to_owned(), 250), ("2026-09-20T15:00:00.000Z".to_owned(), 247)]);
+    assert!(rows[2..].iter().all(|(at, n)| at.as_str() > "2026-09-26" && *n == 247), "{rows:?}");
     let mut kinds = Vec::new();
     while let Ok(e) = events.try_recv() {
         kinds.push(match e {

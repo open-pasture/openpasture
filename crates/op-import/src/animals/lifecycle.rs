@@ -58,7 +58,7 @@ async fn remove(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<Strin
     if let Some(c) = &collar {
         op_ingest::park_collar(&ctx, c, ParkReason::Shelf).await?;
     }
-    op_core::animals::sync_herd_count(ctx.db(), &next.herd_id).await?;
+    op_core::animals::count_removal(&ctx, &next.herd_id, &next.id, at).await?;
     ctx.publish(Event::AnimalsChanged { herd_id: Some(next.herd_id.clone()) });
     let mut payload = json!({ "animal_id": next.id, "reason": b.reason, "at": at });
     if let Some(c) = &collar {

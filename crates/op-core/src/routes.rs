@@ -359,7 +359,7 @@ async fn create_animal(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewAnimal>
     crate::animals::tidy(&mut animal)?;
     check_animal(&ctx, &animal, None).await?;
     ctx.store().insert_animal(&animal).await?;
-    animals_changed(&ctx, &[&animal.herd_id]).await?;
+    animals_changed(&ctx, &[&animal.herd_id], None).await?;
     Ok((StatusCode::CREATED, Json(animal)))
 }
 
@@ -371,7 +371,7 @@ async fn update_animal(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(b
     crate::animals::tidy(&mut a)?;
     check_animal(&ctx, &a, Some(&current)).await?;
     ctx.store().update_animal(&a).await?;
-    animals_changed(&ctx, &[&current.herd_id, &a.herd_id]).await?;
+    animals_changed(&ctx, &[&current.herd_id, &a.herd_id], (current.herd_id != a.herd_id).then_some(&current.herd_id)).await?;
     Ok(Json(a))
 }
 
@@ -381,21 +381,26 @@ async fn delete_animal(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiRes
         return Err(ApiError::not_found("No such animal."));
     }
     if let Some(h) = herd_id {
-        animals_changed(&ctx, &[&h]).await?;
+        animals_changed(&ctx, &[&h], Some(&h)).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// K-animals: after animals change, each herd's count follows its animals and
-/// live clients hear about it.
-async fn animals_changed(ctx: &Ctx, herds: &[&String]) -> ApiResult<()> {
+/// live clients hear about it. `left` is a herd an animal just left: its
+/// count follows even when its last animal went.
+async fn animals_changed(ctx: &Ctx, herds: &[&String], left: Option<&String>) -> ApiResult<()> {
     let mut seen: Vec<&String> = Vec::new();
     for h in herds {
         if seen.contains(h) {
             continue;
         }
         seen.push(h);
-        crate::animals::sync_herd_count(ctx.db(), h).await?;
+        if left == Some(*h) {
+            crate::animals::sync_after_leaving(ctx.db(), h).await?;
+        } else {
+            crate::animals::sync_herd_count(ctx.db(), h).await?;
+        }
         ctx.publish(crate::Event::AnimalsChanged { herd_id: Some((*h).clone()) });
     }
     Ok(())

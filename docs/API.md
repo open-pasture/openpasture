@@ -838,12 +838,18 @@ animal frees its tag.
 **Head count.** Once a herd has any animal rows, `herds.count` is its animals on the farm (not
 removed), kept by every create, delete, herd change, import, remove and swap; `PATCH` of another
 `count` on such a herd is 400 `Count follows the animals in this herd.`. Every such change publishes
-`animals_changed { herd_id }`.
+`animals_changed { herd_id }`. When the last animal moves out of a herd (or is deleted) its count
+goes to 0, and with no animal rows left the farmer can set it again. A removal dated earlier (`at`)
+takes the head off the herd's history from that date, so reports count it only until it left: each
+`herd_history` row from `at` on drops by one and a row at `at` starts the lower count (a date before
+the animal's record began counts from the record).
 
 **Import.** The preview guesses the mapping from the header (Tag, Visual ID, Ear tag; EID, RFID,
 ISO; Name; Breed; Sex, Gender; DOB, Birth date, Born; Collar; Notes, Comments), returns the first 20
 rows as they are in the file and the rows the guessed mapping would skip (with `herd_id`, checked
-against that herd too). Previews live in memory for 30 minutes. A commit creates animals whose tag
+against that herd too). Previews live in memory for 30 minutes (the file itself, 64 MB for all of
+them together, oldest out first). A row filling more than 256 columns is 400 `Row N has more than
+256 columns.`; cells past a row's end read as empty. A commit creates animals whose tag
 isn't in the herd and updates those whose tag is; an empty cell leaves the field as it is, so
 committing the same file twice changes nothing. Sex reads F/female/cow/heifer, M/male/bull,
 steer/castrated; birth dates read `2022-04-01`, `4/1/2022` (month first on a farm in a US time

@@ -8,16 +8,16 @@
 
 use std::collections::HashMap;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::SqliteExecutor;
+use sqlx::{SqliteConnection, SqliteExecutor};
 
 use crate::domain::{Animal, Collar, Sex};
 use crate::error::{ApiError, ApiResult};
 use crate::identity::Role;
 use crate::tools::{ToolCall, ToolSpec};
-use crate::{Ctx, store};
+use crate::{Ctx, store, time};
 
 pub const MAX_TAG: usize = 64;
 const MAX_NAME: usize = 200;
@@ -178,6 +178,86 @@ pub async fn sync_herd_count<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -> a
     .fetch_optional(e)
     .await?;
     Ok(row.map(|(n,)| n.max(0) as u32))
+}
+
+/// [`sync_herd_count`] for a herd animals just left (moved to another herd
+/// or deleted): its count is its active animals even when none are left, so
+/// the last one leaving sets it to 0 rather than leaving it at 1. With no
+/// animal rows left the farmer can set the count again.
+pub async fn sync_after_leaving<'e>(e: impl SqliteExecutor<'e>, herd_id: &str) -> anyhow::Result<Option<u32>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "UPDATE herds SET count = (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         WHERE id = ?1 AND count != (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL)
+         RETURNING count",
+    )
+    .bind(herd_id)
+    .fetch_optional(e)
+    .await?;
+    Ok(row.map(|(n,)| n.max(0) as u32))
+}
+
+/// After an animal of `herd_id` was marked removed as of `at`: the count
+/// drops now, and a removal dated earlier takes the head off the herd's
+/// history from that date too ([`backdate_removal`]), so reports stop
+/// counting it then. One write transaction.
+pub async fn count_removal(ctx: &Ctx, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+    let mut tx = store::begin_immediate(ctx.db()).await?;
+    let counts: Option<(i64, i64)> =
+        sqlx::query_as("SELECT count, (SELECT COUNT(*) FROM animals WHERE herd_id = ?1 AND removed_at IS NULL) FROM herds WHERE id = ?1")
+            .bind(herd_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    // Only when this animal is the one the count is about to lose.
+    if counts.is_some_and(|(count, active)| count == active + 1) {
+        backdate_removal(&mut tx, herd_id, animal_id, at).await?;
+    }
+    sync_herd_count(&mut *tx, herd_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// An animal of `herd_id` left the farm at `at` but is only now taken off
+/// the count. Every herd history row from `at` on counted it, so each drops
+/// by one, and a row at `at` starts the lower count there (in the paddock the
+/// herd was in then): head-days, AU-days and AUM run at the lower count from
+/// the day it left, not from the day it was entered. A date at or before the
+/// animal's record began means it never counted: the rows from its record on
+/// drop, and nothing before them changes. Call before the count itself
+/// changes (the trigger's row for that is right as it is). Nothing happens
+/// for a time that isn't in the past.
+pub async fn backdate_removal(conn: &mut SqliteConnection, herd_id: &str, animal_id: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+    let created: Option<String> = sqlx::query_scalar("SELECT created_at FROM animals WHERE id = ?").bind(animal_id).fetch_optional(&mut *conn).await?;
+    let created = created.as_deref().map(time::from_db).transpose()?;
+    let from_record = created.is_some_and(|c| at <= c);
+    let at = created.filter(|_| from_record).unwrap_or(at);
+    if at >= time::now() {
+        return Ok(());
+    }
+    let at_db = time::to_db(&at);
+    let exact: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM herd_history WHERE herd_id = ? AND at = ? LIMIT 1").bind(herd_id).bind(&at_db).fetch_optional(&mut *conn).await?;
+    if !from_record && exact.is_none() {
+        // The herd as it stood just before `at`, one head fewer from then.
+        let before: Option<(i64, Option<String>, String, String)> =
+            sqlx::query_as("SELECT count, paddock_id, name, species FROM herd_history WHERE herd_id = ? AND at < ? ORDER BY at DESC, id DESC LIMIT 1")
+                .bind(herd_id)
+                .bind(&at_db)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some((count, paddock, name, species)) = before {
+            sqlx::query("INSERT INTO herd_history (herd_id, at, count, paddock_id, name, species, source) VALUES (?, ?, ?, ?, ?, ?, 'changed')")
+                .bind(herd_id)
+                .bind(&at_db)
+                .bind(count)
+                .bind(paddock)
+                .bind(name)
+                .bind(species)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    sqlx::query("UPDATE herd_history SET count = MAX(count - 1, 0) WHERE herd_id = ? AND at >= ?").bind(herd_id).bind(&at_db).execute(&mut *conn).await?;
+    Ok(())
 }
 
 // The list_animals tool
