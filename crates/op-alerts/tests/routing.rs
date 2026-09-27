@@ -242,6 +242,9 @@ async fn the_webhook_gets_every_notified_alert_and_nothing_else() {
 #[tokio::test]
 async fn the_decision_text_is_the_approval_prompt_with_its_code() {
     let f = Farm::new().await;
+    // A farm at Ames starts imperial; the prompt is checked in metric first.
+    let (s, _) = f.core("PUT", "/api/settings", Some(json!({"units": "metric"}))).await;
+    assert_eq!(s, StatusCode::OK);
     f.sms().await;
     let p = f.person("Cody", Role::Owner, Some("+15155550101"), true, None).await;
     let d = f.decision("MOVE", "proposed", t0() - mins(31), None).await;

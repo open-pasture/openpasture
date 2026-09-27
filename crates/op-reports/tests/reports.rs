@@ -281,6 +281,8 @@ async fn backfill_rebuilds_moves_from_applied_decisions() {
 async fn paddock_record_counts_head_days_au_days_density_and_rest() {
     let app = App::new().await;
     let (f, _) = grazing(&app).await;
+    // A farm at Ames starts imperial; the record is checked in metric first.
+    app.units("metric").await;
     let doc = app.report("paddock_record", SEPT).await;
     assert_eq!(doc["title"], "Paddock grazing record");
     assert_eq!(doc["header"], json!([["Farm", "Test farm"], ["Dates", "2025-09-01 – 2025-09-30"]]));
@@ -441,6 +443,8 @@ async fn organic_checks_120_days_and_hides_dry_matter_without_inputs() {
 async fn organic_dry_matter_share_from_weight_intake_and_feed_log() {
     let app = App::new().await;
     let f = farm(&app).await;
+    // A farm at Ames starts imperial; the share is checked in metric first.
+    app.units("metric").await;
     let grass = herd(&app, "Grass", 40, Some(&f.p2)).await;
     app.date_history(&grass, &["2025-04-01T05:00:00.000Z"]).await;
     app.ok("PUT", "/api/reports/settings", json!({"herds": {grass.clone(): {"mean_weight_kg": 500.0, "intake_pct": 2.5}}})).await;

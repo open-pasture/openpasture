@@ -364,6 +364,8 @@ async fn place_phrases_name_the_nearest_named_gate_water_or_shade() {
     let app = App::new().await;
     app.farm().await;
     let ctx = &app.ctx;
+    // A farm at Ames starts imperial; the phrases are checked in metric first.
+    ctx.update_settings(&json!({"units": "metric"})).await.unwrap();
     let describe = |p: LonLat| async move { place::describe(ctx, p).await.unwrap() };
     // With no features: by paddock, as before.
     assert_eq!(describe(at(350.0, 260.0)).await.as_deref(), Some("in P1"));
