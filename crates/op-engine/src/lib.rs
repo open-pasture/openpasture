@@ -29,6 +29,7 @@ pub mod layers;
 // @G
 // @P
 // @Q
+pub mod brief;
 // @C
 pub mod layouts;
 pub mod strips;
@@ -67,6 +68,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @G
         // @P
         // @Q
+        brief::router(),
         // @C
         strips::router(),
         layouts::router(),

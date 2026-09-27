@@ -2,18 +2,22 @@
 //! Claude plan). Prompt on stdin, answer shaped by `--json-schema`, progress
 //! from `--output-format stream-json`, no built-in tools, only our MCP read
 //! tools allowed, empty temp dir. Tested with Claude Code 2.1.283.
+//!
+//! Questions ([`Brain::ask`]) run the same way without the schema: the answer
+//! is the result text, and the MCP is this server's brain scope with a token
+//! that allows the question's tools only (never `run_sql`).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use op_core::BrainId;
+use op_core::{BrainId, BrainToken, Ctx};
 use serde_json::{Value, json};
 
 use crate::parse::{self, snippet};
 use crate::prompt::{SYSTEM, build_prompt};
-use crate::{Brain, DecisionOutput, DecisionRequest, cli, decision_schema};
+use crate::{AskError, AskRequest, Brain, DecisionOutput, DecisionRequest, cli, decision_schema};
 
 pub const TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -36,11 +40,20 @@ pub struct ClaudeBrain {
     bin: PathBuf,
     model: Option<String>,
     pub timeout: Duration,
+    /// This server, whose MCP read tools a question may use.
+    ctx: Option<Ctx>,
 }
 
 impl ClaudeBrain {
     pub fn new(bin: PathBuf, model: Option<String>) -> Self {
-        Self { bin, model, timeout: TIMEOUT }
+        Self { bin, model, timeout: TIMEOUT, ctx: None }
+    }
+
+    /// Questions reach this server's MCP read tools through a brain token.
+    /// Without it they are answered from the record alone.
+    pub fn with_ctx(mut self, ctx: Ctx) -> Self {
+        self.ctx = Some(ctx);
+        self
     }
 }
 
@@ -67,16 +80,24 @@ pub fn write_mcp_config(dir: &std::path::Path, mcp_url: &str) -> anyhow::Result<
 /// without a config (tests, hosted decisions) the run is also in safe mode:
 /// no CLAUDE.md, skills, plugins or memory.
 pub fn args(mcp_config: Option<&std::path::Path>, tools: &[String], model: Option<&str>) -> Vec<OsString> {
-    let mut a: Vec<String> = vec![
-        "-p".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--no-session-persistence".into(),
-        "--json-schema".into(),
-        decision_schema().to_string(),
+    cli_args(Some(decision_schema().to_string()), SYSTEM, mcp_config, tools, model)
+}
+
+/// `claude -p` arguments for a question: as [`args`], with the question's
+/// system prompt and no output schema (the answer is the result text).
+pub fn ask_args(mcp_config: Option<&std::path::Path>, tools: &[String], model: Option<&str>) -> Vec<OsString> {
+    cli_args(None, crate::ask::SYSTEM, mcp_config, tools, model)
+}
+
+fn cli_args(schema: Option<String>, system: &str, mcp_config: Option<&std::path::Path>, tools: &[String], model: Option<&str>) -> Vec<OsString> {
+    let mut a: Vec<String> = vec!["-p".into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--no-session-persistence".into()];
+    if let Some(schema) = schema {
+        a.push("--json-schema".into());
+        a.push(schema);
+    }
+    a.extend([
         "--system-prompt".into(),
-        SYSTEM.into(),
+        system.into(),
         // No built-in tools (no shell, no file edits); anything not allowed is refused.
         "--tools".into(),
         String::new(),
@@ -88,7 +109,7 @@ pub fn args(mcp_config: Option<&std::path::Path>, tools: &[String], model: Optio
         // No code-running tools, no user/project settings files, file tools
         // (none are enabled anyway) confined to the empty run dir.
         "--restricted".into(),
-    ];
+    ]);
     if let Some(cfg) = mcp_config {
         a.push("--mcp-config".into());
         a.push(cfg.display().to_string());
@@ -103,6 +124,17 @@ pub fn args(mcp_config: Option<&std::path::Path>, tools: &[String], model: Optio
         a.push(m.into());
     }
     a.into_iter().map(OsString::from).collect()
+}
+
+/// The MCP config for a question's run: this server's brain scope
+/// (`/mcp?scope=brain`) with a token that lists and calls `tools` only. The
+/// token lives until the returned guard drops, at most the question budget
+/// and a minute.
+pub fn ask_mcp(ctx: &Ctx, dir: &std::path::Path, tools: &[String]) -> anyhow::Result<(PathBuf, BrainToken)> {
+    let tools: Vec<String> = tools.iter().filter(|t| !crate::ask::NEVER.contains(&t.as_str())).cloned().collect();
+    let token = ctx.mint_brain_token(crate::ask::BUDGET + Duration::from_secs(60), tools);
+    let path = write_mcp_config(dir, &format!("{}/mcp?scope=brain&token={}", ctx.local_url(), token.as_str()))?;
+    Ok((path, token))
 }
 
 #[derive(Default)]
@@ -220,6 +252,42 @@ impl Brain for ClaudeBrain {
             (None, None) => {
                 let tail = out.stderr_tail();
                 bail!("Claude gave no answer{}", if tail.is_empty() { String::new() } else { format!(": {}", snippet(&tail)) })
+            }
+        }
+    }
+
+    async fn ask(&self, req: AskRequest) -> Result<String, AskError> {
+        let dir = tempfile::Builder::new().prefix("openpasture-claude-").tempdir().map_err(anyhow::Error::from)?;
+        let tools: Vec<String> = req.offered().into_iter().map(|t| t.name).collect();
+        // The token (if any) lives until this run ends.
+        let mcp = match &self.ctx {
+            Some(ctx) if !tools.is_empty() => Some(ask_mcp(ctx, dir.path(), &tools)?),
+            _ => None,
+        };
+        let named: &[String] = if mcp.is_some() { &tools } else { &[] };
+        let args = ask_args(mcp.as_ref().map(|(p, _)| p.as_path()), named, self.model.as_deref());
+        let prompt = crate::ask::prompt(&req.question, &req.context, named, req.max_chars);
+
+        let mut events = Events::default();
+        let log = req.log.clone();
+        let mut on_line = |line: &str| {
+            for p in events.feed(line) {
+                if let Some(l) = &log {
+                    let _ = l.send(p);
+                }
+            }
+        };
+        let timeout = self.timeout.min(crate::ask::BUDGET);
+        let out = cli::run_streaming(&self.bin, &args, dir.path(), &[], prompt, timeout, &mut on_line).await.context("Claude")?;
+        drop(mcp);
+        if let Some(e) = &events.error {
+            return Err(AskError::Failed(anyhow::anyhow!("Claude: {}", snippet(e))));
+        }
+        match events.result_text.clone().filter(|t| !t.trim().is_empty()).or_else(|| events.last_text.clone()) {
+            Some(t) => crate::ask::answer(&t, req.max_chars),
+            None => {
+                let tail = out.stderr_tail();
+                Err(AskError::Failed(anyhow::anyhow!("Claude gave no answer{}", if tail.is_empty() { String::new() } else { format!(": {}", snippet(&tail)) })))
             }
         }
     }

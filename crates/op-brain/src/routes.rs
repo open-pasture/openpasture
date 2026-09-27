@@ -23,6 +23,7 @@ pub fn router() -> Router<Ctx> {
         .route("/api/brains/hosted/keys", get(hosted::get_keys).post(hosted::post_key))
         .route("/api/brains/hosted/keys/{id}", delete(hosted::remove_key))
         .route("/v1/decide", post(hosted::decide))
+        .route("/v1/ask", post(hosted::ask))
 }
 
 /// `GET /api/brains` (`?refresh=1` re-detects now).

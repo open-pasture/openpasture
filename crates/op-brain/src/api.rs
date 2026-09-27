@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::parse::{self, snippet};
 use crate::prompt::{SYSTEM, build_prompt};
-use crate::{Brain, DecisionOutput, DecisionRequest, decision_schema};
+use crate::{AskError, AskRequest, Brain, DecisionOutput, DecisionRequest, decision_schema};
 
 pub const ANTHROPIC_MODELS: [&str; 3] = ["claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5-20251001"];
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5";
@@ -21,7 +21,7 @@ const DECIDE_TIMEOUT: Duration = Duration::from_secs(180);
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(420);
 const LIST_TIMEOUT: Duration = Duration::from_secs(4);
 
-fn client() -> reqwest::Client {
+pub(crate) fn client() -> reqwest::Client {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         reqwest::Client::builder()
@@ -34,7 +34,7 @@ fn client() -> reqwest::Client {
 }
 
 /// The error message from an API error body, or the status.
-fn api_error(status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn api_error(status: reqwest::StatusCode, body: &str) -> String {
     let msg = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.pointer("/error/message").or_else(|| v.get("error")).or_else(|| v.get("message")).and_then(Value::as_str).map(str::to_owned));
@@ -45,7 +45,7 @@ fn api_error(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
-async fn send_json(rb: reqwest::RequestBuilder) -> anyhow::Result<Value> {
+pub(crate) async fn send_json(rb: reqwest::RequestBuilder) -> anyhow::Result<Value> {
     let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", describe(&e)))?;
     let status = resp.status();
     let body = resp.text().await?;
@@ -55,7 +55,7 @@ async fn send_json(rb: reqwest::RequestBuilder) -> anyhow::Result<Value> {
     serde_json::from_str(&body).with_context(|| format!("not JSON: {}", snippet(&body)))
 }
 
-fn describe(e: &reqwest::Error) -> String {
+pub(crate) fn describe(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "timed out".into()
     } else if e.is_connect() {
@@ -76,6 +76,12 @@ pub struct AnthropicBrain {
 impl AnthropicBrain {
     pub fn new(key: String, model: Option<String>) -> Self {
         Self { key, model: model.unwrap_or_else(|| ANTHROPIC_DEFAULT_MODEL.into()), base: "https://api.anthropic.com".into() }
+    }
+
+    /// Another Messages API endpoint (a proxy, or a test server).
+    pub fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into().trim().trim_end_matches('/').to_owned();
+        self
     }
 }
 
@@ -127,6 +133,10 @@ impl Brain for AnthropicBrain {
         };
         req.say("Decision received");
         Ok(out)
+    }
+
+    async fn ask(&self, req: AskRequest) -> Result<String, AskError> {
+        crate::ask::anthropic(client(), &self.base, &self.key, &self.model, req).await
     }
 }
 
@@ -207,9 +217,18 @@ impl Brain for OpenAiBrain {
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no reply")).context(label))
     }
+
+    async fn ask(&self, req: AskRequest) -> Result<String, AskError> {
+        let model = match &self.model {
+            Some(m) => m.clone(),
+            None => compatible_models(&self.base, self.key.as_deref()).await.ok().and_then(|m| m.into_iter().next()).context("choose a model")?,
+        };
+        let label = if self.id == BrainId::Openai { "OpenAI" } else { "Compatible" };
+        crate::ask::openai(|path| self.post(path), label, &model, self.id == BrainId::Compatible, req).await
+    }
 }
 
-fn is_auth(e: &anyhow::Error) -> bool {
+pub(crate) fn is_auth(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.starts_with("HTTP 401") || s.starts_with("HTTP 403") || s.starts_with("HTTP 404")
 }
@@ -316,6 +335,10 @@ impl Brain for HostedBrain {
         let out = parse::finish(&v, &req.context, None).context("Hosted brain")?;
         req.say("Decision received");
         Ok(out)
+    }
+
+    async fn ask(&self, req: AskRequest) -> Result<String, AskError> {
+        crate::ask::hosted(client(), &self.url, &self.key, req).await
     }
 }
 

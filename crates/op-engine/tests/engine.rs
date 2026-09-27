@@ -423,7 +423,8 @@ async fn mcp_lists_all_tools_and_calls_them() {
     for n in mcp::READ_TOOLS.iter().chain(mcp::WRITE_TOOLS.iter()) {
         assert!(names.contains(n), "missing {n}");
     }
-    assert_eq!(names.len(), 12);
+    // The 12 engine tools, then those other streams add under their anchors.
+    assert_eq!(names, t.ctx.tools().list().iter().map(|s| s.name).collect::<Vec<_>>());
 
     // The brain's scope has only the read tools.
     let v = mcp_call(&t, "/mcp?scope=brain", 3, "tools/list", json!({})).await;

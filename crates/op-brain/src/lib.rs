@@ -3,8 +3,11 @@
 //!
 //! Every LLM backend gets the same prompt ([`prompt::build_prompt`]) and its
 //! output goes through the same parser ([`parse::parse_output`]).
+//!
+//! Brains may also answer free-form questions ([`Brain::ask`], [`ask`]).
 
 pub mod api;
+pub mod ask;
 pub mod claude;
 mod cli;
 pub mod codex;
@@ -21,6 +24,7 @@ pub mod schema;
 use op_core::{BrainId, Ctx};
 use serde::{Deserialize, Serialize};
 
+pub use ask::{AskError, AskRequest};
 pub use op_core::DecisionAction as Action;
 pub use schema::decision_schema;
 
@@ -71,6 +75,14 @@ pub struct DecisionOutput {
 pub trait Brain: Send + Sync {
     fn id(&self) -> BrainId;
     async fn decide(&self, req: DecisionRequest) -> anyhow::Result<DecisionOutput>;
+
+    /// Answer a free-form question (a text) in at most `req.max_chars`
+    /// characters, using the read tools in `req.tools` (never `run_sql`).
+    /// Brains that don't answer questions refuse: Codex (its tools can read
+    /// this machine's files) and the heuristic.
+    async fn ask(&self, _req: AskRequest) -> Result<String, AskError> {
+        Err(AskError::Unsupported)
+    }
 }
 
 /// The brain chosen in settings.
@@ -93,7 +105,7 @@ pub fn brain_for(ctx: &Ctx, id: BrainId, model: Option<String>) -> anyhow::Resul
         }
         BrainId::Claude => {
             let bin = loc.find("claude").ok_or_else(|| anyhow::anyhow!("Claude Code CLI is not installed"))?;
-            Box::new(claude::ClaudeBrain::new(bin, model))
+            Box::new(claude::ClaudeBrain::new(bin, model).with_ctx(ctx.clone()))
         }
         BrainId::Anthropic => {
             let key = secret("anthropic_api_key")?.ok_or_else(|| anyhow::anyhow!("Add an Anthropic API key"))?;

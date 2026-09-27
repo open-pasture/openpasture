@@ -1,6 +1,7 @@
 //! The serving side of the hosted brain: this server decides for other
 //! openpasture servers. `POST /v1/decide` with a key this server issued runs
 //! this server's own configured brain. Our paid hosting runs exactly this.
+//! `POST /v1/ask` answers their questions the same way, with no tools.
 
 use axum::Json;
 use axum::extract::State;
@@ -10,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::{DecisionOutput, DecisionRequest};
+use crate::ask::NoTools;
+use crate::{AskError, AskRequest, DecisionOutput, DecisionRequest};
 
 pub const KEY_PREFIX: &str = "oph_";
 
@@ -141,4 +143,61 @@ pub async fn decide(State(ctx): State<Ctx>, headers: HeaderMap, ApiJson(body): A
     let _ = body.schema;
     let out = brain.decide(req).await.map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct AskBody {
+    pub question: String,
+    #[serde(default)]
+    pub context: Value,
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
+}
+
+fn default_max_chars() -> usize {
+    320
+}
+
+/// Longest answer a caller may ask for.
+pub const ASK_MAX_CHARS: usize = 2000;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AskAnswer {
+    pub answer: String,
+}
+
+/// `POST /v1/ask`: this server's brain answers another server's question from
+/// the context it sent, with no tools (outside input never reaches this
+/// server's farm).
+pub async fn ask(State(ctx): State<Ctx>, headers: HeaderMap, ApiJson(body): ApiJson<AskBody>) -> ApiResult<Json<AskAnswer>> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let Some(bearer) = bearer else { return Err(ApiError::unauthorized("Missing key.")) };
+    let Some(key_id) = check_key(&ctx, bearer).await? else { return Err(ApiError::unauthorized("Key not accepted.")) };
+    let question = body.question.trim().to_owned();
+    if question.is_empty() {
+        return Err(ApiError::bad_request("Ask a question."));
+    }
+
+    let settings = ctx.settings().await?;
+    if settings.brain.id == BrainId::Hosted {
+        return Err(ApiError::conflict("This server's own brain is hosted, so it can't answer questions."));
+    }
+    // Codex never sees outside input (see `decide`), and doesn't answer questions anyway.
+    if settings.brain.id == BrainId::Codex {
+        return Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "This server's brain doesn't answer questions."));
+    }
+    let brain = crate::brain_for(&ctx, settings.brain.id, settings.brain.model.clone())
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    tracing::info!(key = %key_id, brain = ?settings.brain.id, "answering a hosted question");
+    let req = AskRequest { question, context: body.context, tools: std::sync::Arc::new(NoTools), max_chars: body.max_chars.clamp(1, ASK_MAX_CHARS), log: None };
+    match brain.ask(req).await {
+        Ok(answer) => Ok(Json(AskAnswer { answer })),
+        Err(AskError::Unsupported) => Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "This server's brain doesn't answer questions.")),
+        Err(AskError::Failed(e)) => Err(ApiError::new(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
 }

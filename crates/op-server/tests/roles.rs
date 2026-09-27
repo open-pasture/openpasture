@@ -263,7 +263,9 @@ async fn a_viewer_reads_and_never_writes() {
     // MCP: read tools only; a write call fails.
     op_engine::register_tools(&f.ctx);
     let listed = names(&f.mcp(&viewer, 1, "tools/list", json!({})).await);
-    assert_eq!(listed, op_engine::mcp::READ_TOOLS, "no write tools");
+    // The engine's read tools, then read tools added under the anchors (get_morning_brief, …).
+    assert_eq!(listed[..11], op_engine::mcp::READ_TOOLS, "no write tools");
+    assert!(listed.iter().all(|n| f.ctx.tools().get(n).is_some_and(|t| t.read)), "no write tools: {listed:?}");
     let v = f.mcp(&viewer, 2, "tools/call", json!({"name": "propose_boundary", "arguments": {"reasoning": "x", "to_paddock_id": f.p2}})).await;
     assert!(v["error"]["message"].as_str().unwrap().contains("Unknown tool"), "{v}");
     let v = f.mcp(&viewer, 3, "tools/call", json!({"name": "get_farm", "arguments": {}})).await;
