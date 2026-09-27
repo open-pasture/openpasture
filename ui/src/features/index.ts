@@ -11,6 +11,7 @@ import "./hub-ui";
 // @A-notify
 // @D
 // @K-animals
+import "./k-animals";
 // @K-files
 // @I
 // @B
