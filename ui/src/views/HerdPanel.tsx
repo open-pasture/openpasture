@@ -4,6 +4,7 @@ import { areaHa, centroid, inside } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
+import { ackLine } from "../store/boundary";
 import { summarize, undrawn } from "../store/live";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { useUnits } from "../units";
@@ -99,10 +100,8 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
     await store.refresh();
   });
 
-  // The ack count for whatever went out last: pending if one is in flight, else active.
-  const b = bstat?.pending ?? bstat?.active;
-  const applied = b ? (bstat?.acks ?? []).filter((a) => a.version === b.version && a.status === "applied" && byId.has(a.collar_id)).length : 0;
-  const done = collars.length > 0 && applied >= collars.length;
+  // The boundary in effect and how many collars apply it; what's staged next shows dashed on the map.
+  const line = ackLine(bstat, new Set(byId.keys()));
   const item = menu.find((m) => m.id === openItem);
 
   const decision = collars.length > 0 && <>
@@ -211,9 +210,9 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const rows = summary ? [] : collars.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
   const list = (
       <ul className="collars" onMouseLeave={() => onHoverCollar(undefined)}>
-        {b && collars.length > 0 && (
-          <li className="acks mono" title={`Boundary v${b.version}: ${applied} of ${collars.length} collars applied`}>
-            <span>v{b.version}</span><b className={done ? "ok" : undefined}>{applied}/{collars.length}</b>
+        {line && (
+          <li className="acks mono" title={`Boundary v${line.version}: ${line.n} of ${line.of} collars ${line.held ? "hold it" : "applied"}`}>
+            <span>v{line.version}</span><b className={line.n >= line.of ? "ok" : undefined}>{line.n}/{line.of}</b>
           </li>
         )}
         {summary && (

@@ -3,6 +3,7 @@ import type { Map as MLMap, MapMouseEvent } from "maplibre-gl";
 import { api, type LonLat, type Paddock, type Polygon } from "../api";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
+import { nextStaged } from "../store/boundary";
 import { drawable, undrawn } from "../store/live";
 import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, addTopSlot, Labels, paddockLabels, setBoundary, setEscapes, setPaddocks } from "../map/layers";
@@ -189,7 +190,8 @@ export function MapView() {
     if (!sweeping) restingActive.current = sameHerd ? act : undefined;
     sweep.current?.set({ active: act, target: sweeping ? move?.target : undefined, axis, ground }, sameHerd);
     animals.current?.showTrails(sweeping);
-    setBoundary(map, "pending", bstat?.pending?.geometry);
+    // The next staged move, not the last: a schedule stages days ahead (its rail shows those).
+    setBoundary(map, "pending", nextStaged(bstat)?.geometry);
     setBoundary(map, "proposed", mode.k === "change" ? undefined : bstat?.proposed?.geometry);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [map, bstat, mode.k, herdId, sweeping, move?.id]);

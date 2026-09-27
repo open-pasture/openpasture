@@ -67,6 +67,19 @@ function Rail({ map }: { map: MLMap }) {
   const at = a + f * (b - a);
 
   useEffect(() => setF(0), [herdId, s?.id]);
+  // Off "now" the plan line is the one dashed line: the map's next-move line steps aside.
+  const scrubbed = !!s && !!live && f !== 0;
+  useEffect(() => {
+    const show = (v: boolean) => map.getLayer("pending-line") && map.setLayoutProperty("pending-line", "visibility", v ? "visible" : "none");
+    show(!scrubbed);
+    return () => {
+      try {
+        show(true);
+      } catch {
+        /* the map went first */
+      }
+    };
+  }, [map, scrubbed]);
   // What the collars will hold at `at`.
   useEffect(() => {
     const draw = (id: (typeof SOURCES)[number], features: GeoJSON.Feature[]) => setData(map, id, fc(features));
