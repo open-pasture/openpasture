@@ -1,6 +1,6 @@
 // Layers > Coverage (stream G): 10 m squares under the paddock outlines (slot-fill), faint where
-// fixes are good and strong where they are weak, with accuracy · fixes to switch between the two
-// maps. Hovering a square shows its value.
+// fixes are good and strong where they are weak, with accuracy · fixes (and any metric another
+// stream registers in ./metrics) to switch maps. Hovering a square shows its value.
 
 import { createElement } from "react";
 import { createRoot } from "react-dom/client";
@@ -9,7 +9,8 @@ import { gApi, type CoverageMetric } from "../../api/g";
 import type { OverlayCtx, OverlayHandle } from "../../map/overlays";
 import { Segmented } from "../../ui";
 import { unitsNow } from "../../units";
-import { cellText, squares } from "./model";
+import { offered, type CoverageMetricItem } from "./metrics";
+import { squares } from "./model";
 
 // map/base.ts C, inlined so this chunk doesn't load MapLibre's module for three colours.
 const C = { grass: "#9FD760", warn: "#F0936C", red: "#E5484D" } as const;
@@ -18,14 +19,10 @@ const FILL = "g-coverage";
 const METRIC_KEY = "openpasture.coverage.metric";
 const EVERY = 10 * 60_000;
 
-const METRICS: { value: CoverageMetric; label: string }[] = [
-  { value: "accuracy", label: "accuracy" },
-  { value: "fixes", label: "fixes" },
-];
-
 export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
   const { map } = ctx;
-  let metric: CoverageMetric = localStorage.getItem(METRIC_KEY) === "fixes" ? "fixes" : "accuracy";
+  const pick = (id: string | null): CoverageMetricItem => offered().find((m) => m.id === id) ?? offered()[0];
+  let item = pick(localStorage.getItem(METRIC_KEY));
   let gone = false;
 
   map.addSource(SRC, { type: "geojson", data: { type: "FeatureCollection", features: [] } });
@@ -40,9 +37,10 @@ export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
 
   const load = async () => {
     try {
-      const c = await gApi.coverage({ metric, cell_m: 10 });
-      if (gone || c.metric !== metric) return;
-      (map.getSource(SRC) as GeoJSONSource | undefined)?.setData(squares(c) as GeoJSON.FeatureCollection);
+      const want = item;
+      const c = await gApi.coverage({ metric: want.id, cell_m: 10 });
+      if (gone || want !== item) return;
+      (map.getSource(SRC) as GeoJSONSource | undefined)?.setData(squares(c, want.tone) as GeoJSON.FeatureCollection);
     } catch {
       // Keep the squares already drawn.
     }
@@ -55,10 +53,10 @@ export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
   const root = createRoot(box);
   const render = () =>
     root.render(createElement(Segmented<CoverageMetric>, {
-      label: "Coverage", value: metric, options: METRICS,
+      label: "Coverage", value: item.id, options: offered().map((m) => ({ value: m.id, label: m.label })),
       onChange: (m: CoverageMetric) => {
-        metric = m;
-        localStorage.setItem(METRIC_KEY, m);
+        item = pick(m);
+        localStorage.setItem(METRIC_KEY, item.id);
         render();
         void load();
       },
@@ -70,7 +68,7 @@ export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
   const hover = (e: MapMouseEvent & { features?: GeoJSON.Feature[] }) => {
     const v = Number(e.features?.[0]?.properties?.v);
     if (!Number.isFinite(v)) return void (tip.style.display = "none");
-    tip.textContent = cellText(metric, v, unitsNow());
+    tip.textContent = item.text(v, unitsNow());
     tip.style.display = "block";
     tip.style.transform = `translate(${e.point.x + 12}px, ${e.point.y - 24}px)`;
   };

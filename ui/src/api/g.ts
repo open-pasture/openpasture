@@ -4,14 +4,15 @@
 import type { Actor } from "../api";
 import { get, post, put } from "./http";
 
-export type CoverageMetric = "accuracy" | "fixes";
+// accuracy and fixes (G); H adds its own (fix rate, cell signal) through features/g/metrics.ts.
+export type CoverageMetric = "accuracy" | "fixes" | (string & {});
 // [lon, lat, value, n] at the cell's centre. accuracy: median metres, n fixes. fixes: share of
 // the fixes the cadence called for that came (0-1), n fixes called for.
 export type CoverageCell = [number, number, number, number];
 export interface Coverage {
   metric: CoverageMetric;
   cell_m: number;
-  unit: "m" | "ratio";
+  unit: "m" | "ratio" | (string & {});
   size?: [number, number]; // degrees of longitude and latitude one cell spans
   cells: CoverageCell[];
 }

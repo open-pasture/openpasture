@@ -17,6 +17,18 @@ export function tone(metric: CoverageMetric, v: number): Tone {
   return v >= FIXES.fair ? "good" : v >= FIXES.poor ? "fair" : "poor";
 }
 
+// How one coverage metric reads: its switch label, the tone of a value and its hover text.
+export interface MetricItem {
+  id: CoverageMetric;
+  label: string;
+  order: number;
+  tone(v: number): Tone;
+  text(v: number, f: Fmt): string;
+}
+
+export const ACCURACY: MetricItem = { id: "accuracy", label: "accuracy", order: 10, tone: (v) => tone("accuracy", v), text: (v, f) => f.len(v) };
+export const FIXES_CAME: MetricItem = { id: "fixes", label: "fixes", order: 20, tone: (v) => tone("fixes", v), text: (v) => `${Math.round(v * 100)}%` };
+
 export interface Square {
   type: "Feature";
   properties: { v: number; n: number; tone: Tone };
@@ -25,13 +37,13 @@ export interface Square {
 export interface Squares { type: "FeatureCollection"; features: Square[] }
 
 // One square per cell, edge to edge: each cell's centre ± half its size.
-export function squares(c: Coverage): Squares {
+export function squares(c: Coverage, toneOf: (v: number) => Tone = (v) => tone(c.metric, v)): Squares {
   const [w, h] = c.size ?? [0, 0];
   const features = c.cells.map(([lon, lat, v, n]): Square => {
     const [x0, x1, y0, y1] = [lon - w / 2, lon + w / 2, lat - h / 2, lat + h / 2];
     return {
       type: "Feature",
-      properties: { v, n, tone: tone(c.metric, v) },
+      properties: { v, n, tone: toneOf(v) },
       geometry: { type: "Polygon", coordinates: [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]] },
     };
   });
@@ -40,7 +52,7 @@ export function squares(c: Coverage): Squares {
 
 // What a cell reads on hover: "2 m" / "7 ft", or "86%".
 export function cellText(metric: CoverageMetric, v: number, f: Fmt): string {
-  return metric === "accuracy" ? f.len(v) : `${Math.round(v * 100)}%`;
+  return (metric === "accuracy" ? ACCURACY : FIXES_CAME).text(v, f);
 }
 
 export const percent = (b: number) => `${Math.round(b * 100)}%`;
