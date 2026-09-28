@@ -1049,6 +1049,24 @@ mod tests {
     }
 
     #[test]
+    fn the_farm_day_the_clocks_go_back_is_one_day_of_25_hours() {
+        let tz: Tz = "America/Chicago".parse().unwrap();
+        let ms = |s: &str| op_core::time::from_db(s).unwrap().timestamp_millis();
+        // 01:30 CDT and 01:30 CST on 2026-11-01, an hour apart, are both Nov 1; 23:30 CST too.
+        let cues = [
+            cue(1, "c1", ms("2026-11-01T06:30:00.000Z"), "warn"),
+            cue(2, "c1", ms("2026-11-01T07:30:00.000Z"), "warn"),
+            cue(3, "c1", ms("2026-11-02T05:30:00.000Z"), "outside"),
+            cue(4, "c1", ms("2026-11-02T06:30:00.000Z"), "warn"),
+        ];
+        let d = days(&tz, ms("2026-10-31T05:00:00.000Z"), ms("2026-11-03T06:00:00.000Z"), &cues, &[]);
+        let dates: Vec<String> = d.iter().map(|d| d.date.to_string()).collect();
+        assert_eq!(dates, ["2026-10-31", "2026-11-01", "2026-11-02"]);
+        assert_eq!((d[1].warn, d[1].outside), (2, 1));
+        assert_eq!((d[2].warn, d[2].outside), (1, 0));
+    }
+
+    #[test]
     fn spells_merge_when_they_overlap() {
         let t = |m: i64| op_core::time::from_unix_ms(m * 60_000);
         let a = |k: &str, id: &str| vec![(k.to_owned(), id.to_owned())];
