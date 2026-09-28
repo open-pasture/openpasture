@@ -211,10 +211,10 @@ async fn a_sweep_is_previewed_and_ends_on_what_the_check_sent() {
     let minutes = sweep["minutes"].as_f64().unwrap();
     assert_eq!(c["facts"]["sweep_minutes"], sweep["minutes"]);
     let lines = sweep["back_lines"].as_array().unwrap();
-    // About 380 m to the rear of P2 at 3 m a step, 40 s a step: an hour and a half, lines every 10 m.
+    // About 380 m to the rear of P2 at 12 head's 7.4 m a minute: under an hour, lines every 10 m.
     eprintln!("{} back lines, {minutes} min", lines.len());
     assert!(lines.len() >= 25, "{}", lines.len());
-    assert!((60.0..=120.0).contains(&minutes), "{minutes}");
+    assert!((35.0..=60.0).contains(&minutes), "{minutes}");
     let x = |l: &Value| Projection::new(CENTER).forward([l[0][0].as_f64().unwrap(), l[0][1].as_f64().unwrap()])[0];
     assert!(x(&lines[0]) < -370.0 && x(lines.last().unwrap()) > -15.0, "from behind the herd to P2's west edge");
 
@@ -233,24 +233,33 @@ async fn a_sweep_is_previewed_and_ends_on_what_the_check_sent() {
 
 #[tokio::test]
 async fn the_pace_comes_from_the_herds_own_sweeps() {
+    use op_engine::presend::{default_pace, pace_m_per_min};
     let t = T::new().await;
-    assert_eq!(op_engine::presend::seconds_per_step(&t.ctx, &t.herd).await.unwrap(), 40.0, "30 s, plus half the fast poll and report");
+    let pace = pace_m_per_min(&t.ctx, &t.herd, 250).await.unwrap();
+    assert!((pace - 3.7).abs() < 0.1, "250 head with no sweeps of their own: {pace}");
+    assert!((default_pace(12, 10, 10) - 7.4).abs() < 0.1 && (default_pace(72, 10, 10) - 4.9).abs() < 0.1);
     t.ok("PUT", "/api/collars/config", json!({ "report_s": 60, "poll_s": 60, "fast_report_s": 30, "fast_poll_s": 30 })).await;
-    assert_eq!(op_engine::presend::seconds_per_step(&t.ctx, &t.herd).await.unwrap(), 60.0);
-    // A finished sweep of 21 steps over 25 minutes: 75 s a step.
-    let start = Utc::now() - Duration::hours(3);
-    sqlx::query(
-        "INSERT INTO moves (id, herd_id, decision_id, target, status, step, remaining_m, stragglers, warn_m, hysteresis_m, sweep, started_at, updated_at)
-         VALUES ('mov_1', ?, 'dec_1', ?, 'done', 21, 0, '[]', 5, 1, '{}', ?, ?)",
-    )
-    .bind(&t.herd)
-    .bind(p2().to_string())
-    .bind(time::to_db(&start))
-    .bind(time::to_db(&(start + Duration::minutes(25))))
-    .execute(t.ctx.db())
-    .await
-    .unwrap();
-    assert_eq!(op_engine::presend::seconds_per_step(&t.ctx, &t.herd).await.unwrap(), 75.0);
+    let slower = pace_m_per_min(&t.ctx, &t.herd, 250).await.unwrap();
+    assert!((slower - pace * 35.0 / 55.0).abs() < 1e-9, "a step's round takes 55 s, not 35: {slower}");
+    let finished = |id: &str, sweep: &str, start| {
+        sqlx::query(
+            "INSERT INTO moves (id, herd_id, decision_id, target, status, step, remaining_m, stragglers, warn_m, hysteresis_m, sweep, started_at, updated_at)
+             VALUES (?, ?, 'dec_1', ?, 'done', 21, 0, '[]', 5, 1, ?, ?, ?)",
+        )
+        .bind(id.to_owned())
+        .bind(t.herd.clone())
+        .bind(p2().to_string())
+        .bind(sweep.to_owned())
+        .bind(time::to_db(&start))
+        .bind(time::to_db(&(start + Duration::minutes(25))))
+        .execute(t.ctx.db())
+    };
+    // A sweep from before its length was kept says nothing about pace.
+    finished("mov_0", "{}", Utc::now() - Duration::hours(5)).await.unwrap();
+    assert_eq!(pace_m_per_min(&t.ctx, &t.herd, 250).await.unwrap(), slower);
+    // A finished sweep of 150 m over 25 minutes: 6 m a minute.
+    finished("mov_1", r#"{"start_m":150.0}"#, Utc::now() - Duration::hours(3)).await.unwrap();
+    assert!((pace_m_per_min(&t.ctx, &t.herd, 250).await.unwrap() - 6.0).abs() < 1e-9);
 }
 
 #[tokio::test]
