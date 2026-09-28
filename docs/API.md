@@ -1812,23 +1812,33 @@ stream every fix through the server:
 - `GET /api/analytics/health`: SQLite sums the hot fixes per collar, bucket and accuracy
   (`routes::health_hot_sql`); accuracy percentiles come from those counts (to the centimetre,
   exact for fixes that report decimetres). A collar's cadence, when it has none configured, is
-  the median gap over its first 2,000 fixes in the range. Parquet days are read as before.
+  the median gap over every Parquet day's fixes and a sample of the hot ones (the first 250 fixes
+  of each of 8 equal stretches of the hot part, each gap counted for as many hot fixes as the
+  sample stands for), so a cadence that changed partway through the range counts. Parquet days
+  are read as before.
 - `GET /api/analytics/heatmap`: SQLite counts the hot fixes per grid cell, with the same
   arithmetic as the Parquet path (`routes::heat_hot_sql`).
-- `GET /api/analytics/behaviour`: days in Parquet are read from their files; for the hot fixes
+- `GET /api/analytics/behaviour`: days in Parquet are read from their files, with any fix stored
+  for such a day after it was rolled (in SQLite until the next rollup); for the hot fixes
   after them SQLite counts each collar's fixes and sums its dwell, and the walk comes from every
   hot fix while the range holds at most 20,000 of them, else from each collar's first fix in each
   of at most 2,000 time buckets (at least a minute each: 1,440 a collar for a day). Distances for
   big ranges are therefore from one fix a minute or so.
 - `GET /api/analytics/pasture` (and behaviour's dwell): one SQL pass over the hot range sorted by
   collar (`routes::hot_dwell_sql`) instead of one pass a collar, whose interleaved rows made each
-  collar read every page of the day.
+  collar read every page of the day. Its rows are folded in as they stream: fixes with no stored
+  paddock come back one each (4.3 M a day at 250 collars) and are never all held in memory.
+  A collar's animal is the newest named by its last 200 hot fixes, else its first 200.
 - Per-collar reads of one request run six at a time (`routes::PARALLEL_READS`).
 - **A day in both places while the rollup deletes it is counted once.** While a scan reads a
   day's Parquet file it learns the highest row id in it; the day's hot rows at or below it are
   the ones the rollup has written and not yet deleted (ids never repeat), and the scan leaves
   them out (`telemetry::Rolled`). The SQL console does the same from the files' statistics. So
-  exports, health, behaviour, heatmap and `/api/sql` count each fix once at every moment.
+  exports, health, behaviour, heatmap and `/api/sql` count each fix once at every moment. Health
+  and the heatmap leave out exactly the days their Parquet read took (not a second listing), the
+  SQL console lists files and days once, and only days that can still have rows in SQLite (a
+  file's highest id at or above the table's lowest) are named in the filter, nested as a tree: a
+  farm with years of day files stays under SQLite's expression depth of 1000.
 
 Release build, 250 collars, a 4.32 M-fix hot day, on a machine loaded by other work (times move
 with the load): health 34 s → 6-9 s, heatmap 50 s → 2-3 s, behaviour 35 s → about 20 s (for a
