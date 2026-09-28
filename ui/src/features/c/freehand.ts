@@ -2,7 +2,7 @@
 // into a ring. Shared by the Lasso tool and shift-drag (overlay.ts). Type-only MapLibre
 // imports: the map is handed in, so this stays out of the first bundle.
 
-import type { GeoJSONSource, Map as MLMap, MapMouseEvent } from "maplibre-gl";
+import type { GeoJSONSource, Map as MLMap, MapMouseEvent, MapTouchEvent } from "maplibre-gl";
 import type { LonLat, PositionItem } from "../../api";
 import { caught, closeRing, thin } from "./lasso";
 
@@ -66,6 +66,41 @@ export function drag(map: MLMap, start: MapMouseEvent, done: (ring: LonLat[] | u
   };
   map.on("mousemove", move);
   window.addEventListener("mouseup", up);
+  return stop;
+}
+
+// The same by touch (M): one finger drags the lasso, the map doesn't pan meanwhile, lifting it
+// closes the ring. A second finger gives the gesture back to the map (pinch to zoom).
+export function dragTouch(map: MLMap, start: MapTouchEvent, done: (ring: LonLat[] | undefined) => void): () => void {
+  start.preventDefault();
+  const path: LonLat[] = [[start.lngLat.lng, start.lngLat.lat]];
+  const panned = map.dragPan.isEnabled();
+  map.dragPan.disable();
+  let raf = 0;
+  const move = (e: MapTouchEvent) => {
+    if (e.originalEvent.touches.length !== 1) return stop();
+    path.push([e.lngLat.lng, e.lngLat.lat]);
+    if (!raf) raf = requestAnimationFrame(() => {
+      raf = 0;
+      setLasso(map, { path });
+    });
+  };
+  const stop = () => {
+    cancelAnimationFrame(raf);
+    map.off("touchmove", move);
+    map.off("touchend", end);
+    map.off("touchcancel", stop);
+    if (panned) map.dragPan.enable();
+  };
+  const end = () => {
+    stop();
+    const ring = closeRing(thin(path, 0.5));
+    setLasso(map, ring ? { ring } : undefined);
+    done(ring);
+  };
+  map.on("touchmove", move);
+  map.on("touchend", end);
+  map.on("touchcancel", stop);
   return stop;
 }
 

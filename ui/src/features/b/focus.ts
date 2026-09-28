@@ -5,6 +5,7 @@ import { bbox } from "../../geo";
 import type { OverlayCtx, OverlayHandle } from "../../map/overlays";
 import { store } from "../../store";
 import { focus, ghost } from "../../store/b";
+import { pickAnimal } from "../m/select";
 import { TONE } from "./ramp";
 
 const SRC = "b-ghost";
@@ -53,6 +54,8 @@ export function mountFocus(ctx: OverlayCtx): OverlayHandle {
       if (!at) return;
       map.easeTo({ center: at, zoom: Math.max(map.getZoom(), ANIMAL_ZOOM), duration: 700 });
       ctx.highlight([f.id], "fg");
+      // On a touch screen the found animal is picked: its line says how far and which way (M).
+      pickAnimal(f.id);
       clearTimeout(unring);
       unring = setTimeout(() => ctx.highlight([]), RING_MS);
     }

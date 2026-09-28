@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import { Check } from "./Check";
 import { Input } from "./Input";
 import { filterRows, nextSort, sortRows, toggleAll, toggleSelect, windowRange, type SortState } from "./rows";
+// Rows a fingertip can hit on a touch screen (M).
+import { touchUI } from "../features/m/phone";
 
 export interface Column<R> {
   id: string;
@@ -17,7 +19,7 @@ export interface Column<R> {
 // height, or a parent that bounds it. Optional: a text filter (every word must appear in
 // text(row)), a check column for selection (shift-click selects a run), sortable headers.
 export function Table<R>({
-  rows, columns, rowKey, text, query, filter, selected, onSelect, onRowClick, rowHeight = 37, height, initialSort, className,
+  rows, columns, rowKey, text, query, filter, selected, onSelect, onRowClick, rowHeight = touchUI() ? 44 : 37, height, initialSort, className,
 }: {
   rows: R[];
   columns: Column<R>[];

@@ -18,7 +18,7 @@ export interface Policy {
   // The farm's quiet hours, farm time HH:MM.
   quiet_start?: string; quiet_end?: string;
 }
-export type PersonChannel = "sms" | "whatsapp" | "email";
+export type PersonChannel = "sms" | "whatsapp" | "email" | "push";
 export interface RulesView {
   rules: RuleView[];
   policy: Policy;
