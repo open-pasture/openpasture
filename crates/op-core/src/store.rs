@@ -31,8 +31,12 @@ pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 /// ([`spawn_checkpointer`]), so a collar report never waits for one; this
 /// is the backstop when nothing runs it (tests, tools).
 pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 16_384;
-/// How often [`spawn_checkpointer`] checkpoints.
-pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
+/// How often [`spawn_checkpointer`] checkpoints. The WAL starts over from
+/// its beginning only when a writer finds every frame in it copied, so a
+/// checkpoint has to end before the next commit lands: every second each
+/// one has little to copy and usually does. (Every 5 s, 250 collars at the
+/// fast cadence grew the WAL to 40–50 MB.)
+pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 
 /// Checkpoint the WAL every `every` (`PRAGMA wal_checkpoint(PASSIVE)`, which
 /// never waits for readers or writers), until the server shuts down. A

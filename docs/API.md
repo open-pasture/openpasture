@@ -1739,7 +1739,7 @@ depth" and reports got 500. A task runs to its end, and a transaction no one tak
 which rolls it back.
 
 **SQLite.** The server checkpoints the WAL in the background (`PRAGMA wal_checkpoint(PASSIVE)`
-every 5 s, `op_core::store::spawn_checkpointer`, started with the ingest drivers), so no commit
+every second, `op_core::store::spawn_checkpointer`, started with the ingest drivers), so no commit
 does it: before, the commit that crossed 1,000 pages of WAL (usually a collar's report) copied
 and synced the pages itself and waited on the disk. A commit checkpoints by itself only past
 16,384 pages (64 MB, `WAL_AUTOCHECKPOINT_PAGES`), the backstop for tests and tools, and
