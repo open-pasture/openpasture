@@ -252,11 +252,13 @@ pub async fn remove_person(ctx: &Ctx, user_id: &str) -> anyhow::Result<bool> {
     Ok(n == 1)
 }
 
-/// Sign a person out everywhere: revoke their tokens and drop open links.
+/// Sign a person out everywhere: revoke their tokens, drop open links, and
+/// take alerts off every browser of theirs (a lost phone keeps nothing).
 pub async fn revoke_sign_in(ctx: &Ctx, user_id: &str) -> anyhow::Result<()> {
     let at = to_db(&now());
     sqlx::query("UPDATE user_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(&at).bind(user_id).execute(ctx.db()).await?;
     sqlx::query("DELETE FROM invites WHERE user_id = ? AND accepted_at IS NULL").bind(user_id).execute(ctx.db()).await?;
+    sqlx::query("DELETE FROM push_subscriptions WHERE user_id = ?").bind(user_id).execute(ctx.db()).await?;
     evict(ctx, Some(user_id));
     Ok(())
 }
@@ -410,7 +412,8 @@ pub async fn list_tokens(ctx: &Ctx, user_id: Option<&str>) -> anyhow::Result<Vec
     rows.iter().map(token_from_row).collect()
 }
 
-/// Revoke one token; its browser gets 401 on its next request. False when
+/// Revoke one token; its browser gets 401 on its next request and no more
+/// notifications (the push subscriptions made under it go). False when
 /// there is no such live token (for `user_id`: of that person).
 pub async fn revoke_token(ctx: &Ctx, token_id: &str, user_id: Option<&str>) -> anyhow::Result<bool> {
     let row: Option<(String,)> =
@@ -422,6 +425,7 @@ pub async fn revoke_token(ctx: &Ctx, token_id: &str, user_id: Option<&str>) -> a
             .await?;
     match row {
         Some((uid,)) => {
+            sqlx::query("DELETE FROM push_subscriptions WHERE token_id = ?").bind(token_id).execute(ctx.db()).await?;
             evict(ctx, Some(&uid));
             Ok(true)
         }

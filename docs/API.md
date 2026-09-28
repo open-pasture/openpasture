@@ -134,7 +134,7 @@ days plus imported position history.
 | GET | `/api/users/:id` | | `Person` / 404 |
 | PATCH | `/api/users/:id` | `{ name?, role?, phone?, email?, disabled? }` (`null` clears phone, email) | `Person`; a new phone clears its verification; `disabled: true` also revokes every token and open link |
 | DELETE | `/api/users/:id` | | 204 / 404; their tokens and links go too, records keep the name they stored |
-| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped |
+| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped, every push subscription of theirs removed (no browser of theirs gets alerts) |
 | GET | `/api/invites` | | `Invite[]` open (not accepted, not expired), newest first |
 | POST | `/api/invites` | `{ user_id }` or `{ name, role, phone?, email? }` (adds the person now) | 201 `Invite & { code, url }`; `code` and `url` are shown once; replaces the person's open link |
 | DELETE | `/api/invites/:id` | | 204 / 404 (open links only) |
@@ -144,7 +144,7 @@ days plus imported position history.
 | PATCH | `/api/me/profile` | `{ name?, phone?, email? }` | `User` (your own; 404 when you aren't in People; role can't be changed here) |
 | GET | `/api/me/tokens` | | your own `TokenInfo[]` |
 | DELETE | `/api/me/tokens/:id` | | 204 / 404 |
-| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) |
+| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) and removes the push subscriptions made under it (revoking a token in `/api/me/tokens` or `/api/tokens` does the same); the app also unsubscribes the browser and forgets its offline copy |
 
 ```ts
 Person    = User & { tokens: number /* browsers signed in */, last_used?, invite_until? /* open link expires */ }

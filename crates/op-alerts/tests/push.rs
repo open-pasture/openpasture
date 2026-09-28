@@ -503,3 +503,63 @@ async fn a_remote_subscription_must_be_a_public_push_service() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{endpoint}: {v}");
     }
 }
+
+/// Signing out takes alerts off the browser that signed out; signing a
+/// person out everywhere takes them off every browser of theirs. A lost
+/// phone stops showing the farm's alerts on its lock screen.
+#[tokio::test]
+async fn signing_out_stops_that_browsers_notifications() {
+    use op_core::people::{self, NewInvite, SessionToken};
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let owner = Identity::owner(Via::Local);
+    let mut sessions = Vec::new();
+    for n in 0..3 {
+        let (_, code) = people::create_invite(&f.ctx, NewInvite { user_id: Some(mia.clone()), ..Default::default() }, &owner.actor()).await.unwrap();
+        let token = people::accept_invite(&f.ctx, &code, None).await.unwrap().token;
+        let session = people::session_for_token(&f.ctx, &token).await.unwrap().unwrap();
+        // Her browsers on this machine (this test's push service is plain http).
+        let id = Identity { via: Via::Local, ..session.identity.clone() };
+        let router = op_core::with_identity(op_alerts::router().merge(op_core::router()).layer(axum::Extension(SessionToken(session.token_id.clone()))), id)
+            .with_state(f.ctx.clone());
+        let (s, v) = call(router.clone(), "POST", "/api/push/subscriptions", Some(Browser::new().subscription(&svc.endpoint(20 + n)))).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        sessions.push(router);
+    }
+    let count = || async { sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_subscriptions").fetch_one(f.ctx.db()).await.unwrap() };
+    assert_eq!(count().await, 3);
+    let (s, _) = call(sessions[0].clone(), "POST", "/api/me/signout", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(count().await, 2, "the browser that signed out takes no more alerts");
+    people::revoke_sign_in(&f.ctx, &mia).await.unwrap();
+    assert_eq!(count().await, 0, "signed out everywhere: no browser of hers takes alerts");
+}
+
+/// A person whose alerts are limited to herds, one since deleted: turning
+/// alerts on in a browser still adds push to their channels (it failed
+/// after storing the subscription, leaving the box ticked with no pushes),
+/// and deleting a herd takes it out of everyone's list.
+#[tokio::test]
+async fn turning_alerts_on_adds_push_even_with_a_deleted_herd_in_the_prefs() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let (_, h) = f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": f.paddocks[0]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    f.prefs(&mia, json!({ "herds": [f.herd, heifers] })).await;
+    // Deleted the old way, leaving its id behind in her prefs.
+    sqlx::query("DELETE FROM herds WHERE id = ?").bind(&heifers).execute(f.ctx.db()).await.unwrap();
+    subscribe(&f, &mia, Role::Manager, &Browser::new(), &svc.endpoint(30)).await;
+    let (prefs, _) = op_alerts::routing::prefs::get(&f.ctx, &mia).await.unwrap();
+    assert!(prefs.channels.contains(&"push".to_owned()), "{:?}", prefs.channels);
+    // Deleting a herd now takes it out of the prefs that name it.
+    let (_, h) = f.core("POST", "/api/herds", Some(json!({"name": "Bulls", "species": "cattle", "count": 3, "paddock_id": f.paddocks[0]}))).await;
+    let bulls = h["id"].as_str().unwrap().to_owned();
+    f.exec(&format!("UPDATE alert_prefs SET herds = '[\"{}\", \"{bulls}\"]' WHERE user_id = '{mia}'", f.herd)).await;
+    assert!(f.ctx.store().delete_herd(&bulls).await.unwrap());
+    let (prefs, _) = op_alerts::routing::prefs::get(&f.ctx, &mia).await.unwrap();
+    assert_eq!(prefs.herds, Some(vec![f.herd.clone()]));
+}

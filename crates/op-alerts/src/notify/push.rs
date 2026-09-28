@@ -375,13 +375,15 @@ fn public_only() -> &'static reqwest::Client {
 }
 
 /// Store a browser's subscription for a person (the same endpoint again
-/// updates its keys and owner), keep their newest [`PER_PERSON`], and add
-/// `push` to their alert channels.
-pub async fn subscribe(ctx: &Ctx, user_id: &str, endpoint: &str, p256dh: &str, auth: &str) -> anyhow::Result<Subscription> {
+/// updates its keys, owner and sign-in, and counts as new), keep their
+/// newest [`PER_PERSON`], and add `push` to their alert channels.
+/// `token_id`: the sign-in it was made under (revoking it removes it).
+pub async fn subscribe(ctx: &Ctx, user_id: &str, token_id: Option<&str>, endpoint: &str, p256dh: &str, auth: &str) -> anyhow::Result<Subscription> {
     let t = to_db(&now());
     let row = sqlx::query(
-        "INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth
+        "INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, created_at, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+             created_at = excluded.created_at, token_id = excluded.token_id
          RETURNING *",
     )
     .bind(id::new_id(SUBSCRIPTION))
@@ -390,6 +392,7 @@ pub async fn subscribe(ctx: &Ctx, user_id: &str, endpoint: &str, p256dh: &str, a
     .bind(p256dh)
     .bind(auth)
     .bind(&t)
+    .bind(token_id)
     .fetch_one(ctx.db())
     .await?;
     let sub = sub_from(&row)?;
@@ -401,12 +404,7 @@ pub async fn subscribe(ctx: &Ctx, user_id: &str, endpoint: &str, p256dh: &str, a
     .bind(PER_PERSON)
     .execute(ctx.db())
     .await?;
-    let (prefs, _) = crate::routing::prefs::get(ctx, user_id).await?;
-    if !prefs.channels.iter().any(|c| c == "push") {
-        let mut channels = prefs.channels.clone();
-        channels.push("push".into());
-        crate::routing::prefs::put(ctx, user_id, &json!({ "channels": channels })).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
-    }
+    crate::routing::prefs::add_channel(ctx, user_id, "push").await?;
     Ok(sub)
 }
 
@@ -679,7 +677,12 @@ pub struct SubscriptionBody {
 }
 
 /// `POST /api/push/subscriptions`: this browser takes alerts for you.
-async fn post_subscription(State(ctx): State<Ctx>, id: Identity, ApiJson(b): ApiJson<SubscriptionBody>) -> ApiResult<(StatusCode, Json<Mine>)> {
+async fn post_subscription(
+    State(ctx): State<Ctx>,
+    id: Identity,
+    token: Option<axum::Extension<op_core::people::SessionToken>>,
+    ApiJson(b): ApiJson<SubscriptionBody>,
+) -> ApiResult<(StatusCode, Json<Mine>)> {
     let Some(user_id) = id.user_id.clone() else {
         return Err(ApiError::conflict("Add yourself in Settings > People first, then turn alerts on here."));
     };
@@ -691,7 +694,8 @@ async fn post_subscription(State(ctx): State<Ctx>, id: Identity, ApiJson(b): Api
     check_keys(&b.keys.p256dh, &b.keys.auth).map_err(ApiError::bad_request)?;
     // The browser subscribed with the farm's key; make sure there is one to sign with.
     Vapid::load(&ctx, true).await?;
-    let s = subscribe(&ctx, &user_id, endpoint, b.keys.p256dh.trim(), b.keys.auth.trim()).await?;
+    let token_id = token.map(|axum::Extension(op_core::people::SessionToken(t))| t);
+    let s = subscribe(&ctx, &user_id, token_id.as_deref(), endpoint, b.keys.p256dh.trim(), b.keys.auth.trim()).await?;
     Ok((StatusCode::CREATED, Json(Mine { id: s.id, endpoint: s.endpoint, created_at: s.created_at, last_ok: s.last_ok })))
 }
 
