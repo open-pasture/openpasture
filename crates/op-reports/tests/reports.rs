@@ -1001,6 +1001,18 @@ async fn get_report_tool_answers_through_the_registry() {
 }
 
 #[tokio::test]
+async fn get_report_tool_describes_every_report_it_takes() {
+    let app = App::new().await;
+    let tool = app.ctx.tools().get("get_report").expect("registered");
+    let ids = tool.input_schema["properties"]["id"]["enum"].as_array().unwrap().clone();
+    assert!(ids.iter().any(|i| i == "welfare"));
+    for id in ids {
+        let id = id.as_str().unwrap();
+        assert!(tool.description.contains(id), "get_report's description leaves out {id}");
+    }
+}
+
+#[tokio::test]
 async fn an_applied_move_on_the_record_writes_history() {
     let app = App::new().await;
     let f = farm(&app).await;
