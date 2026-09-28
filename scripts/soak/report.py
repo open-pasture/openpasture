@@ -192,6 +192,14 @@ def main():
     print(f"\nWebhook deliveries: {len(hooks)} {json.dumps(kinds)}")
     escapes = len(re.findall(r"escape: own boundary sent", log))
     print(f"Escapes started (server log): {escapes}\n")
+    # The planner's time on each sweep step (the `move` log lines), by herd size.
+    plans = {}
+    for m in re.finditer(r"tracked\S*=\S*?(\d+).*?plan_ms\S*=\S*?\"([\d.]+)\"", log):
+        plans.setdefault(int(m.group(1)), []).append(float(m.group(2)))
+    for n, v in sorted(plans.items(), key=lambda x: -x[0])[:3]:
+        print(f"Planner, {n} animals tracked: {len(v)} steps, p50 {pct(v, 0.5):.1f} ms, p95 {pct(v, 0.95):.1f} ms, max {max(v):.1f} ms")
+    if plans:
+        print()
     if ui:
         print(f"UI: {len(ui)} checks, {sum(len(u['errors']) for u in ui)} console errors, {sum(len(u['failed']) for u in ui)} failed requests, "
               f"page requests p95 {fmt(pct([u['ms_p95'] for u in ui if u['ms_p95'] is not None], 0.5))} ms (median of the checks), "
