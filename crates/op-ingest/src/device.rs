@@ -228,6 +228,8 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     let mut outside_since = if collar.state == FenceState::Outside { collar.outside_since } else { None };
     let mut latest_fix = collar.last_fix.clone();
     let mut latest_event = None;
+    // @L: rows go in with one multi-row INSERT per table (see `insert_fixes`).
+    let mut fix_rows: Vec<FixRow> = Vec::with_capacity(rep.fixes.len());
     for wf in &rep.fixes {
         let newer = last_at.is_none_or(|t| wf.at > t);
         let f = if newer { fence.as_mut() } else { late_fence.as_mut() };
@@ -254,58 +256,27 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             cn0: wf.cn0.or(health.cn0),
             ttf_s: wf.ttf_s.or(health.ttf_s),
         };
-        sqlx::query(
-            "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&collar.id)
-        .bind(&herd_id)
-        .bind(&collar.animal_id)
-        .bind(to_db(&fix.at))
-        .bind(unix_ms(&fix.at))
-        .bind(fix.point[0])
-        .bind(fix.point[1])
-        .bind(fix.accuracy_m)
-        .bind(fix.sats as i64)
-        .bind(fix.cn0)
-        .bind(fix.ttf_s)
-        .bind(wf.boundary_version.or(rep.boundary_version).map(i64::from))
-        .bind(fix_state.as_str())
-        .bind(margin)
-        .bind(db::paddock_for_point(&paddocks, fix.point).map(|p| p.id.as_str()))
-        .bind(wf.hdop)
-        .execute(&mut *tx)
-        .await?;
+        fix_rows.push(FixRow {
+            fix: fix.clone(),
+            boundary_version: wf.boundary_version.or(rep.boundary_version),
+            state: fix_state,
+            margin_m: margin,
+            paddock_id: db::paddock_for_point(&paddocks, fix.point).map(|p| p.id.clone()),
+            hdop: wf.hdop,
+        });
         if newer && latest_fix.as_ref().is_none_or(|l| fix.at >= l.at) {
             latest_fix = Some(fix.clone());
             latest_event = Some((fix, fix_state));
         }
     }
+    insert_fixes(&mut tx, &collar, &herd_id, &fix_rows).await?;
     // One fix event per report (the newest), so a burst of reports can't
     // flood the live feed.
     if let Some((fix, fix_state)) = latest_event {
         events.push(Event::Fix { collar_id: collar.id.clone(), animal_id: collar.animal_id.clone(), herd_id: herd_id.clone(), fix, state: fix_state });
     }
+    insert_cues(&mut tx, &collar, &herd_id, &rep.cues, rep.boundary_version).await?;
     for cue in &rep.cues {
-        sqlx::query(
-            "INSERT INTO cues (collar_id, herd_id, animal_id, at, t, level, margin_m, lon, lat, boundary_version, kind, ring, dur_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&collar.id)
-        .bind(&herd_id)
-        .bind(&collar.animal_id)
-        .bind(to_db(&cue.at))
-        .bind(unix_ms(&cue.at))
-        .bind(cue.level as i64)
-        .bind(cue.margin_m)
-        .bind(cue.point.map(|p| p[0]))
-        .bind(cue.point.map(|p| p[1]))
-        .bind(cue.boundary_version.or(rep.boundary_version).map(i64::from))
-        .bind(cue.kind.map(|k| k.as_str()))
-        .bind(cue.ring.map(i64::from))
-        .bind(cue.dur_ms.map(i64::from))
-        .execute(&mut *tx)
-        .await?;
         // Firmware 0.1 sends no kind: outside when past the line, else warn.
         let kind = cue.kind.map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
         events.push(Event::Cue { collar_id: collar.id.clone(), at: cue.at, level: cue.level, margin_m: cue.margin_m, kind: Some(kind.into()), ring: cue.ring });
@@ -342,6 +313,81 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     }
     ctx.publish(Event::Collar { collar });
     Ok(Json(ReportResponse { latest_version, config }))
+}
+
+// @L
+/// A fix as stored, worked out before the write.
+struct FixRow {
+    fix: Fix,
+    boundary_version: Option<u32>,
+    state: FenceState,
+    margin_m: Option<f64>,
+    paddock_id: Option<String>,
+    hdop: Option<f64>,
+}
+
+/// Rows per INSERT: well under SQLite's bound-variable limit (16 columns a fix).
+const ROWS_PER_INSERT: usize = 64;
+
+/// A report's fixes in as few statements as fit (one for any usual report).
+async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id: &str, rows: &[FixRow]) -> ApiResult<()> {
+    for chunk in rows.chunks(ROWS_PER_INSERT) {
+        let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop) ",
+        );
+        q.push_values(chunk, |mut b, r| {
+            b.push_bind(&collar.id)
+                .push_bind(herd_id)
+                .push_bind(&collar.animal_id)
+                .push_bind(to_db(&r.fix.at))
+                .push_bind(unix_ms(&r.fix.at))
+                .push_bind(r.fix.point[0])
+                .push_bind(r.fix.point[1])
+                .push_bind(r.fix.accuracy_m)
+                .push_bind(r.fix.sats as i64)
+                .push_bind(r.fix.cn0)
+                .push_bind(r.fix.ttf_s)
+                .push_bind(r.boundary_version.map(i64::from))
+                .push_bind(r.state.as_str())
+                .push_bind(r.margin_m)
+                .push_bind(r.paddock_id.as_deref())
+                .push_bind(r.hdop);
+        });
+        q.build().execute(&mut *tx).await?;
+    }
+    Ok(())
+}
+
+/// A report's cues, as [`insert_fixes`].
+async fn insert_cues(
+    tx: &mut sqlx::SqliteConnection,
+    collar: &Collar,
+    herd_id: &str,
+    cues: &[op_protocol::WireCue],
+    report_version: Option<u32>,
+) -> ApiResult<()> {
+    for chunk in cues.chunks(ROWS_PER_INSERT) {
+        let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO cues (collar_id, herd_id, animal_id, at, t, level, margin_m, lon, lat, boundary_version, kind, ring, dur_ms) ",
+        );
+        q.push_values(chunk, |mut b, cue| {
+            b.push_bind(&collar.id)
+                .push_bind(herd_id)
+                .push_bind(&collar.animal_id)
+                .push_bind(to_db(&cue.at))
+                .push_bind(unix_ms(&cue.at))
+                .push_bind(cue.level as i64)
+                .push_bind(cue.margin_m)
+                .push_bind(cue.point.map(|p| p[0]))
+                .push_bind(cue.point.map(|p| p[1]))
+                .push_bind(cue.boundary_version.or(report_version).map(i64::from))
+                .push_bind(cue.kind.map(|k| k.as_str()))
+                .push_bind(cue.ring.map(i64::from))
+                .push_bind(cue.dur_ms.map(i64::from));
+        });
+        q.build().execute(&mut *tx).await?;
+    }
+    Ok(())
 }
 
 /// One episode, stored once however often the collar resends it.
