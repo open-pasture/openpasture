@@ -16,6 +16,7 @@ Writes JSON lines to <dir>/driver.jsonl and samples to <dir>/samples.csv.
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -40,6 +41,18 @@ def cpu_seconds(pid):
     for p in parts:
         secs = secs * 60 + p
     return secs, int(out[1]) // 1024
+
+
+def footprint_mb(pid):
+    """macOS's phys_footprint (what Activity Monitor shows): unlike RSS it
+    keeps counting pages the system compressed or swapped out under memory
+    pressure, so it is the steadier measure of what the server holds."""
+    try:
+        out = subprocess.run(["footprint", "-f", "bytes", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    m = re.search(r"Footprint:\s*(\d+)\s*B", out)
+    return round(int(m.group(1)) / 1048576, 1) if m else ""
 
 
 def du(path):
@@ -67,7 +80,7 @@ def main():
     cows, heifers = herds["Cows"], herds["Heifers"]
     log = open(os.path.join(a.dir, "driver.jsonl"), "a")
     samples = open(os.path.join(a.dir, "samples.csv"), "a")
-    samples.write("t,elapsed_s,cpu_pct,rss_mb,db_bytes,wal_bytes,telemetry_bytes\n")
+    samples.write("t,elapsed_s,cpu_pct,rss_mb,db_bytes,wal_bytes,telemetry_bytes,footprint_mb\n")
 
     def say(kind, **kw):
         kw.update({"t": round(time.time(), 1), "kind": kind})
@@ -147,7 +160,7 @@ def main():
             data = os.path.join(a.dir, "data")
             db = os.path.join(data, "openpasture.db")
             size = lambda p: os.path.getsize(p) if os.path.exists(p) else 0
-            samples.write(f"{round(now, 1)},{round(now - start, 1)},{pct:.1f},{rss},{size(db)},{size(db + '-wal')},{du(os.path.join(data, 'telemetry'))}\n")
+            samples.write(f"{round(now, 1)},{round(now - start, 1)},{pct:.1f},{rss},{size(db)},{size(db + '-wal')},{du(os.path.join(data, 'telemetry'))},{footprint_mb(a.server_pid)}\n")
             samples.flush()
             next_sample += 30
         time.sleep(2)

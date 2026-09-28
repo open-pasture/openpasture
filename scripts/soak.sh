@@ -13,9 +13,10 @@
 # - Collars reach the server through a counting proxy on port+2
 #   (scripts/soak/proxy.py): bytes per request kind and per collar, and the
 #   server's latency for each request.
-# - One browser keeps the map open (scripts/soak/ui.ts), a socket counts
-#   /api/live frames (scripts/soak/ws.mjs), the driver samples CPU, memory
-#   and the data dir every 30 s.
+# - One browser stays connected on the Herd table, with the map every hour
+#   (scripts/soak/ui.ts; relaunched if it dies), a socket counts /api/live
+#   frames (scripts/soak/ws.mjs), the driver samples CPU, RSS, the macOS
+#   memory footprint and the data dir every 30 s.
 # MOVE_EVERY and ADVANCE_EVERY (minutes) change the two cadences for a short trial run.
 # At the end everything is stopped and scripts/soak/report.py writes
 # <dir>/report.md. Needs a release build: cargo build --release -p op-cli -p collar-sim.

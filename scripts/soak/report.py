@@ -117,22 +117,32 @@ def main():
 
     # CPU / memory / disk
     if samples:
-        rows = [{k: float(v) for k, v in r.items()} for r in samples]
+        rows = [{k: float(v) if v not in ("", None) else None for k, v in r.items()} for r in samples]
         after_h1 = [r for r in rows if r["elapsed_s"] >= 3600]
         rss_h1 = after_h1[0]["rss_mb"] if after_h1 else None
         rss_end = rows[-1]["rss_mb"]
         cpu = [r["cpu_pct"] for r in rows[1:]]
         print("## Server process and data dir\n")
         print(f"- CPU: mean {statistics.mean(cpu):.1f} %, p95 {pct(cpu, 0.95):.1f} %, max {max(cpu):.1f} % (of one core)")
-        # RSS swings ±20 % from one sample to the next (allocator), so hours are compared by their medians.
-        hours = {}
-        for r in rows:
-            hours.setdefault(int(r["elapsed_s"] // 3600), []).append(r["rss_mb"])
-        med = {h: statistics.median(v) for h, v in sorted(hours.items())}
-        full = [h for h in med if h >= 1 and len(hours[h]) >= 60]
-        growth = f"{(med[full[-1]] - med[full[0]]) * 100 / med[full[0]]:+.1f} %" if len(full) >= 2 else "-"
         print(f"- RSS: start {rows[0]['rss_mb']:.0f} MB, at 1 h {fmt(rss_h1, 0)} MB, end {rss_end:.0f} MB, max {max(r['rss_mb'] for r in rows):.0f} MB")
-        print(f"- RSS median by hour (MB): {', '.join(f'h{h + 1} {m:.0f}' for h, m in med.items())}; growth from hour 2 to the last full hour: **{growth}**")
+
+        # One sample swings by a fifth either way (the allocator; on macOS RSS
+        # also drops when the system compresses pages), so hours are compared
+        # by their medians: hour 2 against the last full hour.
+        def by_hour(key, label):
+            hours = {}
+            for r in rows:
+                if r.get(key) is not None:
+                    hours.setdefault(int(r["elapsed_s"] // 3600), []).append(r[key])
+            if not hours:
+                return
+            med = {h: statistics.median(v) for h, v in sorted(hours.items())}
+            full = [h for h in med if h >= 1 and len(hours[h]) >= 60]
+            growth = f"{(med[full[-1]] - med[full[0]]) * 100 / med[full[0]]:+.1f} %" if len(full) >= 2 else "-"
+            print(f"- {label} median by hour (MB): {', '.join(f'h{h + 1} {m:.0f}' for h, m in med.items())}; growth from hour 2 to the last full hour: **{growth}**")
+
+        by_hour("rss_mb", "RSS")
+        by_hour("footprint_mb", "Memory footprint (macOS phys_footprint, counts compressed pages)")
         print(f"- DB {rows[-1]['db_bytes'] / 1e6:.0f} MB, WAL {rows[-1]['wal_bytes'] / 1e6:.1f} MB (max {max(r['wal_bytes'] for r in rows) / 1e6:.1f} MB), Parquet {rows[-1]['telemetry_bytes'] / 1e6:.1f} MB\n")
 
     # Data budget
@@ -184,7 +194,14 @@ def main():
     print(f"Escapes started (server log): {escapes}\n")
     if ui:
         print(f"UI: {len(ui)} checks, {sum(len(u['errors']) for u in ui)} console errors, {sum(len(u['failed']) for u in ui)} failed requests, "
-              f"page requests p95 {fmt(pct([u['ms_p95'] for u in ui if u['ms_p95'] is not None], 0.5))} ms (median of the checks)")
+              f"page requests p95 {fmt(pct([u['ms_p95'] for u in ui if u['ms_p95'] is not None], 0.5))} ms (median of the checks), "
+              f"client restarts {ui[-1].get('restarts', 0)}")
+        heaps = [u["heap_mb"] for u in ui if u.get("heap_mb") is not None]
+        if heaps:
+            print(f"UI JS heap (MB) at each check: {', '.join(str(h) for h in heaps)}")
+        for u in ui:
+            for e in u["errors"]:
+                print(f"  - {e[:160]}")
 
 
 if __name__ == "__main__":
