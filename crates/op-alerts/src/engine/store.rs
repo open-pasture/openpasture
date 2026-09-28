@@ -35,7 +35,7 @@ pub const TARGET_COLLARS: &str =
 
 /// `data` keys that never leave the server: the approval code goes out only
 /// in the approval text (and A3 reads it from the table).
-const PRIVATE_DATA: &[&str] = &["code"];
+pub(crate) const PRIVATE_DATA: &[&str] = &["code"];
 
 /// An alert as the API, the MCP tools and live events show it: without the
 /// approval code.
