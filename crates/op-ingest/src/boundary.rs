@@ -149,10 +149,22 @@ pub async fn supersede_proposals(ctx: &Ctx, herd_id: &str, keep: &str) -> anyhow
 
 /// The farm record follows an applied move: the herd in `to`, the paddock it
 /// left (`from`, else its recorded paddock) resting from now, `to` grazing.
-pub async fn move_herd_on_record(ctx: &Ctx, herd_id: &str, to: Option<&str>, from: Option<String>) -> anyhow::Result<()> {
+/// With the move's boundary (`shape`): when the herd's recorded paddock
+/// holds as much of it as any paddock (a boundary over two paddocks, half
+/// each), the herd is still grazing there and the record stays as it is:
+/// its stay there doesn't end, and it isn't resting.
+pub async fn move_herd_on_record(ctx: &Ctx, herd_id: &str, to: Option<&str>, from: Option<String>, shape: Option<&Polygon>) -> anyhow::Result<()> {
     let store = ctx.store();
     let Some(to) = to.map(str::to_owned) else { return Ok(()) };
     let Some(mut herd) = store.get_herd(herd_id).await? else { return Ok(()) };
+    if let (Some(shape), Some(cur)) = (shape, herd.paddock_id.as_deref())
+        && cur != to
+    {
+        let paddocks = store.list_paddocks().await?;
+        if db::paddock_holding(&paddocks, shape, Some(cur)).is_some_and(|p| p.id == cur) {
+            return Ok(());
+        }
+    }
     let from = herd.paddock_id.clone().or(from);
     if from.as_deref() != Some(to.as_str())
         && let Some(f) = &from
@@ -219,6 +231,7 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     let prepared = prepare(&ctx, &herd_id, &body.geometry, &body.opts).await?;
     let paddocks = ctx.store().list_paddocks().await?;
     let to_paddock = prepared.geometry.interior_point().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
+    let target = prepared.geometry.clone();
     let decision_id = id::new_id(id::DECISION);
     let farmer = FarmerDecision { to_paddock_id: to_paddock.as_deref(), reasoning: "Boundary drawn by the farmer." };
     let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer)).await?;
@@ -235,7 +248,7 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     if let Err(e) = supersede_proposals(&ctx, &herd_id, &decision_id).await {
         tracing::warn!("superseding proposals: {e:#}");
     }
-    if let Err(e) = move_herd_on_record(&ctx, &herd_id, to_paddock.as_deref(), None).await {
+    if let Err(e) = move_herd_on_record(&ctx, &herd_id, to_paddock.as_deref(), None, Some(&target)).await {
         tracing::warn!("updating herd position: {e:#}");
     }
     Ok((StatusCode::CREATED, Json(started.r#move)))

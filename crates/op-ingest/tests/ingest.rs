@@ -601,6 +601,35 @@ async fn a_boundary_over_a_paddock_with_a_pond_in_the_middle_moves_the_herd_ther
     assert_eq!(h["paddock_id"], pad["id"], "and the herd is in it on the record");
 }
 
+/// A boundary over two paddocks: the herd is on the record in the one that
+/// holds most of it, and in the one it stands in when they hold it evenly
+/// (the herd still grazes it; its stay doesn't end and it doesn't rest).
+#[tokio::test]
+async fn a_boundary_over_two_paddocks_keeps_the_herd_where_most_of_it_is() {
+    let app = App::new().await;
+    let herd = app.herd().await;
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    let north = h["paddock_id"].as_str().unwrap().to_owned();
+    let (_, east) = app.call("POST", "/api/paddocks", Some(json!({"name": "East", "geometry": square(0.001)}))).await;
+    let east = east["id"].as_str().unwrap().to_owned();
+    let rect = |w: f64, e: f64| json!({"type": "Polygon", "coordinates": [[[w, 38.1245], [e, 38.1245], [e, 38.1255], [w, 38.1255], [w, 38.1245]]]});
+    // North and East together, half each.
+    let (s, mv) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(-92.4055, -92.4035)}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{mv}");
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    assert_eq!(h["paddock_id"], north.as_str(), "still grazing North");
+    let (_, p) = app.call("GET", &format!("/api/paddocks/{north}"), None).await;
+    assert_ne!(p["status"], "resting");
+    assert!(p["grazed_until"].is_null(), "{p}");
+    // Mostly East now: the herd is in East, North rests.
+    let (s, _) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(-92.4047, -92.4035)}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    assert_eq!(h["paddock_id"], east.as_str());
+    let (_, p) = app.call("GET", &format!("/api/paddocks/{north}"), None).await;
+    assert_eq!(p["status"], "resting");
+}
+
 /// 12 collars reporting while boundaries go out: nothing fails with
 /// "database is locked" and versions stay one sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

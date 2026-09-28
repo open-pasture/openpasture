@@ -227,7 +227,9 @@ is handed copies of the new herd's boundary in effect and of each staged one, it
 rest of the new herd downloads nothing.
 `POST /api/herds/:id/boundary` writes the farmer decision, the move and its first boundary
 together, then supersedes the herd's open proposals and moves the herd to the paddock under the
-target.
+target. A target over several paddocks moves the herd on the record only when another paddock holds
+more of it than the one the herd is in (half each, as for P1 + P2, leaves the herd grazing P1: its
+stay goes on and P1 doesn't rest); an applied brain MOVE with a boundary does the same.
 
 Collar state and `last_fix` only move with fixes newer than the current `last_fix`; late or
 backfilled fixes are stored but don't move the collar or send `fix` events.

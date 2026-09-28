@@ -173,3 +173,33 @@ pub async fn latest_acks(db: &SqlitePool, herd_id: &str) -> anyhow::Result<Vec<B
 pub fn paddock_for_point<'a>(paddocks: &'a [Paddock], p: op_geo::LonLat) -> Option<&'a Paddock> {
     paddocks.iter().filter(|pad| pad.geometry.contains(p)).min_by(|a, b| a.area_ha.partial_cmp(&b.area_ha).unwrap_or(std::cmp::Ordering::Equal))
 }
+
+/// The paddock a boundary puts a herd in on the record: the one holding
+/// most of it, and `current` (where the herd is) when it holds as much as
+/// any (a boundary over two paddocks, half each, leaves the herd grazing the
+/// one it stands in rather than ending that stay). Falls back to the
+/// paddock at a point inside the shape when no paddock overlaps it.
+pub fn paddock_holding<'a>(paddocks: &'a [Paddock], shape: &op_geo::Polygon, current: Option<&str>) -> Option<&'a Paddock> {
+    use geo::{Area, BooleanOps};
+    let origin = shape.outer_ring().first().copied()?;
+    let proj = op_geo::Projection::new(origin);
+    let local = |p: &op_geo::Polygon| -> geo::Polygon<f64> {
+        let ring = |r: &[op_geo::LonLat]| geo::LineString::from(r.iter().map(|q| proj.forward(*q)).map(|[x, y]| geo::Coord { x, y }).collect::<Vec<_>>());
+        let rings: Vec<Vec<op_geo::LonLat>> = std::iter::once(p.outer_ring()).chain(p.holes()).collect();
+        geo::Polygon::new(ring(&rings[0]), rings[1..].iter().map(|r| ring(r)).collect())
+    };
+    let target = local(shape);
+    let whole = target.unsigned_area();
+    let overlaps: Vec<(&Paddock, f64)> =
+        paddocks.iter().map(|p| (p, target.intersection(&local(&p.geometry)).unsigned_area())).filter(|(_, a)| *a > 0.0).collect();
+    let most = overlaps.iter().map(|(_, a)| *a).fold(0.0, f64::max);
+    // Rounding at a shared fence line: within 1 % of the shape counts as even.
+    let even = |a: f64| a >= most - 0.01 * whole;
+    if let Some((p, _)) = overlaps.iter().find(|(p, a)| Some(p.id.as_str()) == current && even(*a)) {
+        return Some(p);
+    }
+    if let Some((p, _)) = overlaps.iter().filter(|(_, a)| even(*a)).min_by(|a, b| a.0.area_ha.total_cmp(&b.0.area_ha)) {
+        return Some(p);
+    }
+    shape.interior_point().and_then(|c| paddock_for_point(paddocks, c))
+}

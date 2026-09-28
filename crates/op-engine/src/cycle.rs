@@ -388,7 +388,7 @@ async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Res
 /// The farm record follows an applied move: herd in the new paddock, the old
 /// one resting from now.
 pub async fn move_herd(ctx: &Ctx, d: &Decision) -> anyhow::Result<()> {
-    op_ingest::move_herd_on_record(ctx, &d.herd_id, d.to_paddock_id.as_deref(), signals::from_paddock(d)).await
+    op_ingest::move_herd_on_record(ctx, &d.herd_id, d.to_paddock_id.as_deref(), signals::from_paddock(d), d.geometry.as_ref()).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
