@@ -105,7 +105,7 @@ pub fn get_report_tool() -> ToolSpec {
     let ids: Vec<&'static str> = reports().iter().map(|r| r.id()).collect();
     ToolSpec {
         name: "get_report",
-        description: "A farm report as tables in the farm's units, with its header, method notes and signature lines: paddock_record (every grazing event with head-days, AU-days, stocking density, rest), nrcs_528 (NRCS prescribed grazing record), organic_season (days on pasture, dry matter from pasture), lease_head_days (grazing and amounts per landowner). Dates are farm-local YYYY-MM-DD; the default is this year to today.",
+        description: "A farm report as tables in the farm's units, with its header, method notes and signature lines: paddock_record (every grazing event with head-days, AU-days, stocking density, rest), nrcs_528 (NRCS prescribed grazing record), organic_season (days on pasture, dry matter from pasture), lease_head_days (grazing and amounts per landowner), welfare (cues, tone, episodes and learning status per animal). Dates are farm-local YYYY-MM-DD; the default is this year to today.",
         input_schema: json!({
             "type": "object",
             "properties": {

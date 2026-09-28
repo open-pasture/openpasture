@@ -16,7 +16,7 @@
 .arow[data-sev=critical] .behind,.arow[data-sev=critical] .rem{color:var(--red)}
 .arow[data-sev=info] .behind,.arow[data-sev=info] .rem{color:var(--fg2)}
 .arow[data-acked] .behind,.arow[data-acked] .rem{color:var(--fg3)}
-.arow .aacts{display:flex;gap:2px;margin-left:4px;flex:none}
+.arow .aacts{display:flex;gap:2px;margin-left:4px;flex:none;border-top:0;padding-top:0}
 .arow .aacts .btn.sm{padding-left:6px;padding-right:6px}
 .esc.alerts .more{font-size:12px;color:var(--fg3);padding:6px 8px;margin-left:-8px;border-radius:7px}
 .esc.alerts .more:hover,.esc.alerts .more:focus-visible{background:var(--bg2);color:var(--fg);outline:none}

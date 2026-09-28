@@ -230,6 +230,32 @@ async fn quiet_hours_hold_warnings_and_pass_critical() {
 }
 
 #[tokio::test]
+async fn quiet_hours_end_at_the_farm_clock_on_both_sides_of_a_dst_change() {
+    // Farm quiet hours 22:00-06:00 in America/Chicago. The clocks go back at 02:00 on
+    // 2026-11-01 (06:00 is then 12:00 UTC, not 11:00) and forward on 2027-03-14 (06:00 is
+    // 11:00 UTC, not 12:00).
+    for (night, before, end) in [
+        ("2026-11-01T04:00:00.000Z", "2026-11-01T11:30:00.000Z", "2026-11-01T12:00:00.000Z"),
+        ("2027-03-14T05:00:00.000Z", "2027-03-14T10:30:00.000Z", "2027-03-14T11:00:00.000Z"),
+    ] {
+        let f = Farm::new().await;
+        f.sms().await;
+        f.policy(json!({"quiet_start": "22:00", "quiet_end": "06:00", "renotify_max": 0})).await;
+        let p = f.person("A", Role::Owner, Some("+15155550101"), true, None).await;
+        let night = t(night);
+        outside(&f, "214", night).await;
+        f.route(night + secs(60)).await;
+        assert!(f.messages_to(&p).await.is_empty(), "held in the night of {night}");
+        f.route(t(before)).await;
+        assert!(f.messages_to(&p).await.is_empty(), "05:30 farm time is still quiet ({before})");
+        f.route(t(end)).await;
+        let m = f.messages_to(&p).await;
+        assert_eq!(m.len(), 1, "sent at 06:00 farm time ({end})");
+        assert!(m[0].text.starts_with("214 outside P1"), "{}", m[0].text);
+    }
+}
+
+#[tokio::test]
 async fn warnings_in_one_window_are_one_text() {
     let f = Farm::new().await;
     f.sms().await;

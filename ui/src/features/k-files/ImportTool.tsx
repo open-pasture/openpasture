@@ -8,7 +8,7 @@ import { files, type PaddockPreview } from "../../api/k-files";
 import { C, fc, fitPolys } from "../../map/base";
 import { Labels } from "../../map/layers";
 import type { ToolProps } from "../../map/tools";
-import { centroid } from "../../geo";
+import { interiorPoint } from "../../geo";
 import { store } from "../../store";
 import { kfiles } from "../../store/k-files";
 import { Button } from "../../ui";
@@ -109,7 +109,7 @@ export function ImportTool({ map, ctx, done }: ToolProps) {
   useEffect(() => {
     if (!prev?.drafts.length || !(map.getSource(SRC) as GeoJSONSource | undefined)) return;
     prev.drafts.forEach((_, i) => map.setFeatureState({ source: SRC, id: i + 1 }, { dropped: dropped.has(i) }));
-    labels.current?.set(prev.drafts.flatMap((d, i) => (dropped.has(i) ? [] : [{ id: `kf${i}`, at: centroid(d.geometry), text: d.name }])));
+    labels.current?.set(prev.drafts.flatMap((d, i) => (dropped.has(i) ? [] : [{ id: `kf${i}`, at: interiorPoint(d.geometry), text: d.name }])));
   }, [map, prev, dropped]);
 
   const save = async () => {

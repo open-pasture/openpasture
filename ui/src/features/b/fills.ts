@@ -3,7 +3,7 @@
 
 import type { Marker } from "maplibre-gl";
 import type { PaddockLayer } from "../../api/b";
-import { centroid } from "../../geo";
+import { interiorPoint } from "../../geo";
 import type { OverlayCtx, OverlayHandle } from "../../map/overlays";
 import { store } from "../../store";
 import { layerData } from "../../store/b";
@@ -86,7 +86,7 @@ export function mountFill(ctx: OverlayCtx, kind: LayerKind): OverlayHandle {
         if (f) features.push({ type: "Feature", properties: { c: f.color, o: f.opacity }, geometry: p.geometry });
       }
       const text = LABEL[kind](r);
-      if (text) labels.set(p.id, { at: centroid(p.geometry), text });
+      if (text) labels.set(p.id, { at: interiorPoint(p.geometry), text });
     }
     (map.getSource(src) as { setData(d: GeoJSON.FeatureCollection): void } | undefined)?.setData({ type: "FeatureCollection", features });
     if (!MarkerClass) return;

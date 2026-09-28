@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LonLat, Polygon } from "./api";
-import { areaHa, inside, offset, rect, ringAgainst, signedDistance } from "./geo";
+import { areaHa, centroid, inside, interiorPoint, offset, rect, ringAgainst, signedDistance } from "./geo";
 
 // A 100 m square near Ames with a 20 m square hole in its middle.
 const sw: LonLat = [-93.62, 42.03];
@@ -31,6 +31,15 @@ describe("polygon with a hole", () => {
     expect(signedDistance(at(3, 50), holed)).toBeCloseTo(3, 1);
     // Outside the outer ring.
     expect(signedDistance(at(-7, 50), holed)).toBeCloseTo(-7, 1);
+  });
+
+  test("its label point is inside it, not in the pond at its centroid", () => {
+    expect(inside(centroid(holed), holed)).toBe(false);
+    const p = interiorPoint(holed);
+    expect(inside(p, holed)).toBe(true);
+    expect(signedDistance(p, holed)).toBeGreaterThan(10);
+    // Where the centroid is inside, it is the point.
+    expect(interiorPoint(outer)).toEqual(centroid(outer));
   });
 
   test("a plain ring is unchanged", () => {

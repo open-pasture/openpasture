@@ -2,34 +2,37 @@
 
 The contract between the UI, the crates, and collars. JSON everywhere. Geometry is
 GeoJSON, `[longitude, latitude]`, WGS 84. Times are RFC 3339 UTC. IDs are prefixed
-ULIDs (`farm_…`, `pad_…`, `herd_…`, `ani_…`, `col_…`, `bnd_…`, `dec_…`).
+ULIDs (`farm_…`, `pad_…`, `herd_…`, `ani_…`, `col_…`, `bnd_…`, `dec_…`; newer types name
+theirs, e.g. `usr_…`, `alr_…`, `sch_…`).
 
 Errors: HTTP status plus `{ "error": "message" }`.
 
 `/api/*` and `/mcp` need `Authorization: Bearer <app token>` (or `?token=`; the token is in
-settings, shown in the app and printed by `openpasture token`) unless the request is local: from a loopback address, with a
+settings, shown in the app and printed by `openpasture token`), or a person's own token
+(`opu_…`, see "People, roles and sign-in"), unless the request is local: from a loopback address, with a
 `Host` of `127.0.0.1`, `localhost` or `[::1]` (any port), and no proxy headers
 (`X-Forwarded-*`, `Forwarded`, `CF-Connecting-IP`, `X-Real-IP`, `Tailscale-*`). So traffic
 through a tunnel (cloudflared, Tailscale Funnel) or a LAN address always needs the token, and a
 DNS-rebinding page gets 401. Local requests that write (POST/PUT/PATCH/DELETE) or open the
 WebSocket are refused (403) when `Origin` is another site; requests carrying the token are not
 checked. Debug builds also allow CORS and `Origin` from the Vite dev server
-(`http://localhost:5173`, `http://127.0.0.1:5173`). `/collar/v1/*` uses collar keys and
-`/v1/decide` hosted keys, never the app token.
+(`http://localhost:5173`, `http://127.0.0.1:5173`). `/collar/v1/*` uses collar keys, `/v1/*`
+hosted keys (`oph_…`) and `/hooks/twilio/*` Twilio's signature, never the app token.
 
 ## Farm (op-core)
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/state` | | `{ farm: Farm \| null, herds: Herd[], paddocks: Paddock[], settings: Settings }` |
-| POST | `/api/farm` | `{ name, center: [lon, lat], timezone? }` | `Farm` |
+| GET | `/api/farm` | | `Farm` (404 before there is one) |
+| POST | `/api/farm` | `{ name, center: [lon, lat], timezone? }` | 201 `Farm` (409 once there is one) |
 | PATCH | `/api/farm` | partial `Farm` | `Farm` |
 | GET POST | `/api/paddocks` | `{ name, geometry: Polygon }` | `Paddock[]` / `Paddock` |
-| PATCH DELETE | `/api/paddocks/:id` | partial | `Paddock` / 204 |
+| GET PATCH DELETE | `/api/paddocks/:id` | partial | `Paddock` / 204 |
 | GET POST | `/api/herds` | `{ name, species, count, paddock_id? }` | `Herd[]` / `Herd` |
-| PATCH DELETE | `/api/herds/:id` | partial (incl. `autonomy`) | `Herd` / 204 |
+| GET PATCH DELETE | `/api/herds/:id` | partial (incl. `autonomy`) | `Herd` / 204 |
 | GET POST | `/api/animals` | `{ tag, name?, herd_id, collar_id? }` | `Animal[]` / `Animal` |
-| PATCH DELETE | `/api/animals/:id` | partial (not `removed_at`/`removed_reason`) | `Animal` / 204 |
+| GET PATCH DELETE | `/api/animals/:id` | partial (not `removed_at`/`removed_reason`) | `Animal` / 204 |
 | GET PUT | `/api/settings` | partial `Settings` | `Settings` |
 | GET | `/api/secrets` | | `{ name, set: bool }[]` (never values) |
 | PUT DELETE | `/api/secrets/:name` | `{ value }` | 204 |
@@ -49,7 +52,9 @@ BrainId  = "codex"|"claude"|"anthropic"|"openai"|"compatible"|"hosted"|"heuristi
 
 Secret names: `anthropic_api_key`, `openai_api_key`, `compatible_api_key`,
 `compatible_base_url`, `hosted_api_key`, `hosted_url` (optional, default
-`https://api.openpasture.dev`), `firecrawl_api_key` (the land provider key).
+`https://api.openpasture.dev`), `firecrawl_api_key` (the land provider key), `twilio_account_sid`,
+`twilio_auth_token`, `smtp_password`, `webhook_secret` (see Texting) and `vapid_private_key` (Web
+Push). Any lowercase name may be stored; these are the ones the server reads.
 
 The farm's `timezone` comes from its `center` (offline lookup, `tzf-rs`) on create and
 whenever a PATCH moves the centre; a body `timezone` is used only where the location has no zone.
@@ -64,13 +69,136 @@ Autonomy follows the website's switch: `propose` waits for approval, `timer` app
 `autonomy` (or `timer_minutes` while on timer) also moves its open proposed MOVE: timer sets
 `apply_at = now + timer_minutes`, auto sends it at once, propose clears `apply_at`.
 
+**Paddock areas stored before op-geo measured rings whichever way they wind** (a clockwise
+outer ring, or a hole wound like its outer ring) are measured again from their geometry when
+the data dir opens, in `paddocks` and in the geometry history reports use. Rows that are
+right are left alone.
+
+## Identity, people, shared records (op-core)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/me` | `{ role, via, user?: { id, name, phone?, phone_verified?: bool, email? } }` |
+
+```ts
+Role     = "viewer"|"hand"|"manager"|"owner"          // ordered
+Via      = "local"|"app_token"|"user_token"|"brain"|"text"|"system"|"anonymous"
+Actor    { via: Via, user_id?, name? }                 // who did something, stored on records
+User     { id /* usr_… */, name, role: Role, phone? /* E.164 */, phone_verified_at?, email?, created_at, disabled_at? }
+Severity = "info"|"warning"|"critical"
+Finding  { code, severity: Severity, text, geometry?: GeoJSON, targets?: [kind, id][] }
+Alert    { id /* alr_… */, kind, key, severity, status: "open"|"acked"|"resolved", herd_id?, title, body?,
+           at?: [lon, lat], targets: [kind, id][], data, opened_at, updated_at, acked_at?, acked_by?: Actor,
+           resolved_at?, resolved_by?: Actor, rolled_into? }
+MessageLog { id /* ntf_… */, direction: "out"|"in", channel: "sms"|"whatsapp"|"email"|"webhook"|"relay"|"push",
+           address, user_id?, kind: "alert"|"brief"|"reply"|"test"|"verify"|"inbound", text, subject?,
+           status: "queued"|"sending"|"sent"|"delivered"|"failed"|"received"|"ignored", error?,
+           alert_id?, decision_id?, provider_id?, attempts, created_at, updated_at }
+MapFeature { id /* fea_… */, kind: "exclusion"|"water"|"gate"|"shade"|"hazard"|"road"|"neighbour_line"|"farm_boundary",
+           name?, geometry: Point|LineString|Polygon, paddock_id? /* none = farm-wide */, notes?, props,
+           active_from?, active_until?, created_at, updated_at }
+```
+
+Every request carries an identity. The app token and local requests are the owner
+(`via: "app_token"` / `"local"`); a brain token on `/mcp?scope=brain` is the brain (a viewer that
+lists and calls only its tools); `/collar/v1`, `/v1/*` and `/hooks/*` authenticate themselves.
+`/hooks/*` paths that don't exist are JSON 404s. A handler that needs a role answers 401 without
+credentials and 403 `{"error": "Your role can't do this."}` when the role is too low.
+
+People (`users`) need no sign-in: someone who only texts is a user with a phone. Phones are stored
+as E.164 (10 digits are a US number); changing a phone clears its verification. `users`,
+`messages` and the other tables holding phone numbers are never readable through `/api/sql` or
+export.
+
+Map features: an exclusion is one polygon ring; water, shade and hazards are a point or a polygon
+(a hazard point needs `props.radius_m`); a gate is a point; roads and neighbour lines are lines;
+there is at most one farm boundary (409). A feature is active from `active_from` (inclusive) to
+`active_until` (exclusive); either may be absent. Exclusions become boundary holes on sends whose
+activation time falls in their window; the rest are checked before a send, never enforced.
+
+Numbers people read (reports, texts, the brief) go through the farm's `settings.units`: metric
+(ha, m, cm, kg, m²/hd, AU/ha) or imperial (ac, ft, in, lb, ft²/hd, AU/ac), rounded the same in
+op-core and the UI: area one decimal (two below 0.1, none from 1,000), lengths whole (nearest 10
+from 100), heights whole, mass and area per head three significant figures, density one decimal,
+"," between thousands. The API is always SI.
+
+Pasture history (`/api/analytics/pasture`) reads daily dwell from `paddock_days`: the rollup's own
+days plus imported position history.
+
+## People, roles and sign-in (op-core, op-server)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/users` | | `Person[]`, enabled first, by name |
+| POST | `/api/users` | `{ name, role, phone?, email? }` | 201 `Person` (no sign-in); 409 phone or email taken |
+| GET | `/api/users/:id` | | `Person` / 404 |
+| PATCH | `/api/users/:id` | `{ name?, role?, phone?, email?, disabled? }` (`null` clears phone, email) | `Person`; a new phone clears its verification; `disabled: true` also revokes every token and open link |
+| DELETE | `/api/users/:id` | | 204 / 404; their tokens and links go too, records keep the name they stored |
+| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped |
+| GET | `/api/invites` | | `Invite[]` open (not accepted, not expired), newest first |
+| POST | `/api/invites` | `{ user_id }` or `{ name, role, phone?, email? }` (adds the person now) | 201 `Invite & { code, url }`; `code` and `url` are shown once; replaces the person's open link |
+| DELETE | `/api/invites/:id` | | 204 / 404 (open links only) |
+| POST | `/api/invites/accept` | `{ code, label? }`, no token needed | `{ token, user: User }`; `token` (`opu_` + 64 hex) is shown once. 404 unknown or dropped link, 410 used, expired or person disabled, 429 after 5 tries a minute from one peer |
+| GET | `/api/tokens` | | `TokenInfo[]` not revoked, newest first |
+| DELETE | `/api/tokens/:id` | | 204 / 404; that browser gets 401 on its next request |
+| PATCH | `/api/me/profile` | `{ name?, phone?, email? }` | `User` (your own; 404 when you aren't in People; role can't be changed here) |
+| GET | `/api/me/tokens` | | your own `TokenInfo[]` |
+| DELETE | `/api/me/tokens/:id` | | 204 / 404 |
+| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) |
+
+```ts
+Person    = User & { tokens: number /* browsers signed in */, last_used?, invite_until? /* open link expires */ }
+Invite    { id /* inv_… */, user_id, name, role: Role, phone?, email?, created_by?: Actor, created_at, expires_at, accepted_at? }
+TokenInfo { id /* tok_… */, user_id, label, created_at, last_used?, revoked_at? }
+```
+
+**Sign-in.** No passwords. Adding a person gives them no sign-in: someone who only texts is a
+person with a phone. A sign-in link is `{base_url}/#/join/<code>` (a 128-bit code in hex, valid
+7 days, accepted once; the code rides in the URL fragment, which browsers don't send). Accepting
+it returns a person token (`opu_…`) that the browser keeps and sends as
+`Authorization: Bearer opu_…` (or `?token=` on the WebSocket), everywhere the app token works. A
+person may have several tokens (one per browser); a new link for the same person signs in another
+browser. Codes and tokens are stored as sha256 only. Tokens resolve through a 30 s cache;
+revoking a token or a person's sign-in, or changing, disabling or removing a person, applies to
+the next request. `last_used` is written at most once a minute. A revoked or unknown person token
+is 401 even from this machine (it never falls back to the local owner). The app token and local
+requests are the owner; when the owner added themselves to People (as an owner), they act as the
+first enabled owner person (`/api/me` shows it, records name them).
+
+**Roles** (`viewer < hand < manager < owner`), checked for every `/api` request before the route:
+
+- viewer: `GET`/`HEAD` everywhere except the reads below; `/api/live`; MCP read tools.
+  Every role may also use `/api/me` and `/api/me/*` and `POST`/`DELETE /api/push/subscriptions*`.
+- hand: a viewer plus `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`,
+  `PUT /api/alerts/prefs/me`, `POST /api/herds/:id/move/stop`, `POST /api/collars/:id/escape/stop`,
+  `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/fleet/:id/fit-checks`,
+  `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`, `POST /api/feed-log`,
+  `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
+- manager: every other `/api` request except the owner's; `GET /api/messages` and
+  `GET /api/alerts/prefs` are managers' reads; all MCP tools.
+- owner: also `PUT /api/settings`, `/api/secrets*`, `/api/users*`, `/api/invites*` (except
+  `accept`, which needs no sign-in), `/api/tokens*`, `/api/brains/hosted/keys*`, `/api/notify/*`,
+  `/api/texting*`, `PUT /api/push/settings`, `POST /api/collars/:id/rekey`.
+
+A role too low is 403 `{"error": "Your role can't do this."}`. `GET /api/settings` and
+`GET /api/state` send `server.app_token: ""` to everyone but owners. `POST /api/sql` is a
+manager's (it is a POST). MCP lists and calls tools as the caller: a viewer or hand never sees
+`propose_boundary`, and calling it answers "Unknown tool".
+
+**Who answered.** `POST /api/decisions/:id/respond` records the caller:
+`inputs.farmer_response.by = Actor` (e.g. `{ via: "user_token", user_id, name: "Ana" }`, or
+`{ via: "local" }` for the owner on this machine without a person), and the activity events the
+answer causes (`decision.approved`, `decision.rejected`, `decision.applied`) carry the name in
+`payload.by` ("owner" for the app token or a local request without a person). A proposal made
+through MCP `propose_boundary` keeps its caller as `inputs.by`.
+
 ## Collars and boundaries (op-ingest)
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id }` | `{ collar: Collar, key: string, endpoint: string, public_key: string }` (key shown once) |
-| PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
+| GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
@@ -254,260 +382,6 @@ The server's key pair lives in the data directory; the public key is given at li
 The command carries `herd_id` (signed with the rest); a collar rejects a command for a herd
 other than its own. Commands without `herd_id` (older servers) are accepted.
 
-## Decisions and brains (op-engine, op-brain)
-
-| Method | Path | Body / query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/decisions` | `?herd_id&limit` | `Decision[]` newest first |
-| GET | `/api/decisions/:id` | | `Decision` |
-| POST | `/api/herds/:id/decide` | | `Decision` with `status: "running"` (progress on `/api/live`) |
-| POST | `/api/decisions/:id/respond` | `{ action: "approve"\|"reject"\|"modify", geometry?, note? }` | `Decision` (409 unless `proposed`) |
-| GET | `/api/brains` | `?refresh=1` re-detects now | `Brain[]` |
-| POST | `/api/brains/:id/test` | | `{ ok, detail, ms }`: one real decision on this farm's record, no MCP; `detail` is `ACTION (model)` or a one-line error |
-| GET POST | `/api/brains/hosted/keys` | `{ label? }` | `HostedKey[]` / 201 `HostedKey & { key }` (key shown once, `oph_…`) |
-| DELETE | `/api/brains/hosted/keys/:id` | | 204 / 404 |
-| POST | `/v1/decide` | `{ context, instructions?, schema? }`, `Authorization: Bearer oph_…` | `DecisionOutput` |
-| GET | `/api/knowledge` | `?q&limit` | `{ id, title, kind, body, source }[]`; empty `q` lists lessons then seed |
-| GET | `/api/land/:paddock_id` | `?refresh=true` skips the 6 h cache. Land reports: the configured land provider when a key is set, otherwise open data | `{ paddock_id, report_id, source, as_of, cached, summary: string[], sections }` |
-| GET | `/api/signals` | `?herd_id` | `Signals` |
-
-```ts
-Decision { id, herd_id, source: "brain"|"farmer"|"heuristic", brain?: BrainId, model?,
-           status: "running"|"proposed"|"approved"|"applied"|"rejected"|"failed"|"superseded",
-           action?: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD" /* HOLD: strip schedules (S) */, to_paddock_id?, geometry?: Polygon,
-           reasoning?, confidence?, need?, inputs, apply_at?, boundary_id?, error?,
-           created_at, responded_at?, outcome? }
-Brain    { id: BrainId, name, available: boolean, signed_in: boolean, needs: string[] /* secret names */,
-           models: string[], detail?: string }
-HostedKey { id, label, created_at, last_used? }
-DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need, model }
-Signals  { as_of, herd_id, current_paddock_id, position_source, herd_animal_units, feed_budget_days_current,
-           behavior, risk_flags, assumptions,
-           paddocks: { paddock_id, name, status, area_ha, current, rest_days, grazing_pressure, forage, recovery, risk_flags }[] }
-```
-
-A brain is ready when `available && signed_in`. `needs` lists every secret field the brain
-reads, optional ones included (compatible: `compatible_base_url`, `compatible_api_key`;
-hosted: `hosted_api_key`, `hosted_url`). `detail` is a short status such as "ChatGPT sign-in",
-"Add API key", "Sign in with codex login".
-
-**Responding.** `approve` sends a MOVE (STAY and NEEDS_INFO become `approved`); `reject`
-never sends; `modify` needs `geometry`, sends the farmer's shape and keeps the brain's in
-`inputs.proposed_geometry`. `inputs.farmer_response = { action, at, note?, geometry? }`.
-A `note` becomes a farm lesson and appears in the next decision's context as an
-`observations` entry with `source: "farmer-note"` (and in `history[].farmer_response`).
-The app answers a NEEDS_INFO decision by posting the farmer's reply as `approve` + `note`,
-then starting a new decision.
-
-**Autonomy.** `propose` waits. `timer` sets `apply_at = now + timer_minutes` on a proposed
-MOVE and the server sends it then unless it was answered. `auto` sends a MOVE at once.
-STAY and NEEDS_INFO always wait. The daily decision runs for every herd with collars once
-the farm's local time reaches `settings.decision_time` (within the following hour, once a day).
-
-**Hosted brain.** `/v1/decide` is outside `/api`, so the app token does not apply; the
-hosted key does. It runs this server's own configured brain: 401 bad key, 409 when this
-server's brain is itself `hosted` or is `codex` (Codex's tools can read files on the host even
-in its read-only sandbox, so outside prompts never reach it), 503 brain not set up, 502 brain
-failed. Claude Code serves with no built-in tools, no MCP, `--restricted` and `--safe-mode`. Point another
-server at it with the `hosted_url` and `hosted_api_key` secrets and brain `hosted`.
-
-### Decision context
-
-What the engine hands a brain (`DecisionRequest.context`, also the `context` of
-`/v1/decide`). Any field may be `null` or empty.
-
-```ts
-{ as_of, farm: Farm, herd: Herd & { animal_units },
-  autonomy: { mode, timer_minutes },
-  current_paddock_id, position_source: "collar"|"farm_record"|"unknown",
-  paddocks: { id, name, status, area_ha, geometry, rest_days, last_grazed, notes?, grazed_until? }[],
-  candidate_paddock_ids: string[],
-  boundary: BoundaryStatus /* with move: the target being swept into, if any */,
-  collars: { count, reporting_24h, quiet: string[], low_battery: string[] /* < 0.2 */,
-             states: { inside, warning, outside, unknown }, fixes_24h, cues_24h,
-             dominant_paddock_id, paddock_fix_counts: Record<paddock_id, number> },
-  positions: { collar_id, animal_id?, point, at, state, paddock_id? }[],
-  signals: { as_of, herd_animal_units, rest_days, last_grazed, forage, recovery, grazing_pressure,
-             feed_budget_days_current, behavior, risk_flags, risk_flags_by_paddock, assumptions },
-  land_reports: Record<paddock_id, { report_id, source, as_of, sections }>,
-  land_report_notes: Record<paddock_id, string>,
-  knowledge: { id, title, kind, body, source }[],
-  observations: { content, paddock_id?, at?, source: "farmer-note" /* dated, last 7 days */
-                  | "paddock-note" /* the paddock's standing notes */ }[],
-  history: { id, created_at, source, status, action, from_paddock_id, to_paddock_id,
-             reasoning, confidence, need, farmer_response?, outcome? }[] /* last 10, newest first */,
-  units,
-  schedule /* S: the herd's strip schedule while it runs, see "Strip schedules" */ }
-```
-
-"Where the herd is": the paddock holding at least half of the herd's collar fixes from the
-last 24 h since its current boundary took effect, else `herds.paddock_id`.
-
-## Analytics (op-analytics)
-
-| Method | Path | Query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/tracks` | `collar_id?&herd_id?&from&to&max_points` | `Track[]` |
-| GET | `/api/analytics/health` | `herd_id\|collar_id&from&to&bucket` | `CollarHealth[]` |
-| GET | `/api/analytics/behaviour` | `herd_id&from&to` | `Behaviour[]` |
-| GET | `/api/analytics/heatmap` | `herd_id&from&to&cell_m?&normalize?` | `[lon, lat, weight][]` |
-| GET | `/api/analytics/pasture` | `herd_id?&from&to` (default 90 days) | `PaddockPasture[]` |
-| POST | `/api/sql` | `{ query, limit? }` | `{ columns: string[], rows: any[][], ms, truncated? }` |
-| GET | `/api/export` | `table&format=csv\|geojson\|parquet&from&to&collar_id?&herd_id?` | file download |
-
-`from`/`to`: RFC 3339, `YYYY-MM-DD`, `now`, or relative (`-24h`, `-7d`, `-30m`, `-2w`); default
-the last 24 h. `bucket`: `10m`, `1h`, `1d` or seconds; default the smallest step giving at most
-150 buckets (at most 2,000 when `bucket` is given, else 400) over the span the collars can have data for (health clips `from` to when the first of
-its collars was linked, at least ten minutes, and `to` to now), so a herd linked an hour ago gets
-one-minute buckets. Values with no data behind them are `null`, never estimated.
-
-```ts
-Track        { collar_id, points: [lon, lat, t_unix_seconds][] }   // first fix per time bucket + the latest
-HealthPoint  { t, fixes, fix_rate /* 0-1 */, acc_p50, acc_p95, sats, cn0?, ttf_s?, battery /* 0-1 */, cues }
-CollarHealth { collar_id, name, herd_id, animal_id, bucket_s, cadence_s, summary: HealthPoint,
-               ack: { version, status, reason, at } | null, points: HealthPoint[] }
-Behaviour    { animal_id, collar_id, tag, name, fixes, distance_km, paddock_hours: Record<paddock_id, number>,
-               outside_hours, days: string[], cues_per_day: number[], cues,
-               learning: { slope_per_day, trend: "falling"|"rising"|"flat" } | null }
-PaddockPasture { paddock_id, name, area_ha, status, grazing_days, rest_days, pressure /* AU-days/ha */,
-               au_days, last_grazed, ndvi, herds: string[] }
-```
-
-Battery history is op-ingest's `health` table (one row per report). `ndvi` is the latest
-imagery NDVI mean from the paddock's land reports (so only with the land provider key;
-open data has no imagery). SQL is one read-only `SELECT`/`WITH`/`EXPLAIN` over
-`fixes`, `cues`, `health`, `acks`, `boundaries`, `decisions`, `collars` (no `key_hash`), `animals`,
-`paddocks`, `herds`, at most 10,000 rows, 20 s. A query loads at most 100,000 rows per record
-table and the newest 500,000 hot (SQLite) rows per telemetry table, plus the Parquet days. Export `table` is any of those or `tracks`;
-GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
-
-## Server (op-server)
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| GET | `/api/server` | `{ version, data_dir, bind, port, lan_url?, public_url? }` |
-| GET | `/api/live` | WebSocket, server → client `Event` messages |
-| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`), tools listed and called as the caller's identity; `?scope=brain` lists only the brain tools. A brain run off a loopback URL gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only and lists and calls only the tools it was minted with) |
-
-```ts
-Event =
-  | { type: "fix", collar_id, animal_id?, herd_id, fix: Fix, state }
-  | { type: "cue", collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }
-  | { type: "ack", collar_id, herd_id, version, status, reason?, code? }   // code: protocol v1 reject code, only with rejected
-  | { type: "collar", collar: Collar }
-  | { type: "boundary", herd_id, boundary: Boundary }
-  | { type: "decision", decision: Decision }
-  | { type: "move", move: Move }     // a move started, stepped, dropped a straggler, finished or stopped
-  | { type: "escape", escape: Escape } // an escape started, stepped, ended or was stopped
-  | { type: "decision_log", decision_id, line }   // brain progress, one line at a time
-  | { type: "resync" }   // this socket fell behind and missed events: refetch state
-  // @HUB
-  | { type: "alert", alert: Alert }
-  | { type: "message", message: MessageLog }   // managers and up only
-  | { type: "feature", feature: MapFeature, deleted?: true }
-  | { type: "animals_changed", herd_id? }
-  // @HUB-UI
-  // @E-lib
-  // @E-srv
-  // @J
-  // @A-engine
-  // @A-notify
-  // @D
-  // @K-animals
-  // @K-files
-  // @I
-  // @B
-  // @G
-  // @P  (/api/live only, never on the bus; they replace fix, ack and cue on the socket)
-  | { type: "positions", herd_id, items: PositionItem[] }   // per herd every 500 ms
-  | { type: "ack_batch", herd_id, items: AckItem[] }
-  | { type: "cue_batch", herd_id, items: CueItem[] }
-  // @Q
-  // @C
-  // @F
-  // @S
-  | { type: "schedule", schedule: Schedule }   // made, changed (staged, opened, skipped, held, retimed), paused, resumed or ended
-  // @A3
-  // @H
-  // @L
-  // @M
-  // @Z
-  // @X1  (/api/live only: one farm window's batches together, see "Seams between streams")
-  | { type: "batch", events: Event[] }
-```
-
-Each socket gets only the events its identity may see: `message` events go to managers and up
-(they carry phone numbers), everything else to every role.
-
-A report publishes one `fix` event per collar (its newest new fix), not one per fix. On the
-socket, `fix`, `ack` and `cue` arrive as `positions`, `ack_batch` and `cue_batch` (see "Live feed
-at herd scale").
-
-## MCP tools (op-engine)
-
-Every tool call is logged at info (`op_engine::mcp: mcp tool call tool=…`).
-Read tools for the brain and for any agent: `get_farm`, `list_paddocks`, `get_herd`,
-`get_herd_positions`, `get_boundary_status`, `get_signals`, `get_land_report`,
-`search_knowledge`, `list_decisions`, `get_decision`, `run_sql`. Write tools for outside
-agents only: `propose_boundary` (records a decision; autonomy still applies).
-
-<!-- @HUB -->
-
-## Identity, people, shared records (op-core)
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| GET | `/api/me` | `{ role, via, user?: { id, name, phone?, phone_verified?: bool, email? } }` |
-
-```ts
-Role     = "viewer"|"hand"|"manager"|"owner"          // ordered
-Via      = "local"|"app_token"|"user_token"|"brain"|"text"|"system"|"anonymous"
-Actor    { via: Via, user_id?, name? }                 // who did something, stored on records
-User     { id /* usr_… */, name, role: Role, phone? /* E.164 */, phone_verified_at?, email?, created_at, disabled_at? }
-Severity = "info"|"warning"|"critical"
-Finding  { code, severity: Severity, text, geometry?: GeoJSON, targets?: [kind, id][] }
-Alert    { id /* alr_… */, kind, key, severity, status: "open"|"acked"|"resolved", herd_id?, title, body?,
-           at?: [lon, lat], targets: [kind, id][], data, opened_at, updated_at, acked_at?, acked_by?: Actor,
-           resolved_at?, resolved_by?: Actor, rolled_into? }
-MessageLog { id /* ntf_… */, direction: "out"|"in", channel: "sms"|"whatsapp"|"email"|"webhook"|"relay"|"push",
-           address, user_id?, kind: "alert"|"brief"|"reply"|"test"|"verify"|"inbound", text, subject?,
-           status: "queued"|"sending"|"sent"|"delivered"|"failed"|"received"|"ignored", error?,
-           alert_id?, decision_id?, provider_id?, attempts, created_at, updated_at }
-MapFeature { id /* fea_… */, kind: "exclusion"|"water"|"gate"|"shade"|"hazard"|"road"|"neighbour_line"|"farm_boundary",
-           name?, geometry: Point|LineString|Polygon, paddock_id? /* none = farm-wide */, notes?, props,
-           active_from?, active_until?, created_at, updated_at }
-```
-
-Every request carries an identity. The app token and local requests are the owner
-(`via: "app_token"` / `"local"`); a brain token on `/mcp?scope=brain` is the brain (a viewer that
-lists and calls only its tools); `/collar/v1`, `/v1/*` and `/hooks/*` authenticate themselves.
-`/hooks/*` paths that don't exist are JSON 404s. A handler that needs a role answers 401 without
-credentials and 403 `{"error": "Your role can't do this."}` when the role is too low.
-
-People (`users`) need no sign-in: someone who only texts is a user with a phone. Phones are stored
-as E.164 (10 digits are a US number); changing a phone clears its verification. `users`,
-`messages` and the other tables holding phone numbers are never readable through `/api/sql` or
-export.
-
-Map features: an exclusion is one polygon ring; water, shade and hazards are a point or a polygon
-(a hazard point needs `props.radius_m`); a gate is a point; roads and neighbour lines are lines;
-there is at most one farm boundary (409). A feature is active from `active_from` (inclusive) to
-`active_until` (exclusive); either may be absent. Exclusions become boundary holes on sends whose
-activation time falls in their window; the rest are checked before a send, never enforced.
-
-Numbers people read (reports, texts, the brief) go through the farm's `settings.units`: metric
-(ha, m, cm, kg, m²/hd, AU/ha) or imperial (ac, ft, in, lb, ft²/hd, AU/ac), rounded the same in
-op-core and the UI: area one decimal (two below 0.1, none from 1,000), lengths whole (nearest 10
-from 100), heights whole, mass and area per head three significant figures, density one decimal,
-"," between thousands. The API is always SI.
-
-Pasture history (`/api/analytics/pasture`) reads daily dwell from `paddock_days`: the rollup's own
-days plus imported position history.
-
-<!-- @HUB-UI -->
-<!-- @E-lib -->
-<!-- @E-srv -->
-
 ## Protocol v1 on the server (op-ingest)
 
 The collar protocol v1 (holes, slots, collar-scoped boundaries, cue kinds, episodes, signed
@@ -552,7 +426,7 @@ boundary that still lie whole inside the step with the gap.
 **Downloads are per collar.** The command for a collar is fitted to its caps and limits: `holes`,
 `collar_id` and `cue_mode` only when in its caps. A collar with no caps (firmware 0.1) gets the
 outer ring fitted to 64 vertices and no holes; the server-side fence for that collar uses the same
-ring, so `state` matches what the collar enforces. Selection (§3.3): its boundary set (the herd's,
+ring, so `state` matches what the collar enforces. Selection: its boundary set (the herd's,
 with its own copies after an escape; only its pen while out on one) split at now by the
 activation rule (the highest version whose `effective_at`, or receipt, has passed is in effect; a
 staged version is dead once a higher one takes effect at or before it); versions it refused for
@@ -572,7 +446,7 @@ herd's boundary in effect and of each staged one, as after an escape, and `lates
 them. The server-side fence starts from `unknown` when the herd's boundary took effect after the
 collar's last report, as the collar rearms on a new boundary.
 
-**Reports** (§3.8) may carry `device { fw, caps, limits, config_version, config_reject }` (stored
+**Reports** may carry `device { fw, caps, limits, config_version, config_reject }` (stored
 on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`), `slots` (the complete
 list; replaces the collar's applied/received rows), `episodes` (stored once per collar and start),
 cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, and health
@@ -583,7 +457,7 @@ cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, an
 reports (and for firmware 0.1) acks keep the collar's slot rows: `applied` drops every lower
 version, as the collar does.
 
-**Configs** (§3.4): each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,
+**Configs**: each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,
 version per collar). It gets a new version when its herd changes (at once on the PATCH), when
 `server.public_url` changes (the `endpoint`, only when it is `https://`; seen on the collar's next
 report), when a move starts for its herd or an escape for it (a fast window: `fast_until` = the
@@ -604,258 +478,6 @@ Tables: `collar_slots(collar_id, version, status, effective_at, reported_at, cod
 boundary_version, ring, cues, max_level, min_margin_m, outcome)`, `collar_config(collar_id,
 version, body, updated_at, reject_version, reject_code, sent_at)`; boundary indexes `(herd_id, collar_id,
 version)`, `(effective_at)`, `(version)`.
-<!-- @J -->
-
-## People, roles and sign-in (op-core, op-server)
-
-| Method | Path | Body / query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/users` | | `Person[]`, enabled first, by name |
-| POST | `/api/users` | `{ name, role, phone?, email? }` | 201 `Person` (no sign-in); 409 phone or email taken |
-| GET | `/api/users/:id` | | `Person` / 404 |
-| PATCH | `/api/users/:id` | `{ name?, role?, phone?, email?, disabled? }` (`null` clears phone, email) | `Person`; a new phone clears its verification; `disabled: true` also revokes every token and open link |
-| DELETE | `/api/users/:id` | | 204 / 404; their tokens and links go too, records keep the name they stored |
-| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped |
-| GET | `/api/invites` | | `Invite[]` open (not accepted, not expired), newest first |
-| POST | `/api/invites` | `{ user_id }` or `{ name, role, phone?, email? }` (adds the person now) | 201 `Invite & { code, url }`; `code` and `url` are shown once; replaces the person's open link |
-| DELETE | `/api/invites/:id` | | 204 / 404 (open links only) |
-| POST | `/api/invites/accept` | `{ code, label? }`, no token needed | `{ token, user: User }`; `token` (`opu_` + 64 hex) is shown once. 404 unknown or dropped link, 410 used, expired or person disabled, 429 after 5 tries a minute from one peer |
-| GET | `/api/tokens` | | `TokenInfo[]` not revoked, newest first |
-| DELETE | `/api/tokens/:id` | | 204 / 404; that browser gets 401 on its next request |
-| PATCH | `/api/me/profile` | `{ name?, phone?, email? }` | `User` (your own; 404 when you aren't in People; role can't be changed here) |
-| GET | `/api/me/tokens` | | your own `TokenInfo[]` |
-| DELETE | `/api/me/tokens/:id` | | 204 / 404 |
-| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) |
-
-```ts
-Person    = User & { tokens: number /* browsers signed in */, last_used?, invite_until? /* open link expires */ }
-Invite    { id /* inv_… */, user_id, name, role: Role, phone?, email?, created_by?: Actor, created_at, expires_at, accepted_at? }
-TokenInfo { id /* tok_… */, user_id, label, created_at, last_used?, revoked_at? }
-```
-
-**Sign-in.** No passwords. Adding a person gives them no sign-in: someone who only texts is a
-person with a phone. A sign-in link is `{base_url}/#/join/<code>` (a 128-bit code in hex, valid
-7 days, accepted once; the code rides in the URL fragment, which browsers don't send). Accepting
-it returns a person token (`opu_…`) that the browser keeps and sends as
-`Authorization: Bearer opu_…` (or `?token=` on the WebSocket), everywhere the app token works. A
-person may have several tokens (one per browser); a new link for the same person signs in another
-browser. Codes and tokens are stored as sha256 only. Tokens resolve through a 30 s cache;
-revoking a token or a person's sign-in, or changing, disabling or removing a person, applies to
-the next request. `last_used` is written at most once a minute. A revoked or unknown person token
-is 401 even from this machine (it never falls back to the local owner). The app token and local
-requests are the owner; when the owner added themselves to People (as an owner), they act as the
-first enabled owner person (`/api/me` shows it, records name them).
-
-**Roles** (`viewer < hand < manager < owner`), checked for every `/api` request before the route:
-
-- viewer: `GET`/`HEAD` everywhere except the reads below; `/api/live`; MCP read tools.
-  Every role may also use `/api/me` and `/api/me/*` and `POST`/`DELETE /api/push/subscriptions*`.
-- hand: a viewer plus `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`,
-  `PUT /api/alerts/prefs/me`, `POST /api/herds/:id/move/stop`, `POST /api/collars/:id/escape/stop`,
-  `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/fleet/:id/fit-checks`,
-  `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`, `POST /api/feed-log`,
-  `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
-- manager: every other `/api` request except the owner's; `GET /api/messages` and
-  `GET /api/alerts/prefs` are managers' reads; all MCP tools.
-- owner: also `PUT /api/settings`, `/api/secrets*`, `/api/users*`, `/api/invites*` (except
-  `accept`, which needs no sign-in), `/api/tokens*`, `/api/brains/hosted/keys*`, `/api/notify/*`,
-  `/api/texting*`, `PUT /api/push/settings`, `POST /api/collars/:id/rekey`.
-
-A role too low is 403 `{"error": "Your role can't do this."}`. `GET /api/settings` and
-`GET /api/state` send `server.app_token: ""` to everyone but owners. `POST /api/sql` is a
-manager's (it is a POST). MCP lists and calls tools as the caller: a viewer or hand never sees
-`propose_boundary`, and calling it answers "Unknown tool".
-
-**Who answered.** `POST /api/decisions/:id/respond` records the caller:
-`inputs.farmer_response.by = Actor` (e.g. `{ via: "user_token", user_id, name: "Ana" }`, or
-`{ via: "local" }` for the owner on this machine without a person), and the activity events the
-answer causes (`decision.approved`, `decision.rejected`, `decision.applied`) carry the name in
-`payload.by` ("owner" for the app token or a local request without a person). A proposal made
-through MCP `propose_boundary` keeps its caller as `inputs.by`.
-<!-- @A-engine -->
-
-## Alerts (op-alerts)
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| GET | `/api/alerts?status=&herd_id=&from=&to=&limit=` | `Alert[]`. `status`: `open` (unacked), `acked`, `resolved`, `all`; absent = open and acked, critical first, then newest. `from`/`to` (RFC 3339) bound `opened_at`; `limit` 1–1000, default 100 |
-| GET | `/api/alerts/{id}` | `Alert` |
-| POST | `/api/alerts/{id}/ack` | `Alert`; hand and up. Stops re-notification and escalation; acking again returns it unchanged; resolved → 409 |
-| POST | `/api/alerts/{id}/resolve` | `Alert`; hand and up. Stays closed while its cause lasts; resolved → 409 |
-| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email")[] }` |
-| PUT | `/api/alerts/rules` | same; manager and up. Body `{ rules?: { <kind>: Partial<RuleConfig> }, policy?: Partial<Policy> }` (merge; `null` puts a rule's number back to its default and clears quiet hours) |
-| GET | `/api/alerts/prefs` | `PersonPrefs[]`, every person; manager and up |
-| GET | `/api/alerts/prefs/me` | `PersonPrefs` of the caller's person; 404 when the sign-in isn't a person |
-| PUT | `/api/alerts/prefs/me` | `PersonPrefs`; hand and up. Body: JSON merge patch of `AlertPrefs` |
-| PUT | `/api/alerts/prefs/{user_id}` | `PersonPrefs`; owner only |
-
-```ts
-RuleConfig { enabled: bool, severity: Severity, after_min?: number, threshold?: number, notify: bool }
-RuleView   = RuleConfig & { kind, sentence /* "Collar silent for {n}" */, unit: "min"|"%"|"m"|"", cadence_s, default: RuleConfig }
-Policy     { renotify_every_min: 30, renotify_max: 3, escalate_after_min: 15, group_window_s: 60, rollup_min: 4,
-             herd_silent_share: 0.5, clear_after_min: 2, start_grace_min: 20, critical_window_s: 10,
-             quiet_start?: "HH:MM", quiet_end?: "HH:MM" /* the farm's, farm time */ }
-AlertPrefs { channels: ("sms"|"whatsapp"|"email")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
-             herds?: string[] /* absent = every herd */, muted_kinds: string[], quiet_start?, quiet_end? /* absent = the farm's */,
-             critical_in_quiet: bool /* true */, on_duty: bool /* false */ }
-PersonPrefs = AlertPrefs & { user_id, name, role: Role, sms_opt_out: bool, updated_at? }
-```
-
-Rules (`kind`, default severity, number, notify): `escaped` an open escape (critical) · `outside` outside
-the herd's boundary ≥ 5 min with no escape running and not let go on this trip out (warning; critical
-when the collar is silent too) · `silent` no report for max(20 min, 3 × its median report interval
-over 24 h); held for `start_grace_min` after a server start (warning) · `herd_silent` more than
-`herd_silent_share` of a herd's reporting collars silent, at least two (critical; takes in that herd's
-`silent` alerts; once open it lasts while more than 80 % of that share is silent) · `low_battery`
-< 20 % (warning, no texts; in the brief) · `boundary_not_applied` the herd's boundary in effect
-≥ 10 min and the collar holds an older one (or rejected it), not escaped and not silent (warning) ·
-`decision_waiting` a proposal unanswered 30 min, or a timer decision at once (warning; the 4-digit
-approval code is only in its text, never in the API, the MCP tools or live events) · `move_stalled` a
-sweeping move with no step for 15 min (warning; `data.staged` when it waits on a staged boundary) ·
-`stragglers` a move left animals behind (info) · `drop_off` every fix (sampled every 5 min) within 4 m
-of their median for 240 min (warning) · `gps_degraded` median accuracy over the last 10 min worse than
-10 m, or no fix for 10 min while reports arrive (info, no texts). Parked collars and removed animals
-never alert.
-
-Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
-are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
-members until the last clears; members already open resolve with `rolled_into`. Once people were told
-about a rollup (a text or an ack), animals that join it are a new breakout when they are at least as
-many as the told ones still in it: it opens again as a new alert with every member (the old one
-resolves with `rolled_into` the new one) and is sent like any new alert. So an acked "6 outside P3"
-with one animal still out texts "3 outside P3" when two more get out, and a breakout that keeps
-growing texts again each time it doubles. A rollup closed by hand stays closed while animals it was
-closed with stay out; animals out since then alert on their own, or as a new rollup of every member
-once there are `rollup_min` of them. A key gone for `clear_after_min`, and at least two runs of its
-rule (10 min for `drop_off`), resolves by itself (`resolved_at` without `resolved_by`); back within
-that time it keeps its row; back after it resolved it opens a new row. `decision_waiting` resolves as
-soon as the decision is answered. `data` carries what the texts need: `label`, `herd`, `paddock`,
-`since`, …
-
-Rules run on a 10 s tick (each on its `cadence_s`: `drop_off` 300 s, `low_battery` and `gps_degraded`
-60 s) and early, after 2 quiet seconds, on bus `escape`, `decision`, `move`, `ack` and `boundary`
-events; never on `fix` or `collar`.
-
-Notifications are queued as `messages` (kind `alert`, `alert_id`, `decision_id` for decisions) for the
-sender to deliver. A person gets an alert when its severity is at least theirs, its herd and kind are
-theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
-that hasn't texted STOP; with no Twilio of the farm's own, sms goes over the relay (channel `relay`,
-address the phone); email only over the farm's own SMTP (the relay can't prove an address is the
-person's); WhatsApp only with an approved template. The approval prompt (`decision_waiting`) goes only to
-managers and the owner, who alone may answer it. When anyone matching is on duty, may answer it (OK
-is for hands and up, Y or N for managers and up) and is not held by quiet hours, the first send goes
-only to them; otherwise to everyone matching (those held get it when their quiet hours end). Warnings
-wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214 031 118"); critical
-waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet hours (the
-person's, else the farm's) hold warnings until they end and let critical through unless
-`critical_in_quiet` is off. A prompt with a deadline (a timer decision's `apply_at`, or the `opens_at`
-of the strip a schedule call is about) goes after `critical_window_s` and through quiet hours like a
-critical alert, unless those end at least 30 min before the deadline: then it waits for their end.
-Past the deadline it is a plain warning. A prompt whose decision was answered before it went out is
-resolved, not sent. Unacked critical alerts are sent again every `renotify_every_min` up to
-`renotify_max` times and escalate every `escalate_after_min` to matching people of the next role up not
-yet told (hand → manager → owner). The farm webhook (channel `webhook`) gets every notified alert once.
-
-Texts are GSM-7, at most 160 characters, names cut to fit, numbers in the farm's units:
-`214 outside P3, 200 ft N of east gate, 6m. Reply OK to ack` · `31 outside P3 since 06:12. Reply OK to
-ack` · `Cows: 180 of 250 collars silent 25m. Check coverage or the server` · `Cows: move to P4 (30.6 ac,
-3 d)? Reply Y or N. Code 4821`.
-
-MCP tools: `list_alerts` (read; `status?`, `herd_id?`, `limit?`), `ack_alert` and `resolve_alert` (hand;
-`id`). The morning brief's `attention` line lists what doesn't text: "Battery low: 031 14%, 118 16%.
-GPS weak: 207".
-
-<!-- @A-notify -->
-
-## Texting and delivery (op-alerts)
-
-Farm side. `/api/notify/*` is the owner's; `/api/messages` is for managers and up (it shows phone
-numbers).
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| GET | `/api/notify/channels` | `Channels` |
-| PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why). When the relay becomes how this server texts (it turns on or gets a new key or URL while the farm has no Twilio SMS, or Twilio goes while it is on), phones the relay hasn't verified for this key lose `phone_verified_at`, so Verify (a code from the relay) shows beside them again; phones it has keep theirs and get the dead-man flag by role |
-| POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients |
-| POST | `/api/notify/verify` | `{ user_id }` → `{ via: "sms"\|"relay", verified?: true }`; 400 no phone · 409 already verified or nothing can text · 429 within 30 s · 502 the provider's words |
-| POST | `/api/notify/verify/confirm` | `{ user_id, code }` → `{ verified: true, phone_verified_at }`; 400 wrong or no code · 410 expired · 429 after 5 tries |
-| GET | `/api/messages` | `?direction=in\|out&limit=&from=&to=&user_id=` → `MessageLog[]`, newest first (limit 100, at most 1,000) |
-| GET/PUT | `/api/notify/hosting` | `Hosting` (PUT is a merge patch) |
-
-```ts
-Channels = {
-  sms: { from? /* E.164, or a Messaging Service SID MG… */ },
-  whatsapp: { from?, template_sid? /* HX…, one {{1}} body variable, used for alerts and briefs; replies go as text. Without it WhatsApp isn't offered for alerts or briefs (only replies within 24 h) */ },
-  email: { host?, port /* 587 */, user?, from?, tls: "starttls"|"tls"|"none" },
-  webhook: { url? },
-  relay: { enabled /* only after the relay answered GET /v1/notify/recipients with 200 */, checked_at? },
-  twilio_api_base /* "https://api.twilio.com" */,
-  secrets: { name: "twilio_account_sid"|"twilio_auth_token"|"smtp_password"|"webhook_secret"|"hosted_url"|"hosted_api_key", set }[],
-  configured: ("sms"|"whatsapp"|"email"|"webhook"|"relay")[],   // what can send now
-}
-ChannelsPatch = merge patch over the config (null clears) + { secrets?: { [name]: value | null }, relay?: { enabled } }
-Hosting  = { enabled /* false */, per_key_minute /* 30 */, per_key_day /* 500 */, deadman_after_min /* 15 */ }
-```
-
-Anything that wants to reach a person enqueues a message (`op_core::messages::enqueue`); the sender
-delivers it. It claims at most 10 queued messages at a time and 4 per channel, and a message is
-sent once however many senders run. A send that may work later goes back in the queue: Twilio,
-email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A provider
-this server can't connect to at all (the farm's internet or DNS is down, the connection refused)
-never saw the message, so that isn't counted as a try: the message stays `queued` and is tried
-again after 5 s, then as often as every minute, for up to 6 h (then `failed`, "… can't be reached.
-Gave up after 6 h."). An alert's text or email that had to wait (a minute or more) isn't sent once
-its alert has resolved (`failed`, "Resolved before it could be sent."). A 4xx from
-Twilio fails at once with Twilio's words (`"Twilio 21211: The 'To' number … is not a valid phone
-number."`). Twilio texts are `sent` and read back at 30 s, 2 min and 10 min until Twilio says
-delivered (`delivered`) or undelivered (`failed` with the reason), so failed deliveries show
-without a public URL. A message for a channel that isn't set up fails ("SMS isn't set up.").
-
-- **Twilio**: `POST {twilio_api_base}/2010-04-01/Accounts/{sid}/Messages.json`, basic auth, form
-  `To`, `From` (or `MessagingServiceSid`), `Body`. WhatsApp uses `whatsapp:` addresses and, with a
-  template and for anything but a reply, `ContentSid` + `ContentVariables {"1": text}`.
-- **Email**: the farm's SMTP server, plain text, subject from the message (default "openpasture").
-- **Webhook**: `POST url` with `{ "type": "alert", "alert": Alert, "text" }` for an alert (else
-  `{ "type": "message", "message": MessageLog }`) and
-  `x-openpasture-signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`. Check it
-  over the raw body, e.g. `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`, and
-  refuse an old `t`. A 2xx is `delivered`; 408, 429 and 5xx are retried.
-- **Relay**: `POST {hosted_url}/v1/notify` with `Authorization: Bearer <hosted_api_key>` (the
-  hosted brain's URL and key; the URL defaults to `https://api.openpasture.dev`). The message id is
-  the idempotency key, so a retry is sent once. An address with `@` goes as email, else SMS. A
-  text that asks the person about a decision (the decision's own text, a brief that asks, a LATER
-  reminder, a reply naming what waits) goes with `prompt: true`. People are offered, and alerts
-  and briefs go, by the relay only as SMS: the relay texts only addresses proven to it, and the farm
-  can prove phones, not email addresses, so email needs the farm's own SMTP.
-
-**Phone verification.** A person's phone gets texts only once it is proven by a 6-digit code:
-through the farm's own SMS, else through the relay (which texts its own code). The code text is
-the first text a number gets: `openpasture code 123456. Reply STOP to opt out.` Codes work for 10
-minutes and 5 tries, one new code per 30 s; they are stored hashed together with the phone they
-went to (a code sent to an old number never proves a new one) and the message log keeps the text
-with the code masked. Changing a phone clears its verification. The relay texts only phones proven
-to it for this server's key, so when the relay becomes how the farm texts (turned on, a new key or
-URL, or the farm's own Twilio removed) phones it hasn't proven lose their verification here and
-Verify (a relay code) shows beside them again; phones it has keep theirs, with the dead-man flag set
-by role. A phone the relay later refuses as not verified (403 "That recipient isn't verified.") is
-unverified the same way.
-
-Relay host side (a server with `notify.hosting.enabled`, texting for the `oph_` keys it issued from
-its own channels):
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| POST | `/v1/notify` | `{ idempotency_key, channel: "sms"\|"whatsapp"\|"email", to, text, subject?, kind?, prompt? /* the text asks about a decision */ }` → 202 `{ id, status: "queued"\|"duplicate" }` |
-| POST | `/v1/notify/recipients` | `{ channel, to, deadman? }` → 202 `{ status: "sent"\|"verified" }` (texts or emails a code) |
-| POST | `/v1/notify/recipients/verify` | `{ channel, to, code }` → 200 `{ verified: true }`; 404 no code · 400 wrong · 410 expired · 429 after 5 tries |
-| GET | `/v1/notify/recipients` | `[{ channel, to, verified_at?, deadman }]` for the calling key |
-
-Every `/v1/notify*` call: 401 without a key this server issued, 403 while hosting is off. `POST
-/v1/notify` also: 403 recipient not verified, 409 when this server itself sends through a relay
-(loop guard), 503 when it can't send that channel, 429 over `per_key_minute` or `per_key_day`
-(codes count too). A repeated idempotency key is answered `duplicate` and sent once.
-
-<!-- @D -->
 
 ## Map features (op-core)
 
@@ -882,9 +504,8 @@ Place phrases in texts and replies (`op_core::place::describe`) name the nearest
 water or shade in effect within 200 m: `"60 m N of east gate"`, `"at east gate"` (under 10 m),
 `"in north pond"` (inside a water or shade area); otherwise the paddock: `"in P3"`,
 `"60 m N of P3"`. Distances are in the farm's units.
-<!-- @K-animals -->
 
-## Animals and collar linking (K-animals)
+## Animals and collar linking (op-import)
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
@@ -958,7 +579,6 @@ because the endpoint is written into the collar and a LAN or tunnel address woul
 
 MCP: `list_animals` (read) `{ herd_id?, q?, removed? }` → `{ count, animals: [Animal & { herd, collar?: { id, name, state, battery?, last_seen?, position?, fix_at?, parked? } }] }`;
 animals on the farm unless `removed` is true.
-<!-- @K-files -->
 
 ## Paddock files and position history (op-import)
 
@@ -983,7 +603,8 @@ PositionPreview { import_id, file, source: "csv"|"gpx"|"geojson", columns?: stri
                   total, points, labels: ImportLabel[], tracks: { label, points: [lon, lat, t_unix_seconds][] }[] /* ≤ 200 each */,
                   needs_zone: boolean, zone, errors: string[] }
 PositionImport  { id, file_name, source, zone?, fixes, animals, from?, to?, created_by: Actor, created_at }
-PositionCommit  { import: PositionImport, duplicates, skipped: string[] /* labels left out */, errors: string[] }
+PositionCommit  { import: PositionImport, duplicates, collar_covered /* points the animal's collar already recorded */,
+                  skipped: string[] /* labels left out */, errors: string[] }
 ImportedDay     { date /* YYYY-MM-DD UTC */, animal_id, paddock_id /* "" = outside every paddock */, fixes, dwell_s }
 ImportTrack     { animal_id, points: [lon, lat, t_unix_seconds][] }   // first point per time bucket + the last, like Track
 ```
@@ -1021,272 +642,12 @@ each animal's daily dwell per paddock in `imported_paddock_days` (today's paddoc
 touches either table. Points are written in transactions of 5,000 so a large file never holds the
 database long. After a commit or a delete: `animals_changed` for each herd concerned.
 
-<!-- @I -->
-
-## Reports (op-reports)
-
-| Method | Path | Body / query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/reports` | | `{ id, title }[]` |
-| GET | `/api/reports/:id` | `from?&to?&herd_id?&format=json\|csv` | `ReportDoc`, or one CSV file |
-| GET PUT | `/api/reports/settings` | merge patch of `ReportInputs` | `ReportInputs` |
-| GET POST | `/api/feed-log` | `herd_id?&from?&to?` / `{ herd_id, date, kg_dm, kind?, note? }` | `FeedEntry[]` (newest first) / `FeedEntry` |
-| PATCH DELETE | `/api/feed-log/:id` | partial | `FeedEntry` / 204 |
-| GET | `/api/leases` | | `Lease[]` (leases of existing paddocks) |
-| GET PUT DELETE | `/api/leases/:paddock_id` | `{ landowner, rate_per, rate_amount, currency?, season_from?, season_to?, notes? }` | `Lease` / `Lease` / 204 |
-
-```ts
-ReportDoc     { id, title, farm, from: "YYYY-MM-DD", to: "YYYY-MM-DD", herd_id?, generated_at,
-                header: [label, value][],          // Farm, Operator, FSA farm, Dates, Herd: only those known
-                sections: ReportSection[], notes: string[] /* method lines */, signatures: string[] /* signature-line labels */ }
-ReportSection { title, columns: { key, label, unit?, decimals? /* places a number column prints with */ }[],
-                rows: (string|number|null)[][], totals?: (string|number|null)[] }
-ReportInputs  { operator?, fsa_farm?, au: { cow: 1.0, bull: 1.35, pair: 1.3, weaned_calf: 0.5 },
-                herds: Record<herd_id, { mean_weight_kg?, intake_pct: 2.5, mix?: { cows, bulls, calves, pairs: bool } }> }
-FeedEntry     { id /* fed_… */, herd_id, date: "YYYY-MM-DD", kg_dm, kind /* default "hay" */, note?, created_by?: Actor, created_at }
-Lease         { paddock_id, landowner, rate_per: "acre_season"|"head_day"|"au_day"|"aum"|"pair_month", rate_amount,
-                currency /* ISO 4217, default "USD" */, season_from?, season_to?, notes?, updated_at }
-```
-
-Report ids: `paddock_record` (Paddock grazing record), `nrcs_528` (NRCS 528 grazing record),
-`organic_season` (Organic grazing season), `lease_head_days` (Lease head-days). `from`/`to` are
-farm-local days, both included; the default is January 1 of `to`'s year to today. A report never
-counts past now. Values are in the farm's units (`settings.units`), rounded; each column's `unit`
-names it (`ac`/`ha`, `AU/ac`/`AU/ha`, `lb`/`kg`, `%`, or a currency). `null` is an empty cell.
-
-CSV (`format=csv`, `text/csv`, attachment `<id>-<from>-<to>.csv`): the title row and the header
-rows (`label,value`), a blank row (one empty cell), then each section: its title row, the column row (`Label (unit)`),
-the rows, the totals row (first cell `Total`), a blank row; then `Notes` and one note per row.
-Numbers have no thousands separators and keep their column's `decimals`.
-
-History comes from triggers, not the API: `herd_history` records each herd's count and paddock
-whenever either changes (and its creation and deletion), `paddock_geometry_history` each paddock's
-shape, area and name. On upgrade both are backfilled once: occupancy from applied MOVE decisions
-(the time the activity log says the move was applied, else the response or creation time; where a
-herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
-that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
-one paddock with head: a stretch at 0 head isn't grazing, so a herd made empty and filled by its
-animals a moment later goes in when they came, one emptied into another herd and left in place leaves
-when its last animal did, and one that never had any is no event (the paddock rests through it).
-Head is the count on the day in and head-days follow every count change inside it.
-Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
-any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
-exists: UTC days on which the paddock held at least 1/24 of the herd's tracked dwell (the pasture
-rule), so a few fixes across a fence don't make one. Animal units: the herd's mix with the `au` factors when a cattle herd has one, else
-`cattle 1.0`, `sheep 0.2`, `goats 0.15` per head. A mix's AU stand at its head count and scale with
-the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor and a
-pair is one head. In a herd whose count follows its animal rows, a calf at side may be registered as
-an animal of its own, so any count from cows + bulls to cows × 2 + bulls is the mix itself: 100 pairs
-are 130 AU at 100, 150 or 200 head (tagging calves through calving never moves the AU, and weaning
-them off doesn't either), never 260; a count outside that range scales from its nearer end. The
-method note gives the head counts the mix's AU stand at.
-
-- `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
-  head-days, AU-days, stocking density, rest before in), then a line per paddock.
-- `nrcs_528`: field, FSA farm/tract/field (only those present; one shared FSA farm goes in the
-  header), area, dates in and out, kind and number, AU, days, AUD, rest period; signature lines
-  Operator and NRCS planner. Columns openpasture doesn't measure are left out.
-- `organic_season`: days on pasture (farm days the herd was in a paddock) against 120; dry matter
-  from pasture against 30 % only for herds with `mean_weight_kg` whose feed log has entries in the
-  season's first and last week (a 0 kg entry counts): needed = head-days × weight × `intake_pct`,
-  from pasture = needed − the feed log's dry matter.
-- `lease_head_days`: a section per landowner, a row per leased paddock: dates (the lease season
-  inside the report's dates), head-days, AU-days, AUM (AU-days ÷ 30.4), pair-months (pairs × days ÷
-  30.4, when a herd's mix has pairs), rate and amount. `acre_season` is a flat rent per area for the
-  season, owed when the season meets the report's dates; its `rate_amount` is per hectare, like
-  every area in the API (the UI shows and takes it per acre on imperial farms). Signature lines:
-  Operator and each landowner.
-
-The feed log's `kg_dm` is dry matter in kg; `date` is the farm-local day. `POST /api/feed-log` is
-open to hands; editing and deleting entries, leases and report settings need a manager.
-MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
-
-<!-- @B -->
-
-## Map layers, measured heights (op-engine)
-
-| Method | Path | Body / query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/layers/paddocks` | | `{ as_of, paddocks: PaddockLayer[] }` from the record and cached land reports only (never fetches) |
-| GET | `/api/paddocks/:id/heights` | `?limit` (default 50, at most 500) | `Height[]` newest first |
-| POST | `/api/paddocks/:id/heights` | `{ height_cm, residual_cm?, at? }` (hand and up) | 201 `Height` |
-
-```ts
-PaddockLayer { paddock_id, grazing?: true /* a herd with head is in it now */, rest_days?, last_grazed?,
-               ndvi?, ndvi_at? /* YYYY-MM-DD of the imagery */,
-               drought?: { category: "D0"|"D1"|"D2"|"D3"|"D4"|null /* null: not in drought */ },
-               flood?: { in_floodplain: boolean, zone?, risk?: "medium"|"high" /* 3-day forecast */ } }
-Height       { id /* hgt_… */, paddock_id, at, height_cm, residual_cm?, by: Actor, created_at }
-```
-
-A field is absent when nothing is known. Rest days count from when any herd last grazed the
-paddock (applied moves, collar days, rolled-up and imported history, `grazed_until`; a paddock
-with a herd in it now is 0). Collars graze a paddock on a UTC day when at least 1/24 of the
-herd's tracked day is in it (fixes for hot days, dwell for rolled-up and imported ones), the
-pasture history's rule; fixes across a fence from a herd next door, or one animal that wandered,
-don't count. NDVI, drought and flood come from the newest cached land report:
-they need the land provider key (open data has only weather), so without it they are absent.
-
-A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
-behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
-it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
-signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
-count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay with
-head on the farm record that ended after it, by a move or by the herd being emptied there, a later
-`grazed_until`, or a collar grazing day there, as for rest days): the grass it measured has been
-eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd with head is in now,
-`height_cm` is the grass ahead of it. A herd with no head (the Training herd once its animals went
-back) grazes nothing: its paddock isn't grazed now for rest days, the Rest layer or heights.
-
-Changes to existing shapes (all additive):
-- `Signals.paddocks[]` gains `grazing_days` (days this paddock's forage feeds the herd: 60 % of
-  standing forage above a 3 inch residual at 11.8 kg DM per AU a day, capped at 365) and
-  `last_grazed`.
-- `forage` (in `/api/signals` and the decision context) carries `source: "measured"` with
-  `height_cm` and `measured_at` when a height counts. When the paddock's land report shows snow
-  deeper than 2 cm or a 7-day mean air temperature under 5 °C, imagery forage is withheld:
-  `height_inches`, `available_kg_dm_per_ha` and `source` are null and `reason` is `"snow"` or
-  `"dormant"`. A measured height still counts.
-- The open-data weather section gains `current.snow_depth_cm` and `history[].temp_mean_c`.
-- `POST /api/farm` sets `settings.units` from the farm's time zone: imperial in US zones, metric
-  elsewhere. Only at creation; moving the farm later leaves the units alone.
-<!-- @G -->
-
-## Coverage and fleet care (op-analytics)
-
-| Method | Path | Query or body | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/coverage` | `metric=accuracy\|fixes&from&to&cell_m=10&herd_id?` (default the last 7 days) | `Coverage` |
-| GET | `/api/fleet` | `herd_id?&collar_id?` | `FleetRow[]` |
-| GET | `/api/fleet/{collar_id}/fit-checks` | | `FitCheck[]`, newest first |
-| POST | `/api/fleet/{collar_id}/fit-checks` | `{ checked_at?, notes? }` or no body (hand) | 201 `FitCheck` |
-| POST | `/api/fleet/fit-checks` | `{ collar_ids: string[], checked_at?, notes? }` (hand; a chute day) | 201 `FitCheck[]` |
-| GET | `/api/fleet/settings` | | `{ fit_check_days: 30 }` |
-| PUT | `/api/fleet/settings` | `{ fit_check_days }` (1–365; manager) | the same |
-
-```ts
-Coverage  { metric: "accuracy"|"fixes", cell_m, unit: "m"|"ratio",
-            size?: [dlon, dlat],                 // degrees one cell spans; absent before any fix is counted
-            cells: [lon, lat, value, n][] }      // each cell at its centre
-FleetRow  { collar_id, name, herd_id, tag? /* the animal wearing it */, battery? /* 0-1 */,
-            trend_pct_day?,                      // percentage points a day, last 7 days since the last charge, 2+ days of data
-            days_left?,                          // at that trend: only when falling, 3+ days of data
-            fit_checked_at?, fit_due_at,         // due = last check (else when the collar was added) + fit_check_days
-            last_seen?, parked: boolean,
-            daily: (number|null)[] }             // mean battery of each of the last 14 UTC days, oldest first, today last
-FitCheck  { id /* fit_… */, collar_id, checked_at, by?: Actor, notes? }
-```
-
-Both read only the day tables op-analytics keeps: `coverage_days` (per herd, UTC day and 10 m
-cell: fixes, an accuracy histogram of 8 buckets `<1, <2, <3, <5, <8, <12, <20, ≥20 m`, fixes
-expected and fixes that came) and `battery_days` (per collar and UTC day: min, max, mean and last
-battery). Neither ever reads `fixes` or `health`. A background task rewrites the days that changed
-(new rows, or a Parquet day file that gained rows) a minute after start and then every 10 minutes
-(less often when a run is slow, at most hourly); its first run covers every day there is data for,
-Parquet included. Today is the partial day so far.
-
-- `accuracy`: each cell's median fix accuracy in metres from the histogram; `n` is the fixes in it.
-- `fixes`: fixes that came ÷ fixes the collar's cadence called for (its median gap that day), 0–1.
-  A fix that never came counts where the animal was before the gap; a gap longer than 6 h means
-  the collar was off and counts nothing. `n` is the fixes called for.
-- Cells with `n` under 5 are left out. `cell_m` is a multiple of 10 up to 1,000: blocks of 10 m
-  cells. Cells are counted from a fixed origin (the farm's centre when the first fix is counted),
-  so a cell is the same ground every day.
-- A fit check records who made it; the collar's next check is due `fit_check_days` after its latest
-  check. Each check is also an activity event `fleet.fit_checked`.
-
-MCP (read, viewers): `get_coverage` `{metric?, from?, to?, cell_m?, herd_id?}` returns a
-`Coverage` (at most the 500 weakest cells, with `truncated: <cells there were>` when cut);
-`get_fleet` `{herd_id?}` returns `{ fit_check_days, collars: FleetRow[] }`.
-
-<!-- @P -->
-
-## Live feed at herd scale (op-server, P)
-
-`/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd into one
-`positions`, one `ack_batch` and one `cue_batch` (each only when it has items), gathered for the
-whole farm: 500 ms after the first of them for any herd they go out together, as one message (a
-`batch` when there is more than one, see "Seams between streams"). At 250 collars that is about
-one message a second, at most two batched ones however many herds are live, instead of dozens. Server-side subscribers (alerts, schedules) still get every single event.
-
-```ts
-PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
-AckItem      { collar_id, version, status: "received"|"applied"|"rejected", code?, reason? }  // latest per collar
-CueItem      { collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }              // every cue, in order
-```
-
-A `collar` event goes out on its own only when the collar's JSON minus `last_seen`, `battery`,
-`last_fix`, `state`, `outside_since` and `boundary_version` changed (renamed, relinked, parked,
-moved herd, fields added later). A report's telemetry rides in `positions`; a reported boundary
-version with no ack rides in `ack_batch` as `applied`. A collar with no fix yet has no position
-to send, so its telemetry-only changes wait for a refetch. Every other event goes out at once,
-in bus order; batches can arrive after events published later in the same 500 ms. Each message
-is serialized once for all sockets; a socket drops what its identity may not see; a socket (or
-the coalescer) that falls behind gets `resync`. A socket opened with a person's token closes
-within 5 s once that token is revoked, the person disabled or their role changed; the browser
-reconnects as whoever it is now. A client's close gets a close back.
-
-## Analytics at 250 collars (op-analytics, P)
-
-- The hourly rollup streams a day to Parquet per collar in `(collar_id, t)` order, 65,536 rows a
-  row group, merging an existing file for that day (a row in both is kept once), and sums pasture
-  dwell on the stream. Rows leave SQLite in write transactions of at most 5,000 rows with a pause
-  after each, so reports keep landing (a 4.3 M-fix day: memory under 50 MB, no report waits
-  250 ms). While those deletes run, a rolled day is in both places: the SQL console, exports and
-  health counts can count its rows twice until they finish; tracks and pasture don't.
-- `health` rolls up like `fixes` and `cues` and is a table for `/api/sql` and export; battery
-  history in `/api/analytics/health` reads both.
-- `/api/tracks` seeks each collar's first fix per time bucket by index in SQLite and reads only
-  the track columns of Parquet days (row groups outside the range or collar skipped). 250
-  collars over a 4.3 M-fix day, `max_points=300`: under a second from SQLite, about 2 s from
-  Parquet in a debug build.
-- `/api/analytics/pasture` is as of the end of the range (or now): no day or fix after it
-  counts, `last_grazed` is the last grazing day up to it (before `from` too, from the daily
-  summaries) and `rest_days` runs to it. A day the end falls inside counts whole once rolled.
-- `OPENPASTURE_DB_POOL` sets the SQLite pool (1-256, default 16).
-<!-- @Q -->
-
-## Questions and the morning brief (op-brain, op-engine)
-
-| Method | Path | Body / query | Returns |
-| --- | --- | --- | --- |
-| GET | `/api/brief` | `?herd_id` (optional when the farm has one herd) | `Brief` (404 no such herd, 400 more than one herd and no `herd_id`) |
-| POST | `/v1/ask` | `{ question, context?, max_chars? /* default 320, at most 2000 */ }`, `Authorization: Bearer oph_…` | `{ answer }` |
-
-```ts
-Brief { herd_id, lines: string[], text /* GSM-7, at most 480 characters */ }
-```
-
-**The brief** is written from the decision record, no LLM: the same record gives the same
-brief. For today's decision (the herd's newest since the last `settings.decision_time` in farm
-time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`,
-`Cows: STAY in P3.`, `Cows: NEEDS_INFO.`), where it stands (`Reply Y or N.` while it waits,
-`Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
-once sent: collars not parked that applied its active boundary, and the sweep still left),
-the one thing to check when the decision asks for it, then up to four reasons as the record
-has them (left out once the farmer changed the call: a HOLD made from a STAY, or their own
-boundary for the proposed one). When today's decision is still running, failed or missing, one
-line says so (`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars
-silent for a day.` for collars that reported before; `2 of 250 collars not reported yet.` for
-ones that never have, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20
-days old.`, `No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
-farm's units. `text` is the lines as one text: GSM-7 (curly quotes, dashes and accents made
-plain, emoji left out), at most 480 characters, giving up the fourth and third reason first,
-then stale-data lines, the second reason, other features' lines, the check and the first
-reason; the call and where it stands always stay. MCP: `get_morning_brief { herd_id? }` (read).
-
-**Questions** (`Brain::ask`, used by texting) get a short answer from a farm summary and read
-tools, never `run_sql`: the Anthropic, OpenAI and compatible brains call up to 6 tools within
-45 s; Claude Code reaches this server's `/mcp?scope=brain` with a token that lists and calls only
-those tools; the hosted brain asks another server's `/v1/ask`; Codex and the heuristic don't
-answer questions. Answers are plain text cut to `max_chars` at a sentence end. A compatible
-server that refuses tools answers from the summary alone.
-
-`/v1/ask` is the hosted side: the hosted key applies, and this server's own brain answers from
-the `context` sent, with no tools. 401 bad key, 400 empty question, 409 when this server's brain
-is itself `hosted`, 501 `{"error": "This server's brain doesn't answer questions."}` for Codex
-and the heuristic, 503 brain not set up, 502 brain failed.
-<!-- @C -->
+**Imported history and collar data.** Committing a position import leaves out points the
+animal's collar already recorded (`collar_covered`), so an animal-hour's dwell is counted once,
+from the collar. "Recorded" is read at the dwell rule's resolution: for hot fixes, the 30-minute buckets
+holding a fix of that collar and animal; for days already rolled to Parquet, the stretch the
+collar day's dwell covers, ending 30 minutes after its last fix, credited to the animal the
+collar is on now. A file with nothing new left is 409.
 
 ## Strips and layouts (op-engine)
 
@@ -1337,8 +698,6 @@ deletes its layouts.
 `copy` makes a new paddock of the same shape named `"P3 copy"` (then `"P3 copy 2"`…), moved by
 `offset_m` metres east and north (each within 10 km) when given. Notes, props and grazing history
 stay with the original.
-
-<!-- @F -->
 
 ## Pre-send check (op-engine, op-ingest)
 
@@ -1418,8 +777,6 @@ preview when the herd is already inside, has no fresh positions, or the sweep ca
 
 MCP `check_boundary` (read) `{ herd_id?, geometry, warn_m?, effective_at?, sweep? }` returns the
 same `CheckResult`.
-
-<!-- @S -->
 
 ## Strip schedules (op-ingest, op-engine)
 
@@ -1552,7 +909,323 @@ is the grass it was about to graze, not a residual.
 later), not on a schedule's staged boundaries; `move_stalled`'s "waiting on a staged boundary"
 reads the same way.
 
-<!-- @A3 -->
+## Decisions and brains (op-engine, op-brain)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/decisions` | `?herd_id&limit` | `Decision[]` newest first |
+| GET | `/api/decisions/:id` | | `Decision` |
+| POST | `/api/herds/:id/decide` | | `Decision` with `status: "running"` (progress on `/api/live`) |
+| POST | `/api/decisions/:id/respond` | `{ action: "approve"\|"reject"\|"modify", geometry?, note? }` | `Decision` (409 unless `proposed`) |
+| GET | `/api/brains` | `?refresh=1` re-detects now | `Brain[]` |
+| POST | `/api/brains/:id/test` | | `{ ok, detail, ms }`: one real decision on this farm's record, no MCP; `detail` is `ACTION (model)` or a one-line error |
+| GET POST | `/api/brains/hosted/keys` | `{ label? }` | `HostedKey[]` / 201 `HostedKey & { key }` (key shown once, `oph_…`) |
+| DELETE | `/api/brains/hosted/keys/:id` | | 204 / 404 |
+| POST | `/v1/decide` | `{ context, instructions?, schema? }`, `Authorization: Bearer oph_…` | `DecisionOutput` |
+| GET | `/api/knowledge` | `?q&limit` | `{ id, title, kind, body, source }[]`; empty `q` lists lessons then seed |
+| GET | `/api/land/:paddock_id` | `?refresh=true` skips the 6 h cache. Land reports: the configured land provider when a key is set, otherwise open data | `{ paddock_id, report_id, source, as_of, cached, summary: string[], sections }` |
+| GET | `/api/signals` | `?herd_id` | `Signals` |
+
+```ts
+Decision { id, herd_id, source: "brain"|"farmer"|"heuristic", brain?: BrainId, model?,
+           status: "running"|"proposed"|"approved"|"applied"|"rejected"|"failed"|"superseded",
+           action?: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD" /* HOLD: strip schedules */, to_paddock_id?, geometry?: Polygon,
+           reasoning?, confidence?, need?, inputs, apply_at?, boundary_id?, error?,
+           created_at, responded_at?, outcome? }
+Brain    { id: BrainId, name, available: boolean, signed_in: boolean, needs: string[] /* secret names */,
+           models: string[], detail?: string }
+HostedKey { id, label, created_at, last_used? }
+DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need, model }
+Signals  { as_of, herd_id, current_paddock_id, position_source, herd_animal_units, feed_budget_days_current,
+           behavior, risk_flags, assumptions,
+           paddocks: { paddock_id, name, status, area_ha, current, rest_days, grazing_pressure, forage, recovery, risk_flags }[] }
+```
+
+A brain is ready when `available && signed_in`. `needs` lists every secret field the brain
+reads, optional ones included (compatible: `compatible_base_url`, `compatible_api_key`;
+hosted: `hosted_api_key`, `hosted_url`). `detail` is a short status such as "ChatGPT sign-in",
+"Add API key", "Sign in with codex login".
+
+**Responding.** `approve` sends a MOVE (STAY and NEEDS_INFO become `approved`); `reject`
+never sends; `modify` needs `geometry`, sends the farmer's shape and keeps the brain's in
+`inputs.proposed_geometry`. `inputs.farmer_response = { action, at, note?, geometry? }`.
+A `note` becomes a farm lesson and appears in the next decision's context as an
+`observations` entry with `source: "farmer-note"` (and in `history[].farmer_response`).
+The app answers a NEEDS_INFO decision by posting the farmer's reply as `approve` + `note`,
+then starting a new decision.
+
+**Autonomy.** `propose` waits. `timer` sets `apply_at = now + timer_minutes` on a proposed
+MOVE and the server sends it then unless it was answered. `auto` sends a MOVE at once.
+STAY and NEEDS_INFO always wait. The daily decision runs for every herd with collars once
+the farm's local time reaches `settings.decision_time` (within the following hour, once a day).
+
+**Hosted brain.** `/v1/decide` is outside `/api`, so the app token does not apply; the
+hosted key does. It runs this server's own configured brain: 401 bad key, 409 when this
+server's brain is itself `hosted` or is `codex` (Codex's tools can read files on the host even
+in its read-only sandbox, so outside prompts never reach it), 503 brain not set up, 502 brain
+failed. Claude Code serves with no built-in tools, no MCP, `--restricted` and `--safe-mode`. Point another
+server at it with the `hosted_url` and `hosted_api_key` secrets and brain `hosted`.
+
+### Decision context
+
+What the engine hands a brain (`DecisionRequest.context`, also the `context` of
+`/v1/decide`). Any field may be `null` or empty.
+
+```ts
+{ as_of, farm: Farm, herd: Herd & { animal_units },
+  autonomy: { mode, timer_minutes },
+  current_paddock_id, position_source: "collar"|"farm_record"|"unknown",
+  paddocks: { id, name, status, area_ha, geometry, rest_days, last_grazed, notes?, grazed_until? }[],
+  candidate_paddock_ids: string[],
+  boundary: BoundaryStatus /* with move: the target being swept into, if any */,
+  collars: { count, reporting_24h, quiet: string[], low_battery: string[] /* < 0.2 */,
+             states: { inside, warning, outside, unknown }, fixes_24h, cues_24h,
+             dominant_paddock_id, paddock_fix_counts: Record<paddock_id, number> },
+  positions: { collar_id, animal_id?, point, at, state, paddock_id? }[],
+  signals: { as_of, herd_animal_units, rest_days, last_grazed, forage, recovery, grazing_pressure,
+             feed_budget_days_current, behavior, risk_flags, risk_flags_by_paddock, assumptions },
+  land_reports: Record<paddock_id, { report_id, source, as_of, sections }>,
+  land_report_notes: Record<paddock_id, string>,
+  knowledge: { id, title, kind, body, source }[],
+  observations: { content, paddock_id?, at?, source: "farmer-note" /* dated, last 7 days */
+                  | "paddock-note" /* the paddock's standing notes */ }[],
+  history: { id, created_at, source, status, action, from_paddock_id, to_paddock_id,
+             reasoning, confidence, need, farmer_response?, outcome? }[] /* last 10, newest first */,
+  units,
+  schedule /* the herd's strip schedule while it runs, see "Strip schedules" */ }
+```
+
+"Where the herd is": the paddock holding at least half of the herd's collar fixes from the
+last 24 h since its current boundary took effect, else `herds.paddock_id`.
+
+## Questions and the morning brief (op-brain, op-engine)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/brief` | `?herd_id` (optional when the farm has one herd) | `Brief` (404 no such herd, 400 more than one herd and no `herd_id`) |
+| POST | `/v1/ask` | `{ question, context?, max_chars? /* default 320, at most 2000 */ }`, `Authorization: Bearer oph_…` | `{ answer }` |
+
+```ts
+Brief { herd_id, lines: string[], text /* GSM-7, at most 480 characters */ }
+```
+
+**The brief** is written from the decision record, no LLM: the same record gives the same
+brief. For today's decision (the herd's newest since the last `settings.decision_time` in farm
+time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`, the area the
+boundary's, as in the approval text,
+`Cows: STAY in P3.`, `Cows: NEEDS_INFO.`), where it stands (`Reply Y or N.` while it waits,
+`Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
+once sent: collars not parked that applied its active boundary, and the sweep still left),
+the one thing to check when the decision asks for it, then up to four reasons as the record
+has them (left out once the farmer changed the call: a HOLD made from a STAY, or their own
+boundary for the proposed one). When today's decision is still running, failed or missing, one
+line says so (`Cows: no decision yet today.`). Then stale or missing data (`3 of 250 collars
+silent for a day.` for collars that reported before; `2 of 250 collars not reported yet.` for
+ones that never have, `Herd position from the farm record, not collars.`, `Imagery for P3 is 20
+days old.`, `No field note in 7 days.`) and the lines other features add, in order. Numbers are in the
+farm's units. `text` is the lines as one text: GSM-7 (curly quotes, dashes and accents made
+plain, emoji left out), at most 480 characters, giving up the fourth and third reason first,
+then stale-data lines, the second reason, other features' lines, the check and the first
+reason; the call and where it stands always stay. MCP: `get_morning_brief { herd_id? }` (read).
+
+**Questions** (`Brain::ask`, used by texting) get a short answer from a farm summary and read
+tools, never `run_sql`: the Anthropic, OpenAI and compatible brains call up to 6 tools within
+45 s; Claude Code reaches this server's `/mcp?scope=brain` with a token that lists and calls only
+those tools; the hosted brain asks another server's `/v1/ask`; Codex and the heuristic don't
+answer questions. Answers are plain text cut to `max_chars` at a sentence end. A compatible
+server that refuses tools answers from the summary alone.
+
+`/v1/ask` is the hosted side: the hosted key applies, and this server's own brain answers from
+the `context` sent, with no tools. 401 bad key, 400 empty question, 409 when this server's brain
+is itself `hosted`, 501 `{"error": "This server's brain doesn't answer questions."}` for Codex
+and the heuristic, 503 brain not set up, 502 brain failed.
+
+**The brief after a stopped move.** When today's decision is a MOVE (or HOLD) whose move someone
+stopped before the target, where it stands reads `Stopped 610 ft short, 250/250 collars
+confirmed.` (the distance through the farm's units), also the next morning.
+
+## Alerts (op-alerts)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/alerts?status=&herd_id=&from=&to=&limit=` | `Alert[]`. `status`: `open` (unacked), `acked`, `resolved`, `all`; absent = open and acked, critical first, then newest. `from`/`to` (RFC 3339) bound `opened_at`; `limit` 1–1000, default 100 |
+| GET | `/api/alerts/{id}` | `Alert` |
+| POST | `/api/alerts/{id}/ack` | `Alert`; hand and up. Stops re-notification and escalation; acking again returns it unchanged; resolved → 409 |
+| POST | `/api/alerts/{id}/resolve` | `Alert`; hand and up. Stays closed while its cause lasts; resolved → 409 |
+| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email")[] }` |
+| PUT | `/api/alerts/rules` | same; manager and up. Body `{ rules?: { <kind>: Partial<RuleConfig> }, policy?: Partial<Policy> }` (merge; `null` puts a rule's number back to its default and clears quiet hours) |
+| GET | `/api/alerts/prefs` | `PersonPrefs[]`, every person; manager and up |
+| GET | `/api/alerts/prefs/me` | `PersonPrefs` of the caller's person; 404 when the sign-in isn't a person |
+| PUT | `/api/alerts/prefs/me` | `PersonPrefs`; hand and up. Body: JSON merge patch of `AlertPrefs` |
+| PUT | `/api/alerts/prefs/{user_id}` | `PersonPrefs`; owner only |
+
+```ts
+RuleConfig { enabled: bool, severity: Severity, after_min?: number, threshold?: number, notify: bool }
+RuleView   = RuleConfig & { kind, sentence /* "Collar silent for {n}" */, unit: "min"|"%"|"m"|"", cadence_s, default: RuleConfig }
+Policy     { renotify_every_min: 30, renotify_max: 3, escalate_after_min: 15, group_window_s: 60, rollup_min: 4,
+             herd_silent_share: 0.5, clear_after_min: 2, start_grace_min: 20, critical_window_s: 10,
+             quiet_start?: "HH:MM", quiet_end?: "HH:MM" /* the farm's, farm time */ }
+AlertPrefs { channels: ("sms"|"whatsapp"|"email")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
+             herds?: string[] /* absent = every herd */, muted_kinds: string[], quiet_start?, quiet_end? /* absent = the farm's */,
+             critical_in_quiet: bool /* true */, on_duty: bool /* false */ }
+PersonPrefs = AlertPrefs & { user_id, name, role: Role, sms_opt_out: bool, updated_at? }
+```
+
+Rules (`kind`, default severity, number, notify): `escaped` an open escape (critical) · `outside` outside
+the herd's boundary ≥ 5 min with no escape running and not let go on this trip out (warning; critical
+when the collar is silent too) · `silent` no report for max(20 min, 3 × its median report interval
+over 24 h); held for `start_grace_min` after a server start (warning) · `herd_silent` more than
+`herd_silent_share` of a herd's reporting collars silent, at least two (critical; takes in that herd's
+`silent` alerts; once open it lasts while more than 80 % of that share is silent) · `low_battery`
+< 20 % (warning, no texts; in the brief) · `boundary_not_applied` the herd's boundary in effect
+≥ 10 min and the collar holds an older one (or rejected it), not escaped and not silent (warning) ·
+`decision_waiting` a proposal unanswered 30 min, or a timer decision at once (warning; the 4-digit
+approval code is only in its text, never in the API, the MCP tools or live events) · `move_stalled` a
+sweeping move with no step for 15 min (warning; `data.staged` when it waits on a staged boundary) ·
+`stragglers` a move left animals behind (info) · `drop_off` every fix (sampled every 5 min) within 4 m
+of their median for 240 min (warning) · `gps_degraded` median accuracy over the last 10 min worse than
+10 m, or no fix for 10 min while reports arrive (info, no texts). Parked collars and removed animals
+never alert.
+
+Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
+are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
+members until the last clears; members already open resolve with `rolled_into`. Once people were told
+about a rollup (a text or an ack), animals that join it are a new breakout when they are at least as
+many as the told ones still in it: it opens again as a new alert with every member (the old one
+resolves with `rolled_into` the new one) and is sent like any new alert. So an acked "6 outside P3"
+with one animal still out texts "3 outside P3" when two more get out, and a breakout that keeps
+growing texts again each time it doubles. A rollup closed by hand stays closed while animals it was
+closed with stay out; animals out since then alert on their own, or as a new rollup of every member
+once there are `rollup_min` of them. A key gone for `clear_after_min`, and at least two runs of its
+rule (10 min for `drop_off`), resolves by itself (`resolved_at` without `resolved_by`); back within
+that time it keeps its row; back after it resolved it opens a new row. `decision_waiting` resolves as
+soon as the decision is answered. `data` carries what the texts need: `label`, `herd`, `paddock`,
+`since`, …
+
+Rules run on a 10 s tick (each on its `cadence_s`: `drop_off` 300 s, `low_battery` and `gps_degraded`
+60 s) and early, after 2 quiet seconds, on bus `escape`, `decision`, `move`, `ack` and `boundary`
+events; never on `fix` or `collar`.
+
+Notifications are queued as `messages` (kind `alert`, `alert_id`, `decision_id` for decisions) for the
+sender to deliver. A person gets an alert when its severity is at least theirs, its herd and kind are
+theirs, and they can be reached over a configured channel: sms and whatsapp only to a verified phone
+that hasn't texted STOP; with no Twilio of the farm's own, sms goes over the relay (channel `relay`,
+address the phone); email only over the farm's own SMTP (the relay can't prove an address is the
+person's); WhatsApp only with an approved template. The approval prompt (`decision_waiting`) goes only to
+managers and the owner, who alone may answer it. When anyone matching is on duty, may answer it (OK
+is for hands and up, Y or N for managers and up) and is not held by quiet hours, the first send goes
+only to them; otherwise to everyone matching (those held get it when their quiet hours end). Warnings
+wait `group_window_s` and go as one text per kind and herd ("3 outside P3: 214 031 118"); critical
+waits `critical_window_s` (a breakout of 250 is one text); info never pushes. Quiet hours (the
+person's, else the farm's) hold warnings until they end and let critical through unless
+`critical_in_quiet` is off. A prompt with a deadline (a timer decision's `apply_at`, or the `opens_at`
+of the strip a schedule call is about) goes after `critical_window_s` and through quiet hours like a
+critical alert, unless those end at least 30 min before the deadline: then it waits for their end.
+Past the deadline it is a plain warning. A prompt whose decision was answered before it went out is
+resolved, not sent. Unacked critical alerts are sent again every `renotify_every_min` up to
+`renotify_max` times and escalate every `escalate_after_min` to matching people of the next role up not
+yet told (hand → manager → owner). The farm webhook (channel `webhook`) gets every notified alert once.
+
+Texts are GSM-7, at most 160 characters, names cut to fit, numbers in the farm's units:
+`214 outside P3, 200 ft N of east gate, 6m. Reply OK to ack` · `31 outside P3 since 06:12. Reply OK to
+ack` · `Cows: 180 of 250 collars silent 25m. Check coverage or the server` · `Cows: move to P4 (30.6 ac,
+3 d)? Reply Y or N. Code 4821`.
+
+MCP tools: `list_alerts` (read; `status?`, `herd_id?`, `limit?`), `ack_alert` and `resolve_alert` (hand;
+`id`). The morning brief's `attention` line lists what doesn't text: "Battery low: 031 14%, 118 16%.
+GPS weak: 207".
+
+**Someone else's alert prefs.** `PUT /api/alerts/prefs/{id}` is the owner's at the guard (people
+ids are `usr_…`), so a manager is refused before the body is read; `PUT /api/alerts/prefs/me`
+stays a hand's.
+
+## Texting and delivery (op-alerts)
+
+Farm side. `/api/notify/*` is the owner's; `/api/messages` is for managers and up (it shows phone
+numbers).
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/notify/channels` | `Channels` |
+| PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why). When the relay becomes how this server texts (it turns on or gets a new key or URL while the farm has no Twilio SMS, or Twilio goes while it is on), phones the relay hasn't verified for this key lose `phone_verified_at`, so Verify (a code from the relay) shows beside them again; phones it has keep theirs and get the dead-man flag by role |
+| POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients. Push is tested per browser (`POST /api/push/subscriptions/:id/test`) |
+| POST | `/api/notify/verify` | `{ user_id }` → `{ via: "sms"\|"relay", verified?: true }`; 400 no phone · 409 already verified or nothing can text · 429 within 30 s · 502 the provider's words |
+| POST | `/api/notify/verify/confirm` | `{ user_id, code }` → `{ verified: true, phone_verified_at }`; 400 wrong or no code · 410 expired · 429 after 5 tries |
+| GET | `/api/messages` | `?direction=in\|out&limit=&from=&to=&user_id=` → `MessageLog[]`, newest first (limit 100, at most 1,000) |
+| GET/PUT | `/api/notify/hosting` | `Hosting` (PUT is a merge patch) |
+
+```ts
+Channels = {
+  sms: { from? /* E.164, or a Messaging Service SID MG… */ },
+  whatsapp: { from?, template_sid? /* HX…, one {{1}} body variable, used for alerts and briefs; replies go as text. Without it WhatsApp isn't offered for alerts or briefs (only replies within 24 h) */ },
+  email: { host?, port /* 587 */, user?, from?, tls: "starttls"|"tls"|"none" },
+  webhook: { url? },
+  relay: { enabled /* only after the relay answered GET /v1/notify/recipients with 200 */, checked_at? },
+  twilio_api_base /* "https://api.twilio.com" */,
+  secrets: { name: "twilio_account_sid"|"twilio_auth_token"|"smtp_password"|"webhook_secret"|"hosted_url"|"hosted_api_key", set }[],
+  configured: ("sms"|"whatsapp"|"email"|"webhook"|"relay"|"push")[],   // what can send now
+}
+ChannelsPatch = merge patch over the config (null clears) + { secrets?: { [name]: value | null }, relay?: { enabled } }
+Hosting  = { enabled /* false */, per_key_minute /* 30 */, per_key_day /* 500 */, deadman_after_min /* 15 */ }
+```
+
+Anything that wants to reach a person enqueues a message (`op_core::messages::enqueue`); the sender
+delivers it. It claims at most 10 queued messages at a time and 4 per channel, and a message is
+sent once however many senders run. A send that may work later goes back in the queue: Twilio,
+email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A provider
+this server can't connect to at all (the farm's internet or DNS is down, the connection refused)
+never saw the message, so that isn't counted as a try: the message stays `queued` and is tried
+again after 5 s, then as often as every minute, for up to 6 h (then `failed`, "… can't be reached.
+Gave up after 6 h."). An alert's text or email that had to wait (a minute or more) isn't sent once
+its alert has resolved (`failed`, "Resolved before it could be sent."). A 4xx from
+Twilio fails at once with Twilio's words (`"Twilio 21211: The 'To' number … is not a valid phone
+number."`). Twilio texts are `sent` and read back at 30 s, 2 min and 10 min until Twilio says
+delivered (`delivered`) or undelivered (`failed` with the reason), so failed deliveries show
+without a public URL. A message for a channel that isn't set up fails ("SMS isn't set up.").
+
+- **Twilio**: `POST {twilio_api_base}/2010-04-01/Accounts/{sid}/Messages.json`, basic auth, form
+  `To`, `From` (or `MessagingServiceSid`), `Body`. WhatsApp uses `whatsapp:` addresses and, with a
+  template and for anything but a reply, `ContentSid` + `ContentVariables {"1": text}`.
+- **Email**: the farm's SMTP server, plain text, subject from the message (default "openpasture").
+- **Webhook**: `POST url` with `{ "type": "alert", "alert": Alert, "text" }` for an alert (else
+  `{ "type": "message", "message": MessageLog }`) and
+  `x-openpasture-signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<body>")>`. Check it
+  over the raw body, e.g. `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`, and
+  refuse an old `t`. A 2xx is `delivered`; 408, 429 and 5xx are retried.
+- **Relay**: `POST {hosted_url}/v1/notify` with `Authorization: Bearer <hosted_api_key>` (the
+  hosted brain's URL and key; the URL defaults to `https://api.openpasture.dev`). The message id is
+  the idempotency key, so a retry is sent once. An address with `@` goes as email, else SMS. A
+  text that asks the person about a decision (the decision's own text, a brief that asks, a LATER
+  reminder, a reply naming what waits) goes with `prompt: true`. People are offered, and alerts
+  and briefs go, by the relay only as SMS: the relay texts only addresses proven to it, and the farm
+  can prove phones, not email addresses, so email needs the farm's own SMTP.
+
+**Phone verification.** A person's phone gets texts only once it is proven by a 6-digit code:
+through the farm's own SMS, else through the relay (which texts its own code). The code text is
+the first text a number gets: `openpasture code 123456. Reply STOP to opt out.` Codes work for 10
+minutes and 5 tries, one new code per 30 s; they are stored hashed together with the phone they
+went to (a code sent to an old number never proves a new one) and the message log keeps the text
+with the code masked. Changing a phone clears its verification. The relay texts only phones proven
+to it for this server's key, so when the relay becomes how the farm texts (turned on, a new key or
+URL, or the farm's own Twilio removed) phones it hasn't proven lose their verification here and
+Verify (a relay code) shows beside them again; phones it has keep theirs, with the dead-man flag set
+by role. A phone the relay later refuses as not verified (403 "That recipient isn't verified.") is
+unverified the same way.
+
+Relay host side (a server with `notify.hosting.enabled`, texting for the `oph_` keys it issued from
+its own channels):
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| POST | `/v1/notify` | `{ idempotency_key, channel: "sms"\|"whatsapp"\|"email", to, text, subject?, kind?, prompt? /* the text asks about a decision */ }` → 202 `{ id, status: "queued"\|"duplicate" }` |
+| POST | `/v1/notify/recipients` | `{ channel, to, deadman? }` → 202 `{ status: "sent"\|"verified" }` (texts or emails a code) |
+| POST | `/v1/notify/recipients/verify` | `{ channel, to, code }` → 200 `{ verified: true }`; 404 no code · 400 wrong · 410 expired · 429 after 5 tries |
+| GET | `/v1/notify/recipients` | `[{ channel, to, verified_at?, deadman }]` for the calling key |
+
+Every `/v1/notify*` call: 401 without a key this server issued, 403 while hosting is off. `POST
+/v1/notify` also: 403 recipient not verified, 409 when this server itself sends through a relay
+(loop guard), 503 when it can't send that channel, 429 over `per_key_minute` or `per_key_day`
+(codes count too). A repeated idempotency key is answered `duplicate` and sent once.
 
 ## Texts in and the morning brief (op-alerts)
 
@@ -1640,9 +1313,194 @@ delivered and deleted. **Dead-man**: a key that polled before and has been quiet
 `notify.hosting.deadman_after_min` texts its `deadman` recipients once per outage ("openpasture:
 Test farm hasn't checked in for 16 min. Its power or internet may be down.").
 
-<!-- @H -->
+## Web Push (op-alerts)
 
-## Welfare record and training mode (op-analytics, H)
+Alerts and the morning brief as notifications on a phone (the app installed from its manifest) or
+in any browser that can take them, free and without Twilio. Only while the server is reached over
+https (`server.public_url` or a tunnel): browsers subscribe to push, and install the app, only from a
+secure origin. On an iPhone only the app added to the Home Screen can subscribe (iOS 16.4+).
+
+Every role may `POST`/`DELETE` its own subscriptions (and test them); `PUT /api/push/settings` is the
+owner's. Turning alerts on in a browser adds `push` to that person's alert channels (their prefs
+decide severity, herds, muted kinds and quiet hours as for texts); each subscription is its own
+address, so one alert reaches every browser the person turned it on in.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/push` | `PushView`; makes the farm's VAPID key the first time it is asked for over https |
+| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
+| DELETE | `/api/push/subscriptions/:id` | 204; your own (the owner: anyone's), else 404 |
+| POST | `/api/push/subscriptions/:id/test` | `{ ok, detail }` — "openpasture test." to that browser now, recorded in `/api/messages` |
+| PUT | `/api/push/settings` | `{ enabled?, new_keys? }` → `PushView`. `enabled: false` sends nothing by push (subscriptions stay); `new_keys: true` makes a new key pair and drops every subscription (browsers turn alerts on again) |
+
+```ts
+PushView = {
+  available: boolean,          // over https and enabled: browsers may subscribe
+  enabled: boolean,
+  reason?: string,             // why not, when not available
+  vapid_public_key?: string,   // base64url uncompressed P-256 point: PushManager.subscribe's applicationServerKey
+  key_set: boolean,            // the vapid_private_key secret exists (never its value)
+  mine: MySubscription[],      // yours, oldest first
+}
+MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push service last took a message for it */ }
+```
+
+- Channel `push` is in `configured` (`/api/notify/channels`, `/api/alerts/rules`) while the server is
+  reached over https, `push.enabled` is on, the key exists and at least one browser is subscribed;
+  `person_channels` then offers it. A `push` message's `address` is the subscription id.
+- A message goes as one aes128gcm record (RFC 8291) with a VAPID JWT (RFC 8292; `aud` the push
+  service's origin, `exp` 12 h, `sub` the farm's https address), `TTL` 4 h for alerts, 12 h for the
+  brief, 1 h for a test, `Urgency: high` for alerts, and the alert id as `Topic`. The payload the
+  service worker shows: `{ title /* the farm's name */, body, tag /* alert id */, url /* "/#/map?alert=<id>" */, alert_id?, herd_id? }`;
+  the body is the text without its texting instructions ("Reply OK to ack", "Reply Y or N. Code 4821").
+- 404 or 410 from the push service: the browser dropped it; the subscription is removed and the
+  message fails "That phone stopped taking notifications.". 408, 429 and 5xx are tried again (5 s,
+  30 s, 2 min); a push service that can't be reached at all waits as texts do.
+- Settings: `push` = `{ vapid_public_key?, enabled /* true */ }`; secret `vapid_private_key` (PKCS#8,
+  base64url). `push_subscriptions` holds personal data and is not in `/api/sql`.
+
+## Analytics (op-analytics)
+
+| Method | Path | Query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/tracks` | `collar_id?&herd_id?&from&to&max_points` | `Track[]` |
+| GET | `/api/analytics/health` | `herd_id\|collar_id&from&to&bucket` | `CollarHealth[]` |
+| GET | `/api/analytics/behaviour` | `herd_id&from&to` | `Behaviour[]` |
+| GET | `/api/analytics/heatmap` | `herd_id&from&to&cell_m?&normalize?` | `[lon, lat, weight][]` |
+| GET | `/api/analytics/pasture` | `herd_id?&from&to` (default 90 days) | `PaddockPasture[]` |
+| POST | `/api/sql` | `{ query, limit? }` | `{ columns: string[], rows: any[][], ms, truncated? }` |
+| GET | `/api/export` | `table&format=csv\|geojson\|parquet&from&to&collar_id?&herd_id?` | file download |
+
+`from`/`to`: RFC 3339, `YYYY-MM-DD`, `now`, or relative (`-24h`, `-7d`, `-30m`, `-2w`); default
+the last 24 h. `bucket`: `10m`, `1h`, `1d` or seconds; default the smallest step giving at most
+150 buckets (at most 2,000 when `bucket` is given, else 400) over the span the collars can have data for (health clips `from` to when the first of
+its collars was linked, at least ten minutes, and `to` to now), so a herd linked an hour ago gets
+one-minute buckets. Values with no data behind them are `null`, never estimated.
+
+```ts
+Track        { collar_id, points: [lon, lat, t_unix_seconds][] }   // first fix per time bucket + the latest
+HealthPoint  { t, fixes, fix_rate /* 0-1 */, acc_p50, acc_p95, sats, cn0?, ttf_s?, battery /* 0-1 */, cues }
+CollarHealth { collar_id, name, herd_id, animal_id, bucket_s, cadence_s, summary: HealthPoint,
+               ack: { version, status, reason, at } | null, points: HealthPoint[] }
+Behaviour    { animal_id, collar_id, tag, name, fixes, distance_km, paddock_hours: Record<paddock_id, number>,
+               outside_hours, days: string[], cues_per_day: number[], cues,
+               learning: { slope_per_day, trend: "falling"|"rising"|"flat" } | null }
+PaddockPasture { paddock_id, name, area_ha, status, grazing_days, rest_days, pressure /* AU-days/ha */,
+               au_days, last_grazed, ndvi, herds: string[] }
+```
+
+Battery history is op-ingest's `health` table (one row per report). `ndvi` is the latest
+imagery NDVI mean from the paddock's land reports (so only with the land provider key;
+open data has no imagery). SQL is one read-only `SELECT`/`WITH`/`EXPLAIN` over
+`fixes`, `cues`, `health`, `acks`, `boundaries`, `decisions`, `collars` (no `key_hash`), `animals`,
+`paddocks`, `herds`, at most 10,000 rows, 20 s. A query loads at most 100,000 rows per record
+table and the newest 500,000 hot (SQLite) rows per telemetry table, plus the Parquet days. Export `table` is any of those or `tracks`;
+GeoJSON works for `fixes`, `cues`, `tracks`, `paddocks` and `boundaries`.
+
+## Map layers, measured heights (op-engine)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/layers/paddocks` | | `{ as_of, paddocks: PaddockLayer[] }` from the record and cached land reports only (never fetches) |
+| GET | `/api/paddocks/:id/heights` | `?limit` (default 50, at most 500) | `Height[]` newest first |
+| POST | `/api/paddocks/:id/heights` | `{ height_cm, residual_cm?, at? }` (hand and up) | 201 `Height` |
+
+```ts
+PaddockLayer { paddock_id, grazing?: true /* a herd with head is in it now */, rest_days?, last_grazed?,
+               ndvi?, ndvi_at? /* YYYY-MM-DD of the imagery */,
+               drought?: { category: "D0"|"D1"|"D2"|"D3"|"D4"|null /* null: not in drought */ },
+               flood?: { in_floodplain: boolean, zone?, risk?: "medium"|"high" /* 3-day forecast */ } }
+Height       { id /* hgt_… */, paddock_id, at, height_cm, residual_cm?, by: Actor, created_at }
+```
+
+A field is absent when nothing is known. Rest days count from when any herd last grazed the
+paddock (applied moves, collar days, rolled-up and imported history, `grazed_until`; a paddock
+with a herd in it now is 0). Collars graze a paddock on a UTC day when at least 1/24 of the
+herd's tracked day is in it (fixes for hot days, dwell for rolled-up and imported ones), the
+pasture history's rule; fixes across a fence from a herd next door, or one animal that wandered,
+don't count. NDVI, drought and flood come from the newest cached land report:
+they need the land provider key (open data has only weather), so without it they are absent.
+
+A height is measured in the paddock (cm, over 0 and at most 300; `residual_cm` is what was left
+behind, at most `height_cm`; `at` defaults to now and can't be in the future). `by` is who recorded
+it. The newest height measured in the last 21 days replaces the imagery estimate in the grazing
+signals (and so in strips, schedules and the pre-send check); older ones stay listed but no longer
+count. Nor does one taken before a herd grazed the paddock (more than an hour after it: a stay with
+head on the farm record that ended after it, by a move or by the herd being emptied there, a later
+`grazed_until`, or a collar grazing day there, as for rest days): the grass it measured has been
+eaten. Away from the herds a `residual_cm` is what stands; in a paddock a herd with head is in now,
+`height_cm` is the grass ahead of it. A herd with no head (the Training herd once its animals went
+back) grazes nothing: its paddock isn't grazed now for rest days, the Rest layer or heights.
+
+Shapes elsewhere:
+- `Signals.paddocks[]` has `grazing_days` (days this paddock's forage feeds the herd: 60 % of
+  standing forage above a 3 inch residual at 11.8 kg DM per AU a day, capped at 365) and
+  `last_grazed`.
+- `forage` (in `/api/signals` and the decision context) carries `source: "measured"` with
+  `height_cm` and `measured_at` when a height counts. When the paddock's land report shows snow
+  deeper than 2 cm or a 7-day mean air temperature under 5 °C, imagery forage is withheld:
+  `height_inches`, `available_kg_dm_per_ha` and `source` are null and `reason` is `"snow"` or
+  `"dormant"`. A measured height still counts.
+- The open-data weather section has `current.snow_depth_cm` and `history[].temp_mean_c`.
+- `POST /api/farm` sets `settings.units` from the farm's time zone: imperial in US zones, metric
+  elsewhere. Only at creation; moving the farm later leaves the units alone.
+
+**Rest days at 250 collars.** "Last grazed" for signals, the decision context and
+`GET /api/layers/paddocks` reads per-day summaries kept by triggers: `fix_paddock_days` (hot
+fixes per herd, UTC day and paddock) and `paddock_day_dwell` (rolled-up and imported dwell per
+herd, date, paddock), a few rows per paddock and day, not the herd's hot fixes or the collar days
+(`fix_paddock_last` is gone); the herd's position over the last
+day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
+holds more. No response shape changes.
+
+## Coverage and fleet care (op-analytics)
+
+| Method | Path | Query or body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/coverage` | `metric=accuracy\|fixes&from&to&cell_m=10&herd_id?` (default the last 7 days) | `Coverage` |
+| GET | `/api/fleet` | `herd_id?&collar_id?` | `FleetRow[]` |
+| GET | `/api/fleet/{collar_id}/fit-checks` | | `FitCheck[]`, newest first |
+| POST | `/api/fleet/{collar_id}/fit-checks` | `{ checked_at?, notes? }` or no body (hand) | 201 `FitCheck` |
+| POST | `/api/fleet/fit-checks` | `{ collar_ids: string[], checked_at?, notes? }` (hand; a chute day) | 201 `FitCheck[]` |
+| GET | `/api/fleet/settings` | | `{ fit_check_days: 30 }` |
+| PUT | `/api/fleet/settings` | `{ fit_check_days }` (1–365; manager) | the same |
+
+```ts
+Coverage  { metric: "accuracy"|"fixes", cell_m, unit: "m"|"ratio",
+            size?: [dlon, dlat],                 // degrees one cell spans; absent before any fix is counted
+            cells: [lon, lat, value, n][] }      // each cell at its centre
+FleetRow  { collar_id, name, herd_id, tag? /* the animal wearing it */, battery? /* 0-1 */,
+            trend_pct_day?,                      // percentage points a day, last 7 days since the last charge, 2+ days of data
+            days_left?,                          // at that trend: only when falling, 3+ days of data
+            fit_checked_at?, fit_due_at,         // due = last check (else when the collar was added) + fit_check_days
+            last_seen?, parked: boolean,
+            daily: (number|null)[] }             // mean battery of each of the last 14 UTC days, oldest first, today last
+FitCheck  { id /* fit_… */, collar_id, checked_at, by?: Actor, notes? }
+```
+
+Both read only the day tables op-analytics keeps: `coverage_days` (per herd, UTC day and 10 m
+cell: fixes, an accuracy histogram of 8 buckets `<1, <2, <3, <5, <8, <12, <20, ≥20 m`, fixes
+expected and fixes that came) and `battery_days` (per collar and UTC day: min, max, mean and last
+battery). Neither ever reads `fixes` or `health`. A background task rewrites the days that changed
+(new rows, or a Parquet day file that gained rows) a minute after start and then every 10 minutes
+(less often when a run is slow, at most hourly); its first run covers every day there is data for,
+Parquet included. Today is the partial day so far.
+
+- `accuracy`: each cell's median fix accuracy in metres from the histogram; `n` is the fixes in it.
+- `fixes`: fixes that came ÷ fixes the collar's cadence called for (its median gap that day), 0–1.
+  A fix that never came counts where the animal was before the gap; a gap longer than 6 h means
+  the collar was off and counts nothing. `n` is the fixes called for.
+- Cells with `n` under 5 are left out. `cell_m` is a multiple of 10 up to 1,000: blocks of 10 m
+  cells. Cells are counted from a fixed origin (the farm's centre when the first fix is counted),
+  so a cell is the same ground every day.
+- A fit check records who made it; the collar's next check is due `fit_check_days` after its latest
+  check. Each check is also an activity event `fleet.fit_checked`.
+
+MCP (read, viewers): `get_coverage` `{metric?, from?, to?, cell_m?, herd_id?}` returns a
+`Coverage` (at most the 500 weakest cells, with `truncated: <cells there were>` when cut);
+`get_fleet` `{herd_id?}` returns `{ fit_check_days, collars: FleetRow[] }`.
+
+## Welfare record and training mode (op-analytics)
 
 The collars are audio only. Cue kinds are `warn` (the warning tone in the zone inside the line,
 level 1–4) and `outside` (a tone for up to 10 s after a crossing); there are no others.
@@ -1705,25 +1563,220 @@ HerdTraining   Training & { herd_id }
   episodes by outcome, status and since as of the end of the dates, "From fixes"; fit checks and
   times the collar lay still; the farm days with cues; method notes; an Operator signature line.
 
-Coverage (G's `/api/coverage`) gains two metrics from the collars' health reports, each report
+Coverage (`/api/coverage`) has two more metrics from the collars' health reports, each report
 counted in the cell of that collar's fix nearest in time (within 6 h):
 - `fix_rate`: fixes the receivers got ÷ fixes they tried (`health.fix_ok / fix_attempts`), 0–1,
   unit `ratio`; `n` is the attempts.
 - `cell`: the median LTE cell signal (`health.rsrp_dbm`, whole dBm), unit `dBm`; `n` is the reports
   that measured it. Only boards with a modem report one.
 
-Alert rules (H): `drop_off` also reads a collar's IMU (`health.still_s`, `tilt_deg`): still for
+Alert rules: `drop_off` also reads a collar's IMU (`health.still_s`, `tilt_deg`): still for
 45 min (or the rule's `after_min` if sooner) and tilted past 60° is a collar lying on its side
 (`data.imu: true`, `tilt_deg`); an IMU collar is judged on that alone. `fit_check_due` (info, no
 texts): a collar on an animal whose fit hasn't been checked for `fleet.fit_check_days` since its
 last check (else since it was added); the brief counts them ("Fit check due: 5").
-<!-- @L -->
 
-## 250 collars (L)
+## Reports (op-reports)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/reports` | | `{ id, title }[]` |
+| GET | `/api/reports/:id` | `from?&to?&herd_id?&format=json\|csv` | `ReportDoc`, or one CSV file |
+| GET PUT | `/api/reports/settings` | merge patch of `ReportInputs` | `ReportInputs` |
+| GET POST | `/api/feed-log` | `herd_id?&from?&to?` / `{ herd_id, date, kg_dm, kind?, note? }` | `FeedEntry[]` (newest first) / `FeedEntry` |
+| PATCH DELETE | `/api/feed-log/:id` | partial | `FeedEntry` / 204 |
+| GET | `/api/leases` | | `Lease[]` (leases of existing paddocks) |
+| GET PUT DELETE | `/api/leases/:paddock_id` | `{ landowner, rate_per, rate_amount, currency?, season_from?, season_to?, notes? }` | `Lease` / `Lease` / 204 |
+
+```ts
+ReportDoc     { id, title, farm, from: "YYYY-MM-DD", to: "YYYY-MM-DD", herd_id?, generated_at,
+                header: [label, value][],          // Farm, Operator, FSA farm, Dates, Herd: only those known
+                sections: ReportSection[], notes: string[] /* method lines */, signatures: string[] /* signature-line labels */ }
+ReportSection { title, columns: { key, label, unit?, decimals? /* places a number column prints with */ }[],
+                rows: (string|number|null)[][], totals?: (string|number|null)[] }
+ReportInputs  { operator?, fsa_farm?, au: { cow: 1.0, bull: 1.35, pair: 1.3, weaned_calf: 0.5 },
+                herds: Record<herd_id, { mean_weight_kg?, intake_pct: 2.5, mix?: { cows, bulls, calves, pairs: bool } }> }
+FeedEntry     { id /* fed_… */, herd_id, date: "YYYY-MM-DD", kg_dm, kind /* default "hay" */, note?, created_by?: Actor, created_at }
+Lease         { paddock_id, landowner, rate_per: "acre_season"|"head_day"|"au_day"|"aum"|"pair_month", rate_amount,
+                currency /* ISO 4217, default "USD" */, season_from?, season_to?, notes?, updated_at }
+```
+
+Report ids: `paddock_record` (Paddock grazing record), `nrcs_528` (NRCS 528 grazing record),
+`organic_season` (Organic grazing season), `lease_head_days` (Lease head-days), `welfare`
+(Welfare record, see "Welfare record and training mode"). `from`/`to` are
+farm-local days, both included; the default is January 1 of `to`'s year to today. A report never
+counts past now. Values are in the farm's units (`settings.units`), rounded; each column's `unit`
+names it (`ac`/`ha`, `AU/ac`/`AU/ha`, `lb`/`kg`, `%`, or a currency). `null` is an empty cell.
+
+CSV (`format=csv`, `text/csv`, attachment `<id>-<from>-<to>.csv`): the title row and the header
+rows (`label,value`), a blank row (one empty cell), then each section: its title row, the column row (`Label (unit)`),
+the rows, the totals row (first cell `Total`), a blank row; then `Notes` and one note per row.
+Numbers have no thousands separators and keep their column's `decimals`.
+
+History comes from triggers, not the API: `herd_history` records each herd's count and paddock
+whenever either changes (and its creation and deletion), `paddock_geometry_history` each paddock's
+shape, area and name. On upgrade both are backfilled once: occupancy from applied MOVE decisions
+(the time the activity log says the move was applied, else the response or creation time; where a
+herd started from its first move's `from_paddock_id`, or for a farmer-drawn move the one paddock
+that move marked `grazed_until`), head counts at the count on upgrade day, which the report notes say. A grazing event is a herd's stay in
+one paddock with head: a stretch at 0 head isn't grazing, so a herd made empty and filled by its
+animals a moment later goes in when they came, one emptied into another herd and left in place leaves
+when its last animal did, and one that never had any is no event (the paddock rests through it).
+Head is the count on the day in and head-days follow every count change inside it.
+Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
+any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
+exists: UTC days on which the paddock held at least 1/24 of the herd's tracked dwell (the pasture
+rule), so a few fixes across a fence don't make one. Animal units: the herd's mix with the `au` factors when a cattle herd has one, else
+`cattle 1.0`, `sheep 0.2`, `goats 0.15` per head. A mix's AU stand at its head count and scale with
+the count at each stretch of a stay. With `pairs` a cow and her calf are at the pair factor and a
+pair is one head. In a herd whose count follows its animal rows, a calf at side may be registered as
+an animal of its own, so any count from cows + bulls to cows × 2 + bulls is the mix itself: 100 pairs
+are 130 AU at 100, 150 or 200 head (tagging calves through calving never moves the AU, and weaning
+them off doesn't either), never 260; a count outside that range scales from its nearer end. The
+method note gives the head counts the mix's AU stand at.
+
+- `paddock_record`: every event (paddock, FSA field when present, herd, in, out, days, head, AU,
+  head-days, AU-days, stocking density, rest before in), then a line per paddock.
+- `nrcs_528`: field, FSA farm/tract/field (only those present; one shared FSA farm goes in the
+  header), area, dates in and out, kind and number, AU, days, AUD, rest period; signature lines
+  Operator and NRCS planner. Columns openpasture doesn't measure are left out.
+- `organic_season`: days on pasture (farm days the herd was in a paddock) against 120; dry matter
+  from pasture against 30 % only for herds with `mean_weight_kg` whose feed log has entries in the
+  season's first and last week (a 0 kg entry counts): needed = head-days × weight × `intake_pct`,
+  from pasture = needed − the feed log's dry matter.
+- `lease_head_days`: a section per landowner, a row per leased paddock: dates (the lease season
+  inside the report's dates), head-days, AU-days, AUM (AU-days ÷ 30.4), pair-months (pairs × days ÷
+  30.4, when a herd's mix has pairs), rate and amount. `acre_season` is a flat rent per area for the
+  season, owed when the season meets the report's dates; its `rate_amount` is per hectare, like
+  every area in the API (the UI shows and takes it per acre on imperial farms). Signature lines:
+  Operator and each landowner.
+
+The feed log's `kg_dm` is dry matter in kg; `date` is the farm-local day. `POST /api/feed-log` is
+open to hands; editing and deleting entries, leases and report settings need a manager.
+MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
+
+## Server and live feed (op-server)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/server` | `{ version, data_dir, bind, port, lan_url?, public_url? }` |
+| GET | `/api/live` | WebSocket, server → client `Event` messages |
+| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`), tools listed and called as the caller's identity; `?scope=brain` lists only the brain tools. A brain run off a loopback URL gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only and lists and calls only the tools it was minted with) |
+
+```ts
+Event =
+  | { type: "fix", collar_id, animal_id?, herd_id, fix: Fix, state }
+  | { type: "cue", collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }
+  | { type: "ack", collar_id, herd_id, version, status, reason?, code? }   // code: protocol v1 reject code, only with rejected
+  | { type: "collar", collar: Collar }
+  | { type: "boundary", herd_id, boundary: Boundary }
+  | { type: "decision", decision: Decision }
+  | { type: "move", move: Move }         // a move started, stepped, dropped a straggler, finished or stopped
+  | { type: "escape", escape: Escape }   // an escape started, stepped, ended or was stopped
+  | { type: "decision_log", decision_id, line }   // brain progress, one line at a time
+  | { type: "alert", alert: Alert }      // opened, changed, acked or resolved
+  | { type: "message", message: MessageLog }   // queued, sent, failed or came in; managers and up only
+  | { type: "feature", feature: MapFeature, deleted?: true }
+  | { type: "animals_changed", herd_id? }
+  | { type: "schedule", schedule: Schedule }   // made, changed (staged, opened, skipped, held, retimed), paused, resumed or ended
+  | { type: "resync" }                   // this socket fell behind and missed events: refetch state
+  // on /api/live only, never on the bus; they replace fix, ack and cue on the socket:
+  | { type: "positions", herd_id, items: PositionItem[] }
+  | { type: "ack_batch", herd_id, items: AckItem[] }
+  | { type: "cue_batch", herd_id, items: CueItem[] }
+  | { type: "batch", events: Event[] }   // one farm window's positions, ack_batch and cue_batch, in herd id order
+
+PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
+AckItem      { collar_id, version, status: "received"|"applied"|"rejected", code?, reason? }  // latest per collar
+CueItem      { collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }              // every cue, in order
+```
+
+Each socket gets only the events its identity may see: `message` events go to managers and up
+(they carry phone numbers), everything else to every role. A report publishes one `fix` event per
+collar (its newest new fix), not one per fix.
+
+**At herd scale.** `/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd
+into one `positions`, one `ack_batch` and one `cue_batch` (each only when it has items), gathered
+for the whole farm: 500 ms after the first of them for any herd they go out together. A window
+holding only one of them sends it as itself; a window holding more sends one `batch`, which
+clients read as its events in order. At 250 collars that is about one message a second, and
+several herds live at once still make at most two batched messages a second. Every batched event
+is for any role; `message` events never ride in a batch. Server-side subscribers (alerts,
+schedules) still get every single event. A collar's `rejected` ack with a protocol v1 code
+(`hole_too_close`, `slots_full`, …) carries it on the bus (`ack.code`) and in `AckItem.code`.
+
+A `collar` event goes out on its own only when the collar's JSON minus `last_seen`, `battery`,
+`last_fix`, `state`, `outside_since` and `boundary_version` changed (renamed, relinked, parked,
+moved herd, fields added later). A report's telemetry rides in `positions`; a reported boundary
+version with no ack rides in `ack_batch` as `applied`. A collar with no fix yet has no position
+to send, so its telemetry-only changes wait for a refetch. Every other event goes out at once,
+in bus order; batches can arrive after events published later in the same 500 ms. Each message
+is serialized once for all sockets; a socket drops what its identity may not see; a socket (or
+the coalescer) that falls behind gets `resync`. A socket opened with a person's token closes
+within 5 s once that token is revoked, the person disabled or their role changed; the browser
+reconnects as whoever it is now. A client's close gets a close back.
+
+## MCP tools
+
+`/mcp` lists and calls tools as the caller. Every tool call is logged at info
+(`op_engine::mcp: mcp tool call tool=…`). A viewer or hand never sees a tool above their role, and
+calling one answers "Unknown tool". The brain (`?scope=brain`) gets only the tools marked brain.
+
+| Tool | Role | Brain | Arguments |
+| --- | --- | --- | --- |
+| `get_farm` | viewer | yes | |
+| `list_paddocks` | viewer | yes | |
+| `get_herd` | viewer | yes | `herd_id?` |
+| `get_herd_positions` | viewer | yes | `herd_id?` |
+| `get_boundary_status` | viewer | yes | `herd_id?` |
+| `get_signals` | viewer | yes | `herd_id?` |
+| `get_land_report` | viewer | yes | `paddock_id, refresh?` |
+| `search_knowledge` | viewer | yes | `query, limit?` |
+| `list_decisions` | viewer | yes | `herd_id?, limit?` |
+| `get_decision` | viewer | yes | `decision_id` |
+| `run_sql` | viewer | yes | `query, max_rows?` |
+| `get_morning_brief` | viewer | | `herd_id?` → `Brief` |
+| `check_boundary` | viewer | | `geometry, herd_id?, warn_m?, effective_at?, sweep?` → `CheckResult` |
+| `get_schedule` | viewer | | `herd_id?` → `{ herd_id, schedule \| null, moves, next? }` |
+| `list_features` | viewer | | `kind?, paddock_id?, active?: bool` → `MapFeature[]` |
+| `list_animals` | viewer | | `herd_id?, q?, removed?` (see Animals) |
+| `get_coverage` | viewer | | `metric?, from?, to?, cell_m?, herd_id?` → `Coverage` (at most the 500 weakest cells) |
+| `get_fleet` | viewer | | `herd_id?` → `{ fit_check_days, collars: FleetRow[] }` |
+| `get_welfare` | viewer | | `herd_id?, animal_id?, from?, to?` → `HerdWelfare`, or `AnimalWelfare` with at most 50 cues and episodes |
+| `get_report` | viewer | | `id, from?, to?, herd_id?` → `ReportDoc` |
+| `list_alerts` | viewer | | `status?, herd_id?, limit?` → `Alert[]` |
+| `ack_alert` | hand | | `id` |
+| `resolve_alert` | hand | | `id` |
+| `propose_boundary` | manager | | `reasoning, herd_id?, to_paddock_id?, geometry?, confidence?`: records a decision; the herd's autonomy still applies |
+| `schedule_strips` | manager | | `herd_id?, layout_id? \| orientation_deg + count \| width_m \| days, every_days?, at?, starts_at?, back_fence?: boolean, next_index?` |
+
+`herd_id` may be left out when the farm has one herd. `run_sql` is one read-only query, as
+`/api/sql`; questions by text never get it.
+
+## Analytics at 250 collars (op-analytics)
+
+- The hourly rollup streams a day to Parquet per collar in `(collar_id, t)` order, 65,536 rows a
+  row group, merging an existing file for that day (a row in both is kept once), and sums pasture
+  dwell on the stream. Rows leave SQLite in write transactions of at most 5,000 rows with a pause
+  after each, so reports keep landing (a 4.3 M-fix day: memory under 50 MB, no report waits
+  250 ms). While those deletes run, a rolled day is in both places: the SQL console, exports and
+  health counts can count its rows twice until they finish; tracks and pasture don't.
+- `health` rolls up like `fixes` and `cues` and is a table for `/api/sql` and export; battery
+  history in `/api/analytics/health` reads both.
+- `/api/tracks` seeks each collar's first fix per time bucket by index in SQLite and reads only
+  the track columns of Parquet days (row groups outside the range or collar skipped). 250
+  collars over a 4.3 M-fix day, `max_points=300`: under a second from SQLite, about 2 s from
+  Parquet in a debug build.
+- `/api/analytics/pasture` is as of the end of the range (or now): no day or fix after it
+  counts, `last_grazed` is the last grazing day up to it (before `from` too, from the daily
+  summaries) and `rest_days` runs to it. A day the end falls inside counts whole once rolled.
+- `OPENPASTURE_DB_POOL` sets the SQLite pool (1-256, default 16).
+
+## 250 collars
 
 **Sweeps.** See "Moves: target and sweep" for the rule. Each pass of the planner runs on a
 blocking thread and is timed: `plan_ms` on every `move` log line, a warning past 150 ms (a pass
-for 250 animals takes about 1.5 ms in a debug build). The move row's `sweep` JSON gains
+for 250 animals takes about 1.5 ms in a debug build). The move row's `sweep` JSON has
 `start_m`, the back line's distance to the target at the first step, so a finished sweep has a
 pace (metres a minute) for the pre-send preview.
 
@@ -1782,104 +1835,3 @@ seconds, `--duration <s>` stops the run. `scripts/soak.sh` runs a server, collar
 collars, a counting proxy for the collars' traffic, a farm webhook, a live-socket counter and one
 browser for hours, with a move every 30 minutes and a strip schedule advancing every hour, and
 writes `report.md` (latency, errors, live rate, CPU and memory, data budget, sweeps).
-
-<!-- @M -->
-
-## Web Push (op-alerts)
-
-Alerts and the morning brief as notifications on a phone (the app installed from its manifest) or
-in any browser that can take them, free and without Twilio. Only while the server is reached over
-https (`server.public_url` or a tunnel): browsers subscribe to push, and install the app, only from a
-secure origin. On an iPhone only the app added to the Home Screen can subscribe (iOS 16.4+).
-
-Every role may `POST`/`DELETE` its own subscriptions (and test them); `PUT /api/push/settings` is the
-owner's. Turning alerts on in a browser adds `push` to that person's alert channels (their prefs
-decide severity, herds, muted kinds and quiet hours as for texts); each subscription is its own
-address, so one alert reaches every browser the person turned it on in.
-
-| Method | Path | Returns |
-| --- | --- | --- |
-| GET | `/api/push` | `PushView`; makes the farm's VAPID key the first time it is asked for over https |
-| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
-| DELETE | `/api/push/subscriptions/:id` | 204; your own (the owner: anyone's), else 404 |
-| POST | `/api/push/subscriptions/:id/test` | `{ ok, detail }` — "openpasture test." to that browser now, recorded in `/api/messages` |
-| PUT | `/api/push/settings` | `{ enabled?, new_keys? }` → `PushView`. `enabled: false` sends nothing by push (subscriptions stay); `new_keys: true` makes a new key pair and drops every subscription (browsers turn alerts on again) |
-
-```ts
-PushView = {
-  available: boolean,          // over https and enabled: browsers may subscribe
-  enabled: boolean,
-  reason?: string,             // why not, when not available
-  vapid_public_key?: string,   // base64url uncompressed P-256 point: PushManager.subscribe's applicationServerKey
-  key_set: boolean,            // the vapid_private_key secret exists (never its value)
-  mine: MySubscription[],      // yours, oldest first
-}
-MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push service last took a message for it */ }
-```
-
-- Channel `push` is in `configured` (`/api/notify/channels`, `/api/alerts/rules`) while the server is
-  reached over https, `push.enabled` is on, the key exists and at least one browser is subscribed;
-  `person_channels` then offers it. A `push` message's `address` is the subscription id.
-- A message goes as one aes128gcm record (RFC 8291) with a VAPID JWT (RFC 8292; `aud` the push
-  service's origin, `exp` 12 h, `sub` the farm's https address), `TTL` 4 h for alerts, 12 h for the
-  brief, 1 h for a test, `Urgency: high` for alerts, and the alert id as `Topic`. The payload the
-  service worker shows: `{ title /* the farm's name */, body, tag /* alert id */, url /* "/#/map?alert=<id>" */, alert_id?, herd_id? }`;
-  the body is the text without its texting instructions ("Reply OK to ack", "Reply Y or N. Code 4821").
-- 404 or 410 from the push service: the browser dropped it; the subscription is removed and the
-  message fails "That phone stopped taking notifications.". 408, 429 and 5xx are tried again (5 s,
-  30 s, 2 min); a push service that can't be reached at all waits as texts do.
-- Settings: `push` = `{ vapid_public_key?, enabled /* true */ }`; secret `vapid_private_key` (PKCS#8,
-  base64url). `push_subscriptions` holds personal data and is not in `/api/sql`.
-<!-- @Z -->
-<!-- @X1 -->
-
-## Seams between streams (X1)
-
-**Live feed, one message per farm window.** Every 500 ms window gathers the whole farm's
-batches. A window holding only one of them sends it as itself (`positions`, `ack_batch` or
-`cue_batch`, as above); a window holding more sends one message:
-
-```ts
-{ type: "batch", events: Event[] }   // each herd's positions, ack_batch, cue_batch, in herd id order
-```
-
-So several herds live at once still make at most two batched messages a second for the farm
-(before: up to three per herd). Clients read a `batch` as its events in order. Every batched
-event is for any role, so viewers get the same message; `message` events never ride in a batch.
-
-**Reject codes on the feed.** A collar's `rejected` ack with a protocol v1 code
-(`hole_too_close`, `slots_full`, …) carries it on the bus (`ack.code`) and in `AckItem.code`.
-
-**Someone else's alert prefs.** `PUT /api/alerts/prefs/{id}` is the owner's at the guard (people
-ids are `usr_…`), so a manager is refused before the body is read; `PUT /api/alerts/prefs/me`
-stays a hand's.
-
-**The brief after a stopped move.** When today's decision is a MOVE (or HOLD) whose move someone
-stopped before the target, where it stands reads `Stopped 610 ft short, 250/250 collars
-confirmed.` (the distance through the farm's units), also the next morning.
-
-**Imported history and collar data.** Committing a position import leaves out points the
-animal's collar already recorded, so an animal-hour's dwell is counted once, from the collar.
-`POST /api/import/positions/{id}/commit` gains:
-
-```ts
-{ …, collar_covered: number }   // points left out because the animal's collar recorded that time
-```
-
-"Recorded" is read at the dwell rule's resolution: for hot fixes, the 30-minute buckets
-holding a fix of that collar and animal; for days already rolled to Parquet, the stretch the
-collar day's dwell covers, ending 30 minutes after its last fix, credited to the animal the
-collar is on now. A file with nothing new left is 409.
-
-**Paddock areas stored before op-geo measured rings whichever way they wind** (a clockwise
-outer ring, or a hole wound like its outer ring) are measured again from their geometry when
-the data dir opens, in `paddocks` and in the geometry history reports use. Rows that are
-right are left alone.
-
-**Rest days at 250 collars.** "Last grazed" for signals, the decision context and
-`GET /api/layers/paddocks` reads per-day summaries kept by triggers: `fix_paddock_days` (hot
-fixes per herd, UTC day and paddock) and `paddock_day_dwell` (rolled-up and imported dwell per
-herd, date, paddock), a few rows per paddock and day, not the herd's hot fixes or the collar days
-(`fix_paddock_last` is gone); the herd's position over the last
-day reads at most 20,000 fixes, sampled per collar and time bucket by index seeks when the day
-holds more. No response shape changes.

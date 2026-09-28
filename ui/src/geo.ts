@@ -44,6 +44,33 @@ export function centroid(poly: Polygon): LonLat {
   return [s[0] / r.length, s[1] / r.length];
 }
 
+// A point inside the shape, for its label and for "the paddock it is in": the centroid when that
+// is inside, else the middle of the inside stretch, along a few lines of latitude, that lies
+// farthest from every edge (a paddock with a pond in the middle has its centroid in the pond).
+export function interiorPoint(poly: Polygon): LonLat {
+  const c = centroid(poly);
+  if (inside(c, poly)) return c;
+  const ys = ring(poly).map((p) => p[1]);
+  const [lo, hi] = [Math.min(...ys), Math.max(...ys)];
+  let best: { d: number; at: LonLat } | undefined;
+  for (let k = 1; k < 16; k++) {
+    const y = lo + ((hi - lo) * k) / 16;
+    const xs: number[] = [];
+    for (const r of poly.coordinates)
+      for (let i = 0; i < r.length - 1; i++) {
+        const [[x1, y1], [x2, y2]] = [r[i], r[i + 1]];
+        if (y1 > y !== y2 > y) xs.push(x1 + ((y - y1) * (x2 - x1)) / (y2 - y1));
+      }
+    xs.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < xs.length; i += 2) {
+      const at: LonLat = [(xs[i] + xs[i + 1]) / 2, y];
+      const d = signedDistance(at, poly);
+      if (!best || d > best.d) best = { d, at };
+    }
+  }
+  return best?.at ?? c;
+}
+
 // Inside the outer ring and in none of its holes.
 export function inside(p: LonLat, poly: Polygon): boolean {
   const [outer, ...holes] = poly.coordinates;

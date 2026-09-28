@@ -187,12 +187,20 @@ fn sends(d: &Decision) -> bool {
 fn call(d: &Decision, herd: &Herd, herd_name: &str, paddocks: &[Paddock], fmt: &Fmt) -> String {
     let paddock = |id: Option<&str>| id.and_then(|id| paddocks.iter().find(|p| p.id == id));
     match action_of(d).as_str() {
-        "MOVE" => match (paddock(d.to_paddock_id.as_deref()), &d.geometry) {
-            (Some(p), _) if p.area_ha > 0.0 => format!("{herd_name}: MOVE to {} ({}).", name(&p.name), fmt.area(p.area_ha)),
-            (Some(p), _) => format!("{herd_name}: MOVE to {}.", name(&p.name)),
-            (None, Some(g)) => format!("{herd_name}: MOVE to a drawn boundary ({}).", fmt.area(g.area_ha())),
-            (None, None) => format!("{herd_name}: MOVE."),
-        },
+        // The area is the boundary's (what the herd gets, as the approval text says), else the paddock's.
+        "MOVE" => {
+            let drawn = d.geometry.as_ref().map(|g| g.area_ha()).filter(|a| *a > 0.0);
+            match paddock(d.to_paddock_id.as_deref()) {
+                Some(p) => match drawn.or((p.area_ha > 0.0).then_some(p.area_ha)) {
+                    Some(a) => format!("{herd_name}: MOVE to {} ({}).", name(&p.name), fmt.area(a)),
+                    None => format!("{herd_name}: MOVE to {}.", name(&p.name)),
+                },
+                None => match drawn {
+                    Some(a) => format!("{herd_name}: MOVE to a drawn boundary ({}).", fmt.area(a)),
+                    None => format!("{herd_name}: MOVE."),
+                },
+            }
+        }
         "STAY" => {
             let here = d.inputs.get("from_paddock_id").and_then(Value::as_str).or(herd.paddock_id.as_deref());
             match paddock(here) {

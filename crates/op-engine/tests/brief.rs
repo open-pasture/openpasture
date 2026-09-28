@@ -185,6 +185,21 @@ async fn a_waiting_move_asks_for_y_or_n_in_both_unit_systems() {
 }
 
 #[tokio::test]
+async fn a_move_onto_part_of_a_paddock_gives_the_boundarys_area_as_its_text_does() {
+    let t = setup().await;
+    let f = farm(&t, "propose", 1).await;
+    // The west half of P2: a strip, not the whole paddock.
+    let half = json!({ "type": "Polygon", "coordinates": [[[-93.62, 42.03], [-93.6175, 42.03], [-93.6175, 42.0336], [-93.62, 42.0336], [-93.62, 42.03]]] });
+    let mut d = decision(&f, DecisionAction::Move, "P2 has rested 34 days.");
+    d.geometry = Some(serde_json::from_value(half).unwrap());
+    let d = record(&t, &f, d).await;
+    let strip = d.geometry.as_ref().unwrap().area_ha();
+    assert!((strip - area(&f.p2) / 2.0).abs() < 0.05, "{strip}");
+    t.units("metric").await;
+    assert_eq!(t.lines(&f).await[0], format!("Cows: MOVE to P2 ({}).", Fmt::new(Units::Metric).area(strip)));
+}
+
+#[tokio::test]
 async fn a_timer_move_says_when_it_sends() {
     let t = setup().await;
     let f = farm(&t, "timer", 1).await;

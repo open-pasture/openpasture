@@ -375,6 +375,35 @@ async fn paddock_record_counts_head_days_au_days_density_and_rest() {
 }
 
 #[tokio::test]
+async fn reports_read_farm_days_across_the_clocks_going_back() {
+    // America/Chicago falls back at 02:00 on 2025-11-02: that farm day is 25 hours long.
+    let app = App::new().await;
+    let f = farm(&app).await;
+    app.units("metric").await;
+    let h = herd(&app, "Cows", 100, Some(&f.p1)).await;
+    patch_herd(&app, &h, json!({"paddock_id": f.p2})).await;
+    // In P1 at 07:00 CDT on Oct 30, out at 07:00 CST on Nov 4.
+    app.date_history(&h, &["2025-10-30T12:00:00.000Z", "2025-11-04T13:00:00.000Z"]).await;
+    let doc = app.report("paddock_record", "from=2025-10-01&to=2025-11-30").await;
+    let ev = &doc["sections"][0];
+    assert_eq!(column(ev, "paddock")[0], json!("P1"));
+    assert_eq!((column(ev, "in")[0].clone(), column(ev, "out")[0].clone()), (json!("2025-10-30 07:00"), json!("2025-11-04 07:00")));
+    // Five farm days and the hour the clocks gave back.
+    assert_eq!(column(ev, "days")[0], json!(5.0));
+    assert_eq!(column(ev, "head_days")[0], json!(round(100.0 * (5.0 + 1.0 / 24.0), 1)));
+    // The day itself runs from its midnight to the next, 25 hours.
+    let doc = app.report("paddock_record", "from=2025-11-02&to=2025-11-02").await;
+    let ev = &doc["sections"][0];
+    assert_eq!((column(ev, "in")[0].clone(), column(ev, "out")[0].clone()), (json!("2025-11-02 00:00"), json!("2025-11-03 00:00")));
+    assert_eq!(column(ev, "head_days")[0], json!(round(100.0 * 25.0 / 24.0, 1)));
+    // Farm days on pasture count Nov 2 once.
+    let doc = app.report("organic_season", "from=2025-11-01&to=2025-11-03").await;
+    let rows = doc["sections"][0]["rows"].as_array().unwrap();
+    let cows = rows.iter().find(|r| r[0] == "Cows").unwrap();
+    assert_eq!((cows[1].clone(), cows[2].clone()), (json!(3), json!(3)), "{rows:?}");
+}
+
+#[tokio::test]
 async fn a_mix_sets_animal_units_and_a_stay_running_now_has_no_out() {
     let app = App::new().await;
     let f = farm(&app).await;
@@ -998,6 +1027,18 @@ async fn get_report_tool_answers_through_the_registry() {
     assert_eq!(doc["sections"][0]["rows"].as_array().unwrap().len(), 5);
     let err = app.ctx.tools().call(&app.ctx, "get_report", json!({"id": "nope"}), None, Identity::brain(), &scope).await.unwrap_err();
     assert_eq!(err.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_report_tool_describes_every_report_it_takes() {
+    let app = App::new().await;
+    let tool = app.ctx.tools().get("get_report").expect("registered");
+    let ids = tool.input_schema["properties"]["id"]["enum"].as_array().unwrap().clone();
+    assert!(ids.iter().any(|i| i == "welfare"));
+    for id in ids {
+        let id = id.as_str().unwrap();
+        assert!(tool.description.contains(id), "get_report's description leaves out {id}");
+    }
 }
 
 #[tokio::test]

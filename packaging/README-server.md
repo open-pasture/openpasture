@@ -34,6 +34,19 @@ Create a farm, a paddock and a herd in the app, then:
 
 Add `--token <app token>` when the server is on another machine.
 
+## For a farm
+
+Collars and phones need an https address (a reverse proxy, Cloudflare Tunnel or Tailscale
+Funnel); set it in Settings > Server > Public URL. Back up the data directory, including
+`server_ed25519.key`: collars trust that key.
+
+Texts, alerts and approvals work with your own Twilio number (Settings > Texting). Replies come in
+by Twilio's webhook to `<public URL>/hooks/twilio/sms`, or, with no public URL, by polling Twilio
+every 10 s.
+
+Guides: https://github.com/open-pasture/openpasture/blob/main/docs/SELF-HOSTING.md and
+https://github.com/open-pasture/openpasture/blob/main/docs/TEXTING.md
+
 Source, docs and issues: https://github.com/open-pasture/openpasture
 
 Licence: AGPL-3.0 (see LICENSE).
