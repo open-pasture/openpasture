@@ -1058,7 +1058,7 @@ confirmed.` (the distance through the farm's units), also the next morning.
 | GET | `/api/alerts/{id}` | `Alert` |
 | POST | `/api/alerts/{id}/ack` | `Alert`; hand and up. Stops re-notification and escalation; acking again returns it unchanged; resolved → 409 |
 | POST | `/api/alerts/{id}/resolve` | `Alert`; hand and up. Stays closed while its cause lasts; resolved → 409 |
-| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email")[] }` |
+| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email"\|"push")[] }` |
 | PUT | `/api/alerts/rules` | same; manager and up. Body `{ rules?: { <kind>: Partial<RuleConfig> }, policy?: Partial<Policy> }` (merge; `null` puts a rule's number back to its default and clears quiet hours) |
 | GET | `/api/alerts/prefs` | `PersonPrefs[]`, every person; manager and up |
 | GET | `/api/alerts/prefs/me` | `PersonPrefs` of the caller's person; 404 when the sign-in isn't a person |
@@ -1071,7 +1071,7 @@ RuleView   = RuleConfig & { kind, sentence /* "Collar silent for {n}" */, unit: 
 Policy     { renotify_every_min: 30, renotify_max: 3, escalate_after_min: 15, group_window_s: 60, rollup_min: 4,
              herd_silent_share: 0.5, clear_after_min: 2, start_grace_min: 20, critical_window_s: 10,
              quiet_start?: "HH:MM", quiet_end?: "HH:MM" /* the farm's, farm time */ }
-AlertPrefs { channels: ("sms"|"whatsapp"|"email")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
+AlertPrefs { channels: ("sms"|"whatsapp"|"email"|"push")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
              herds?: string[] /* absent = every herd */, muted_kinds: string[], quiet_start?, quiet_end? /* absent = the farm's */,
              critical_in_quiet: bool /* true */, on_duty: bool /* false */ }
 PersonPrefs = AlertPrefs & { user_id, name, role: Role, sms_opt_out: bool, updated_at? }
