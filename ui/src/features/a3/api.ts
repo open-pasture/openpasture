@@ -15,7 +15,7 @@ export interface TextingConfig {
 
 // The last check of Twilio (polling) or of the relay's inbox.
 export interface Checked { at?: string; ok_at?: string; error?: string }
-export interface PersonTexting { user_id: string; brief: boolean; sms_opt_out: boolean }
+export interface PersonTexting { user_id: string; brief: boolean; sms_opt_out: boolean; push: boolean }
 
 // GET /api/texting: the setting, plus how texts come in now (read-only).
 export interface Texting extends TextingConfig {

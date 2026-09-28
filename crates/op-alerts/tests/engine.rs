@@ -36,7 +36,7 @@ async fn a_breakout_of_250_is_one_alert_and_one_text_per_person() {
     let escaped: Vec<_> = open.iter().filter(|x| x.kind == "escaped").collect();
     assert_eq!(escaped.len(), 1, "one rollup row");
     let r = escaped[0];
-    assert_eq!((r.title.as_str(), r.severity), ("250 outside P1", Severity::Critical));
+    assert_eq!((r.title.as_str(), r.severity), ("250 collars outside P1", Severity::Critical));
     assert_eq!(r.key, format!("escaped:herd:{}", f.herd));
     assert_eq!(r.targets.iter().filter(|(k, _)| k == "collar").count(), 250);
     assert_eq!(r.data["count"], 250);
@@ -84,14 +84,14 @@ async fn a_rollup_keeps_its_members_until_the_last_clears() {
     }
     f.eval(t).await;
     let r = f.open_kind("outside").await;
-    assert_eq!((r.len(), r[0].title.as_str()), (1, "5 outside P1"));
+    assert_eq!((r.len(), r[0].title.as_str()), (1, "5 collars outside P1"));
     for c in &cs[1..] {
         f.inside(c, t + mins(1)).await;
     }
     f.eval(t + mins(1)).await;
     let r2 = f.open_kind("outside").await;
     assert_eq!(r2.len(), 1, "never splits back into rows");
-    assert_eq!((r2[0].id.as_str(), r2[0].title.as_str()), (r[0].id.as_str(), "1 outside P1"));
+    assert_eq!((r2[0].id.as_str(), r2[0].title.as_str()), (r[0].id.as_str(), "1 collar outside P1"));
     f.inside(&cs[0], t + mins(2)).await;
     f.eval(t + mins(2)).await;
     f.eval(t + mins(4) + secs(1)).await;
@@ -113,7 +113,7 @@ async fn members_already_open_roll_into_the_new_rollup() {
     f.outside(&cs[3], t - mins(6), t).await;
     f.eval(t + secs(10)).await;
     let open = f.open_kind("outside").await;
-    assert_eq!((open.len(), open[0].title.as_str()), (1, "4 outside P1"));
+    assert_eq!((open.len(), open[0].title.as_str()), (1, "4 collars outside P1"));
     for s in singles {
         let s = f.alert(&s.id).await;
         assert_eq!((s.status, s.rolled_into.as_deref()), (AlertStatus::Resolved, Some(open[0].id.as_str())));
@@ -511,7 +511,10 @@ async fn a_new_breakout_joining_an_acked_rollup_is_texted_again() {
     back_in(&f, &cs[1..6], t + mins(1)).await;
     run(&f, t + mins(1), t + mins(60), mins(1)).await;
     let still = f.open_kind("escaped").await;
-    assert_eq!((still.len(), still[0].id.as_str(), still[0].title.as_str(), still[0].status), (1, first.id.as_str(), "1 outside P1", AlertStatus::Acked));
+    assert_eq!(
+        (still.len(), still[0].id.as_str(), still[0].title.as_str(), still[0].status),
+        (1, first.id.as_str(), "1 collar outside P1", AlertStatus::Acked)
+    );
     assert_eq!(f.messages_to(&a).await.len(), 1);
     // 240 more get out: a new alert for all 241, texted to everyone.
     let later = t + mins(120);
@@ -520,7 +523,7 @@ async fn a_new_breakout_joining_an_acked_rollup_is_texted_again() {
     let open = f.open_kind("escaped").await;
     assert_eq!(open.len(), 1);
     assert_ne!(open[0].id, first.id);
-    assert_eq!((open[0].title.as_str(), open[0].status, open[0].data["count"].as_u64()), ("241 outside P1", AlertStatus::Open, Some(241)));
+    assert_eq!((open[0].title.as_str(), open[0].status, open[0].data["count"].as_u64()), ("241 collars outside P1", AlertStatus::Open, Some(241)));
     let old = f.alert(&first.id).await;
     assert_eq!((old.status, old.rolled_into.as_deref(), old.resolved_by), (AlertStatus::Resolved, Some(open[0].id.as_str()), None));
     for p in [&a, &b] {
@@ -559,7 +562,7 @@ async fn a_new_breakout_joining_a_rollup_closed_by_hand_is_texted_again() {
     break_out(&f, &cs[6..246], later).await;
     run(&f, later, later + mins(1), secs(10)).await;
     let open = f.open_kind("escaped").await;
-    assert_eq!((open.len(), open[0].title.as_str()), (1, "243 outside P1"));
+    assert_eq!((open.len(), open[0].title.as_str()), (1, "243 collars outside P1"));
     let m = f.messages_to(&a).await;
     assert_eq!(m.len(), 1, "{m:#?}");
     assert!(m[0].text.starts_with("243 outside P1"), "{}", m[0].text);
@@ -585,7 +588,7 @@ async fn a_straggler_left_in_an_acked_rollup_doesnt_hide_the_next_escape() {
     break_out(&f, &cs[6..8], later).await;
     run(&f, later, later + mins(1), secs(10)).await;
     let open = f.open_kind("escaped").await;
-    assert_eq!((open.len(), open[0].title.as_str(), open[0].status), (1, "3 outside P1", AlertStatus::Open));
+    assert_eq!((open.len(), open[0].title.as_str(), open[0].status), (1, "3 collars outside P1", AlertStatus::Open));
     let m = f.messages_to(&a).await;
     assert_eq!(m.len(), 2, "{m:#?}");
     assert!(m[1].text.starts_with("3 outside P1"), "{}", m[1].text);
@@ -620,7 +623,7 @@ async fn escapes_after_a_rollup_was_closed_by_hand_alert_on_their_own() {
     run(&f, later + mins(2), later + mins(3), secs(10)).await;
     let open = f.open_kind("escaped").await;
     assert_eq!(open.len(), 1, "{open:#?}");
-    assert_eq!((open[0].title.as_str(), open[0].key.as_str()), ("10 outside P1", first.key.as_str()));
+    assert_eq!((open[0].title.as_str(), open[0].key.as_str()), ("10 collars outside P1", first.key.as_str()));
     assert_ne!(open[0].id, first.id);
     let m = f.messages_to(&a).await;
     assert_eq!(m.len(), 3, "{m:#?}");
@@ -640,7 +643,7 @@ async fn a_growing_breakout_is_texted_again_each_time_it_doubles() {
     break_out(&f, &cs[6..11], t + mins(1)).await;
     run(&f, t + mins(1), t + mins(2), secs(10)).await;
     assert_eq!(f.messages_to(&a).await.len(), 1);
-    assert_eq!(f.open_kind("escaped").await[0].title, "11 outside P1");
+    assert_eq!(f.open_kind("escaped").await[0].title, "11 collars outside P1");
     // One more makes six new: texted again, one row open.
     break_out(&f, &cs[11..12], t + mins(3)).await;
     run(&f, t + mins(3), t + mins(4), secs(10)).await;

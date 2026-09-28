@@ -120,18 +120,36 @@ export function useStore<T>(sel: (s: Store) => T): T {
 let lastSeen: (() => Partial<Store> | undefined) | undefined;
 export const setLastSeen = (f: typeof lastSeen) => void (lastSeen = f);
 
+// M: a first read unanswered this long (one flaky bar hangs it for minutes) shows the last copy meanwhile.
+const FIRST_READ_WAIT_MS = 4000;
+let showingCopy = false;
+
 async function refresh() {
+  const wait = s.state
+    ? undefined
+    : setTimeout(() => {
+        const last = !s.state ? lastSeen?.() : undefined;
+        if (last) {
+          showingCopy = true;
+          set({ ...last, ready: true, error: undefined });
+        }
+      }, FIRST_READ_WAIT_MS);
   try {
     const [state] = await Promise.all([api.state(), loadMe()]);
     const herdId = s.herdId && state.herds.some((h) => h.id === s.herdId) ? s.herdId : state.herds[0]?.id;
+    showingCopy = false;
     set({ state, herdId, ready: true, error: undefined });
     await refreshHerd();
   } catch (e) {
     // The server out of reach (no network, or a proxy saying it's gone) before anything loaded:
     // the last copy, if any, until the live feed comes back and this runs again.
     const unreachable = !(e instanceof ApiError) || e.status >= 500;
+    if (unreachable && showingCopy) return;
     const last = !s.state && unreachable ? lastSeen?.() : undefined;
+    if (last) showingCopy = true;
     set(last ? { ...last, ready: true, error: undefined } : { ready: true, error: (e as Error).message });
+  } finally {
+    clearTimeout(wait);
   }
 }
 

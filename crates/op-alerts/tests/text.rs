@@ -76,8 +76,13 @@ fn a_group_lists_its_animals() {
     let tail: usize = text.rsplit('+').next().unwrap().parse().unwrap();
     let shown = text.split(": ").nth(1).unwrap().split(' ').count() - 1;
     assert_eq!(shown + tail, 250, "{text}");
-    assert_eq!(rollup_title("outside", 31, Some("P3")), "31 outside P3");
-    assert_eq!(rollup_title("silent", 31, None), "31 silent");
+    // A count reads as one, not as a collar's label ("138 GPS weak" is collar 138).
+    assert_eq!(rollup_title("outside", 31, Some("P3")), "31 collars outside P3");
+    assert_eq!(rollup_title("silent", 31, None), "31 collars silent");
+    assert_eq!(rollup_title("gps_degraded", 5, None), "5 collars GPS weak");
+    assert_eq!(rollup_title("drop_off", 2, None), "2 collars not moving");
+    assert_eq!(rollup_title("low_battery", 4, None), "4 batteries low");
+    assert_eq!(rollup_title("outside", 1, Some("P3")), "1 collar outside P3");
 }
 
 #[test]

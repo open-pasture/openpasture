@@ -843,7 +843,7 @@ async fn opting_out_stops_alerts_and_briefs_and_start_restores_them() {
     assert!(r.reply.is_none());
     let (_, v) = t.f.owner("GET", "/api/texting", None).await;
     let hank = v["people"].as_array().unwrap().iter().find(|p| p["user_id"] == t.id(HANK)).unwrap().clone();
-    assert_eq!(hank, json!({"user_id": t.id(HANK), "brief": true, "sms_opt_out": true}));
+    assert_eq!(hank, json!({"user_id": t.id(HANK), "brief": true, "sms_opt_out": true, "push": false}));
     // Nothing reaches Hank: no alert, no brief, no reply to anything but START.
     let c = t.f.collar(Some("031"), now()).await;
     t.f.outside(&c, t0() - mins(30), t0() - mins(1)).await;
@@ -1134,6 +1134,20 @@ async fn relay_post(host: &notify_support::Host, key: &str, id: &str, to: &str, 
     op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
 }
 
+/// [`relay_post`] with the farm's `kind` of text.
+async fn relay_post_kind(host: &notify_support::Host, key: &str, id: &str, to: &str, text: &str, kind: &str) {
+    let (s, v) = call_with(
+        &notify_support::app(&host.ctx),
+        "POST",
+        "/v1/notify",
+        Some(json!({"idempotency_key": id, "channel": "sms", "to": to, "text": text, "kind": kind})),
+        &[("authorization", &format!("Bearer {key}"))],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
+}
+
 /// The texts waiting in `key`'s inbox (taken: the next call starts after them).
 async fn take(host: &notify_support::Host, key: &str) -> Vec<String> {
     let (_, v) = inbox(host, key, "", 0).await;
@@ -1200,6 +1214,47 @@ async fn a_text_to_the_relay_reaches_only_the_farm_it_answers() {
     let r = text(&host.ctx, "sms", CODY, "status").await;
     assert_eq!((r.message.status.as_str(), r.message.error.as_deref()), ("received", None));
     assert_eq!(take(&host, &key_a).await, ["status"]);
+}
+
+/// OK answers an alert: it goes to the farm whose alert last reached the
+/// person, not to whichever farm texted last (another farm's brief).
+#[tokio::test]
+async fn ok_on_the_relay_acks_the_farm_whose_alert_asked_for_it() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    host_recipient(&host, &key_b, CODY, false).await;
+    relay_post_kind(&host, &key_a, "ntf_a1", CODY, "6 outside P3 since 06:12. Reply OK to ack", "alert").await;
+    relay_post_kind(&host, &key_b, "ntf_b1", CODY, "Heifers: STAY in P2.", "brief").await;
+    text(&host.ctx, "sms", CODY, "OK").await;
+    assert_eq!(take(&host, &key_a).await, ["OK"]);
+    assert!(take(&host, &key_b).await.is_empty());
+}
+
+/// A bare STOP MOVE says nothing about which farm's move: a decision prompt
+/// from one farm doesn't make it that farm's. With more than one farm the
+/// host asks for the move's code (or the app); with one it goes there.
+#[tokio::test]
+async fn a_bare_stop_move_on_the_relay_goes_nowhere_it_might_not_mean() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    let r = text(&host.ctx, "sms", CODY, "STOP MOVE").await;
+    assert!(r.reply.is_none());
+    assert_eq!(take(&host, &key_a).await, ["STOP MOVE"], "one farm: it is that farm's");
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    host_recipient(&host, &key_b, CODY, false).await;
+    relay_post(&host, &key_b, "ntf_b1", CODY, "Heifers: move to P2? Reply Y or N. Code 1234", true).await;
+    let r = text(&host.ctx, "sms", CODY, "STOP MOVE").await;
+    let asked = r.reply.expect("the host asks which move");
+    assert_eq!(asked.text, "More than one farm texts you. Add the code from the move's text, like STOP MOVE 4821, or stop it in the app.");
+    assert!(op_alerts::text::septets(&asked.text) <= 160);
+    assert!(take(&host, &key_a).await.is_empty());
+    assert!(take(&host, &key_b).await.is_empty());
+    // With the code it reaches the farm whose text carried it.
+    text(&host.ctx, "sms", CODY, "STOP MOVE 1234").await;
+    assert_eq!(take(&host, &key_b).await, ["STOP MOVE 1234"]);
 }
 
 #[tokio::test]
@@ -1364,6 +1419,32 @@ async fn the_brief_goes_at_the_farm_time_once_a_day() {
     let (s, _) = t.f.owner("PUT", "/api/texting", Some(json!({"brief": {"enabled": false}}))).await;
     assert_eq!(s, StatusCode::OK);
     assert!(op_alerts::brief_send::run_once(ctx, at + Duration::days(3)).await.unwrap().is_empty());
+}
+
+/// Only managers and up answer decisions: a hand's brief says where the
+/// decision stands without asking for a Y or N, and doesn't count as asking
+/// (a bare N from them isn't the brief's to take, and on the relay it
+/// doesn't mark this farm as asking them).
+#[tokio::test]
+async fn a_hands_brief_doesnt_ask_for_an_answer() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (s, _) = t.f.owner("PUT", "/api/texting", Some(json!({"brief": {"enabled": true, "time": "06:30"}}))).await;
+    assert_eq!(s, StatusCode::OK);
+    for p in [MIA, HANK] {
+        let (s, _) = t.f.owner("PUT", &format!("/api/texting/people/{}", t.id(p)), Some(json!({"brief": true}))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let at = next_0630(ctx).await;
+    let d = t.f.decision("MOVE", "proposed", at - mins(10), None).await;
+    let sent = op_alerts::brief_send::run_once(ctx, at).await.unwrap();
+    let of = |phone: &str| sent.iter().find(|m| m.address == phone).unwrap_or_else(|| panic!("a brief to {phone}: {sent:#?}")).clone();
+    let (mia, hank) = (of(MIA), of(HANK));
+    assert!(mia.text.contains("Reply Y or N.") || mia.text.contains("unless you reply N."), "{}", mia.text);
+    assert_eq!(mia.decision_id.as_deref(), Some(d.as_str()));
+    assert!(!hank.text.contains("Reply") && !hank.text.contains("reply"), "{}", hank.text);
+    assert!(hank.text.starts_with("Cows: MOVE"), "{}", hank.text);
+    assert_eq!(hank.decision_id, None, "not an asking text");
 }
 
 // ---- settings --------------------------------------------------------------------------------

@@ -16,7 +16,7 @@ use crate::metrics::{Cadence, Dwell, DwellAgg, DwellKey, Grid, Hist, MAX_DWELL_G
 use crate::range::{self, TimeRange, bucket_ms};
 use crate::schema::table_schema;
 use crate::sql;
-use crate::telemetry::{Order, Scope, Source, each_cue, each_fix, for_each, scan_in};
+use crate::telemetry::{Order, Scope, Source, each_cue, each_fix, for_each, scan_cold, scan_in};
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -365,13 +365,26 @@ pub fn health_hot_sql(collars: usize, rolled: usize) -> String {
 }
 
 /// Seconds between one collar's hot fixes (whole, at least 1), counted:
-/// [`Cadence`]'s gaps over its first [`CADENCE_FIXES`] fixes in `[?2, ?3)`
-/// (`?1` the collar), read from the `(collar_id, t)` index alone. The typical
-/// gap is its cadence; a day of them would read 17,280 entries a collar.
-pub const HEALTH_GAPS_SQL: &str = "SELECT MAX(1, CAST(ROUND((t - pt) / 1000.0) AS INTEGER)) AS g, COUNT(*) FROM (
-         SELECT t, LAG(t) OVER (ORDER BY t) AS pt FROM (SELECT t FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 ORDER BY t LIMIT ?4)
-     ) WHERE t > pt GROUP BY g";
+/// [`Cadence`]'s gaps over [`CADENCE_FIXES`] of its fixes, the first
+/// `CADENCE_FIXES / CADENCE_CHUNKS` of each of [`CADENCE_CHUNKS`] equal
+/// stretches of the range, so a change of cadence partway through counts
+/// (`?1` the collar, `?2` fixes a stretch, then each stretch's from and to),
+/// read from the `(collar_id, t)` index alone. The typical gap is its
+/// cadence; a day of them would read 17,280 entries a collar. Also gives
+/// how many fixes were read, to weigh the gaps against the cold days'.
+pub fn health_gaps_sql() -> String {
+    let chunk = |i: usize| {
+        format!(
+            "SELECT t - pt AS d FROM (SELECT t, LAG(t) OVER (ORDER BY t) AS pt FROM (SELECT t FROM fixes WHERE collar_id = ?1 AND t >= ?{} AND t < ?{} ORDER BY t LIMIT ?2))",
+            3 + 2 * i,
+            4 + 2 * i
+        )
+    };
+    let all: Vec<String> = (0..CADENCE_CHUNKS).map(chunk).collect();
+    format!("SELECT MAX(1, CAST(ROUND(d / 1000.0) AS INTEGER)) AS g, COUNT(*) FROM ({}) WHERE d > 0 GROUP BY g", all.join(" UNION ALL "))
+}
 pub const CADENCE_FIXES: i64 = 2_000;
+pub const CADENCE_CHUNKS: usize = 8;
 
 fn mean((sum, n): (f64, i64)) -> Option<f64> {
     (n > 0).then(|| sum / n as f64)
@@ -449,7 +462,8 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
         ids.iter().map(|id| (id.clone(), ((0..n_buckets).map(|_| HealthAcc::default()).collect(), HealthAcc::default(), Cadence::default()))).collect();
     let scope = Scope { collar_ids: Some(ids.clone()), herd_id: None };
     // Parquet days row by row; per collar in time order is all it needs.
-    for_each(scan_in(ctx, "fixes", range, scope.clone(), Source::Cold, Order::Time), |b| {
+    let (cold, read) = scan_cold(ctx, "fixes", range, scope.clone(), Order::Time);
+    for_each(cold, |b| {
         each_fix(b, |f| {
             let Some((buckets, total, cadence)) = per.get_mut(f.collar_id) else { return };
             cadence.push(f.t);
@@ -474,12 +488,9 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
         })
     })
     .await?;
-    // @L: the hot fixes summed in SQLite, leaving out rows the rollup has put in a file.
+    // @L: the hot fixes summed in SQLite, leaving out the rows of the files just read.
+    let rolled = read.await.unwrap_or_default();
     if !ids.is_empty() {
-        let rolled = {
-            let (dir, r) = (ctx.data_dir().to_path_buf(), range);
-            tokio::task::spawn_blocking(move || crate::telemetry::rolled_days(&dir, "fixes", Some(&r))).await??
-        };
         let rolled: Vec<_> = rolled.into_iter().filter(|r| r.from < to && r.to > from).collect();
         let sql = health_hot_sql(ids.len(), rolled.len());
         let mut q = sqlx::query(&sql).bind(first).bind(bucket).bind(from).bind(to);
@@ -489,11 +500,13 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
         for r in &rolled {
             q = q.bind(r.from).bind(r.to).bind(r.max_id);
         }
+        let mut hot_n: HashMap<String, i64> = HashMap::new();
         for row in q.fetch_all(ctx.db()).await? {
             let collar: String = row.try_get(0)?;
             let Some((buckets, total, _)) = per.get_mut(&collar) else { continue };
             let b = (row.try_get::<i64, _>(1)?.max(0) as usize).min(n_buckets - 1);
             let n: i64 = row.try_get(3)?;
+            *hot_n.entry(collar.clone()).or_default() += n;
             let acc: Option<f64> = row.try_get(2)?;
             let sums = |i: usize| -> anyhow::Result<(f64, i64)> { Ok((row.try_get::<Option<f64>, _>(i)?.unwrap_or(0.0), row.try_get::<i64, _>(i + 1)?)) };
             let (sats, cn0, ttf) = (sums(4)?, sums(6)?, sums(8)?);
@@ -508,22 +521,33 @@ pub async fn collar_health(ctx: &Ctx, range: TimeRange, bucket: i64, list: Vec<C
                 }
             }
         }
-        // Cadence only matters when the collar's isn't configured, and cold days already gave some.
+        // Cadence only matters when the collar's isn't configured. The hot
+        // gaps are a sample spread over the hot part, each counted for as
+        // many of its hot fixes as it stands for, beside every cold gap.
+        let hot_from = rolled.iter().map(|r| r.to).max().unwrap_or(from).clamp(from, to);
         let want: Vec<String> =
-            list.iter().filter(|c| c.cadence_s.is_none()).map(|c| c.id.clone()).filter(|id| per.get(id).is_some_and(|p| p.2.median_s().is_none())).collect();
+            list.iter().filter(|c| c.cadence_s.is_none()).map(|c| c.id.clone()).filter(|id| hot_n.get(id).is_some_and(|n| *n > 1)).collect();
+        let sql = health_gaps_sql();
+        let chunks = CADENCE_CHUNKS as i64;
+        let step = ((to - hot_from).max(1) + chunks - 1) / chunks;
         let reads = want.into_iter().map(|collar| {
-            let ctx = ctx.clone();
+            let (ctx, sql) = (ctx.clone(), sql.clone());
             async move {
-                let rows: Vec<(i64, i64)> = sqlx::query_as(HEALTH_GAPS_SQL).bind(&collar).bind(from).bind(to).bind(CADENCE_FIXES).fetch_all(ctx.db()).await?;
+                let mut q = sqlx::query_as::<_, (i64, i64)>(&sql).bind(collar.clone()).bind(CADENCE_FIXES / chunks);
+                for i in 0..chunks {
+                    q = q.bind(hot_from + i * step).bind((hot_from + (i + 1) * step).min(to));
+                }
+                let rows = q.fetch_all(ctx.db()).await?;
                 anyhow::Ok((collar, rows))
             }
         });
         let gaps: Vec<(String, Vec<(i64, i64)>)> = futures::stream::iter(reads).buffer_unordered(PARALLEL_READS).try_collect().await?;
         for (collar, rows) in gaps {
-            if let Some((_, _, cadence)) = per.get_mut(&collar) {
-                for (g, n) in rows {
-                    cadence.add_gaps(g, n as u64);
-                }
+            let sampled: i64 = rows.iter().map(|r| r.1).sum();
+            let (Some((_, _, cadence)), Some(n)) = (per.get_mut(&collar), hot_n.get(&collar)) else { continue };
+            let weight = (*n - 1).max(1) as f64 / sampled.max(1) as f64;
+            for (g, k) in rows {
+                cadence.add_gaps(g, (k as f64 * weight).round().max(1.0) as u64);
             }
         }
     }
@@ -821,7 +845,9 @@ pub async fn animal_behaviour(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -
     };
     let hot_from = cold.iter().map(|r| r.to).max().unwrap_or(from).clamp(from, to);
     let cold_range = TimeRange::new(range.from, op_core::time::from_unix_ms(hot_from));
-    for_each(scan_in(ctx, "fixes", cold_range, scope.clone(), Source::Cold, Order::Collar), |b| {
+    // Those days' files, then what SQLite holds for them beyond the files (a
+    // late fix stored after its day was rolled, until the next rollup).
+    for_each(scan_in(ctx, "fixes", cold_range, scope.clone(), Source::All, Order::Time), |b| {
         each_fix(b, |f| {
             if !per.contains_key(f.collar_id) {
                 per.insert(f.collar_id.to_owned(), CollarBehaviour::default());
@@ -968,11 +994,15 @@ pub fn hot_counts_sql(herd: bool) -> String {
     format!("SELECT collar_id, COUNT(*) FROM fixes WHERE t >= ? AND t < ?{herd_filter} GROUP BY collar_id")
 }
 
-/// The animal a collar's newest fixes in `[?3, ?2)` name (`?1` collar, `?4`
-/// herd or NULL): the newest of its last 200 that names one, so a collar
-/// with no animal costs 200 rows, not its day.
+/// The animal a collar's fixes in `[?3, ?2)` name (`?1` collar, `?4` herd
+/// or NULL): the newest of its last 200 that names one, else of its first
+/// 200 (an animal's collar taken off partway through keeps reporting with
+/// none, and the stretch before is still that animal's), so a collar with
+/// no animal costs 400 rows, not its day.
 pub const HOT_ANIMAL_SQL: &str = "SELECT animal_id FROM (
-         SELECT animal_id, t, id FROM fixes WHERE collar_id = ?1 AND t >= ?3 AND t < ?2 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t DESC, id DESC LIMIT 200
+         SELECT * FROM (SELECT animal_id, t, id FROM fixes WHERE collar_id = ?1 AND t >= ?3 AND t < ?2 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t DESC, id DESC LIMIT 200)
+         UNION ALL
+         SELECT * FROM (SELECT animal_id, t, id FROM fixes WHERE collar_id = ?1 AND t >= ?3 AND t < ?2 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t, id LIMIT 200)
      ) WHERE animal_id IS NOT NULL ORDER BY t DESC, id DESC LIMIT 1";
 
 /// A collar's first fix in each of `?5 + 1` buckets of `?4` ms from `?3`
@@ -1068,19 +1098,26 @@ pub async fn heat_points(ctx: &Ctx, range: TimeRange, herd: Option<&str>, collar
     let scope = Scope { collar_ids: collar.map(|c| vec![c.to_owned()]), herd_id: herd.map(str::to_owned) };
     let mut grid: Option<Grid> = origin.map(|o| Grid::new(o, cell_m));
     // @L: with the farm's centre known, the hot fixes are counted per cell in SQLite (below).
-    let source = if origin.is_some() { Source::Cold } else { Source::All };
-    for_each(scan_in(ctx, "fixes", range, scope, source, Order::Time), |b| {
+    let (rx, read) = match origin {
+        Some(_) => {
+            let (rx, read) = scan_cold(ctx, "fixes", range, scope, Order::Time);
+            (rx, Some(read))
+        }
+        None => (scan_in(ctx, "fixes", range, scope, Source::All, Order::Time), None),
+    };
+    for_each(rx, |b| {
         each_fix(b, |f| {
             grid.get_or_insert_with(|| Grid::new([f.lon, f.lat], cell_m)).add([f.lon, f.lat], 1.0);
         })
     })
     .await?;
-    if let (Some(o), Some(g)) = (origin, grid.as_mut()) {
+    let rolled = match read {
+        Some(read) => read.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if let Some(o) = origin {
+        let g = grid.get_or_insert_with(|| Grid::new(o, cell_m));
         let (from, to) = (range.from_ms(), range.to_ms());
-        let rolled = {
-            let (dir, r) = (ctx.data_dir().to_path_buf(), range);
-            tokio::task::spawn_blocking(move || crate::telemetry::rolled_days(&dir, "fixes", Some(&r))).await??
-        };
         let rolled: Vec<_> = rolled.into_iter().filter(|r| r.from < to && r.to > from).collect();
         let p = op_geo::Projection::new(o);
         let sql = heat_hot_sql(herd.is_some(), collar.is_some(), rolled.len());
@@ -1301,12 +1338,14 @@ pub fn hot_dwell_sql(herd: bool) -> String {
 
 /// Dwell per (day, herd, collar, paddock) of the hot fixes in `[from, end)`,
 /// summed in SQLite in one pass: a day of 250 collars is never decoded row
-/// by row.
+/// by row. The rows are folded in as they stream: fixes with no stored
+/// paddock (none drawn yet, a lane, paddocks imported again with new ids)
+/// come one per fix, 4.3 M a day at 250 collars, and are never all held.
 pub async fn hot_dwell(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
     let sql = hot_dwell_sql(herd.is_some());
-    let rows = sqlx::query(&sql).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS).fetch_all(ctx.db()).await?;
+    let mut rows = sqlx::query(&sql).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS).fetch(ctx.db());
     let mut out: HashMap<DwellKey, DwellAgg> = HashMap::new();
-    for r in rows {
+    while let Some(r) = rows.try_next().await? {
         let pad: Option<String> = r.try_get("pad")?;
         let paddock = match pad {
             Some(p) => p,

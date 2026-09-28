@@ -90,8 +90,15 @@ pub async fn resolve_herd(ctx: &Ctx, herd_id: Option<&str>) -> ApiResult<Herd> {
     }
 }
 
-/// The brief for one herd at `now`.
+/// The brief for one herd at `now`, for someone who answers decisions.
 pub async fn brief(ctx: &Ctx, herd: &Herd, now: DateTime<Utc>) -> anyhow::Result<Brief> {
+    brief_for(ctx, herd, now, true).await
+}
+
+/// [`brief`]; `answers`: whether its reader answers decisions (managers and
+/// up). For anyone else a proposed decision reads as where it stands ("Sends
+/// 07:40.", "Waiting for an answer.") without asking for a Y or N.
+pub async fn brief_for(ctx: &Ctx, herd: &Herd, now: DateTime<Utc>, answers: bool) -> anyhow::Result<Brief> {
     let settings = ctx.settings().await?;
     let fmt = Fmt::new(settings.units);
     let tz: chrono_tz::Tz = ctx.store().get_farm().await?.and_then(|f| f.timezone.parse().ok()).unwrap_or(chrono_tz::UTC);
@@ -112,7 +119,7 @@ pub async fn brief(ctx: &Ctx, herd: &Herd, now: DateTime<Utc>) -> anyhow::Result
         }
         Some(d) => {
             lines.push(Line::keep(call(d, herd, &herd_name, &paddocks, &fmt)));
-            if let Some(s) = standing(ctx, d, &collars, &fmt, tz, now).await? {
+            if let Some(s) = standing(ctx, d, &collars, &fmt, tz, now, answers).await? {
                 lines.push(Line::keep(s));
             }
             // The reasons and the check argued for the call as proposed; once the
@@ -215,11 +222,21 @@ fn call(d: &Decision, herd: &Herd, herd_name: &str, paddocks: &[Paddock], fmt: &
 }
 
 /// Where the decision stands, when there is something to say.
-async fn standing(ctx: &Ctx, d: &Decision, collars: &[Collar], fmt: &Fmt, tz: chrono_tz::Tz, now: DateTime<Utc>) -> anyhow::Result<Option<String>> {
+async fn standing(
+    ctx: &Ctx,
+    d: &Decision,
+    collars: &[Collar],
+    fmt: &Fmt,
+    tz: chrono_tz::Tz,
+    now: DateTime<Utc>,
+    answers: bool,
+) -> anyhow::Result<Option<String>> {
     Ok(match d.status {
-        DecisionStatus::Proposed if sends(d) => Some(match d.apply_at {
-            Some(at) => format!("Sends {} unless you reply N.", clock(at, tz, now)),
-            None => "Reply Y or N.".into(),
+        DecisionStatus::Proposed if sends(d) => Some(match (d.apply_at, answers) {
+            (Some(at), true) => format!("Sends {} unless you reply N.", clock(at, tz, now)),
+            (Some(at), false) => format!("Sends {}.", clock(at, tz, now)),
+            (None, true) => "Reply Y or N.".into(),
+            (None, false) => "Waiting for an answer.".into(),
         }),
         DecisionStatus::Approved if sends(d) => Some("Approved, sending.".into()),
         DecisionStatus::Approved => Some("Approved.".into()),

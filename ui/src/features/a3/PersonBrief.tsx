@@ -13,8 +13,9 @@ export function PersonBrief({ user }: { user: User }) {
   const t = useTexting();
   const c = useChannels();
   const [err, setErr] = useState<string>();
-  if (!t || !c || !reachable(user, briefChannels(c))) return null;
+  if (!t || !c) return null;
   const p = personOf(t, user.id);
+  if (!reachable(user, briefChannels(c), p.push)) return null;
   const flip = async (on: boolean) => {
     setErr(undefined);
     try {

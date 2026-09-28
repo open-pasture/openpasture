@@ -601,6 +601,35 @@ async fn a_boundary_over_a_paddock_with_a_pond_in_the_middle_moves_the_herd_ther
     assert_eq!(h["paddock_id"], pad["id"], "and the herd is in it on the record");
 }
 
+/// A boundary over two paddocks: the herd is on the record in the one that
+/// holds most of it, and in the one it stands in when they hold it evenly
+/// (the herd still grazes it; its stay doesn't end and it doesn't rest).
+#[tokio::test]
+async fn a_boundary_over_two_paddocks_keeps_the_herd_where_most_of_it_is() {
+    let app = App::new().await;
+    let herd = app.herd().await;
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    let north = h["paddock_id"].as_str().unwrap().to_owned();
+    let (_, east) = app.call("POST", "/api/paddocks", Some(json!({"name": "East", "geometry": square(0.001)}))).await;
+    let east = east["id"].as_str().unwrap().to_owned();
+    let rect = |w: f64, e: f64| json!({"type": "Polygon", "coordinates": [[[w, 38.1245], [e, 38.1245], [e, 38.1255], [w, 38.1255], [w, 38.1245]]]});
+    // North and East together, half each.
+    let (s, mv) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(-92.4055, -92.4035)}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{mv}");
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    assert_eq!(h["paddock_id"], north.as_str(), "still grazing North");
+    let (_, p) = app.call("GET", &format!("/api/paddocks/{north}"), None).await;
+    assert_ne!(p["status"], "resting");
+    assert!(p["grazed_until"].is_null(), "{p}");
+    // Mostly East now: the herd is in East, North rests.
+    let (s, _) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": rect(-92.4047, -92.4035)}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    assert_eq!(h["paddock_id"], east.as_str());
+    let (_, p) = app.call("GET", &format!("/api/paddocks/{north}"), None).await;
+    assert_eq!(p["status"], "resting");
+}
+
 /// 12 collars reporting while boundaries go out: nothing fails with
 /// "database is locked" and versions stay one sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -808,6 +837,54 @@ async fn a_straggler_is_dropped_and_left_behind() {
     let st = app.active(&herd).await;
     assert!(!poly(&st["active"]["geometry"]).contains(m_at(30.0, 25.0)));
     assert_eq!(st["move"]["stragglers"], json!([collars[0].0]));
+}
+
+/// A herd of legacy collars (one ring of at most 64 corners, no holes) and
+/// one that holds holes, so the herd's steps are planned for V0's 128
+/// corners. Every animal must still be inside the fence each collar
+/// downloads, not only inside the stored step: fitting a many-cornered
+/// followed edge down to 64 cuts the apex corners behind single animals.
+#[tokio::test]
+async fn every_animal_keeps_its_room_in_the_fence_each_collar_downloads_for_a_sweep_step() {
+    let app = App::new().await;
+    let (_, _) = app.call("POST", "/api/farm", Some(json!({"name": "Home", "center": MID}))).await;
+    let (_, pad) = app.call("POST", "/api/paddocks", Some(json!({"name": "Big", "geometry": m_rect(0.0, 0.0, 600.0, 600.0)}))).await;
+    let (_, herd) = app.call("POST", "/api/herds", Some(json!({"name": "Cows", "species": "cattle", "count": 49, "paddock_id": pad["id"]}))).await;
+    let herd = herd["id"].as_str().unwrap().to_owned();
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 600.0, 600.0)}))).await;
+    // One collar that holds holes, at the front.
+    let (_, v0_key) = app.device(&herd).await;
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let body = json!({"device": {"fw": "0.2.0", "caps": ["holes", "slots", "collar_id", "cue_mode", "episodes", "config"]},
+        "fixes": [{"at": at, "point": m_at(260.0, 260.0), "accuracy_m": 2.0, "sats": 9}]});
+    let (s, v) = app.req("POST", "/collar/v1/report", Some(&v0_key), Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // 48 legacy collars in a line across the back, 12 m apart: each is its own corner of the edge.
+    let mut points = vec![m_at(260.0, 260.0)];
+    let mut legacy = Vec::new();
+    for i in 0..48 {
+        let t = i as f64 / 47.0;
+        let p = m_at(10.0 + 410.0 * t, 420.0 - 410.0 * t);
+        let (_, key) = app.device(&herd).await;
+        app.fix(&key, p, chrono::Utc::now()).await;
+        points.push(p);
+        legacy.push(key);
+    }
+    let (s, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(500.0, 500.0, 600.0, 600.0)}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{m}");
+    assert_eq!(m["status"], "sweeping");
+    for key in [&v0_key, &legacy[0]] {
+        let (s, cmd) = app.req("GET", "/collar/v1/boundary", Some(key), None).await;
+        assert_eq!(s, StatusCode::OK, "{cmd}");
+        let ring: Vec<[f64; 2]> = serde_json::from_value(cmd["boundary"].clone()).unwrap();
+        let fence = op_geo::Polygon::from_ring(ring);
+        // The room the plan gives each animal: half its warning band, less a quarter metre.
+        let need = 0.5 * cmd["warn_m"].as_f64().unwrap() - 0.25;
+        let pr = op_geo::Projection::new(MID);
+        let edge = pr.forward_ring(&fence.outer_ring());
+        let short = points.iter().filter(|p| op_ingest::planner::signed_distance(pr.forward(**p), &edge) < need).count();
+        assert_eq!(short, 0, "{short} animals without their room in the {}-corner fence a collar downloads", cmd["boundary"].as_array().unwrap().len());
+    }
 }
 
 #[tokio::test]

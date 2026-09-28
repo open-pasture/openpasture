@@ -15,7 +15,7 @@ import { collarLabels, store, useStore } from "../../store";
 import { picked, sheet, you } from "../../store/m";
 import { useUnits } from "../../units";
 import { pageHash, pageKeys } from "../k-animals/herd";
-import { walkLine } from "./geo";
+import { afterLocateError, walkLine } from "./geo";
 import { useTouchUI } from "./phone";
 
 const SRC = "m-you";
@@ -72,12 +72,14 @@ export function toggleYou(map: MLMap, ctx: OverlayCtx) {
       map.fitBounds([[Math.min(...lon), Math.min(...lat)], [Math.max(...lon), Math.max(...lat)]], { padding: { top: 90, left: 50, right: 50, bottom: 150 }, maxZoom: 18, duration: 700 });
     },
     (e) => {
-      if (watchId !== undefined) navigator.geolocation.clearWatch(watchId);
-      watchId = undefined;
-      you.set({ on: false, error: e.code === e.PERMISSION_DENIED ? "Location is off for this site." : "Can't find where you are." });
-      setTimeout(() => you.get().error && you.set({ on: false }), 5000);
+      const { next, stop } = afterLocateError(you.get(), e.code);
+      if (stop && watchId !== undefined) navigator.geolocation.clearWatch(watchId);
+      if (stop) watchId = undefined;
+      you.set(next);
+      setTimeout(() => you.get().error && you.set({ ...you.get(), error: undefined }), 5000);
     },
-    { enableHighAccuracy: true, maximumAge: 5000, timeout: 30_000 },
+    // No timeout: a watch waits for the next fix however long it takes.
+    { enableHighAccuracy: true, maximumAge: 5000 },
   );
 }
 

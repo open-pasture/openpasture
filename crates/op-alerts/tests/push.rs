@@ -114,10 +114,16 @@ async fn take(State(s): State<Service>, Path(n): Path<String>, headers: HeaderMa
     (StatusCode::from_u16(code).unwrap(), [("location", format!("/m/{n}"))], "")
 }
 
+/// Where a push service's redirect points: the server must never follow one.
+async fn redirected(State(s): State<Service>, Path(n): Path<String>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+    s.got.lock().unwrap().push(Push { path: format!("/m/{n}"), headers, body });
+    StatusCode::OK
+}
+
 impl Service {
     async fn start() -> Self {
         let mut s = Service { answer: Arc::new(Mutex::new(201)), ..Default::default() };
-        let app = Router::new().route("/push/{n}", axum::routing::post(take)).with_state(s.clone());
+        let app = Router::new().route("/push/{n}", axum::routing::post(take)).route("/m/{n}", axum::routing::any(redirected)).with_state(s.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         s.url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -417,7 +423,13 @@ async fn the_morning_brief_goes_by_push_without_its_texting_line() {
     let svc = Service::start().await;
     let mia = f.person("Mia", Role::Manager, None, false, None).await;
     let b = Browser::new();
+    let (_, v) = f.owner("GET", "/api/texting", None).await;
+    let row = |v: &Value| v["people"].as_array().unwrap().iter().find(|p| p["user_id"] == mia.as_str()).cloned().unwrap();
+    assert_eq!(row(&v)["push"], json!(false));
     subscribe(&f, &mia, Role::Manager, &b, &svc.endpoint(5)).await;
+    // Settings can offer her the brief: a browser of hers takes notifications.
+    let (_, v) = f.owner("GET", "/api/texting", None).await;
+    assert_eq!(row(&v)["push"], json!(true));
     f.ctx.store().set_setting_json("texting", &json!({"brief": {"enabled": true, "time": "07:00"}})).await.unwrap();
     op_alerts::brief_send::set_brief(&f.ctx, &mia, true).await.unwrap();
     f.decision("MOVE", "proposed", t0() - mins(5), None).await;
@@ -455,4 +467,105 @@ async fn push_settings_are_the_owners_and_new_keys_drop_every_browser() {
     assert_eq!(left, 0, "browsers subscribed with the old key must subscribe again");
     let (s, _) = f.owner("PUT", "/api/push/settings", Some(json!({"colour": "red"}))).await;
     assert_ne!(s, StatusCode::OK);
+}
+
+/// A push service that answers with a redirect (to the farm's own API, say,
+/// which trusts requests from this machine) is not followed: the message
+/// fails and nothing is sent where the redirect points.
+#[tokio::test]
+async fn a_push_service_redirect_is_never_followed() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let sub = subscribe(&f, &mia, Role::Manager, &Browser::new(), &svc.endpoint(3)).await;
+    for code in [307, 308, 303, 302] {
+        svc.answer(code);
+        let (_, v) = f.api(me(Role::Manager, &mia), "POST", &format!("/api/push/subscriptions/{sub}/test"), None).await;
+        assert_eq!(v["ok"], json!(false), "{code}: {v}");
+        let paths: Vec<String> = svc.got().iter().map(|p| p.path.clone()).collect();
+        assert!(paths.iter().all(|p| p.starts_with("/push/")), "{code}: followed to {paths:?}");
+    }
+}
+
+/// Someone signed in from elsewhere can't point a subscription at this
+/// server, the farm's network or another port than a push service's.
+#[tokio::test]
+async fn a_remote_subscription_must_be_a_public_push_service() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let remote = Identity { role: Role::Viewer, user_id: Some(mia.clone()), name: None, via: Via::UserToken };
+    for endpoint in [
+        "https://127.0.0.1/x",
+        "https://localhost/x",
+        "https://10.0.0.5/x",
+        "https://192.168.1.20/x",
+        "https://169.254.169.254/latest",
+        "https://[::1]/x",
+        "https://fcm.googleapis.com:7878/fcm/send/x",
+    ] {
+        let (s, v) = f.api(remote.clone(), "POST", "/api/push/subscriptions", Some(Browser::new().subscription(endpoint))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{endpoint}: {v}");
+    }
+}
+
+/// Signing out takes alerts off the browser that signed out; signing a
+/// person out everywhere takes them off every browser of theirs. A lost
+/// phone stops showing the farm's alerts on its lock screen.
+#[tokio::test]
+async fn signing_out_stops_that_browsers_notifications() {
+    use op_core::people::{self, NewInvite, SessionToken};
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let owner = Identity::owner(Via::Local);
+    let mut sessions = Vec::new();
+    for n in 0..3 {
+        let (_, code) = people::create_invite(&f.ctx, NewInvite { user_id: Some(mia.clone()), ..Default::default() }, &owner.actor()).await.unwrap();
+        let token = people::accept_invite(&f.ctx, &code, None).await.unwrap().token;
+        let session = people::session_for_token(&f.ctx, &token).await.unwrap().unwrap();
+        // Her browsers on this machine (this test's push service is plain http).
+        let id = Identity { via: Via::Local, ..session.identity.clone() };
+        let router = op_core::with_identity(op_alerts::router().merge(op_core::router()).layer(axum::Extension(SessionToken(session.token_id.clone()))), id)
+            .with_state(f.ctx.clone());
+        let (s, v) = call(router.clone(), "POST", "/api/push/subscriptions", Some(Browser::new().subscription(&svc.endpoint(20 + n)))).await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        sessions.push(router);
+    }
+    let count = || async { sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_subscriptions").fetch_one(f.ctx.db()).await.unwrap() };
+    assert_eq!(count().await, 3);
+    let (s, _) = call(sessions[0].clone(), "POST", "/api/me/signout", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(count().await, 2, "the browser that signed out takes no more alerts");
+    people::revoke_sign_in(&f.ctx, &mia).await.unwrap();
+    assert_eq!(count().await, 0, "signed out everywhere: no browser of hers takes alerts");
+}
+
+/// A person whose alerts are limited to herds, one since deleted: turning
+/// alerts on in a browser still adds push to their channels (it failed
+/// after storing the subscription, leaving the box ticked with no pushes),
+/// and deleting a herd takes it out of everyone's list.
+#[tokio::test]
+async fn turning_alerts_on_adds_push_even_with_a_deleted_herd_in_the_prefs() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let (_, h) = f.core("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 12, "paddock_id": f.paddocks[0]}))).await;
+    let heifers = h["id"].as_str().unwrap().to_owned();
+    f.prefs(&mia, json!({ "herds": [f.herd, heifers] })).await;
+    // Deleted the old way, leaving its id behind in her prefs.
+    sqlx::query("DELETE FROM herds WHERE id = ?").bind(&heifers).execute(f.ctx.db()).await.unwrap();
+    subscribe(&f, &mia, Role::Manager, &Browser::new(), &svc.endpoint(30)).await;
+    let (prefs, _) = op_alerts::routing::prefs::get(&f.ctx, &mia).await.unwrap();
+    assert!(prefs.channels.contains(&"push".to_owned()), "{:?}", prefs.channels);
+    // Deleting a herd now takes it out of the prefs that name it.
+    let (_, h) = f.core("POST", "/api/herds", Some(json!({"name": "Bulls", "species": "cattle", "count": 3, "paddock_id": f.paddocks[0]}))).await;
+    let bulls = h["id"].as_str().unwrap().to_owned();
+    f.exec(&format!("UPDATE alert_prefs SET herds = '[\"{}\", \"{bulls}\"]' WHERE user_id = '{mia}'", f.herd)).await;
+    assert!(f.ctx.store().delete_herd(&bulls).await.unwrap());
+    let (prefs, _) = op_alerts::routing::prefs::get(&f.ctx, &mia).await.unwrap();
+    assert_eq!(prefs.herds, Some(vec![f.herd.clone()]));
 }

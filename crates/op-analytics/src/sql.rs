@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::range::TimeRange;
 use crate::schema::{BatchBuilder, SQL_TABLES, TableSchema, cell_json, is_telemetry, table_schema};
-use crate::telemetry::{BATCH_ROWS, Rolled, cold_files, not_rolled_sql};
+use crate::telemetry::{BATCH_ROWS, Rolled, not_rolled_sql};
 
 /// Most rows a query returns.
 pub const MAX_ROWS: usize = 10_000;
@@ -124,18 +124,18 @@ pub async fn provider(ctx: &Ctx, session: &SessionContext, table: &str, range: O
     let schema = table_schema(ctx.db(), table).await?;
     let cap = if is_telemetry(table) { HOT_CAP } else { RECORD_CAP };
     // @L: rows the rollup has written to a day's file and not yet deleted are read from the file only.
-    let rolled = if is_telemetry(table) {
+    let (files, rolled) = if is_telemetry(table) {
         let (dir, t, r) = (ctx.data_dir().to_path_buf(), table.to_owned(), range.copied());
-        tokio::task::spawn_blocking(move || crate::telemetry::rolled_days(&dir, &t, r.as_ref())).await.map_err(anyhow::Error::from)??
+        let (files, rolled) = tokio::task::spawn_blocking(move || crate::telemetry::day_files(&dir, &t, r.as_ref())).await.map_err(anyhow::Error::from)??;
+        (files, crate::telemetry::live(ctx, table, rolled).await?)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let (batches, cut) = load_sqlite(ctx, &schema, range, cap, &rolled).await?;
     let hot: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema.arrow.clone(), vec![batches]).map_err(df_err)?);
     if !is_telemetry(table) {
         return Ok((hot, cut));
     }
-    let files = cold_files(ctx.data_dir(), table, range);
     if files.is_empty() {
         return Ok((hot, cut));
     }

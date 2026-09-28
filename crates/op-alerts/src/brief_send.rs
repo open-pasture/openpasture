@@ -85,9 +85,13 @@ pub async fn run_once(ctx: &Ctx, at: DateTime<Utc>) -> anyhow::Result<Vec<Messag
 async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<MessageLog>> {
     let configured = crate::notify::alert_channels(ctx).await?;
     let herds: Vec<Herd> = ctx.store().list_herds().await?;
-    let mut briefs: Vec<(String, String, Option<String>)> = Vec::new();
+    // Per herd: the text for those who answer decisions (with the decision it asks about), and for
+    // everyone else (asking nothing: only managers and up answer).
+    let mut briefs: Vec<(String, String, Option<String>, String)> = Vec::new();
     for h in &herds {
-        briefs.push((h.id.clone(), op_engine::brief::brief(ctx, h, at).await?.text, asks_about(ctx, h, at).await?));
+        let asking = op_engine::brief::brief_for(ctx, h, at, true).await?.text;
+        let telling = op_engine::brief::brief_for(ctx, h, at, false).await?.text;
+        briefs.push((h.id.clone(), asking, asks_about(ctx, h, at).await?, telling));
     }
     let mut out = Vec::new();
     for p in routing::people(ctx).await? {
@@ -95,7 +99,9 @@ async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<Mes
             continue;
         }
         let ways = routing::deliveries(&p, &configured);
-        for (herd_id, text, decision_id) in &briefs {
+        let answers = p.user.role >= op_core::Role::Manager;
+        for (herd_id, asking, decision_id, telling) in &briefs {
+            let (text, decision_id) = if answers { (asking, decision_id.clone()) } else { (telling, None) };
             if p.prefs.herds.as_ref().is_some_and(|hs| !hs.contains(herd_id)) {
                 continue;
             }

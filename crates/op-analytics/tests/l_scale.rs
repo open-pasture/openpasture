@@ -120,3 +120,97 @@ async fn scans_by_time_read_the_time_indexes_without_a_sort() {
         assert!(!plan.contains("TEMP B-TREE") && !plan.contains("SCAN fixes"), "{plan}");
     }
 }
+
+/// A fix a day for about three years, rolled into a Parquet file a day, and
+/// today's in SQLite: the SQL console, scans, health and the heatmap still
+/// answer (one filter term a rolled day ran past SQLite's 1000-deep
+/// expression limit).
+#[tokio::test]
+async fn years_of_rolled_days_leave_every_read_working() {
+    let (_d, ctx) = ctx().await;
+    let now = time::now();
+    let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let days = 1_100;
+    fill(&ctx, 1, today - days * DAY_MS + 3_600_000, DAY_MS, days).await;
+    let rolled = op_analytics::rollup::rollup(&ctx, 3, now).await.unwrap();
+    assert!(rolled.iter().filter(|r| r.table == "fixes").count() >= 1_000, "{} days rolled", rolled.len());
+    let r = op_analytics::sql::run(&ctx, "SELECT COUNT(*) AS n FROM fixes", 10).await.unwrap();
+    assert_eq!(r.rows[0][0], serde_json::json!(days));
+    let range = TimeRange::new(time::from_unix_ms(today - days * DAY_MS), now);
+    assert_eq!(scanned(&ctx, range, Order::Time).await.len() as i64, days);
+    let heat = op_analytics::routes::heat_points(&ctx, range, None, None, 10.0, false).await.unwrap();
+    assert_eq!(heat.iter().map(|p| p[2]).sum::<f64>() as i64, days);
+    // The SQL console's filter only names the days that can still have rows in SQLite.
+    let rolled = op_analytics::telemetry::rolled_days(ctx.data_dir(), "fixes", None).unwrap();
+    assert!(op_analytics::telemetry::live(&ctx, "fixes", rolled).await.unwrap().len() <= 1);
+}
+
+/// A fix stored after its day went to Parquet is in SQLite only until the
+/// next rollup: behaviour counts it, as the scans do.
+#[tokio::test]
+async fn behaviour_counts_a_late_fix_for_a_day_already_in_parquet() {
+    let (_d, ctx) = ctx().await;
+    let now = time::now();
+    let day = (now - chrono::Duration::days(5)).date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    fill(&ctx, 3, day + 3_600_000, 60_000, 100).await;
+    op_analytics::rollup::rollup(&ctx, 3, now).await.unwrap();
+    sqlx::query("INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, sats) VALUES ('col_0', 'herd_1', 'x', ?, -93.62, 42.03, 3.0, 9)")
+        .bind(day + 20 * 3_600_000)
+        .execute(ctx.db())
+        .await
+        .unwrap();
+    let range = TimeRange::new(time::from_unix_ms(day), time::from_unix_ms(day + DAY_MS));
+    assert_eq!(scanned(&ctx, range, Order::Time).await.len(), 301);
+    let b = op_analytics::routes::animal_behaviour(&ctx, range, None).await.unwrap();
+    assert_eq!(b.iter().map(|a| a.fixes).sum::<i64>(), 301, "behaviour counts the late fix too");
+}
+
+/// A collar with no configured cadence that reported a fix a minute on the
+/// older days (in Parquet now) and every 5 s for the last day and a half:
+/// most of its gaps are 5 s, so that is its cadence, not the cold days'.
+#[tokio::test]
+async fn health_cadence_counts_the_hot_fixes_too() {
+    let (_d, ctx) = ctx().await;
+    let now = time::now();
+    let ms = now.timestamp_millis();
+    let day = (now - chrono::Duration::days(6)).date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    fill(&ctx, 1, day, 60_000, 3 * 1_440).await;
+    op_analytics::rollup::rollup(&ctx, 3, now).await.unwrap();
+    fill(&ctx, 1, ms - 36 * 3_600_000, 5_000, 36 * 720).await;
+    let info = op_analytics::routes::CollarInfo {
+        id: "col_0".into(),
+        name: "c0".into(),
+        herd_id: "herd_1".into(),
+        animal_id: None,
+        battery: None,
+        boundary_version: None,
+        created_ms: None,
+        cadence_s: None,
+    };
+    let range = TimeRange::new(now - chrono::Duration::days(7), now);
+    let h = op_analytics::routes::collar_health(&ctx, range, 6 * 3_600_000, vec![info]).await.unwrap();
+    assert_eq!(h[0].cadence_s, Some(5.0));
+}
+
+#[tokio::test]
+async fn health_cadence_reads_the_collar_index_alone() {
+    let (_d, ctx) = ctx().await;
+    let sql = op_analytics::routes::health_gaps_sql();
+    let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(ctx.db()).await.unwrap().iter().map(|r| r.get("detail")).collect();
+    let plan = plan.join(" | ");
+    assert!(plan.contains("COVERING INDEX fixes_collar_t") && !plan.contains("SCAN fixes"), "{plan}");
+}
+
+/// An animal's collar taken off partway through the day keeps reporting with
+/// no animal: the day it tracked the animal is still that animal's.
+#[tokio::test]
+async fn behaviour_keeps_the_animal_a_collar_tracked_before_it_was_unlinked() {
+    let (_d, ctx) = ctx().await;
+    let now = time::now().timestamp_millis();
+    fill(&ctx, 1, now - 6 * 3_600_000, 5_000, 4_000).await;
+    sqlx::query("UPDATE fixes SET animal_id = 'ani_a' WHERE t < ?").bind(now - 6 * 3_600_000 + 2_000 * 5_000).execute(ctx.db()).await.unwrap();
+    let range = TimeRange::new(time::from_unix_ms(now - 12 * 3_600_000), time::from_unix_ms(now));
+    let b = op_analytics::routes::animal_behaviour(&ctx, range, None).await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!((b[0].animal_id.as_deref(), b[0].fixes), (Some("ani_a"), 4_000));
+}

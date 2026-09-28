@@ -33,7 +33,7 @@ describe("the brief", () => {
   test("is offered once a channel can carry it", () => {
     expect(canBrief([])).toBe(false);
     expect(canBrief(["webhook"])).toBe(false);
-    for (const c of ["sms", "whatsapp", "email", "relay"]) expect(canBrief([c])).toBe(true);
+    for (const c of ["sms", "whatsapp", "email", "relay", "push"]) expect(canBrief([c])).toBe(true);
   });
 
   test("reaches a verified phone or an email", () => {
@@ -43,6 +43,11 @@ describe("the brief", () => {
     expect(reachable(user({ email: "cody@farm.example" }), ["email"])).toBe(true);
     expect(reachable(user({ email: "cody@farm.example" }), ["relay"])).toBe(false);
     expect(reachable(user({ email: "cody@farm.example", disabled_at: "2026-09-27T00:00:00Z" }), ["email"])).toBe(false);
+    // Reached by push only: a browser of theirs takes notifications, and push is a farm channel.
+    expect(reachable(user({}), ["push"], true)).toBe(true);
+    expect(reachable(user({}), ["push"], false)).toBe(false);
+    expect(reachable(user({}), ["sms"], true)).toBe(false);
+    expect(reachable(user({ disabled_at: "2026-09-27T00:00:00Z" }), ["push"], true)).toBe(false);
   });
 
   test("goes by WhatsApp only with an approved template", () => {
@@ -60,9 +65,9 @@ describe("the brief", () => {
   });
 
   test("a person's state is kept per person", () => {
-    expect(personOf(base, "usr_1")).toEqual({ user_id: "usr_1", brief: false, sms_opt_out: false });
-    const t = withPerson(base, { user_id: "usr_1", brief: true, sms_opt_out: false });
+    expect(personOf(base, "usr_1")).toEqual({ user_id: "usr_1", brief: false, sms_opt_out: false, push: false });
+    const t = withPerson(base, { user_id: "usr_1", brief: true, sms_opt_out: false, push: false });
     expect(personOf(t, "usr_1").brief).toBe(true);
-    expect(withPerson(t, { user_id: "usr_1", brief: false, sms_opt_out: true }).people).toEqual([{ user_id: "usr_1", brief: false, sms_opt_out: true }]);
+    expect(withPerson(t, { user_id: "usr_1", brief: false, sms_opt_out: true, push: false }).people).toEqual([{ user_id: "usr_1", brief: false, sms_opt_out: true, push: false }]);
   });
 });

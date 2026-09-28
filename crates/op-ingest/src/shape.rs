@@ -30,6 +30,9 @@ use crate::{SendOpts, margins};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prepared {
     pub geometry: Polygon,
+    /// The shape with the exclusions in effect cut out or made holes, before
+    /// it was fitted to the collars: what fitting took from it is `geometry`'s difference.
+    pub excluded: Polygon,
     pub warn_m: f64,
     pub hysteresis_m: f64,
     pub findings: Vec<Finding>,
@@ -104,7 +107,7 @@ pub async fn prepare(ctx: &Ctx, herd_id: &str, target: &Polygon, opts: &SendOpts
     // @F
     findings.extend(crate::prepare::findings(ctx, herd_id, &fitted, &excluded, &collars, at, warn_m).await?);
     crate::prepare::sort(&mut findings);
-    Ok(Prepared { geometry: fitted, warn_m, hysteresis_m, findings })
+    Ok(Prepared { geometry: fitted, excluded: excluded.shaped, warn_m, hysteresis_m, findings })
 }
 
 /// What a collar can take, from its row: no caps is a legacy collar
@@ -209,6 +212,11 @@ pub(crate) fn record_bytes(b: &Boundary, caps: &CollarCaps) -> ApiResult<usize> 
     Ok(unsigned_command(b, caps)?.record_bytes())
 }
 
+/// `g` as a collar with `limits` gets it (see [`command_for`]).
+pub(crate) fn fit_for(g: &Polygon, limits: &CollarLimits, warn_m: f64) -> Polygon {
+    shape::fit_gap(g, limits, shape::min_gap_m(warn_m) + SERVER_SLACK_M)
+}
+
 /// Stored boundaries never change, so each is fitted once per set of limits.
 type FitCache = HashMap<(String, CollarLimits), Arc<Polygon>>;
 static FITTED: LazyLock<Mutex<FitCache>> = LazyLock::new(Default::default);
@@ -219,7 +227,7 @@ fn fitted(b: &Boundary, limits: &CollarLimits) -> Arc<Polygon> {
     if let Some(p) = FITTED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return p.clone();
     }
-    let p = Arc::new(shape::fit_gap(&b.geometry, limits, shape::min_gap_m(b.warn_m) + SERVER_SLACK_M));
+    let p = Arc::new(fit_for(&b.geometry, limits, b.warn_m));
     let mut cache = FITTED.lock().unwrap_or_else(|e| e.into_inner());
     if cache.len() >= FIT_CACHE_MAX {
         cache.clear();

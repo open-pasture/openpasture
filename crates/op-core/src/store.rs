@@ -232,9 +232,20 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the herd's animals and collars too.
+    /// Deletes the herd's animals and collars too, and takes it out of the
+    /// alert prefs that name it (a person limited to it alone then has none).
     pub async fn delete_herd(&self, id: &str) -> anyhow::Result<bool> {
-        Ok(sqlx::query("DELETE FROM herds WHERE id = ?").bind(id).execute(&self.pool).await?.rows_affected() > 0)
+        let gone = sqlx::query("DELETE FROM herds WHERE id = ?").bind(id).execute(&self.pool).await?.rows_affected() > 0;
+        if gone {
+            sqlx::query(
+                "UPDATE alert_prefs SET herds = (SELECT json_group_array(value) FROM json_each(alert_prefs.herds) WHERE value != ?1)
+                 WHERE herds IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(alert_prefs.herds) WHERE value = ?1)",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(gone)
     }
 
     // Animals

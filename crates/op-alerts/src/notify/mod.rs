@@ -330,17 +330,22 @@ pub(crate) fn draft(channel: &str, to: &str, kind: &str, text: &str, subject: Op
 
 // ---- shared helpers -----------------------------------------------------------------
 
-/// One HTTP client for every channel: rustls, 20 s per request.
+/// One HTTP client for every channel: rustls, 20 s per request, and no
+/// redirects followed (a 3xx is the provider's answer): a followed redirect
+/// could point a request the server makes back at itself, where a request
+/// from this machine is the owner's.
 pub(crate) fn http() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("openpasture/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("HTTP client")
-    })
+    CLIENT.get_or_init(|| client_builder().build().expect("HTTP client"))
+}
+
+/// The settings of [`http`], for a client that needs more (push's resolver).
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("openpasture/", env!("CARGO_PKG_VERSION")))
 }
 
 /// A network failure in words, without the URL (it may carry a key). Not

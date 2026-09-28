@@ -134,7 +134,7 @@ days plus imported position history.
 | GET | `/api/users/:id` | | `Person` / 404 |
 | PATCH | `/api/users/:id` | `{ name?, role?, phone?, email?, disabled? }` (`null` clears phone, email) | `Person`; a new phone clears its verification; `disabled: true` also revokes every token and open link |
 | DELETE | `/api/users/:id` | | 204 / 404; their tokens and links go too, records keep the name they stored |
-| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped |
+| POST | `/api/users/:id/revoke` | | `Person`: every token revoked, open link dropped, every push subscription of theirs removed (no browser of theirs gets alerts) |
 | GET | `/api/invites` | | `Invite[]` open (not accepted, not expired), newest first |
 | POST | `/api/invites` | `{ user_id }` or `{ name, role, phone?, email? }` (adds the person now) | 201 `Invite & { code, url }`; `code` and `url` are shown once; replaces the person's open link |
 | DELETE | `/api/invites/:id` | | 204 / 404 (open links only) |
@@ -144,7 +144,7 @@ days plus imported position history.
 | PATCH | `/api/me/profile` | `{ name?, phone?, email? }` | `User` (your own; 404 when you aren't in People; role can't be changed here) |
 | GET | `/api/me/tokens` | | your own `TokenInfo[]` |
 | DELETE | `/api/me/tokens/:id` | | 204 / 404 |
-| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) |
+| POST | `/api/me/signout` | | 204: revokes the token this request came with (400 without one) and removes the push subscriptions made under it (revoking a token in `/api/me/tokens` or `/api/tokens` does the same); the app also unsubscribes the browser and forgets its offline copy |
 
 ```ts
 Person    = User & { tokens: number /* browsers signed in */, last_used?, invite_until? /* open link expires */ }
@@ -227,7 +227,9 @@ is handed copies of the new herd's boundary in effect and of each staged one, it
 rest of the new herd downloads nothing.
 `POST /api/herds/:id/boundary` writes the farmer decision, the move and its first boundary
 together, then supersedes the herd's open proposals and moves the herd to the paddock under the
-target.
+target. A target over several paddocks moves the herd on the record only when another paddock holds
+more of it than the one the herd is in (half each, as for P1 + P2, leaves the herd grazing P1: its
+stay goes on and P1 doesn't rest); an applied brain MOVE with a boundary does the same.
 
 Collar state and `last_fix` only move with fixes newer than the current `last_fix`; late or
 backfilled fixes are stored but don't move the collar or send `fix` events.
@@ -272,17 +274,23 @@ boundary. The server never sends an active boundary that leaves an animal outsid
 
 Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. Where an
 animal is: its fixes of the last 12 s before its newest that agree with it (within twice their
-accuracy), averaged by `1 / accuracy²` (one fix wanders by metres); the edge behind it leaves
+accuracy), averaged by `1 / accuracy²` (one fix wanders by metres), or its newest fix when that is further
+back along the sweep (an animal walking back is behind its average, and its collar judges the fence
+from its newest fix); the edge behind it leaves
 extra room of half that average's spread plus 0.05 m per second since the fix, at most 0.5 m, so
 it stays in its warning zone. The edge uses at most half the corners the herd's collars hold (64
-of V0's 128); past that its smallest bumps are straightened, which only moves it back. The sweep
+of V0's 128; a herd with legacy collars plans for their 64 corners, 32 for the edge); past that its
+smallest bumps are straightened, which only moves it back. A step goes out only if every animal
+keeps its room (half its warning zone less a quarter metre, or what it had) in the fence each of
+the herd's collars gets, after exclusions and the fit to that collar; else it is planned again with
+fewer corners, and after four tries nothing is sent that pass. The sweep
 direction (herd centroid toward target centroid) is fixed for the whole move; when the herd
 surrounds the target (its centroid is about on the target), the steps close in from every side
 instead (the hull of the herd, buffered by `0.6 × warn_m`). The last step is sent when every
 animal in the sweep is inside the target by 1.5 m (with the sweep's own edge behind them, nobody
 needs a back line past the target's rear first). `remaining_m` is from the back line (nine in
-ten ahead) to the target's rear edge. Only animals holding the back line up (behind the next back
-line, or not held by the next step) run the 5-minute straggler clock, timed by their own fixes
+ten ahead) to the target's rear edge. Only animals holding the sweep up (the few within a stride, 0.1 ×
+`warn_m`, of the rearmost animal, or those not held by the next step) run the 5-minute straggler clock, timed by their own fixes
 (silence never counts as being stuck); moving up 1 m restarts it, and so does every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
 starts are listed as stragglers at once. When the old active boundary and the target don't touch
 (paddocks drawn with a gap), the first step spans the convex hull of both, so the herd has a way
@@ -1052,7 +1060,7 @@ confirmed.` (the distance through the farm's units), also the next morning.
 | GET | `/api/alerts/{id}` | `Alert` |
 | POST | `/api/alerts/{id}/ack` | `Alert`; hand and up. Stops re-notification and escalation; acking again returns it unchanged; resolved → 409 |
 | POST | `/api/alerts/{id}/resolve` | `Alert`; hand and up. Stays closed while its cause lasts; resolved → 409 |
-| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email")[] }` |
+| GET | `/api/alerts/rules` | `{ rules: RuleView[], policy: Policy, configured: string[], person_channels: ("sms"\|"whatsapp"\|"email"\|"push")[] }` |
 | PUT | `/api/alerts/rules` | same; manager and up. Body `{ rules?: { <kind>: Partial<RuleConfig> }, policy?: Partial<Policy> }` (merge; `null` puts a rule's number back to its default and clears quiet hours) |
 | GET | `/api/alerts/prefs` | `PersonPrefs[]`, every person; manager and up |
 | GET | `/api/alerts/prefs/me` | `PersonPrefs` of the caller's person; 404 when the sign-in isn't a person |
@@ -1065,7 +1073,7 @@ RuleView   = RuleConfig & { kind, sentence /* "Collar silent for {n}" */, unit: 
 Policy     { renotify_every_min: 30, renotify_max: 3, escalate_after_min: 15, group_window_s: 60, rollup_min: 4,
              herd_silent_share: 0.5, clear_after_min: 2, start_grace_min: 20, critical_window_s: 10,
              quiet_start?: "HH:MM", quiet_end?: "HH:MM" /* the farm's, farm time */ }
-AlertPrefs { channels: ("sms"|"whatsapp"|"email")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
+AlertPrefs { channels: ("sms"|"whatsapp"|"email"|"push")[] /* ["sms"] */, min_severity: Severity /* "warning" */,
              herds?: string[] /* absent = every herd */, muted_kinds: string[], quiet_start?, quiet_end? /* absent = the farm's */,
              critical_in_quiet: bool /* true */, on_duty: bool /* false */ }
 PersonPrefs = AlertPrefs & { user_id, name, role: Role, sms_opt_out: bool, updated_at? }
@@ -1088,7 +1096,8 @@ of their median for 240 min (warning) · `gps_degraded` median accuracy over the
 never alert.
 
 Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
-are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
+are one alert `<kind>:herd:<herd id>` (titled "31 collars outside P3", "5 collars GPS weak": a count
+always with its noun, never read as a collar's label; `data.count`, `data.members`), which keeps its
 members until the last clears; members already open resolve with `rolled_into`. Once people were told
 about a rollup (a text or an ack), animals that join it are a new breakout when they are at least as
 many as the told ones still in it: it opens again as a new alert with every member (the old one
@@ -1174,7 +1183,8 @@ delivers it. It claims at most 10 queued messages at a time and 4 per channel, a
 sent once however many senders run. A send that may work later goes back in the queue: Twilio,
 email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A provider
 this server can't connect to at all (the farm's internet or DNS is down, the connection refused)
-never saw the message, so that isn't counted as a try: the message stays `queued` and is tried
+never saw the message, and neither did a relay answering 5xx (its proxy's 502 or 503 while it
+redeploys or restarts), so that isn't counted as a try: the message stays `queued` and is tried
 again after 5 s, then as often as every minute, for up to 6 h (then `failed`, "… can't be reached.
 Gave up after 6 h."). An alert's text or email that had to wait (a minute or more) isn't sent once
 its alert has resolved (`failed`, "Resolved before it could be sent."). A 4xx from
@@ -1247,7 +1257,7 @@ Texting = TextingConfig & {
   checked?: { at?, ok_at?, error? },                        // polling / relay: the last check
   people: PersonTexting[],
 }
-PersonTexting = { user_id, brief /* gets the brief by text */, sms_opt_out /* texted STOP */ }
+PersonTexting = { user_id, brief /* gets the brief on their alert channels, push included */, sms_opt_out /* texted STOP */, push /* a browser of theirs takes notifications */ }
 Inbox = { messages: [{ id /* rin_… */, channel: "sms"|"whatsapp", from /* E.164 */, text, at }], cursor }
 ```
 
@@ -1295,14 +1305,21 @@ window or ask about its decisions.
 gets each of their herds' brief (`GET /api/brief`'s `text`, ≤ 480 characters) on every way their
 alerts reach them. Once a farm day; a server that was down then sends it within two hours, not
 later. A brief opens the reply window like an alert, and a bare Y or N to a brief that asks
-("Reply Y or N.") answers the decision it asked about.
+("Reply Y or N.") answers the decision it asked about. Only managers and up are asked: a hand's or
+viewer's brief says where the decision stands without asking ("Sends 07:40.", "Waiting for an
+answer.") and is not an asking text (no `decision_id`, not `prompt` on the relay).
 
 **The relay's inbox** (host side). A text to the relay's number reaches only farms whose key has
 that number verified, and of those the one it answers: a Y, N, LATER or STOP MOVE with a decision's
-code goes to the farm whose text carried "Code 4821"; a bare one goes to the one farm that asked
-the person about a decision (`prompt: true`) in the last 12 h, and when more than one did, the host
-answers itself: "More than one farm asked you. Add the code from the text you mean, like Y 4821.";
-anything else goes to the farm whose text to that number was the host's last. The host's own farm
+code goes to the farm whose text carried "Code 4821"; a bare Y, N or LATER goes to the one farm
+that asked the person about a decision (`prompt: true`) in the last 12 h, and when more than one
+did, the host answers itself: "More than one farm asked you. Add the code from the text you mean,
+like Y 4821.". A bare STOP MOVE goes to the farm when the number has only one; with more, the host
+answers "More than one farm texts you. Add the code from the move's text, like STOP MOVE 4821, or
+stop it in the app." (a decision prompt says nothing about whose move it is); STOP MOVE and a
+number goes to the farm whose reply (the list) was the host's last to that number. OK goes to the
+farm whose alert (`kind: alert`) was the host's last to that number; anything else to the farm
+whose text to that number was the host's last. The host's own farm
 counts as one of them when it has a verified person with that phone; a key that only asked to
 verify the number, or was deleted, never does. STOP and START go to every key that has the
 number (Twilio opts a phone out per sender number, so STOP to the shared number stops every farm on
@@ -1328,7 +1345,7 @@ address, so one alert reaches every browser the person turned it on in.
 | Method | Path | Returns |
 | --- | --- | --- |
 | GET | `/api/push` | `PushView`; makes the farm's VAPID key the first time it is asked for over https |
-| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
+| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine; asked from anywhere else, https on port 443 at a public address: not this machine, a private, shared or link-local network) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
 | DELETE | `/api/push/subscriptions/:id` | 204; your own (the owner: anyone's), else 404 |
 | POST | `/api/push/subscriptions/:id/test` | `{ ok, detail }` — "openpasture test." to that browser now, recorded in `/api/messages` |
 | PUT | `/api/push/settings` | `{ enabled?, new_keys? }` → `PushView`. `enabled: false` sends nothing by push (subscriptions stay); `new_keys: true` makes a new key pair and drops every subscription (browsers turn alerts on again) |
@@ -1355,7 +1372,9 @@ MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push 
   the body is the text without its texting instructions ("Reply OK to ack", "Reply Y or N. Code 4821").
 - 404 or 410 from the push service: the browser dropped it; the subscription is removed and the
   message fails "That phone stopped taking notifications.". 408, 429 and 5xx are tried again (5 s,
-  30 s, 2 min); a push service that can't be reached at all waits as texts do.
+  30 s, 2 min); a push service that can't be reached at all waits as texts do. A redirect is
+  never followed (by any channel: a 3xx is the answer, so push fails "refused it (307)"), and a
+  push service's name is only connected to at a public address.
 - Settings: `push` = `{ vapid_public_key?, enabled /* true */ }`; secret `vapid_private_key` (PKCS#8,
   base64url). `push_subscriptions` holds personal data and is not in `/api/sql`.
 
@@ -1806,23 +1825,33 @@ stream every fix through the server:
 - `GET /api/analytics/health`: SQLite sums the hot fixes per collar, bucket and accuracy
   (`routes::health_hot_sql`); accuracy percentiles come from those counts (to the centimetre,
   exact for fixes that report decimetres). A collar's cadence, when it has none configured, is
-  the median gap over its first 2,000 fixes in the range. Parquet days are read as before.
+  the median gap over every Parquet day's fixes and a sample of the hot ones (the first 250 fixes
+  of each of 8 equal stretches of the hot part, each gap counted for as many hot fixes as the
+  sample stands for), so a cadence that changed partway through the range counts. Parquet days
+  are read as before.
 - `GET /api/analytics/heatmap`: SQLite counts the hot fixes per grid cell, with the same
   arithmetic as the Parquet path (`routes::heat_hot_sql`).
-- `GET /api/analytics/behaviour`: days in Parquet are read from their files; for the hot fixes
+- `GET /api/analytics/behaviour`: days in Parquet are read from their files, with any fix stored
+  for such a day after it was rolled (in SQLite until the next rollup); for the hot fixes
   after them SQLite counts each collar's fixes and sums its dwell, and the walk comes from every
   hot fix while the range holds at most 20,000 of them, else from each collar's first fix in each
   of at most 2,000 time buckets (at least a minute each: 1,440 a collar for a day). Distances for
   big ranges are therefore from one fix a minute or so.
 - `GET /api/analytics/pasture` (and behaviour's dwell): one SQL pass over the hot range sorted by
   collar (`routes::hot_dwell_sql`) instead of one pass a collar, whose interleaved rows made each
-  collar read every page of the day.
+  collar read every page of the day. Its rows are folded in as they stream: fixes with no stored
+  paddock come back one each (4.3 M a day at 250 collars) and are never all held in memory.
+  A collar's animal is the newest named by its last 200 hot fixes, else its first 200.
 - Per-collar reads of one request run six at a time (`routes::PARALLEL_READS`).
 - **A day in both places while the rollup deletes it is counted once.** While a scan reads a
   day's Parquet file it learns the highest row id in it; the day's hot rows at or below it are
   the ones the rollup has written and not yet deleted (ids never repeat), and the scan leaves
   them out (`telemetry::Rolled`). The SQL console does the same from the files' statistics. So
-  exports, health, behaviour, heatmap and `/api/sql` count each fix once at every moment.
+  exports, health, behaviour, heatmap and `/api/sql` count each fix once at every moment. Health
+  and the heatmap leave out exactly the days their Parquet read took (not a second listing), the
+  SQL console lists files and days once, and only days that can still have rows in SQLite (a
+  file's highest id at or above the table's lowest) are named in the filter, nested as a tree: a
+  farm with years of day files stays under SQLite's expression depth of 1000.
 
 Release build, 250 collars, a 4.32 M-fix hot day, on a machine loaded by other work (times move
 with the load): health 34 s → 6-9 s, heatmap 50 s → 2-3 s, behaviour 35 s → about 20 s (for a

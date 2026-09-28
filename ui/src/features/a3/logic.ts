@@ -6,7 +6,7 @@ import type { PersonTexting, Texting } from "./api";
 // Channels that carry a text back to the farm.
 const INBOUND = ["sms", "whatsapp", "relay"];
 // Channels that can carry a brief to someone.
-const OUTBOUND = ["sms", "whatsapp", "email", "relay"];
+const OUTBOUND = ["sms", "whatsapp", "email", "relay", "push"];
 
 export interface RepliesLine {
   label: string;
@@ -43,17 +43,18 @@ export const briefChannels = (c: { configured: readonly string[]; whatsapp: { te
 // The brief time beside Daily shows once something can carry it.
 export const canBrief = (configured: readonly string[]) => configured.some((c) => OUTBOUND.includes(c));
 
-// A person can get the brief: a verified phone over a text channel, or an email over the farm's
-// own email (the relay texts only phones proven to it).
-export function reachable(u: User, configured: readonly string[]): boolean {
+// A person can get the brief: a verified phone over a text channel, an email over the farm's own
+// email (the relay texts only phones proven to it), or a browser of theirs that takes notifications
+// (`push`, from their texting row) while push is a farm channel.
+export function reachable(u: User, configured: readonly string[], push = false): boolean {
   if (u.disabled_at) return false;
   const phone = !!u.phone && !!u.phone_verified_at && ["sms", "whatsapp", "relay"].some((c) => configured.includes(c));
   const email = !!u.email && configured.includes("email");
-  return phone || email;
+  return phone || email || (push && configured.includes("push"));
 }
 
 export const personOf = (t: Texting, userId: string): PersonTexting =>
-  t.people.find((p) => p.user_id === userId) ?? { user_id: userId, brief: false, sms_opt_out: false };
+  t.people.find((p) => p.user_id === userId) ?? { user_id: userId, brief: false, sms_opt_out: false, push: false };
 
 // HH:MM, 00:00 to 23:59.
 export const validTime = (s: string) => /^([01]\d|2[0-3]):[0-5]\d$/.test(s);

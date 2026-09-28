@@ -3,6 +3,8 @@
 
 import { setToken } from "../../api";
 import { people } from "../../api/j";
+import { forgetLastSeen } from "../m/offline-run";
+import { current } from "../m/subscribe";
 import { loadMe, useMe } from "../../store/me";
 import { Button } from "../../ui";
 import { Field } from "./Field";
@@ -19,7 +21,13 @@ export function You() {
     await loadMe();
   };
   const signout = async () => {
+    // Signing out also takes this browser's alerts off it (the server drops its subscription with
+    // the token) and the farm's offline copy out of it.
+    await current()
+      .then((sub) => sub?.unsubscribe())
+      .catch(() => {});
     await people.signout().catch(() => {});
+    forgetLastSeen();
     setToken("");
     location.replace("#/");
     location.reload();

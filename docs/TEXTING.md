@@ -73,7 +73,8 @@ iPhone, add the app to the Home Screen first (iOS 16.4+).
 ## The morning brief
 
 Settings > Daily > Brief and a time (farm time). Turn it on per person in People. Each herd's
-brief is one text of at most 480 characters; one that asks takes a bare Y or N.
+brief is one text of at most 480 characters; one that asks takes a bare Y or N (only managers
+and owners are asked; hands and viewers get where the decision stands).
 
 ## The hosted relay
 
@@ -91,7 +92,9 @@ Worth knowing:
 - The relay texts SMS only. Email needs your own mail server.
 - STOP to the relay's number stops texts from every farm on it, as Twilio blocks the number for
   that sender. START undoes it.
-- A bare Y when two farms asked the same person gets a reply asking for the code.
+- A bare Y when two farms asked the same person gets a reply asking for the code. A bare STOP MOVE
+  from a phone on more than one farm does too (add the move's code, or stop it in the app); OK
+  goes to the farm whose alert reached you last.
 - If your server stops checking in for 15 minutes, the relay texts your owners and managers once.
 
 ### Running your own relay

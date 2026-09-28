@@ -127,6 +127,22 @@ pub async fn put(ctx: &Ctx, user_id: &str, patch: &Value) -> ApiResult<Prefs> {
     let (current, _) = get(ctx, user_id).await?;
     let mut next: Prefs = op_core::patch::apply(&current, patch, &[])?;
     check(ctx, &mut next).await?;
+    store(ctx, user_id, &next).await?;
+    Ok(next)
+}
+
+/// Add `channel` to a person's channels, leaving the rest of their prefs as
+/// they are (not checked again: a herd deleted since doesn't stop it).
+pub async fn add_channel(ctx: &Ctx, user_id: &str, channel: &str) -> anyhow::Result<()> {
+    let (mut p, _) = get(ctx, user_id).await?;
+    if !p.channels.iter().any(|c| c == channel) {
+        p.channels.push(channel.to_owned());
+        store(ctx, user_id, &p).await?;
+    }
+    Ok(())
+}
+
+async fn store(ctx: &Ctx, user_id: &str, next: &Prefs) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO alert_prefs (user_id, channels, min_severity, herds, muted_kinds, quiet_start, quiet_end, critical_in_quiet, on_duty, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -135,10 +151,10 @@ pub async fn put(ctx: &Ctx, user_id: &str, patch: &Value) -> ApiResult<Prefs> {
              critical_in_quiet = excluded.critical_in_quiet, on_duty = excluded.on_duty, updated_at = excluded.updated_at",
     )
     .bind(user_id)
-    .bind(serde_json::to_string(&next.channels).map_err(anyhow::Error::from)?)
+    .bind(serde_json::to_string(&next.channels)?)
     .bind(next.min_severity.as_db())
-    .bind(next.herds.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?)
-    .bind(serde_json::to_string(&next.muted_kinds).map_err(anyhow::Error::from)?)
+    .bind(next.herds.as_ref().map(serde_json::to_string).transpose()?)
+    .bind(serde_json::to_string(&next.muted_kinds)?)
     .bind(&next.quiet_start)
     .bind(&next.quiet_end)
     .bind(next.critical_in_quiet)
@@ -146,7 +162,7 @@ pub async fn put(ctx: &Ctx, user_id: &str, patch: &Value) -> ApiResult<Prefs> {
     .bind(to_db(&now()))
     .execute(ctx.db())
     .await?;
-    Ok(next)
+    Ok(())
 }
 
 async fn check(ctx: &Ctx, p: &mut Prefs) -> ApiResult<()> {

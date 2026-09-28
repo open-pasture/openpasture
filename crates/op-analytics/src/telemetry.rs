@@ -131,11 +131,33 @@ pub fn scan_in(ctx: &Ctx, table: &'static str, range: TimeRange, scope: Scope, s
     let (tx, rx) = mpsc::channel(4);
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = scan_into(&ctx, table, range, &scope, source, order, &tx).await {
+        if let Err(e) = scan_into(&ctx, table, range, &scope, source, order, &tx, None).await {
             let _ = tx.send(Err(e)).await;
         }
     });
     rx
+}
+
+/// The Parquet part of a scan ([`Source::Cold`]), and the days it read
+/// with their highest ids (sent once they are read): a caller summing the
+/// SQLite part itself leaves out exactly those days' rolled rows, even if
+/// the rollup writes a file meanwhile. Only [`live`] days are sent.
+pub fn scan_cold(
+    ctx: &Ctx,
+    table: &'static str,
+    range: TimeRange,
+    scope: Scope,
+    order: Order,
+) -> (mpsc::Receiver<anyhow::Result<RecordBatch>>, tokio::sync::oneshot::Receiver<Vec<Rolled>>) {
+    let (tx, rx) = mpsc::channel(4);
+    let (days_tx, days_rx) = tokio::sync::oneshot::channel();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = scan_into(&ctx, table, range, &scope, Source::Cold, order, &tx, Some(days_tx)).await {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+    (rx, days_rx)
 }
 
 async fn scan_into(
@@ -146,8 +168,12 @@ async fn scan_into(
     source: Source,
     order: Order,
     tx: &mpsc::Sender<anyhow::Result<RecordBatch>>,
+    read: Option<tokio::sync::oneshot::Sender<Vec<Rolled>>>,
 ) -> anyhow::Result<()> {
     if scope.collar_ids.as_ref().is_some_and(|c| c.is_empty()) {
+        if let Some(read) = read {
+            let _ = read.send(Vec::new());
+        }
         return Ok(());
     }
     let schema = table_schema(ctx.db(), table).await?;
@@ -189,6 +215,10 @@ async fn scan_into(
             }
         }
     }
+    let rolled = live(ctx, table, rolled).await?;
+    if let Some(read) = read {
+        let _ = read.send(rolled.clone());
+    }
     if source != Source::Cold {
         hot_scan(ctx, &schema, from, to, scope, order, &rolled, tx).await?;
     }
@@ -208,25 +238,57 @@ pub struct Rolled {
     pub max_id: i64,
 }
 
-/// SQL keeping rows of `rolled` days out (three binds each: from, to, max id).
+/// SQL keeping rows of `rolled` days out (three binds each, in order: from,
+/// to, max id). The terms are nested as a balanced tree, not a chain: SQLite
+/// refuses an expression more than 1000 deep. Pass only [`live`] days: a
+/// term for a day with no rows left in SQLite costs every row a test.
 pub fn not_rolled_sql(n: usize) -> String {
-    " AND NOT (t >= ? AND t < ? AND id <= ?)".repeat(n)
+    fn tree(n: usize) -> String {
+        match n {
+            1 => "NOT (t >= ? AND t < ? AND id <= ?)".to_owned(),
+            _ => format!("({} AND {})", tree(n / 2), tree(n - n / 2)),
+        }
+    }
+    if n == 0 { String::new() } else { format!(" AND {}", tree(n)) }
+}
+
+/// The `rolled` days that can still have rows in `table`'s SQLite part: a
+/// day's rolled rows are the ones at or below its file's highest id, so a
+/// day whose highest id is below the table's lowest has none left (all but
+/// the day or two the rollup is deleting, on a farm with years of files).
+pub async fn live(ctx: &Ctx, table: &str, rolled: Vec<Rolled>) -> anyhow::Result<Vec<Rolled>> {
+    if rolled.is_empty() {
+        return Ok(rolled);
+    }
+    let low: Option<i64> = sqlx::query_scalar(&format!("SELECT MIN(id) FROM {table}")).fetch_one(ctx.db()).await?;
+    Ok(match low {
+        Some(low) => rolled.into_iter().filter(|r| r.max_id >= low).collect(),
+        None => Vec::new(),
+    })
 }
 
 /// The days of `table` in Parquet (overlapping `range`) with their highest
 /// row id, from the files' statistics (else the id column).
 pub fn rolled_days(data_dir: &Path, table: &str, range: Option<&TimeRange>) -> anyhow::Result<Vec<Rolled>> {
-    let mut out = Vec::new();
+    Ok(day_files(data_dir, table, range)?.1)
+}
+
+/// The day files of `table` overlapping `range` ([`cold_files`]) and the
+/// same days as [`rolled_days`], from one listing: a file the rollup writes
+/// meanwhile is in both or in neither.
+pub fn day_files(data_dir: &Path, table: &str, range: Option<&TimeRange>) -> anyhow::Result<(Vec<PathBuf>, Vec<Rolled>)> {
+    let (mut files, mut rolled) = (Vec::new(), Vec::new());
     for (date, path) in list_days(data_dir, table) {
         if range.is_some_and(|r| date < date_of(r.from_ms()) || date > date_of(r.to_ms() - 1)) {
             continue;
         }
         if let Some(max_id) = file_max_id(&path)? {
             let start = crate::range::day_start_ms(date);
-            out.push(Rolled { from: start, to: start + 86_400_000, max_id });
+            rolled.push(Rolled { from: start, to: start + 86_400_000, max_id });
         }
+        files.push(path);
     }
-    Ok(out)
+    Ok((files, rolled))
 }
 
 fn file_max_id(path: &Path) -> anyhow::Result<Option<i64>> {

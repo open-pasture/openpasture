@@ -75,6 +75,12 @@ pub async fn alert_json(db: &SqlitePool, id: &str) -> Option<Value> {
             obj.insert(col.name().to_owned(), v);
         }
     }
+    // The approval code lives only in the alert and the text (as `store::public` leaves it out of the API).
+    if let Some(d) = obj.get_mut("data").and_then(Value::as_object_mut) {
+        for k in crate::engine::store::PRIVATE_DATA {
+            d.remove(*k);
+        }
+    }
     // A point kept as two columns.
     if !obj.contains_key("at")
         && let (Some(lon), Some(lat)) = (obj.get("at_lon").and_then(Value::as_f64), obj.get("at_lat").and_then(Value::as_f64))

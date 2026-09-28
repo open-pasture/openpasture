@@ -321,6 +321,21 @@ async fn the_decision_text_is_the_approval_prompt_with_its_code() {
     assert_eq!(op_alerts::text::alert_text(a, None, &tctx), format!("Cows: move to P2 (40.9 ac, 5 d)? Reply Y or N. Code {code}"));
 }
 
+/// The farm webhook's body carries the alert as the API shows it: never the
+/// approval code, which lives only in the alert and the text.
+#[tokio::test]
+async fn the_webhook_body_has_no_approval_code() {
+    let f = Farm::new().await;
+    f.decision("MOVE", "proposed", t0() - mins(31), None).await;
+    f.eval(t0()).await;
+    let a = &f.open_kind("decision_waiting").await[0];
+    let code = a.data["code"].as_str().unwrap().to_owned();
+    let body = op_alerts::notify::webhook::alert_json(f.ctx.db(), &a.id).await.expect("the alert");
+    assert_eq!(body["id"], a.id.as_str());
+    assert!(body["data"].get("code").is_none(), "{body}");
+    assert!(!body.to_string().contains(&code), "{body}");
+}
+
 #[tokio::test]
 async fn prefs_routes_check_roles_and_values() {
     let f = Farm::new().await;
