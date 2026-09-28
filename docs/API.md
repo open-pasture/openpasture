@@ -1096,7 +1096,8 @@ of their median for 240 min (warning) · `gps_degraded` median accuracy over the
 never alert.
 
 Keys are `<kind>:<subject id>`. Four or more collar alerts of one kind in one herd at once (`rollup_min`)
-are one alert `<kind>:herd:<herd id>` ("31 outside P3", `data.count`, `data.members`), which keeps its
+are one alert `<kind>:herd:<herd id>` (titled "31 collars outside P3", "5 collars GPS weak": a count
+always with its noun, never read as a collar's label; `data.count`, `data.members`), which keeps its
 members until the last clears; members already open resolve with `rolled_into`. Once people were told
 about a rollup (a text or an ack), animals that join it are a new breakout when they are at least as
 many as the told ones still in it: it opens again as a new alert with every member (the old one

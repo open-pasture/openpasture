@@ -233,20 +233,23 @@ fn days(d: f64) -> String {
     if d >= 1.0 { format!("{}", d.round() as i64) } else { format!("{:.1}", (d * 10.0).round() / 10.0) }
 }
 
-/// A rollup's title: "31 outside P3", "31 silent".
+/// A rollup's title: "31 collars outside P3", "31 collars silent". A count
+/// always has its noun, so it never reads as a collar's label beside one
+/// ("5 collars GPS weak" next to "138 GPS weak", collar 138).
 pub fn rollup_title(kind: &str, n: usize, paddock: Option<&str>) -> String {
+    let collars = if n == 1 { "collar" } else { "collars" };
     match kind {
         "escaped" | "outside" => match paddock {
-            Some(p) => format!("{n} outside {p}"),
-            None => format!("{n} outside the boundary"),
+            Some(p) => format!("{n} {collars} outside {p}"),
+            None => format!("{n} {collars} outside the boundary"),
         },
-        "silent" => format!("{n} silent"),
+        "silent" => format!("{n} {collars} silent"),
         "low_battery" => format!("{n} batteries low"),
         "boundary_not_applied" => format!("{n} boundaries not applied"),
-        "drop_off" => format!("{n} not moving"),
-        "gps_degraded" => format!("{n} GPS weak"),
+        "drop_off" => format!("{n} {collars} not moving"),
+        "gps_degraded" => format!("{n} {collars} GPS weak"),
         // @S
-        "schedule_not_stored" => format!("{n} missing the next strip"),
+        "schedule_not_stored" => format!("{n} {collars} missing the next strip"),
         // @H
         "fit_check_due" => format!("{n} fit checks due"),
         other => format!("{n} {}", other.replace('_', " ")),
