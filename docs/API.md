@@ -1180,7 +1180,8 @@ delivers it. It claims at most 10 queued messages at a time and 4 per channel, a
 sent once however many senders run. A send that may work later goes back in the queue: Twilio,
 email and relay at 5 s, 30 s and 2 min; webhooks at 1 s, 5 s and 25 s; then `failed`. A provider
 this server can't connect to at all (the farm's internet or DNS is down, the connection refused)
-never saw the message, so that isn't counted as a try: the message stays `queued` and is tried
+never saw the message, and neither did a relay answering 5xx (its proxy's 502 or 503 while it
+redeploys or restarts), so that isn't counted as a try: the message stays `queued` and is tried
 again after 5 s, then as often as every minute, for up to 6 h (then `failed`, "… can't be reached.
 Gave up after 6 h."). An alert's text or email that had to wait (a minute or more) isn't sent once
 its alert has resolved (`failed`, "Resolved before it could be sent."). A 4xx from

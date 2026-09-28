@@ -117,11 +117,15 @@ impl Relay {
     }
 }
 
-/// 401, 403 and 409 need a person; 429 and 5xx pass.
+/// 401, 403 and 409 need a person; 429 passes. A 5xx is the relay itself
+/// down (its proxy answers 502 or 503 while it redeploys or restarts): the
+/// text waits as it does with no network, its tries not counted, for up to
+/// the same hours, rather than failing after a few minutes.
 fn refused(r: Refusal) -> ChannelError {
     match r.status {
         401 => ChannelError::Fail("The relay didn't accept the key.".into()),
-        429 | 500..=599 => ChannelError::Retry(r.message),
+        429 => ChannelError::Retry(r.message),
+        500..=599 => ChannelError::Offline(r.message),
         _ => ChannelError::Fail(r.message),
     }
 }
@@ -177,7 +181,10 @@ mod tests {
     fn refusals_retry_only_when_waiting_helps() {
         let r = |status: u16| refused(Refusal { status, message: "no".into() });
         assert!(matches!(r(429), ChannelError::Retry(_)));
-        assert!(matches!(r(502), ChannelError::Retry(_)));
+        // The relay down behind its proxy (a redeploy, a restart): the text waits as for no network.
+        for s in [500, 502, 503, 504] {
+            assert!(matches!(r(s), ChannelError::Offline(_)), "{s}");
+        }
         assert!(matches!(r(403), ChannelError::Fail(_)));
         assert!(matches!(r(409), ChannelError::Fail(_)));
         assert_eq!(r(401), ChannelError::Fail("The relay didn't accept the key.".into()));
