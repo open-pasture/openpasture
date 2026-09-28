@@ -37,3 +37,12 @@ export function walkLine(label: string, you: LonLat | undefined, animal: LonLat 
   if (m < 5) return `${label}  here`;
   return `${label}  ${len(m)} ${compass(bearing(you, animal))}`;
 }
+
+// Where "you" stands after the browser reports a location error (GeolocationPositionError.code):
+// only a refusal (1) ends the watch; a timeout (3, a phone standing still) or no fix for now (2, under
+// trees, in a truck cab) keeps the watch and the last fix, with the error shown for a moment.
+export type YouState = { on: boolean; at?: LonLat; accuracy_m?: number; error?: string };
+export function afterLocateError(prev: YouState, code: number): { next: YouState; stop: boolean } {
+  if (code === 1) return { next: { on: false, error: "Location is off for this site." }, stop: true };
+  return { next: { ...prev, error: "Can't find where you are." }, stop: false };
+}

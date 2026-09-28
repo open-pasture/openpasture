@@ -2,10 +2,35 @@ import { describe, expect, test } from "bun:test";
 import type { Animal, AppState, Collar, Me } from "../../api";
 import type { Store } from "../../store";
 import { fmt } from "../../units";
-import { bearing, compass, metres, walkLine } from "./geo";
+import { afterLocateError, bearing, compass, metres, walkLine } from "./geo";
 import { alertOfHash } from "./links";
 import { decode, encode, KEY, newestFix, restore, signedInAs } from "./offline";
 import { FLING, nextState, PEEK_MIN, settle, stops } from "./sheet-model";
+import { keepAction } from "./subscribe";
+
+test("at start a browser the server dropped subscribes again", () => {
+  expect(keepAction(true, true)).toBe("keep");
+  expect(keepAction(true, false)).toBe("renew");
+  expect(keepAction(false, true)).toBe("rekey");
+  expect(keepAction(false, false)).toBe("rekey");
+});
+
+describe("the you dot", () => {
+  const at: [number, number] = [-93.62, 42.03];
+  test("a timeout or a lost fix keeps following, with the last place", () => {
+    for (const code of [2, 3]) {
+      const { next, stop } = afterLocateError({ on: true, at, accuracy_m: 4 }, code);
+      expect(stop).toBe(false);
+      expect([next.on, next.at, next.accuracy_m]).toEqual([true, at, 4]);
+      expect(next.error).toBe("Can't find where you are.");
+    }
+  });
+  test("only a refusal stops it", () => {
+    const { next, stop } = afterLocateError({ on: true, at }, 1);
+    expect(stop).toBe(true);
+    expect([next.on, next.at, next.error]).toEqual([false, undefined, "Location is off for this site."]);
+  });
+});
 
 describe("the walk line", () => {
   // Around Ames: 0.001° of latitude is 111 m; of longitude, 83 m.

@@ -63,13 +63,24 @@ export async function turnOff(v: PushView | undefined) {
   await sub?.unsubscribe();
 }
 
-// At start: a browser that had alerts on keeps them when the farm's key changed (new keys drop
-// every subscription on the server). Nothing is asked of the person.
+// What start does with a browser that has alerts on: nothing while the server holds its subscription
+// on the farm's key; subscribe again with the new key when the key changed (new keys drop every
+// subscription on the server); and a fresh subscription when the server no longer holds it (its push
+// service said it was gone, or the browser renewed it), so alerts don't stop without a word.
+export function keepAction(keyMatches: boolean, onServer: boolean): "keep" | "rekey" | "renew" {
+  if (!keyMatches) return "rekey";
+  return onServer ? "keep" : "renew";
+}
+
+// At start. Nothing is asked of the person.
 export async function keepCurrent() {
   if (!pushSupported() || Notification.permission !== "granted") return;
   const sub = await current();
   if (!sub) return;
   const v = await pushApi.get();
-  if (!v.available || !v.vapid_public_key || sameKey(sub, keyBytes(v.vapid_public_key))) return;
+  if (!v.available || !v.vapid_public_key) return;
+  const action = keepAction(sameKey(sub, keyBytes(v.vapid_public_key)), mineOf(v, sub) !== undefined);
+  if (action === "keep") return;
+  if (action === "renew") await sub.unsubscribe();
   await turnOn(v);
 }

@@ -25,7 +25,7 @@ class FakeCache {
 
 let caches: Map<string, FakeCache>;
 let listeners: Record<string, (e: unknown) => void>;
-let net: { online: boolean; seen: string[] };
+let net: { online: boolean; hang: boolean; version: number; seen: string[] };
 let shown: { title: string; opts: NotificationOptions }[];
 let windows: { url: string; focused: boolean; messages: unknown[] }[];
 let opened: string[];
@@ -34,7 +34,7 @@ let route: (url: URL, method: string, mode: string, origin: string) => string;
 beforeEach(() => {
   caches = new Map();
   listeners = {};
-  net = { online: true, seen: [] };
+  net = { online: true, hang: false, version: 0, seen: [] };
   shown = [];
   windows = [];
   opened = [];
@@ -51,9 +51,13 @@ beforeEach(() => {
   };
   const fetchFn = async (r: Request) => {
     net.seen.push(r.url);
+    // One flaky bar: the request neither answers nor fails.
+    if (net.hang) return new Promise<Response>(() => {});
     if (!net.online) throw new TypeError("Failed to fetch");
-    return Object.defineProperty(new Response(`net ${r.url}`), "type", { value: "basic" });
+    return Object.defineProperty(new Response(`net ${r.url}${net.version ? ` v${net.version}` : ""}`), "type", { value: "basic" });
   };
+  // The worker's timers run a thousand times faster here.
+  const timer = (f: () => void, ms: number) => setTimeout(f, ms / 1000);
   const self = {
     location: { origin: ORIGIN },
     addEventListener: (t: string, f: (e: unknown) => void) => (listeners[t] = f),
@@ -65,7 +69,7 @@ beforeEach(() => {
     },
     registration: { showNotification: async (title: string, opts: NotificationOptions) => void shown.push({ title, opts }) },
   };
-  route = new Function("self", "caches", "fetch", `${SRC}\nreturn route;`)(self, storage, fetchFn);
+  route = new Function("self", "caches", "fetch", "setTimeout", `${SRC}\nreturn route;`)(self, storage, fetchFn, timer);
 });
 
 // A fetch event; returns the response the worker gave, or "passed" when it stayed out.
@@ -119,6 +123,27 @@ describe("the service worker", () => {
     expect(await ((await request("/assets/index-Ab12.js")) as Response).text()).toBe(`net ${ORIGIN}/assets/index-Ab12.js`);
     // The API fails as it would with no worker: the app shows its own last copy.
     expect(await request("/api/state")).toBe("passed");
+  });
+
+  test("opens the kept shell when the network hangs, not a blank page", async () => {
+    await request("/", { mode: "navigate" });
+    net.hang = true;
+    const page = await request("/", { mode: "navigate" });
+    expect(await (page as Response).text()).toBe(`net ${ORIGIN}/`);
+  });
+
+  test("files kept under the same name are refreshed; hashed assets are kept as they are", async () => {
+    for (const p of ["/icons/icon-192.png", "/fonts/dm-sans-latin-wght.woff2", "/manifest.webmanifest", "/favicon.svg", "/assets/index-Ab12.js"]) await request(p);
+    net.version = 2;
+    for (const p of ["/icons/icon-192.png", "/manifest.webmanifest"]) {
+      // The kept copy at once, the new one fetched for next time.
+      expect(await ((await request(p)) as Response).text()).toBe(`net ${ORIGIN}${p}`);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(await ((await request(p)) as Response).text()).toBe(`net ${ORIGIN}${p} v2`);
+    }
+    expect(await ((await request("/assets/index-Ab12.js")) as Response).text()).toBe(`net ${ORIGIN}/assets/index-Ab12.js`);
+    net.online = false;
+    expect(await ((await request("/icons/icon-192.png")) as Response).text()).toBe(`net ${ORIGIN}/icons/icon-192.png v2`);
   });
 
   test("leaves other sites (imagery) and other files to the browser", async () => {
