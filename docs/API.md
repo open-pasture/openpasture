@@ -1302,7 +1302,9 @@ window or ask about its decisions.
 gets each of their herds' brief (`GET /api/brief`'s `text`, ≤ 480 characters) on every way their
 alerts reach them. Once a farm day; a server that was down then sends it within two hours, not
 later. A brief opens the reply window like an alert, and a bare Y or N to a brief that asks
-("Reply Y or N.") answers the decision it asked about.
+("Reply Y or N.") answers the decision it asked about. Only managers and up are asked: a hand's or
+viewer's brief says where the decision stands without asking ("Sends 07:40.", "Waiting for an
+answer.") and is not an asking text (no `decision_id`, not `prompt` on the relay).
 
 **The relay's inbox** (host side). A text to the relay's number reaches only farms whose key has
 that number verified, and of those the one it answers: a Y, N, LATER or STOP MOVE with a decision's

@@ -1421,6 +1421,32 @@ async fn the_brief_goes_at_the_farm_time_once_a_day() {
     assert!(op_alerts::brief_send::run_once(ctx, at + Duration::days(3)).await.unwrap().is_empty());
 }
 
+/// Only managers and up answer decisions: a hand's brief says where the
+/// decision stands without asking for a Y or N, and doesn't count as asking
+/// (a bare N from them isn't the brief's to take, and on the relay it
+/// doesn't mark this farm as asking them).
+#[tokio::test]
+async fn a_hands_brief_doesnt_ask_for_an_answer() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (s, _) = t.f.owner("PUT", "/api/texting", Some(json!({"brief": {"enabled": true, "time": "06:30"}}))).await;
+    assert_eq!(s, StatusCode::OK);
+    for p in [MIA, HANK] {
+        let (s, _) = t.f.owner("PUT", &format!("/api/texting/people/{}", t.id(p)), Some(json!({"brief": true}))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let at = next_0630(ctx).await;
+    let d = t.f.decision("MOVE", "proposed", at - mins(10), None).await;
+    let sent = op_alerts::brief_send::run_once(ctx, at).await.unwrap();
+    let of = |phone: &str| sent.iter().find(|m| m.address == phone).unwrap_or_else(|| panic!("a brief to {phone}: {sent:#?}")).clone();
+    let (mia, hank) = (of(MIA), of(HANK));
+    assert!(mia.text.contains("Reply Y or N.") || mia.text.contains("unless you reply N."), "{}", mia.text);
+    assert_eq!(mia.decision_id.as_deref(), Some(d.as_str()));
+    assert!(!hank.text.contains("Reply") && !hank.text.contains("reply"), "{}", hank.text);
+    assert!(hank.text.starts_with("Cows: MOVE"), "{}", hank.text);
+    assert_eq!(hank.decision_id, None, "not an asking text");
+}
+
 // ---- settings --------------------------------------------------------------------------------
 
 #[tokio::test]

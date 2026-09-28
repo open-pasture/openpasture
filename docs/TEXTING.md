@@ -73,7 +73,8 @@ iPhone, add the app to the Home Screen first (iOS 16.4+).
 ## The morning brief
 
 Settings > Daily > Brief and a time (farm time). Turn it on per person in People. Each herd's
-brief is one text of at most 480 characters; one that asks takes a bare Y or N.
+brief is one text of at most 480 characters; one that asks takes a bare Y or N (only managers
+and owners are asked; hands and viewers get where the decision stands).
 
 ## The hosted relay
 
