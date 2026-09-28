@@ -19,6 +19,7 @@ pub mod verify;
 pub mod webhook;
 // @A3
 // @M
+pub mod push;
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -36,7 +37,7 @@ use serde::{Deserialize, Serialize};
 /// sender decides about retries from the error.
 #[async_trait::async_trait]
 pub trait Channel: Send + Sync {
-    /// `sms` | `whatsapp` | `email` | `webhook` | `relay` (M adds `push`).
+    /// `sms` | `whatsapp` | `email` | `webhook` | `relay` | `push`.
     fn kind(&self) -> &'static str;
     async fn send(&self, msg: &MessageLog) -> Result<Delivery, ChannelError>;
 }
@@ -89,7 +90,7 @@ impl fmt::Display for ChannelError {
 impl std::error::Error for ChannelError {}
 
 /// The channels this module delivers, in the order the sender visits them.
-pub const CHANNELS: [&str; 5] = ["sms", "whatsapp", "email", "webhook", "relay"];
+pub const CHANNELS: [&str; 6] = ["sms", "whatsapp", "email", "webhook", "relay", "push"];
 
 /// Secrets the channels read. Settings reports `set` for each, never a value.
 pub const SECRETS: [&str; 6] = ["twilio_account_sid", "twilio_auth_token", "smtp_password", "webhook_secret", "hosted_url", "hosted_api_key"];
@@ -240,6 +241,7 @@ pub async fn channel(ctx: &Ctx, kind: &str) -> anyhow::Result<Option<Box<dyn Cha
         "relay" => relay::Relay::from_secrets(ctx)?.map(|c| Box::new(c) as Box<dyn Channel>),
         // @A3
         // @M
+        "push" => push::Push::load(ctx).await?.map(|c| Box::new(c) as Box<dyn Channel>),
         _ => None,
     })
 }

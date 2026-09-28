@@ -11,12 +11,13 @@ use sqlx::sqlite::SqliteRow;
 
 use crate::engine::config::valid_hhmm;
 
-/// Channels a person can choose (the farm webhook is farm-level).
-pub const PERSON_CHANNELS: [&str; 3] = ["sms", "whatsapp", "email"];
+/// Channels a person can choose (the farm webhook is farm-level). `push`
+/// reaches every browser they turned alerts on in.
+pub const PERSON_CHANNELS: [&str; 4] = ["sms", "whatsapp", "email", "push"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prefs {
-    /// Of `sms`, `whatsapp`, `email`.
+    /// Of `sms`, `whatsapp`, `email`, `push`.
     pub channels: Vec<String>,
     pub min_severity: Severity,
     /// Only these herds; absent = every herd.
@@ -152,7 +153,7 @@ async fn check(ctx: &Ctx, p: &mut Prefs) -> ApiResult<()> {
     let mut seen = Vec::new();
     for c in &p.channels {
         if !PERSON_CHANNELS.contains(&c.as_str()) {
-            return Err(ApiError::bad_request(format!("Channels are sms, whatsapp or email, not {c}.")));
+            return Err(ApiError::bad_request(format!("Channels are sms, whatsapp, email or push, not {c}.")));
         }
         if !seen.contains(c) {
             seen.push(c.clone());

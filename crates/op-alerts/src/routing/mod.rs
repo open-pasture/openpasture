@@ -5,7 +5,8 @@
 //!   is one of theirs and its kind isn't muted, their role gets it (the
 //!   approval prompt is for managers and up, [`told_from`]), and they can
 //!   be reached over a configured channel: sms and whatsapp only to a
-//!   verified phone that hasn't texted STOP; sms goes through the relay when
+//!   verified phone that hasn't texted STOP; push to each browser they turned
+//!   alerts on in (only over https); sms goes through the relay when
 //!   the farm has no Twilio of its own; email only through the farm's own
 //!   SMTP (the relay can't prove an address is the person's); whatsapp only
 //!   with an approved template (`notify::alert_channels`).
@@ -50,6 +51,8 @@ pub struct Person {
     pub user: User,
     pub prefs: Prefs,
     pub sms_opt_out: bool,
+    /// Their push subscriptions (browsers that turned alerts on), oldest first.
+    pub push: Vec<String>,
 }
 
 /// Enabled people with their prefs.
@@ -57,7 +60,8 @@ pub async fn people(ctx: &Ctx) -> anyhow::Result<Vec<Person>> {
     let mut out = Vec::new();
     for u in op_core::users::list_users(ctx).await?.into_iter().filter(|u| u.disabled_at.is_none()) {
         let (prefs, sms_opt_out) = prefs::get(ctx, &u.id).await?;
-        out.push(Person { user: u, prefs, sms_opt_out });
+        let push = sqlx::query_scalar("SELECT id FROM push_subscriptions WHERE user_id = ? ORDER BY created_at, id").bind(&u.id).fetch_all(ctx.db()).await?;
+        out.push(Person { user: u, prefs, sms_opt_out, push });
     }
     Ok(out)
 }
@@ -81,6 +85,13 @@ pub fn deliveries(p: &Person, configured: &[&str]) -> Vec<(&'static str, String)
     let relay = configured.contains(&"relay");
     let mut out: Vec<(&'static str, String)> = Vec::new();
     for c in &p.prefs.channels {
+        // Push: every browser they turned alerts on in, each its own address.
+        if c == "push" {
+            if configured.contains(&"push") {
+                out.extend(p.push.iter().map(|id| ("push", id.clone())).filter(|d| !out.contains(d)).collect::<Vec<_>>());
+            }
+            continue;
+        }
         let pick = match c.as_str() {
             "sms" => phone.clone().and_then(|ph| if configured.contains(&"sms") { Some(("sms", ph)) } else { relay.then_some(("relay", ph)) }),
             "whatsapp" => phone.clone().filter(|_| configured.contains(&"whatsapp")).map(|ph| ("whatsapp", ph)),
