@@ -1011,7 +1011,8 @@ Brief { herd_id, lines: string[], text /* GSM-7, at most 480 characters */ }
 
 **The brief** is written from the decision record, no LLM: the same record gives the same
 brief. For today's decision (the herd's newest since the last `settings.decision_time` in farm
-time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`,
+time, superseded ones left out) it gives the call (`Cows: MOVE to P4 (30.6 ac).`, the area the
+boundary's, as in the approval text,
 `Cows: STAY in P3.`, `Cows: NEEDS_INFO.`), where it stands (`Reply Y or N.` while it waits,
 `Sends 07:40 unless you reply N.` on a timer, `Sent, 248/250 collars confirmed, 200 ft to go.`
 once sent: collars not parked that applied its active boundary, and the sweep still left),
