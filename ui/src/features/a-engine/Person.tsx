@@ -10,7 +10,7 @@ import { Segmented } from "../../ui";
 import { useMe } from "../../store/me";
 import { TimeField } from "./Settings";
 
-const LABEL: Record<PersonChannel, string> = { sms: "SMS", whatsapp: "WhatsApp", email: "Email" };
+const LABEL: Record<PersonChannel, string> = { sms: "SMS", whatsapp: "WhatsApp", email: "Email", push: "Push" };
 
 // One read of everyone's prefs and the channels for all the rows on the page, read again for a
 // person it doesn't know yet (added since).

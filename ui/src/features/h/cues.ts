@@ -68,6 +68,9 @@ export function mountCues(ctx: OverlayCtx): OverlayHandle {
   const leave = () => void (tip.style.display = "none");
   map.on("mousemove", LAYER, hover);
   map.on("mouseleave", LAYER, leave);
+  // No hover on a touch screen: a tap shows the counts, moving the map hides them (M).
+  map.on("click", LAYER, hover);
+  map.on("movestart", leave);
 
   // New cues of this herd show a few seconds after they arrive.
   let soon: ReturnType<typeof setTimeout> | undefined;
@@ -95,6 +98,8 @@ export function mountCues(ctx: OverlayCtx): OverlayHandle {
       if (soon) clearTimeout(soon);
       map.off("mousemove", LAYER, hover);
       map.off("mouseleave", LAYER, leave);
+      map.off("click", LAYER, hover);
+      map.off("movestart", leave);
       tip.remove();
       if (map.getLayer(LAYER)) map.removeLayer(LAYER);
       if (map.getSource(SRC)) map.removeSource(SRC);

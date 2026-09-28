@@ -1784,6 +1784,52 @@ browser for hours, with a move every 30 minutes and a strip schedule advancing e
 writes `report.md` (latency, errors, live rate, CPU and memory, data budget, sweeps).
 
 <!-- @M -->
+
+## Web Push (op-alerts)
+
+Alerts and the morning brief as notifications on a phone (the app installed from its manifest) or
+in any browser that can take them, free and without Twilio. Only while the server is reached over
+https (`server.public_url` or a tunnel): browsers subscribe to push, and install the app, only from a
+secure origin. On an iPhone only the app added to the Home Screen can subscribe (iOS 16.4+).
+
+Every role may `POST`/`DELETE` its own subscriptions (and test them); `PUT /api/push/settings` is the
+owner's. Turning alerts on in a browser adds `push` to that person's alert channels (their prefs
+decide severity, herds, muted kinds and quiet hours as for texts); each subscription is its own
+address, so one alert reaches every browser the person turned it on in.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/api/push` | `PushView`; makes the farm's VAPID key the first time it is asked for over https |
+| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
+| DELETE | `/api/push/subscriptions/:id` | 204; your own (the owner: anyone's), else 404 |
+| POST | `/api/push/subscriptions/:id/test` | `{ ok, detail }` — "openpasture test." to that browser now, recorded in `/api/messages` |
+| PUT | `/api/push/settings` | `{ enabled?, new_keys? }` → `PushView`. `enabled: false` sends nothing by push (subscriptions stay); `new_keys: true` makes a new key pair and drops every subscription (browsers turn alerts on again) |
+
+```ts
+PushView = {
+  available: boolean,          // over https and enabled: browsers may subscribe
+  enabled: boolean,
+  reason?: string,             // why not, when not available
+  vapid_public_key?: string,   // base64url uncompressed P-256 point: PushManager.subscribe's applicationServerKey
+  key_set: boolean,            // the vapid_private_key secret exists (never its value)
+  mine: MySubscription[],      // yours, oldest first
+}
+MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push service last took a message for it */ }
+```
+
+- Channel `push` is in `configured` (`/api/notify/channels`, `/api/alerts/rules`) while the server is
+  reached over https, `push.enabled` is on, the key exists and at least one browser is subscribed;
+  `person_channels` then offers it. A `push` message's `address` is the subscription id.
+- A message goes as one aes128gcm record (RFC 8291) with a VAPID JWT (RFC 8292; `aud` the push
+  service's origin, `exp` 12 h, `sub` the farm's https address), `TTL` 4 h for alerts, 12 h for the
+  brief, 1 h for a test, `Urgency: high` for alerts, and the alert id as `Topic`. The payload the
+  service worker shows: `{ title /* the farm's name */, body, tag /* alert id */, url /* "/#/map?alert=<id>" */, alert_id?, herd_id? }`;
+  the body is the text without its texting instructions ("Reply OK to ack", "Reply Y or N. Code 4821").
+- 404 or 410 from the push service: the browser dropped it; the subscription is removed and the
+  message fails "That phone stopped taking notifications.". 408, 429 and 5xx are tried again (5 s,
+  30 s, 2 min); a push service that can't be reached at all waits as texts do.
+- Settings: `push` = `{ vapid_public_key?, enabled /* true */ }`; secret `vapid_private_key` (PKCS#8,
+  base64url). `push_subscriptions` holds personal data and is not in `/api/sql`.
 <!-- @Z -->
 <!-- @X1 -->
 

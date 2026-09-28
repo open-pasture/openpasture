@@ -2,7 +2,7 @@
 // kept fresh by /api/live.
 
 import { useSyncExternalStore } from "react";
-import { api, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type LiveEventOf, type LiveEventType, type Move, type PositionItem } from "./api";
+import { api, ApiError, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type LiveEventOf, type LiveEventType, type Move, type PositionItem } from "./api";
 import "./api/p";
 import { loadMe } from "./store/me";
 import { applyAcks, applyCollar, applyPositions, indexById, labels } from "./store/live";
@@ -116,6 +116,10 @@ export function useStore<T>(sel: (s: Store) => T): T {
   return useSyncExternalStore(store.subscribe, () => sel(s));
 }
 
+// M: the farm as this browser last saw it (features/m/offline-run.ts), for a start without the server.
+let lastSeen: (() => Partial<Store> | undefined) | undefined;
+export const setLastSeen = (f: typeof lastSeen) => void (lastSeen = f);
+
 async function refresh() {
   try {
     const [state] = await Promise.all([api.state(), loadMe()]);
@@ -123,7 +127,11 @@ async function refresh() {
     set({ state, herdId, ready: true, error: undefined });
     await refreshHerd();
   } catch (e) {
-    set({ ready: true, error: (e as Error).message });
+    // The server out of reach (no network, or a proxy saying it's gone) before anything loaded:
+    // the last copy, if any, until the live feed comes back and this runs again.
+    const unreachable = !(e instanceof ApiError) || e.status >= 500;
+    const last = !s.state && unreachable ? lastSeen?.() : undefined;
+    set(last ? { ...last, ready: true, error: undefined } : { ready: true, error: (e as Error).message });
   }
 }
 

@@ -7,6 +7,7 @@ import type { Alert, LonLat } from "../../api";
 import type { OverlayCtx } from "../../map/overlays";
 import { store } from "../../store";
 import { collarsOf } from "./model";
+import { pickAnimal, showMap } from "../m/select";
 
 let map: OverlayCtx | null = null;
 let pending: Alert | null = null;
@@ -51,6 +52,10 @@ export function focus(a: Alert) {
   }
   const ctx = map;
   ctx.highlight(collarsOf(a), a.severity === "critical" ? "red" : "warn");
+  // On a phone the map comes out from under the sheet; one animal is picked, to walk to (M).
+  const ids = collarsOf(a);
+  if (ids.length === 1) pickAnimal(ids[0]);
+  else showMap();
   clearTimeout(clear);
   clear = setTimeout(() => ctx.highlight([]), 8000);
 }

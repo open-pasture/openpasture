@@ -1,0 +1,229 @@
+/* M: the phone. Under 760 px the map fills the screen and the herd panel is a bottom sheet;
+   44 px targets, the notch and the home bar kept clear, every view in one column. Tokens and
+   patterns from base.css and app.css; nothing here applies at 760 px and up except the parts
+   that only exist on phones (the grab, the Locate button, the pick line). */
+
+/* Every view is the window's width: content wider than it (the Herd table) scrolls inside its own
+   box instead of widening the page past the edge, where nothing could reach it. */
+.shell{grid-template-columns:minmax(0,1fr)}
+.shell>main{min-width:0}
+.herdv{grid-template-columns:minmax(0,1fr)}
+
+/* things only a phone or a touch screen shows */
+.mgrab,.sheet .sgrab{display:none}
+.mhost{display:contents}
+.mlocate{position:absolute;right:12px;top:12px;z-index:3;width:44px;height:44px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.82);backdrop-filter:blur(6px);color:var(--fg2);display:grid;place-items:center}
+.mlocate[aria-pressed=true]{color:var(--blaze);border-color:var(--fg3)}
+.mline{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(var(--m-sheet,0px) + 36px);z-index:3;max-width:calc(100% - 140px);min-height:44px;padding:0 14px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.88);backdrop-filter:blur(6px);color:var(--fg);font-size:13px;line-height:42px;white-space:pre;overflow:hidden;text-overflow:ellipsis;transition:bottom .22s cubic-bezier(.2,.8,.2,1);animation:fade .15s both}
+.mline.err{color:var(--red);white-space:normal;line-height:18px;padding:12px 14px}
+.tright .mage{order:2;font-size:11.5px;color:var(--fg3)}
+.mpush{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mpush .mono{font-size:11.5px}
+
+@media (max-width:759px){
+  html{-webkit-text-size-adjust:100%}
+  body{overscroll-behavior:none}
+  button,a,[role=button],[role=checkbox],[role=radio]{touch-action:manipulation}
+  /* 16 px: iOS zooms into anything smaller when it takes focus */
+  .input,.input.sm,.input.mono,textarea.input{font-size:16px}
+
+  /* ---- shell: the top bar clears the notch; every view is one column of the screen's width ---- */
+  .shell{grid-template-rows:calc(44px + env(safe-area-inset-top)) minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
+  .shell>main{min-width:0;overflow:hidden}
+  .topbar{gap:12px;padding:env(safe-area-inset-top) max(10px,env(safe-area-inset-right)) 0 max(10px,env(safe-area-inset-left));min-width:0}
+  .brand{font-size:0;gap:0;min-height:44px;flex:none}
+  .topbar nav{gap:0;font-size:13.5px;min-width:0;flex:1;justify-content:space-between;max-width:248px}
+  .topbar nav a{display:flex;align-items:center;min-height:44px;padding:0 6px}
+  .tright{gap:4px;flex:none}
+  .bfind,.atrigger{min-width:36px;min-height:44px;justify-content:center}
+  .atrigger{margin:0}
+  .offline{margin-left:4px}
+  .alist{position:fixed;top:calc(44px + env(safe-area-inset-top) + 6px);left:8px;right:8px;width:auto;max-height:70vh}
+  .bsearch{position:fixed;top:calc(env(safe-area-inset-top) + 4px);left:8px;right:8px;width:auto;z-index:40}
+  .bsearch .input{height:40px}
+  .bhits button{min-height:44px;align-items:center}
+
+  /* ---- 44 px targets ---- */
+  .brand{min-width:44px}
+  .topbar nav a{min-width:44px;justify-content:center}
+  .bfind,.atrigger{min-width:44px}
+  .menutrigger{min-height:44px}
+  .input,.input.sm,select.input{min-height:44px}
+  .sorth{min-height:44px}
+  .play{width:44px;height:44px}
+  input[type=range]{height:44px}
+  .kv .editv{min-height:44px;min-width:44px}
+  .kv li{align-items:center}
+  .tagl{display:inline-flex;align-items:center;min-height:44px;min-width:44px}
+  .check{min-width:44px}
+  .sorth{min-width:44px}
+  .back{min-width:44px}
+  .atag .editv{min-height:44px}
+  /* table rows are 44 px on touch (ui/Table.tsx): the cells give their height to what's in them */
+  .tblw .tbl td{padding-top:0;padding-bottom:0}
+  .tblw .tbl td .editv,.tblw .tbl td .tagl{min-height:44px}
+  .btn,.btn.sm{min-height:44px;padding-left:14px;padding-right:14px}
+  .btn.plain,.btn.sm.plain{padding-left:10px;padding-right:10px}
+  .seg button{min-height:44px;padding-left:.9rem;padding-right:.9rem}
+  .menu button{min-height:44px;display:flex!important;align-items:center;font-size:14px}
+  .menu{max-width:calc(100vw - 16px)}
+  .menu kbd,.tools .menu kbd{display:none}
+  .check{min-height:44px}
+  .go{width:44px;height:44px}
+
+  /* ---- the map: full screen, the herd panel a sheet over it ---- */
+  .mapview{display:block;position:relative;height:100%}
+  .mapwrap{position:absolute;inset:0}
+  .maplibregl-ctrl-bottom-right,.maplibregl-ctrl-bottom-left{bottom:var(--m-sheet,0px)}
+  .maplibregl-ctrl-attrib{font-size:9px}
+
+  .mgrab{display:block;flex:none;order:-3;position:sticky;top:0;z-index:2;width:100%;height:32px;padding:0!important;background:var(--bg);touch-action:none;cursor:grab}
+  .mgrab::before{content:"";display:block;width:36px;height:4px;margin:10px auto 0;border-radius:2px;background:var(--line2)}
+  .mgrab:focus-visible{outline:none}
+  .mgrab:focus-visible::before{background:var(--fg3)}
+
+  .panel{position:absolute;left:0;right:0;bottom:0;height:var(--m-sheet,120px);max-height:100%;z-index:4;border-left:0;border-top:1px solid var(--line2);border-radius:14px 14px 0 0;
+    overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;padding-bottom:env(safe-area-inset-bottom);box-shadow:0 -12px 40px rgba(0,0,0,.45);
+    transition:height .22s cubic-bezier(.2,.8,.2,1)}
+  .panel.mdrag{transition:none}
+  .panel>*{padding-left:max(16px,env(safe-area-inset-left));padding-right:max(16px,env(safe-area-inset-right))}
+  .panel>.ph{order:-2;padding-top:2px}
+  .panel>.hitem{order:-1}
+  /* resting at peek: what to do now, no scrolling (a drag or the grab opens it) */
+  .panel[data-m-sheet=peek]{overflow:hidden;touch-action:none}
+  .panel[data-m-sheet=peek]>.auto,.panel[data-m-sheet=peek] .dec .why:not(.err){display:none}
+  .dec{max-height:none;min-height:0;overflow:visible;padding-top:12px;padding-bottom:12px}
+  .dec .call{font-size:17px}
+  .dec .acts{flex-wrap:wrap}
+  .collars{flex:none;overflow:visible;-webkit-mask-image:none;mask-image:none}
+  .collars button{min-height:44px;align-items:center}
+  .collars .sum{flex-wrap:wrap;min-height:44px;align-items:center}
+  .collars .sum button{min-height:44px;min-width:44px}
+  .esc .behind,.dec .behind{min-height:44px;display:inline-flex;align-items:center}
+  .arow{flex-wrap:nowrap}
+  /* k-animals.css's .aacts (the animal page's actions) also matches the alert row's buttons */
+  .arow .aacts{border-top:0;padding-top:0}
+  .arow .behind{min-width:0}
+  .esc.alerts .more{min-height:44px}
+  .snext{min-height:44px;align-items:center}
+  .sqrow{line-height:44px}
+  .sqrow .sacts .btn.sm{height:44px;line-height:20px}
+  .sqrow[data-first] .sacts{margin-left:0;flex-wrap:wrap}
+  .squeue{max-height:none;overflow:visible}
+  .addcollar{padding-bottom:24px}
+  /* drawing: the map to itself */
+  .mapview:has(.tools .toolhint,.tools .toolform) .panel,.mapview:has(.tools .toolhint,.tools .toolform) .mline{display:none}
+  .mapview:has(.tools .toolhint,.tools .toolform){--m-sheet:0px!important}
+
+  /* the tools bar: across the top, wrapping; forms and footers the width of the screen */
+  .tools{top:8px;left:max(8px,env(safe-area-inset-left));right:max(8px,env(safe-area-inset-right));flex-wrap:wrap;align-items:flex-start}
+  .toolform{flex-wrap:wrap;max-width:100%;row-gap:4px}
+  .toolform .input{width:auto;flex:1 1 120px;min-width:0}
+  .toolform .ferr,.toolform .cerr,.toolform .dmsg{max-width:none;flex-basis:100%;white-space:normal}
+  .toolfoot,.cfoot{position:absolute;left:0;right:0;width:auto;max-height:calc(100vh - 220px);overflow:auto}
+  .cfoot .toolfoot{max-height:none}
+  .toolhint{min-height:44px;display:inline-flex;align-items:center}
+  .mlocate{top:auto;bottom:calc(var(--m-sheet,0px) + 36px);transition:bottom .22s cubic-bezier(.2,.8,.2,1)}
+  .layersmenu{bottom:calc(var(--m-sheet,0px) + 36px);left:max(12px,env(safe-area-inset-left));transition:bottom .22s cubic-bezier(.2,.8,.2,1)}
+  .layersmenu .btn.quiet{min-width:44px}
+  .gcov{bottom:calc(var(--m-sheet,0px) + 88px)}
+  .srail-host{bottom:calc(var(--m-sheet,0px) + 88px);max-width:calc(100% - 16px)}
+  .srail{padding:6px 10px}
+  .strack{width:calc(100vw - 150px);height:44px}
+  .strack::before{top:21px}
+  .strack .stick{top:14px}
+  .strack b{top:19px}
+  .strack b.sopen{top:18px}
+  .sknob{top:14px;height:15px;width:13px;margin-left:-6px}
+  .sat{min-height:44px}
+
+  /* the side sheet (paddock, a feature, alerts, a knowledge entry) rises from the bottom */
+  .sheet,.sheet:has(.cpicked){top:auto;left:0;right:0;bottom:0;width:auto;max-height:78%;overflow:auto;border-radius:14px 14px 0 0;border-bottom:0;
+    padding:0 max(16px,env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));z-index:6;box-shadow:0 -12px 40px rgba(0,0,0,.5)}
+  .sheet .sgrab{display:block;position:sticky;top:0;z-index:1;height:32px;margin:0 -16px -4px;background:rgba(17,19,16,.96)}
+  .sheet .sgrab::before{content:"";display:block;width:36px;height:4px;margin:12px auto 0;border-radius:2px;background:var(--line2)}
+  .sheet .asheet{max-height:none}
+  .sheet .input.title{font-size:17px}
+  .lease .lrow{flex-wrap:wrap}
+
+  /* ---- herd view and animal pages ---- */
+  .hbar{flex-wrap:wrap;row-gap:8px;padding:8px max(12px,env(safe-area-inset-left))}
+  .hfilter{flex:1 1 160px;width:auto;min-width:0}
+  .hacts{margin-left:0;flex-wrap:wrap;width:100%}
+  .hflow{padding:12px}
+  .hline{flex-wrap:wrap}
+  .tblw{-webkit-overflow-scrolling:touch}
+  .tbl th{padding-top:12px;padding-bottom:12px}
+  .tblfilter{max-width:none}
+  .apage{display:block;overflow:auto;height:100%}
+  .aside{border-right:0;overflow:visible;padding:12px max(16px,env(safe-area-inset-left)) 24px}
+  .amap{height:min(56vh,420px)}
+  .kv .input.editin{width:140px}
+  .back{min-height:44px;display:inline-flex;align-items:center}
+
+  /* ---- data ---- */
+  .dbar{flex-wrap:wrap;gap:8px;padding:8px 12px}
+  .charts{grid-template-columns:minmax(0,1fr);gap:24px;padding:16px 12px}
+  .replay{height:380px}
+  .scrub{gap:8px;padding:0 12px}
+  .scrub .mono{min-width:0}
+  .editor{grid-template-columns:minmax(0,1fr)}
+  .run{padding:8px 12px}
+  .btl li>button,.btl li>div{grid-template-columns:78px 1fr;padding:10px 12px}
+  .btl .st{grid-column:2}
+  .rrow{padding:4px 12px}
+  .rline{flex-wrap:wrap;row-gap:4px;min-height:44px}
+  .rname{min-width:0;flex:1 1 100%;min-height:44px}
+  .rdates .input{width:auto;flex:1}
+  .rmore{padding-left:0}
+  .feedlog{overflow-x:auto;max-width:100%}
+  .msgs{padding:0 12px 12px;overflow-x:auto}
+  .ahistory{padding:4px 12px 16px;overflow-x:auto}
+
+  /* ---- settings: label over its content ---- */
+  .settings{padding:8px max(16px,env(safe-area-inset-left)) calc(48px + env(safe-area-inset-bottom))}
+  .srow{grid-template-columns:minmax(0,1fr);gap:10px;padding:18px 0}
+  .srow h2{padding-top:0}
+  .srow .line{flex-wrap:wrap}
+  .srow .grow{white-space:normal}
+  .brains li>button{min-height:44px;flex-wrap:wrap}
+  .brains code{margin-left:0}
+  .brains .more{padding-left:12px}
+  .server .port{width:88px}
+  .copy{flex-wrap:wrap}
+  .copy code{flex-basis:100%}
+  .people .prow{flex-wrap:wrap;row-gap:2px;min-height:44px}
+  .people .prow .pn{min-width:0;flex:1 1 auto}
+  .people .more{padding-left:0}
+  .field,.field.pname{flex:1 1 100%;min-width:0}
+  .people .padd .line>.input:first-child{flex:1 1 100%}
+  .aprefs{gap:8px 12px}
+  /* a rule: its on/off and sentence on one line, Notify under the sentence */
+  .arule{flex-wrap:wrap;gap:0 10px}
+  .arule .asent{flex:1 1 calc(100% - 44px);min-height:44px}
+  .arule .asent+.check{margin-left:24px}
+  .tgrid{grid-template-columns:minmax(0,1fr)}
+  .tfields .line .input.to{width:auto;flex:1 1 160px}
+  .verify{flex-wrap:wrap}
+  .htraining{row-gap:4px}
+
+  /* ---- first run, sign-in ---- */
+  .q.top{width:calc(100vw - 24px);top:calc(env(safe-area-inset-top) + 12px)}
+  .q.bottom{bottom:calc(24px + env(safe-area-inset-bottom));flex-wrap:wrap;justify-content:center;width:calc(100vw - 24px)}
+  .q.herd{flex-wrap:wrap;justify-content:center}
+  .q.herd .input{width:auto;flex:1 1 160px}
+  .corner{top:calc(env(safe-area-inset-top) + 12px)}
+  .boot .token{width:calc(100vw - 48px)}
+}
+
+/* 760 to 1023 px (a tablet, a narrow window): the map is narrow beside the panel, so the time rail
+   sits above the Layers button and fits between the map's edges */
+@media (min-width:760px) and (max-width:1023px){
+  .srail-host{bottom:60px}
+  .strack{width:min(380px,calc(100vw - 304px - 150px))}
+}
+
+/* a touch screen of any size: bigger things to put a finger on */
+@media (hover:none){
+  .chandle{width:22px;height:22px}
+}

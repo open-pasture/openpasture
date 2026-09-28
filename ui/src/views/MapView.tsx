@@ -19,6 +19,9 @@ import { Button, Input, Menu, Sheet } from "../ui";
 import { useUnits } from "../units";
 import { attempt, typing, useKey } from "../util";
 import { pageHash, pageKeys } from "../features/k-animals/herd";
+import { touchUI, usePhone } from "../features/m/phone";
+import { pickAnimal } from "../features/m/select";
+import { picked } from "../store/m";
 import { HerdPanel } from "./HerdPanel";
 
 type Mode =
@@ -95,11 +98,31 @@ export function MapView() {
       fitPolys(m, store.get().state?.paddocks.map((p) => p.geometry) ?? [], 96);
       setMap(m);
     });
-    // An animal opens its page once there is a Herd view to open it in.
-    const animalAt = (e: MapMouseEvent) =>
-      views.has("herd") && m.getLayer("animals") ? m.queryRenderedFeatures(e.point, { layers: ["animals"] })[0] : undefined;
+    // An animal opens its page once there is a Herd view to open it in. On a touch screen a tap
+    // picks it instead (M), and a fingertip near it counts.
+    const TAP_PX = 20;
+    const animalAt = (e: MapMouseEvent) => {
+      if (!m.getLayer("animals")) return undefined;
+      if (!touchUI()) return views.has("herd") ? m.queryRenderedFeatures(e.point, { layers: ["animals"] })[0] : undefined;
+      const { x, y } = e.point;
+      const near = m.queryRenderedFeatures([[x - TAP_PX, y - TAP_PX], [x + TAP_PX, y + TAP_PX]], { layers: ["animals"] });
+      const d = (f: GeoJSON.Feature) => {
+        const p = m.project((f.geometry as GeoJSON.Point).coordinates as [number, number]);
+        return (p.x - x) ** 2 + (p.y - y) ** 2;
+      };
+      return near.sort((a, b) => d(a) - d(b))[0];
+    };
+    // A tap that only let go of the picked animal doesn't open the paddock under it too.
+    let unpicked = false;
     m.on("click", (e) => {
       if (modeRef.current.k !== "idle") return;
+      if (touchUI()) {
+        const tapped = animalAt(e)?.properties?.id as string | undefined;
+        unpicked = !tapped && !!picked.get();
+        // Its name by it, as hovering shows it with a mouse.
+        hoverRef.current(tapped);
+        return pickAnimal(tapped ?? null);
+      }
       const id = animalAt(e)?.properties?.id as string | undefined;
       const c = id ? store.get().collars.find((x) => x.id === id) : undefined;
       if (!c) return;
@@ -137,7 +160,7 @@ export function MapView() {
       m.getCanvas().style.cursor = "";
     });
     m.on("click", "paddocks-fill", (e: MapMouseEvent & { features?: GeoJSON.Feature[] }) => {
-      if (modeRef.current.k !== "idle" || animalAt(e)) return;
+      if (modeRef.current.k !== "idle" || animalAt(e) || unpicked) return;
       const id = e.features?.[0]?.properties?.id as string | undefined;
       if (id) setSheet({ k: "paddock", id });
     });
@@ -313,8 +336,11 @@ export function MapView() {
   const active = mode.k === "tool" ? shown.find((t) => t.id === mode.id) : undefined;
   // One context per tool run, so a tool's effects don't re-run on every render.
   const activeCtx = useMemo(() => (active && host.current ? overlayCtx(host.current, `tool:${active.id}`) : undefined), [active?.id, map]); // eslint-disable-line react-hooks/exhaustive-deps
-  const bar = shown.filter((t) => t.group === "bar");
-  const drawGroup = shown.filter((t) => t.group === "draw");
+  // On a phone the bar is Boundary and Draw; the other bar tools join the Draw menu (M).
+  const phone = usePhone();
+  const folded = (t: ToolItem) => phone && t.group === "bar" && t.id !== "boundary";
+  const bar = shown.filter((t) => t.group === "bar" && !folded(t));
+  const drawGroup = [...shown.filter(folded), ...shown.filter((t) => t.group === "draw")];
   const barItems = [
     ...bar.map((t) => ({ order: t.order, node: <Button key={t.id} small onClick={() => begin(t)} title={t.key ? `${t.label} (${t.key.toUpperCase()})` : t.label}>{t.label}</Button> })),
     ...(drawGroup.length ? [{ order: DRAW_ORDER, node: <DrawGroup key="draw" items={drawGroup} onPick={begin} /> }] : []),
@@ -347,8 +373,12 @@ export function MapView() {
       </div>
       <HerdPanel onChange={change} changing={mode.k === "change"} onFocusCollar={(id) => {
         const p = animals.current?.where(id);
+        pickAnimal(id);
         if (p && map) map.easeTo({ center: p, duration: 600 });
-      }} onFocusCollars={flyTo} onHoverCollar={hover} />
+      }} onFocusCollars={(ids) => {
+        pickAnimal(ids.length === 1 ? ids[0] : null);
+        flyTo(ids);
+      }} onHoverCollar={hover} />
     </div>
   );
 }

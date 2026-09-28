@@ -70,6 +70,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @H
         // @L
         // @M
+        notify::push::router(),
         // @Z
     ] {
         app = app.merge(part);

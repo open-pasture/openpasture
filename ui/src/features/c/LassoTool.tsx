@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { MapMouseEvent } from "maplibre-gl";
+import type { MapMouseEvent, MapTouchEvent } from "maplibre-gl";
 import { api, type Collar, type LonLat } from "../../api";
 import { done as taken, peek } from "../../store/c";
 import { collarLabel, store, useStore } from "../../store";
@@ -10,7 +10,7 @@ import { views } from "../../registry";
 import { selectUrl } from "../k-animals/herd";
 import type { ToolProps } from "../../map/tools";
 import type { OverlayCtx } from "../../map/overlays";
-import { caughtIn, drag, lassoLayers, removeLasso, setLasso } from "./freehand";
+import { caughtIn, drag, dragTouch, lassoLayers, removeLasso, setLasso } from "./freehand";
 
 interface Caught { ids: string[]; ring: LonLat[] }
 
@@ -49,9 +49,16 @@ export function LassoTool({ map, ctx, done }: ToolProps) {
       if (e.originalEvent.button !== 0) return;
       stop = drag(map, e, (ring) => ring && setSel({ ring, ids: caughtIn(ring, ctx.positions()) }));
     };
+    // By touch too (M): one finger draws the lasso.
+    const touch = (e: MapTouchEvent) => {
+      if (e.originalEvent.touches.length !== 1) return;
+      stop = dragTouch(map, e, (ring) => ring && setSel({ ring, ids: caughtIn(ring, ctx.positions()) }));
+    };
     map.on("mousedown", down);
+    map.on("touchstart", touch);
     return () => {
       map.off("mousedown", down);
+      map.off("touchstart", touch);
       stop?.();
       el.classList.remove("classo-draw");
     };

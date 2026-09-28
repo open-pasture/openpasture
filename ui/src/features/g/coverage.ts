@@ -75,6 +75,9 @@ export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
   const leave = () => void (tip.style.display = "none");
   map.on("mousemove", FILL, hover);
   map.on("mouseleave", FILL, leave);
+  // No hover on a touch screen: a tap shows the value, moving the map hides it (M).
+  map.on("click", FILL, hover);
+  map.on("movestart", leave);
 
   render();
   void load();
@@ -86,6 +89,8 @@ export function mountCoverage(ctx: OverlayCtx): OverlayHandle {
       clearInterval(timer);
       map.off("mousemove", FILL, hover);
       map.off("mouseleave", FILL, leave);
+      map.off("click", FILL, hover);
+      map.off("movestart", leave);
       // Not while React may be committing the Layers menu.
       setTimeout(() => root.unmount(), 0);
       box.remove();

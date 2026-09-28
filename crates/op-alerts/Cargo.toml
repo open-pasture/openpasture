@@ -54,6 +54,7 @@ form_urlencoded.workspace = true
 # @H
 # @L
 # @M
+ring.workspace = true
 # @Z
 
 [dev-dependencies]
