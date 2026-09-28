@@ -275,7 +275,11 @@ animal is: its fixes of the last 12 s before its newest that agree with it (with
 accuracy), averaged by `1 / accuracy²` (one fix wanders by metres); the edge behind it leaves
 extra room of half that average's spread plus 0.05 m per second since the fix, at most 0.5 m, so
 it stays in its warning zone. The edge uses at most half the corners the herd's collars hold (64
-of V0's 128); past that its smallest bumps are straightened, which only moves it back. The sweep
+of V0's 128; a herd with legacy collars plans for their 64 corners, 32 for the edge); past that its
+smallest bumps are straightened, which only moves it back. A step goes out only if every animal
+keeps its room (half its warning zone less a quarter metre, or what it had) in the fence each of
+the herd's collars gets, after exclusions and the fit to that collar; else it is planned again with
+fewer corners, and after four tries nothing is sent that pass. The sweep
 direction (herd centroid toward target centroid) is fixed for the whole move; when the herd
 surrounds the target (its centroid is about on the target), the steps close in from every side
 instead (the hull of the herd, buffered by `0.6 × warn_m`). The last step is sent when every

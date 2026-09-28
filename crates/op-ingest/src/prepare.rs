@@ -53,6 +53,8 @@ pub fn activation(opts: &SendOpts) -> DateTime<Utc> {
 
 /// The target after exclusions and fitting, and what each overlapping exclusion became.
 pub(crate) struct Excluded {
+    /// The target with the exclusions cut out or made holes, before fitting.
+    pub shaped: Polygon,
     pub fitted: Polygon,
     /// Fitting to the collars changed the shape (beyond the exclusions).
     pub simplified: bool,
@@ -83,7 +85,7 @@ pub(crate) async fn exclude(ctx: &Ctx, geometry: &Polygon, limits: &CollarLimits
     if pending.is_empty() {
         let fitted = shape::fit_gap(geometry, limits, gap);
         let simplified = fitted.coordinates != geometry.coordinates;
-        return Ok(Excluded { fitted, simplified, placed: vec![] });
+        return Ok(Excluded { shaped: geometry.clone(), fitted, simplified, placed: vec![] });
     }
     // Shaped with room for any number of corners (only `holes` matters until the
     // final fit), then fitted: the same result as shaping with `limits`, and the
@@ -94,7 +96,7 @@ pub(crate) async fn exclude(ctx: &Ctx, geometry: &Polygon, limits: &CollarLimits
     let fitted = shape::fit_gap(&shaped.geometry, limits, gap);
     let simplified = fitted.coordinates != shaped.geometry.coordinates;
     let placed = pending.into_iter().zip(shaped.placements).map(|((feature, _, overlap), placement)| Placed { feature, placement, overlap }).collect();
-    Ok(Excluded { fitted, simplified, placed })
+    Ok(Excluded { shaped: shaped.geometry, fitted, simplified, placed })
 }
 
 /// What the farmer should know about `sent` (the shape as it goes to the

@@ -810,6 +810,54 @@ async fn a_straggler_is_dropped_and_left_behind() {
     assert_eq!(st["move"]["stragglers"], json!([collars[0].0]));
 }
 
+/// A herd of legacy collars (one ring of at most 64 corners, no holes) and
+/// one that holds holes, so the herd's steps are planned for V0's 128
+/// corners. Every animal must still be inside the fence each collar
+/// downloads, not only inside the stored step: fitting a many-cornered
+/// followed edge down to 64 cuts the apex corners behind single animals.
+#[tokio::test]
+async fn every_animal_keeps_its_room_in_the_fence_each_collar_downloads_for_a_sweep_step() {
+    let app = App::new().await;
+    let (_, _) = app.call("POST", "/api/farm", Some(json!({"name": "Home", "center": MID}))).await;
+    let (_, pad) = app.call("POST", "/api/paddocks", Some(json!({"name": "Big", "geometry": m_rect(0.0, 0.0, 600.0, 600.0)}))).await;
+    let (_, herd) = app.call("POST", "/api/herds", Some(json!({"name": "Cows", "species": "cattle", "count": 49, "paddock_id": pad["id"]}))).await;
+    let herd = herd["id"].as_str().unwrap().to_owned();
+    app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 600.0, 600.0)}))).await;
+    // One collar that holds holes, at the front.
+    let (_, v0_key) = app.device(&herd).await;
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let body = json!({"device": {"fw": "0.2.0", "caps": ["holes", "slots", "collar_id", "cue_mode", "episodes", "config"]},
+        "fixes": [{"at": at, "point": m_at(260.0, 260.0), "accuracy_m": 2.0, "sats": 9}]});
+    let (s, v) = app.req("POST", "/collar/v1/report", Some(&v0_key), Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // 48 legacy collars in a line across the back, 12 m apart: each is its own corner of the edge.
+    let mut points = vec![m_at(260.0, 260.0)];
+    let mut legacy = Vec::new();
+    for i in 0..48 {
+        let t = i as f64 / 47.0;
+        let p = m_at(10.0 + 410.0 * t, 420.0 - 410.0 * t);
+        let (_, key) = app.device(&herd).await;
+        app.fix(&key, p, chrono::Utc::now()).await;
+        points.push(p);
+        legacy.push(key);
+    }
+    let (s, m) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(500.0, 500.0, 600.0, 600.0)}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{m}");
+    assert_eq!(m["status"], "sweeping");
+    for key in [&v0_key, &legacy[0]] {
+        let (s, cmd) = app.req("GET", "/collar/v1/boundary", Some(key), None).await;
+        assert_eq!(s, StatusCode::OK, "{cmd}");
+        let ring: Vec<[f64; 2]> = serde_json::from_value(cmd["boundary"].clone()).unwrap();
+        let fence = op_geo::Polygon::from_ring(ring);
+        // The room the plan gives each animal: half its warning band, less a quarter metre.
+        let need = 0.5 * cmd["warn_m"].as_f64().unwrap() - 0.25;
+        let pr = op_geo::Projection::new(MID);
+        let edge = pr.forward_ring(&fence.outer_ring());
+        let short = points.iter().filter(|p| op_ingest::planner::signed_distance(pr.forward(**p), &edge) < need).count();
+        assert_eq!(short, 0, "{short} animals without their room in the {}-corner fence a collar downloads", cmd["boundary"].as_array().unwrap().len());
+    }
+}
+
 #[tokio::test]
 async fn a_sweep_waits_out_a_collar_outage() {
     let app = App::new().await;

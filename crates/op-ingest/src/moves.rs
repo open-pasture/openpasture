@@ -147,8 +147,13 @@ pub struct Situation {
     /// [`WITH_HERD`] before it) that have no fresh fix now (last fix older
     /// than [`FRESH_FIX`]): where and when each was last fixed.
     pub silent: Vec<(String, LonLat, DateTime<Utc>)>,
-    /// What the herd's collars hold (the strictest limits among those that hold holes).
+    /// What the herd's collars hold: the strictest limits among those that
+    /// hold holes, with no more outer corners than any of its collars holds
+    /// (so no collar's copy of a step is cut down behind an animal).
     pub limits: CollarLimits,
+    /// The limits each of the herd's collars gets its copy of a step fitted
+    /// to ([`crate::shape::CollarCaps::fit_limits`], each set once).
+    pub fits: Vec<CollarLimits>,
 }
 
 impl Default for Situation {
@@ -162,6 +167,7 @@ impl Default for Situation {
             spread: HashMap::new(),
             silent: vec![],
             limits: CollarLimits::V0,
+            fits: vec![],
         }
     }
 }
@@ -428,10 +434,18 @@ pub(crate) async fn situation(
             silent.push((c.id, f.point, f.at));
         }
     }
-    let limits = crate::shape::herd_limits(ctx, herd_id).await?;
+    let collars = crate::shape::herd_collars(ctx.db(), herd_id).await?;
+    let mut limits = crate::shape::strictest(collars.iter().map(|c| &c.caps));
+    let mut fits: Vec<CollarLimits> = Vec::new();
+    for l in collars.iter().filter(|c| c.parked.is_none()).map(|c| c.caps.fit_limits()) {
+        if !fits.contains(&l) {
+            limits.outer = limits.outer.min(l.outer);
+            fits.push(l);
+        }
+    }
     // @S: the freeze covers the move's own staged step only.
     let pending = split.staged.iter().any(|b| decision_id.is_some_and(|d| b.decision_id == d));
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, spread, silent, limits })
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, spread, silent, limits, fits })
 }
 
 /// The fixes [`estimate`] averages for a collar whose newest fix is
@@ -516,9 +530,79 @@ async fn advance_off_thread(m: &MoveState<'_>, sit: Situation, now: DateTime<Utc
 }
 
 /// A sweep step on its way to the collars, like every herd boundary.
-async fn prepare_step(ctx: &Ctx, herd_id: &str, polygon: &Polygon, warn_m: f64, hysteresis_m: f64) -> ApiResult<Polygon> {
+async fn prepare_step(ctx: &Ctx, herd_id: &str, polygon: &Polygon, warn_m: f64, hysteresis_m: f64) -> ApiResult<Prepared> {
     let opts = SendOpts { warn_m: Some(warn_m), hysteresis_m: Some(hysteresis_m), effective_at: None };
-    Ok(prepare(ctx, herd_id, polygon, &opts).await?.geometry)
+    prepare(ctx, herd_id, polygon, &opts).await
+}
+
+/// How many of `animals` a prepared step leaves without the room the plan
+/// gave them in one of the fences the herd's collars enforce (the stored
+/// step, and its copy fitted to each collar's `fits`). The room is judged
+/// in `shaped`, the step with the exclusions in effect: an animal in an
+/// exclusion is its to cue out, not the fit's. Half the warning band less a
+/// quarter metre, or what it had if that was less, as the planner gives.
+pub fn short_of_room(shaped: &Polygon, fitted: &Polygon, fits: &[CollarLimits], animals: &[LonLat], warn_m: f64) -> usize {
+    use op_geo::ring::point_in_ring;
+    let Some(origin) = shaped.centroid() else { return 0 };
+    let proj = op_geo::Projection::new(origin);
+    let reference = proj.forward_ring(&shaped.outer_ring());
+    let mut fences = vec![proj.forward_ring(&fitted.outer_ring())];
+    fences.extend(fits.iter().map(|l| proj.forward_ring(&crate::shape::fit_for(fitted, l, warn_m).outer_ring())));
+    animals
+        .iter()
+        .filter(|a| {
+            if shaped.holes().any(|h| point_in_ring(**a, &h)) {
+                return false;
+            }
+            let q = proj.forward(**a);
+            let m = planner::signed_distance(q, &reference);
+            let need = ((0.5 * warn_m).min(m) - 0.25).max(0.0);
+            m > 0.0 && fences.iter().any(|f| planner::signed_distance(q, f) < need - 1e-3)
+        })
+        .count()
+}
+
+/// Tries at planning a step whose fences keep every animal's room (see [`next_step`]).
+const FIT_TRIES: usize = 4;
+
+/// [`advance`], with a step prepared for the collars ([`prepare_step`]).
+/// Exclusions notched into a step add corners, and fitting it down to what
+/// a collar holds cuts its smallest corners, the apexes of a followed edge
+/// a few metres behind single animals. So a step goes only if every animal
+/// keeps its room in each collar's fence ([`short_of_room`]); else it is
+/// planned again with fewer corners (room for the ones the exclusions
+/// add); `None` when after [`FIT_TRIES`] none does (nothing is sent this pass).
+async fn next_step(
+    ctx: &Ctx,
+    herd_id: &str,
+    m: &MoveState<'_>,
+    mut sit: Situation,
+    now: DateTime<Utc>,
+    hysteresis_m: f64,
+) -> ApiResult<Option<(Outcome, Situation, f64)>> {
+    let mut total_ms = 0.0;
+    for _ in 0..FIT_TRIES {
+        let (mut out, back, ms) = advance_off_thread(m, sit, now).await?;
+        sit = back;
+        total_ms += ms;
+        let Next::Send { polygon, last: false, .. } = &mut out.next else { return Ok(Some((out, sit, total_ms))) };
+        let prepared = prepare_step(ctx, herd_id, polygon, m.warn_m, hysteresis_m).await?;
+        let animals: Vec<LonLat> = sit.positions.iter().filter(|(c, _)| !out.stragglers.contains(c)).map(|(_, p)| *p).collect();
+        let short = short_of_room(&prepared.excluded, &prepared.geometry, &sit.fits, &animals, m.warn_m);
+        if short == 0 {
+            *polygon = prepared.geometry;
+            return Ok(Some((out, sit, total_ms)));
+        }
+        let planned = polygon.outer_ring().len();
+        let added = prepared.excluded.outer_ring().len().saturating_sub(planned);
+        let outer = sit.limits.outer.min(planned).saturating_sub(added.max(4)).max(8);
+        tracing::debug!(herd = %herd_id, short, planned, outer, "sweep step planned again with fewer corners");
+        if outer >= sit.limits.outer {
+            break;
+        }
+        sit.limits.outer = outer;
+    }
+    Ok(None)
 }
 
 /// Moves are driven one herd at a time.
@@ -572,13 +656,19 @@ pub(crate) async fn begin(
     let at = now();
     let effective_at = effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
     let sit = situation(ctx, herd_id, at, None, Some(at)).await?;
-    let (mut out, sit, plan_ms) =
-        advance_off_thread(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, sit, at).await?;
-    match &mut out.next {
-        Next::Send { polygon, last: false, .. } => *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?,
-        Next::Send { .. } => {}
-        // Nothing goes yet (the collars are silent): the first step keeps the farmer's time.
-        Next::Wait => out.sweep.not_before = effective_at,
+    let positions = sit.positions.len();
+    let first = MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] };
+    let (mut out, plan_ms) = match next_step(ctx, herd_id, &first, sit, at, hysteresis_m).await? {
+        Some((out, _, ms)) => (out, ms),
+        // No first step keeps every animal inside its collar's fence yet: the driver tries again as the herd moves.
+        None => {
+            tracing::warn!(herd = %herd_id, "first sweep step not sent: no step keeps every animal inside the fence its collar holds");
+            (Outcome { next: Next::Wait, sweep: Sweep::default(), stragglers: vec![] }, 0.0)
+        }
+    };
+    // Nothing goes yet (the collars are silent): the first step keeps the farmer's time.
+    if out.next == Next::Wait {
+        out.sweep.not_before = effective_at;
     }
 
     let mut m = Move {
@@ -655,7 +745,7 @@ pub(crate) async fn begin(
     if let Some(b) = &boundary {
         announce(ctx, b).await;
     }
-    log_move(&m, boundary.as_ref(), sit.positions.len(), plan_ms);
+    log_move(&m, boundary.as_ref(), positions, plan_ms);
     ctx.publish(Event::Move { r#move: m.clone() });
     // A sweep: the herd's collars report and poll fast until it is over.
     if m.status == MoveStatus::Sweeping {
@@ -727,16 +817,17 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     }
     let mut m = row.m.clone();
     let state = MoveState { target: &m.target, warn_m: row.warn_m, step: m.step, sweep: &row.sweep, stragglers: &m.stragglers };
-    let (mut out, sit, plan_ms) = advance_off_thread(&state, sit, at).await?;
-    if let Next::Send { polygon, last: false, .. } = &mut out.next {
-        match prepare_step(ctx, herd_id, polygon, row.warn_m, row.hysteresis_m).await {
-            Ok(p) => *polygon = p,
-            Err(e) => {
-                tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: {}", e.message);
-                return Ok(None);
-            }
+    let (mut out, sit, plan_ms) = match next_step(ctx, herd_id, &state, sit, at, row.hysteresis_m).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: no step keeps every animal inside the fence its collar holds");
+            return Ok(None);
         }
-    }
+        Err(e) => {
+            tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: {}", e.message);
+            return Ok(None);
+        }
+    };
     let visible = out.stragglers != m.stragglers || matches!(out.next, Next::Send { .. });
     if !visible && out.sweep == row.sweep {
         return Ok(None);
@@ -1064,6 +1155,26 @@ mod tests {
                 dropped_before = r.stragglers.len();
             }
         }
+    }
+
+    #[test]
+    fn a_fit_that_cuts_the_corner_behind_an_animal_leaves_it_short_of_room() {
+        // A followed edge behind ten animals 12 m apart: each one its own corner.
+        let pts: Vec<[f64; 2]> = (0..10).map(|i| [20.0 + 12.0 * i as f64, 60.0]).collect();
+        let mut r = Run::new(&pts);
+        r.target = rect(0.0, 150.0, 300.0, 200.0);
+        let Next::Send { polygon, .. } = r.tick(t0()) else { panic!("a step") };
+        let animals: Vec<LonLat> = r.sit.positions.iter().map(|(_, p)| *p).collect();
+        assert_eq!(short_of_room(&polygon, &polygon, &[], &animals, W), 0);
+        let corners = polygon.outer_ring().len();
+        let small = CollarLimits { outer: corners - 6, holes: 0, hole_vertices: 0, total: corners - 6, ..CollarLimits::LEGACY };
+        assert!(short_of_room(&polygon, &polygon, &[small], &animals, W) > 0, "fitting {corners} corners down to {} cuts behind animals", corners - 6);
+        // An animal in an exclusion is the exclusion's to cue out, not the fit's.
+        let p = Projection::new(ORIGIN);
+        let hole: Vec<LonLat> = [[16.0, 56.0], [24.0, 56.0], [24.0, 64.0], [16.0, 64.0]].iter().map(|q| p.inverse(*q)).collect();
+        let mut shaped = polygon.clone();
+        shaped.coordinates.push(Polygon::from_ring(hole).coordinates.remove(0));
+        assert_eq!(short_of_room(&shaped, &polygon, &[], &animals[..1], W), 0);
     }
 
     #[test]
