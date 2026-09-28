@@ -986,6 +986,20 @@ async fn planned(ctx: &Ctx, n: NewSchedule, occ: Occurrences<'_>) -> ApiResult<(
 
 static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
 
+// @L
+/// Staging refusals already warned about, `(schedule, strip, step, reason)`.
+static REFUSED: LazyLock<std::sync::Mutex<HashSet<(String, u32, u32, String)>>> = LazyLock::new(Default::default);
+
+/// Whether this refusal is new (and so worth a warning). Bounded: past a
+/// thousand remembered, it starts over.
+fn first_refusal(schedule: &str, strip: u32, step: u32, reason: &str) -> bool {
+    let mut seen = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() > 1000 {
+        seen.clear();
+    }
+    seen.insert((schedule.to_owned(), strip, step, reason.to_owned()))
+}
+
 async fn lock(schedule_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let m = LOCKS.lock().unwrap_or_else(|e| e.into_inner()).entry(schedule_id.to_owned()).or_default().clone();
     m.lock_owned().await
@@ -1826,7 +1840,12 @@ async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc
         let prepared = match shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts).await {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move can't be staged: {}", e.message);
+                // @L: the driver tries again every pass; one warning per move and reason is enough.
+                if first_refusal(&s.id, rows[i].strip, rows[i].step, &e.message) {
+                    tracing::warn!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move can't be staged: {}", e.message);
+                } else {
+                    tracing::debug!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move can't be staged: {}", e.message);
+                }
                 break;
             }
         };
