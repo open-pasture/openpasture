@@ -124,8 +124,15 @@ def main():
         cpu = [r["cpu_pct"] for r in rows[1:]]
         print("## Server process and data dir\n")
         print(f"- CPU: mean {statistics.mean(cpu):.1f} %, p95 {pct(cpu, 0.95):.1f} %, max {max(cpu):.1f} % (of one core)")
-        growth = f"{(rss_end - rss_h1) * 100 / rss_h1:+.1f} %" if rss_h1 else "-"
-        print(f"- RSS: start {rows[0]['rss_mb']:.0f} MB, at 1 h {fmt(rss_h1, 0)} MB, end {rss_end:.0f} MB, max {max(r['rss_mb'] for r in rows):.0f} MB; growth after hour 1: **{growth}**")
+        # RSS swings ±20 % from one sample to the next (allocator), so hours are compared by their medians.
+        hours = {}
+        for r in rows:
+            hours.setdefault(int(r["elapsed_s"] // 3600), []).append(r["rss_mb"])
+        med = {h: statistics.median(v) for h, v in sorted(hours.items())}
+        full = [h for h in med if h >= 1 and len(hours[h]) >= 60]
+        growth = f"{(med[full[-1]] - med[full[0]]) * 100 / med[full[0]]:+.1f} %" if len(full) >= 2 else "-"
+        print(f"- RSS: start {rows[0]['rss_mb']:.0f} MB, at 1 h {fmt(rss_h1, 0)} MB, end {rss_end:.0f} MB, max {max(r['rss_mb'] for r in rows):.0f} MB")
+        print(f"- RSS median by hour (MB): {', '.join(f'h{h + 1} {m:.0f}' for h, m in med.items())}; growth from hour 2 to the last full hour: **{growth}**")
         print(f"- DB {rows[-1]['db_bytes'] / 1e6:.0f} MB, WAL {rows[-1]['wal_bytes'] / 1e6:.1f} MB (max {max(r['wal_bytes'] for r in rows) / 1e6:.1f} MB), Parquet {rows[-1]['telemetry_bytes'] / 1e6:.1f} MB\n")
 
     # Data budget
