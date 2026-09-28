@@ -68,7 +68,8 @@ export function toggleYou(map: MLMap, ctx: OverlayCtx) {
       const to = id ? ctx.positions().get(id)?.fix.point : undefined;
       if (!to) return void map.easeTo({ center: at, duration: 700 });
       const lon = [at[0], to[0]], lat = [at[1], to[1]];
-      map.fitBounds([[Math.min(...lon), Math.min(...lat)], [Math.max(...lon), Math.max(...lat)]], { padding: 80, maxZoom: 18, duration: 700 });
+      // Clear of the top bar's tools and of the Layers row, the line and the time rail above the sheet.
+      map.fitBounds([[Math.min(...lon), Math.min(...lat)], [Math.max(...lon), Math.max(...lat)]], { padding: { top: 90, left: 50, right: 50, bottom: 150 }, maxZoom: 18, duration: 700 });
     },
     (e) => {
       if (watchId !== undefined) navigator.geolocation.clearWatch(watchId);
