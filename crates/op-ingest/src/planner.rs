@@ -205,7 +205,7 @@ pub fn plan_with(input: &PlanInput, rear_edge: Rear<'_>) -> Plan {
         return Plan::Hold("The current boundary has no area.".into());
     }
     let area = gpoly(&ccw(area_ring.clone()));
-    let mut region = area.union(&target);
+    let mut region = without_crumbs(area.union(&target));
     let corridor = region.0.len() != 1;
     if corridor {
         let all: MultiPoint<f64> = area_ring.iter().chain(&space.target).map(|p| Point::new(p[0], p[1])).collect();
@@ -257,7 +257,7 @@ pub fn plan_with(input: &PlanInput, rear_edge: Rear<'_>) -> Plan {
             };
             clipped = clipped.intersection(&behind);
         }
-        let joined = clipped.union(&target);
+        let joined = without_crumbs(clipped.union(&target));
         // One piece: the one holding the target.
         let Some(piece) = joined.0.into_iter().find(|p| geo::Contains::contains(p, &inner)) else {
             outcome = Plan::Hold("The step lost the target.".into());
@@ -399,6 +399,26 @@ fn drop_flat_corners(ring: &mut Vec<P>) {
             i += 1;
         }
     }
+}
+
+/// Holes smaller than this (m²) in the ground a step may use are crumbs,
+/// not ground to keep the herd off: where the previous boundary's edge
+/// runs back and forth across the target's (the notches of a followed back
+/// edge, with a metre between two strips), the two together enclose bits
+/// of neither. Kept, they are a hole no step may have, and the move holds.
+const CRUMB_M2: f64 = 10.0;
+
+/// `m` without the holes smaller than [`CRUMB_M2`].
+fn without_crumbs(m: MultiPolygon<f64>) -> MultiPolygon<f64> {
+    use geo::Area;
+    MultiPolygon(
+        m.0.into_iter()
+            .map(|p| {
+                let (outer, holes) = p.into_inner();
+                GPoly::new(outer, holes.into_iter().filter(|h| GPoly::new(h.clone(), vec![]).unsigned_area() >= CRUMB_M2).collect())
+            })
+            .collect(),
+    )
 }
 
 /// The `q` quantile of `v` (0: the least), by nearest rank.
@@ -1008,6 +1028,31 @@ mod tests {
             }
         }
         panic!("the sweep never finished");
+    }
+
+    /// Found by stream L's soak: a sweep ended with its followed back edge
+    /// notched, one notch reaching over the metre between two strips into
+    /// the next target and its edge dipping back across the target's. The
+    /// two together enclose a crumb of ground in neither, and the next move
+    /// held ("The step would have a hole") for its whole half hour.
+    #[test]
+    fn a_notched_edge_across_the_next_target_leaves_no_crumb_to_hold_on() {
+        let previous =
+            poly(&[[0.0, 0.0], [100.0, 0.0], [100.0, 90.0], [102.5, 92.0], [100.8, 94.0], [102.4, 96.0], [100.0, 98.0], [100.0, 200.0], [0.0, 200.0]]);
+        let target = rect(101.0, 0.0, 200.0, 200.0);
+        let paddock = rect(0.0, 0.0, 200.0, 200.0);
+        let herd = animals(&scatter(40, 60.0, 40.0, 95.0, 160.0));
+        let input =
+            PlanInput { target: &target, previous: Some(&previous), paddock: Some(&paddock), animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        for rear in [Rear::Line, Rear::Follow { quantile: 0.1, extra: &[] }] {
+            match plan_with(&input, rear) {
+                Plan::Step(s) => {
+                    check_step(&input, &s);
+                    assert!(s.left_out.is_empty(), "{rear:?}: {:?}", s.left_out);
+                }
+                other => panic!("{rear:?}: expected a step, got {other:?}"),
+            }
+        }
     }
 
     /// The sweep driver plans on every fix while a herd moves: 250 animals
