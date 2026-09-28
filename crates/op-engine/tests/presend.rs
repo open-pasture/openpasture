@@ -442,10 +442,12 @@ async fn fixes_across_the_fence_are_not_grazing() {
     let rested = Utc::now() - Duration::days(40);
     t.ok("PATCH", &format!("/api/paddocks/{}", t.p2), json!({ "grazed_until": ts(rested) })).await;
     let keys = t.collars(10, true).await;
-    // Yesterday 10:00 to 15:55 UTC, a fix every 5 minutes: 72 a collar, the
+    // Two days ago 10:00 to 15:55 UTC, a fix every 5 minutes: 72 a collar, the
     // herd in P1. Two cows lie along the P1/P2 fence and 3 of their fixes each
-    // land 5 m into P2: 6 of 720, under 1 % of the herd's day.
-    let day = (Utc::now() - Duration::days(1)).date_naive().and_hms_opt(10, 0, 0).unwrap().and_utc();
+    // land 5 m into P2: 6 of 720, under 1 % of the herd's day. (Not
+    // yesterday: before 16:55 UTC the last fixes below would be under a day
+    // old, the herd's position now, and P2 grazed now.)
+    let day = (Utc::now() - Duration::days(2)).date_naive().and_hms_opt(10, 0, 0).unwrap().and_utc();
     for (i, k) in keys.iter().enumerate() {
         let fixes: Vec<Value> = (0..72)
             .map(|j| {
