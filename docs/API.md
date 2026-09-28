@@ -1334,7 +1334,7 @@ address, so one alert reaches every browser the person turned it on in.
 | Method | Path | Returns |
 | --- | --- | --- |
 | GET | `/api/push` | `PushView`; makes the farm's VAPID key the first time it is asked for over https |
-| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
+| POST | `/api/push/subscriptions` | a browser's `PushSubscription.toJSON()` (`{ endpoint, keys: { p256dh, auth }, expirationTime? }`) → 201 `MySubscription`; the same endpoint again updates its keys and owner. 400 an endpoint that isn't https (plain http only to a push service on this machine, asked from this machine; asked from anywhere else, https on port 443 at a public address: not this machine, a private, shared or link-local network) or keys that aren't a browser's (`p256dh` a P-256 point, `auth` 16 bytes) · 409 not over https, or no person to send to (a local owner who isn't in People). A person keeps their newest 10 |
 | DELETE | `/api/push/subscriptions/:id` | 204; your own (the owner: anyone's), else 404 |
 | POST | `/api/push/subscriptions/:id/test` | `{ ok, detail }` — "openpasture test." to that browser now, recorded in `/api/messages` |
 | PUT | `/api/push/settings` | `{ enabled?, new_keys? }` → `PushView`. `enabled: false` sends nothing by push (subscriptions stay); `new_keys: true` makes a new key pair and drops every subscription (browsers turn alerts on again) |
@@ -1361,7 +1361,9 @@ MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push 
   the body is the text without its texting instructions ("Reply OK to ack", "Reply Y or N. Code 4821").
 - 404 or 410 from the push service: the browser dropped it; the subscription is removed and the
   message fails "That phone stopped taking notifications.". 408, 429 and 5xx are tried again (5 s,
-  30 s, 2 min); a push service that can't be reached at all waits as texts do.
+  30 s, 2 min); a push service that can't be reached at all waits as texts do. A redirect is
+  never followed (by any channel: a 3xx is the answer, so push fails "refused it (307)"), and a
+  push service's name is only connected to at a public address.
 - Settings: `push` = `{ vapid_public_key?, enabled /* true */ }`; secret `vapid_private_key` (PKCS#8,
   base64url). `push_subscriptions` holds personal data and is not in `/api/sql`.
 

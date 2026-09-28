@@ -114,10 +114,16 @@ async fn take(State(s): State<Service>, Path(n): Path<String>, headers: HeaderMa
     (StatusCode::from_u16(code).unwrap(), [("location", format!("/m/{n}"))], "")
 }
 
+/// Where a push service's redirect points: the server must never follow one.
+async fn redirected(State(s): State<Service>, Path(n): Path<String>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+    s.got.lock().unwrap().push(Push { path: format!("/m/{n}"), headers, body });
+    StatusCode::OK
+}
+
 impl Service {
     async fn start() -> Self {
         let mut s = Service { answer: Arc::new(Mutex::new(201)), ..Default::default() };
-        let app = Router::new().route("/push/{n}", axum::routing::post(take)).with_state(s.clone());
+        let app = Router::new().route("/push/{n}", axum::routing::post(take)).route("/m/{n}", axum::routing::any(redirected)).with_state(s.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         s.url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -455,4 +461,45 @@ async fn push_settings_are_the_owners_and_new_keys_drop_every_browser() {
     assert_eq!(left, 0, "browsers subscribed with the old key must subscribe again");
     let (s, _) = f.owner("PUT", "/api/push/settings", Some(json!({"colour": "red"}))).await;
     assert_ne!(s, StatusCode::OK);
+}
+
+/// A push service that answers with a redirect (to the farm's own API, say,
+/// which trusts requests from this machine) is not followed: the message
+/// fails and nothing is sent where the redirect points.
+#[tokio::test]
+async fn a_push_service_redirect_is_never_followed() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let svc = Service::start().await;
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let sub = subscribe(&f, &mia, Role::Manager, &Browser::new(), &svc.endpoint(3)).await;
+    for code in [307, 308, 303, 302] {
+        svc.answer(code);
+        let (_, v) = f.api(me(Role::Manager, &mia), "POST", &format!("/api/push/subscriptions/{sub}/test"), None).await;
+        assert_eq!(v["ok"], json!(false), "{code}: {v}");
+        let paths: Vec<String> = svc.got().iter().map(|p| p.path.clone()).collect();
+        assert!(paths.iter().all(|p| p.starts_with("/push/")), "{code}: followed to {paths:?}");
+    }
+}
+
+/// Someone signed in from elsewhere can't point a subscription at this
+/// server, the farm's network or another port than a push service's.
+#[tokio::test]
+async fn a_remote_subscription_must_be_a_public_push_service() {
+    let f = Farm::new().await;
+    f.ctx.set_public_url(Some(PUBLIC_URL.into()));
+    let mia = f.person("Mia", Role::Manager, None, false, None).await;
+    let remote = Identity { role: Role::Viewer, user_id: Some(mia.clone()), name: None, via: Via::UserToken };
+    for endpoint in [
+        "https://127.0.0.1/x",
+        "https://localhost/x",
+        "https://10.0.0.5/x",
+        "https://192.168.1.20/x",
+        "https://169.254.169.254/latest",
+        "https://[::1]/x",
+        "https://fcm.googleapis.com:7878/fcm/send/x",
+    ] {
+        let (s, v) = f.api(remote.clone(), "POST", "/api/push/subscriptions", Some(Browser::new().subscription(endpoint))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{endpoint}: {v}");
+    }
 }

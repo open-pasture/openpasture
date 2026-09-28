@@ -44,7 +44,7 @@ use sha2::Sha256;
 use sqlx::Row as _;
 use sqlx::sqlite::SqliteRow;
 
-use super::{Channel, ChannelError, Delivery, Sent, http, net_error, record_sent};
+use super::{Channel, ChannelError, Delivery, Sent, net_error, record_sent};
 
 /// Id prefix of a subscription.
 pub const SUBSCRIPTION: &str = "psh";
@@ -274,10 +274,13 @@ fn loopback(u: &reqwest::Url) -> bool {
     })
 }
 
-/// Whether `endpoint` may be a push service for a request made as `id`:
-/// https anywhere; plain http only on this machine and only when the request
-/// came from this machine (whoever makes it already has every right here, so
-/// the server's own requests to it give nothing away).
+/// Whether `endpoint` may be a push service for a request made as `id`.
+/// From this machine (whoever makes it already has every right here, so the
+/// server's own requests to it give nothing away): https anywhere, plain
+/// http only on this machine. From anywhere else, as push services are:
+/// https on its usual port, at a public address (not this machine, the
+/// farm's network or link-local; the name is checked again when it is
+/// resolved, see [`public_only`]).
 pub fn check_endpoint(endpoint: &str, id: &Identity) -> Result<(), &'static str> {
     if endpoint.len() > 2048 {
         return Err("That endpoint is too long.");
@@ -286,11 +289,89 @@ pub fn check_endpoint(endpoint: &str, id: &Identity) -> Result<(), &'static str>
     if u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() {
         return Err("endpoint must be a push service URL.");
     }
+    let local = id.via == Via::Local;
     match u.scheme() {
-        "https" => Ok(()),
-        "http" if loopback(&u) && id.via == Via::Local => Ok(()),
+        "https" if local => Ok(()),
+        "https" => {
+            let host = u.host_str().unwrap_or_default().to_ascii_lowercase();
+            let public = match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+                Ok(ip) => is_public(ip),
+                Err(_) => host != "localhost" && !host.ends_with(".localhost"),
+            };
+            if !public {
+                Err("endpoint must be a push service URL.")
+            } else if u.port().is_some() {
+                Err("Push services take https on its usual port.")
+            } else {
+                Ok(())
+            }
+        }
+        "http" if loopback(&u) && local => Ok(()),
         _ => Err("Push services are https."),
     }
+}
+
+/// An address on the internet: not this machine, a private or shared
+/// network, link-local, multicast, documentation or unspecified.
+pub fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            !(v.is_loopback()
+                || v.is_private()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.is_documentation()
+                || v.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (18..20).contains(&o[1]))
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let s = v.segments();
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || s[0] == 0x2001 && s[1] == 0x0db8)
+        }
+    }
+}
+
+/// Resolves push services' names to public addresses only ([`is_public`]):
+/// a name that points at this machine or the farm's network (set up after
+/// it was checked, say) is not reached. `localhost` resolves as usual, for
+/// a browser on this machine (only it may subscribe one).
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let all: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let keep: Vec<std::net::SocketAddr> =
+                if host.eq_ignore_ascii_case("localhost") { all } else { all.into_iter().filter(|a| is_public(a.ip())).collect() };
+            if keep.is_empty() {
+                return Err(format!("{host} has no public address").into());
+            }
+            Ok(Box::new(keep.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The client push is sent with: [`crate::notify::http`]'s settings, names
+/// resolved by [`PublicOnly`].
+fn public_only() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| crate::notify::client_builder().dns_resolver(std::sync::Arc::new(PublicOnly)).build().expect("HTTP client"))
 }
 
 /// Store a browser's subscription for a person (the same endpoint again
@@ -438,7 +519,7 @@ impl Push {
             .vapid
             .authorization(&aud, &self.contact, (now() + chrono::Duration::seconds(JWT_S)).timestamp())
             .map_err(|e| ChannelError::Fail(e.to_string()))?;
-        let mut req = http()
+        let mut req = public_only()
             .post(&sub.endpoint)
             .header("authorization", auth_header)
             .header("content-encoding", "aes128gcm")
@@ -737,6 +818,22 @@ mod tests {
         assert!(check_endpoint("ftp://push.example.com/1", &local).is_err());
         assert!(check_endpoint("https://user:pw@push.example.com/1", &remote).is_err());
         assert!(check_endpoint("not a url", &remote).is_err());
+        // From elsewhere: public addresses on the usual port only.
+        for e in [
+            "https://127.0.0.1/x",
+            "https://10.1.2.3/x",
+            "https://172.16.0.9/x",
+            "https://100.64.0.1/x",
+            "https://[fd00::1]/x",
+            "https://[fe80::1]/x",
+            "https://[::ffff:192.168.0.1]/x",
+            "https://app.localhost/x",
+            "https://fcm.googleapis.com:8443/x",
+        ] {
+            assert!(check_endpoint(e, &remote).is_err(), "{e}");
+        }
+        assert!(check_endpoint("https://8.8.8.8/x", &remote).is_ok());
+        assert!(check_endpoint("https://127.0.0.1:8443/x", &local).is_ok(), "this machine's own test service");
         assert_eq!(origin("https://fcm.googleapis.com/fcm/send/abc").as_deref(), Some("https://fcm.googleapis.com"));
         assert_eq!(origin("http://127.0.0.1:9123/p/1").as_deref(), Some("http://127.0.0.1:9123"));
     }
