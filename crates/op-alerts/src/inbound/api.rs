@@ -38,6 +38,8 @@ pub struct PersonTexting {
     pub brief: bool,
     /// Texted STOP: gets no texts until START.
     pub sms_opt_out: bool,
+    /// A browser of theirs takes notifications (push reaches them).
+    pub push: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +59,8 @@ async fn person(ctx: &Ctx, user_id: &str) -> anyhow::Result<PersonTexting> {
     let row: Option<(bool, bool)> =
         sqlx::query_as("SELECT brief, sms_opt_out FROM alert_prefs WHERE user_id = ?").bind(user_id).fetch_optional(ctx.db()).await?;
     let (brief, sms_opt_out) = row.unwrap_or((false, false));
-    Ok(PersonTexting { user_id: user_id.to_owned(), brief, sms_opt_out })
+    let push: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM push_subscriptions WHERE user_id = ?)").bind(user_id).fetch_one(ctx.db()).await?;
+    Ok(PersonTexting { user_id: user_id.to_owned(), brief, sms_opt_out, push })
 }
 
 pub async fn view(ctx: &Ctx) -> ApiResult<TextingView> {

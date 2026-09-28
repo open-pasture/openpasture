@@ -843,7 +843,7 @@ async fn opting_out_stops_alerts_and_briefs_and_start_restores_them() {
     assert!(r.reply.is_none());
     let (_, v) = t.f.owner("GET", "/api/texting", None).await;
     let hank = v["people"].as_array().unwrap().iter().find(|p| p["user_id"] == t.id(HANK)).unwrap().clone();
-    assert_eq!(hank, json!({"user_id": t.id(HANK), "brief": true, "sms_opt_out": true}));
+    assert_eq!(hank, json!({"user_id": t.id(HANK), "brief": true, "sms_opt_out": true, "push": false}));
     // Nothing reaches Hank: no alert, no brief, no reply to anything but START.
     let c = t.f.collar(Some("031"), now()).await;
     t.f.outside(&c, t0() - mins(30), t0() - mins(1)).await;

@@ -423,7 +423,13 @@ async fn the_morning_brief_goes_by_push_without_its_texting_line() {
     let svc = Service::start().await;
     let mia = f.person("Mia", Role::Manager, None, false, None).await;
     let b = Browser::new();
+    let (_, v) = f.owner("GET", "/api/texting", None).await;
+    let row = |v: &Value| v["people"].as_array().unwrap().iter().find(|p| p["user_id"] == mia.as_str()).cloned().unwrap();
+    assert_eq!(row(&v)["push"], json!(false));
     subscribe(&f, &mia, Role::Manager, &b, &svc.endpoint(5)).await;
+    // Settings can offer her the brief: a browser of hers takes notifications.
+    let (_, v) = f.owner("GET", "/api/texting", None).await;
+    assert_eq!(row(&v)["push"], json!(true));
     f.ctx.store().set_setting_json("texting", &json!({"brief": {"enabled": true, "time": "07:00"}})).await.unwrap();
     op_alerts::brief_send::set_brief(&f.ctx, &mia, true).await.unwrap();
     f.decision("MOVE", "proposed", t0() - mins(5), None).await;

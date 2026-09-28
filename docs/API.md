@@ -1254,7 +1254,7 @@ Texting = TextingConfig & {
   checked?: { at?, ok_at?, error? },                        // polling / relay: the last check
   people: PersonTexting[],
 }
-PersonTexting = { user_id, brief /* gets the brief by text */, sms_opt_out /* texted STOP */ }
+PersonTexting = { user_id, brief /* gets the brief on their alert channels, push included */, sms_opt_out /* texted STOP */, push /* a browser of theirs takes notifications */ }
 Inbox = { messages: [{ id /* rin_… */, channel: "sms"|"whatsapp", from /* E.164 */, text, at }], cursor }
 ```
 
