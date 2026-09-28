@@ -272,7 +272,9 @@ boundary. The server never sends an active boundary that leaves an animal outsid
 
 Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. Where an
 animal is: its fixes of the last 12 s before its newest that agree with it (within twice their
-accuracy), averaged by `1 / accuracy²` (one fix wanders by metres); the edge behind it leaves
+accuracy), averaged by `1 / accuracy²` (one fix wanders by metres), or its newest fix when that is further
+back along the sweep (an animal walking back is behind its average, and its collar judges the fence
+from its newest fix); the edge behind it leaves
 extra room of half that average's spread plus 0.05 m per second since the fix, at most 0.5 m, so
 it stays in its warning zone. The edge uses at most half the corners the herd's collars hold (64
 of V0's 128; a herd with legacy collars plans for their 64 corners, 32 for the edge); past that its

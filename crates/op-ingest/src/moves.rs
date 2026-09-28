@@ -143,6 +143,10 @@ pub struct Situation {
     /// How uncertain each of `positions` is, metres (see [`estimate`]); a
     /// collar not here counts as exact.
     pub spread: HashMap<String, f64>,
+    /// Each collar's newest fix where it isn't its position (an average of
+    /// its latest fixes): the collar judges its fence from this one, so a
+    /// step is planned from whichever of the two is further back.
+    pub newest: HashMap<String, LonLat>,
     /// Collars with the herd when the move started (heard within
     /// [`WITH_HERD`] before it) that have no fresh fix now (last fix older
     /// than [`FRESH_FIX`]): where and when each was last fixed.
@@ -165,6 +169,7 @@ impl Default for Situation {
             positions: vec![],
             heard: HashMap::new(),
             spread: HashMap::new(),
+            newest: HashMap::new(),
             silent: vec![],
             limits: CollarLimits::V0,
             fits: vec![],
@@ -243,12 +248,26 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
     let quiet_since = |at: DateTime<Utc>| sweep.resumed_at.map_or(at, |r| r.max(at));
     let (gone, waited): (Vec<_>, Vec<_>) = silent.into_iter().partition(|(_, _, at)| now - quiet_since(*at) >= SILENT_DROP);
     stragglers.extend(gone.into_iter().map(|(c, _, _)| c.clone()));
+    let space = Space::new(m.target);
+    // Where each animal is, or its newest fix if that is further back: an
+    // animal walking back against the sweep is behind the average of its
+    // fixes, and its collar judges the fence from the newest one.
+    let mut positions: Vec<(String, LonLat)> = sit
+        .positions
+        .iter()
+        .map(|(c, p)| {
+            let q = match (sit.newest.get(c), &space, sweep.frame) {
+                (Some(n), Some(space), Some(f)) if space.progress(f, *n) < space.progress(f, *p) => *n,
+                (Some(n), _, None) => *n,
+                _ => *p,
+            };
+            (c.clone(), q)
+        })
+        .collect();
     // The rest are with the herd where they were last fixed.
-    let mut positions = sit.positions.clone();
     positions.extend(waited.iter().map(|(c, p, _)| (c.clone(), *p)));
     let last_fix: HashMap<&str, DateTime<Utc>> = waited.iter().map(|(c, _, at)| (c.as_str(), *at)).collect();
     let fixed_at = |c: &str| sit.heard.get(c).or_else(|| last_fix.get(c)).copied().unwrap_or(now);
-    let space = Space::new(m.target);
     let stride = SWEEP_STRIDE * m.warn_m;
     for _ in 0..8 {
         let herd: Vec<&(String, LonLat)> = positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
@@ -420,7 +439,7 @@ pub(crate) async fn situation(
     // Animals out on their own boundary are walked back by their escape.
     let escaped = crate::escapes::escaped_collars(ctx.db(), herd_id).await?;
     let recent = recent_fixes(ctx, herd_id, at).await?;
-    let (mut positions, mut heard, mut spread, mut silent) = (Vec::new(), HashMap::new(), HashMap::new(), Vec::new());
+    let (mut positions, mut heard, mut spread, mut newest, mut silent) = (Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), Vec::new());
     // Parked collars are off duty; animals out on their own boundary are walked back by their escape.
     for c in db::list_collars(ctx.db(), Some(herd_id)).await?.into_iter().filter(|c| c.parked_at.is_none() && !escaped.contains(&c.id)) {
         let Some(f) = c.last_fix else { continue };
@@ -429,6 +448,9 @@ pub(crate) async fn situation(
             let (point, s) = estimate(&near).unwrap_or((f.point, f.accuracy_m));
             heard.insert(c.id.clone(), f.at);
             spread.insert(c.id.clone(), s);
+            if point != f.point {
+                newest.insert(c.id.clone(), f.point);
+            }
             positions.push((c.id, point));
         } else if since.is_some_and(|s| f.at >= s - WITH_HERD) {
             silent.push((c.id, f.point, f.at));
@@ -445,7 +467,7 @@ pub(crate) async fn situation(
     }
     // @S: the freeze covers the move's own staged step only.
     let pending = split.staged.iter().any(|b| decision_id.is_some_and(|d| b.decision_id == d));
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, spread, silent, limits, fits })
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, spread, newest, silent, limits, fits })
 }
 
 /// The fixes [`estimate`] averages for a collar whose newest fix is
@@ -587,7 +609,12 @@ async fn next_step(
         total_ms += ms;
         let Next::Send { polygon, last: false, .. } = &mut out.next else { return Ok(Some((out, sit, total_ms))) };
         let prepared = prepare_step(ctx, herd_id, polygon, m.warn_m, hysteresis_m).await?;
-        let animals: Vec<LonLat> = sit.positions.iter().filter(|(c, _)| !out.stragglers.contains(c)).map(|(_, p)| *p).collect();
+        let animals: Vec<LonLat> = sit
+            .positions
+            .iter()
+            .filter(|(c, _)| !out.stragglers.contains(c))
+            .flat_map(|(c, p)| std::iter::once(*p).chain(sit.newest.get(c).copied()))
+            .collect();
         let short = short_of_room(&prepared.excluded, &prepared.geometry, &sit.fits, &animals, m.warn_m);
         if short == 0 {
             *polygon = prepared.geometry;
@@ -1102,6 +1129,25 @@ mod tests {
         assert!((margin_of(0.0, 10) - exact - 10.0 * DRIFT_M_PER_S).abs() < 0.05);
         // Never so much that the animal leaves its warning band.
         assert!((margin_of(9.0, 600) - exact - EXTRA_MAX_M).abs() < 0.05);
+    }
+
+    /// Fixes 5 s apart at 5 m accuracy all agree while a cow walks back at
+    /// 0.9 m/s: their average is 4.5 m ahead of her newest fix, the one her
+    /// collar judges the fence from. The step is planned behind that one.
+    #[test]
+    fn an_animal_walking_back_against_the_sweep_is_planned_from_its_newest_fix() {
+        let mut r = Run::new(&[[60.0, 50.0], [60.0, 90.0], [60.0, 130.0]]);
+        assert!(matches!(r.tick(t0()), Next::Send { .. }));
+        let Some(Frame::Axis { axis }) = r.sweep.frame else { panic!("an axis") };
+        r.shift(20.0, 12.0);
+        let p = Projection::new(ORIGIN);
+        let avg = p.forward(r.sit.positions[1].1);
+        let newest = p.inverse([avg[0] - 4.5 * axis[0], avg[1] - 4.5 * axis[1]]);
+        r.sit.newest.insert("col_1".into(), newest);
+        r.sit.spread.insert("col_1".into(), 5.0 / 3f64.sqrt());
+        let Next::Send { polygon, .. } = r.tick(t0() + STEP_EVERY) else { panic!("a step") };
+        let margin = crate::planner::signed_distance(p.forward(newest), &p.forward_ring(&polygon.outer_ring()));
+        assert!(margin >= planner::FOLLOW_FACTOR * W - 0.05, "her newest fix is {margin:.2} m inside the step");
     }
 
     #[test]
