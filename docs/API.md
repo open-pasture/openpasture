@@ -1148,7 +1148,7 @@ numbers).
 | --- | --- | --- |
 | GET | `/api/notify/channels` | `Channels` |
 | PUT | `/api/notify/channels` | `ChannelsPatch` → `Channels`; 400 with the reason (a relay that refused says why). When the relay becomes how this server texts (it turns on or gets a new key or URL while the farm has no Twilio SMS, or Twilio goes while it is on), phones the relay hasn't verified for this key lose `phone_verified_at`, so Verify (a code from the relay) shows beside them again; phones it has keep theirs and get the dead-man flag by role |
-| POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients |
+| POST | `/api/notify/test` | `{ channel, to? }` → `{ ok, detail }` — sends now; without `to` Twilio checks the account and the relay lists its recipients. Push is tested per browser (`POST /api/push/subscriptions/:id/test`) |
 | POST | `/api/notify/verify` | `{ user_id }` → `{ via: "sms"\|"relay", verified?: true }`; 400 no phone · 409 already verified or nothing can text · 429 within 30 s · 502 the provider's words |
 | POST | `/api/notify/verify/confirm` | `{ user_id, code }` → `{ verified: true, phone_verified_at }`; 400 wrong or no code · 410 expired · 429 after 5 tries |
 | GET | `/api/messages` | `?direction=in\|out&limit=&from=&to=&user_id=` → `MessageLog[]`, newest first (limit 100, at most 1,000) |
