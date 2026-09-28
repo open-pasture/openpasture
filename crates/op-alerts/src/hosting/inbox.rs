@@ -190,6 +190,9 @@ pub fn which_farm_text(verb: &str) -> String {
     format!("More than one farm asked you. Add the code from the text you mean, like {verb} 4821.")
 }
 
+/// The host's answer to a bare STOP MOVE from a number more than one farm texts.
+pub const WHICH_MOVE_TEXT: &str = "More than one farm texts you. Add the code from the move's text, like STOP MOVE 4821, or stop it in the app.";
+
 /// Statuses of a text that reached the person.
 const REACHED: &str = "('sending', 'sent', 'delivered')";
 
@@ -233,25 +236,28 @@ fn sender_of(idempotency_key: Option<&str>) -> Farm {
     }
 }
 
-/// When `farm`'s last text that reached `address` was sent.
-async fn last_text(ctx: &Ctx, address: &str, farm: &Farm) -> anyhow::Result<Option<DateTime<Utc>>> {
+/// When `farm`'s last text (of `kind`, any when `None`) that reached `address` was sent.
+async fn last_text(ctx: &Ctx, address: &str, farm: &Farm, kind: Option<&str>) -> anyhow::Result<Option<DateTime<Utc>>> {
     let t: (Option<String>,) = match farm {
         Farm::Key(k) => {
             sqlx::query_as(&format!(
-                "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED} AND idempotency_key >= ? AND idempotency_key < ?"
+                "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED} AND idempotency_key >= ? AND idempotency_key < ?
+                   AND (?4 IS NULL OR kind = ?4)"
             ))
             .bind(address)
             .bind(key_prefix(k))
             .bind(format!("relay:{k};"))
+            .bind(kind)
             .fetch_one(ctx.db())
             .await?
         }
         Farm::Host => {
             sqlx::query_as(&format!(
-                "SELECT MAX(created_at) FROM messages WHERE address = ? AND direction = 'out' AND status IN {REACHED}
-                   AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'relay:%')"
+                "SELECT MAX(created_at) FROM messages WHERE address = ?1 AND direction = 'out' AND status IN {REACHED}
+                   AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'relay:%') AND (?2 IS NULL OR kind = ?2)"
             ))
             .bind(address)
+            .bind(kind)
             .fetch_one(ctx.db())
             .await?
         }
@@ -259,18 +265,32 @@ async fn last_text(ctx: &Ctx, address: &str, farm: &Farm) -> anyhow::Result<Opti
     opt_from_db(t.0)
 }
 
-/// Of `farms`, the one whose text to `address` was the last this host sent
-/// (the first when none has one).
-async fn newest(ctx: &Ctx, address: &str, farms: &[Farm]) -> anyhow::Result<Farm> {
+/// Of `farms`, the one whose text to `address` (of `kind`, any when `None`)
+/// was the last this host sent; `None` when none sent one.
+async fn newest_of(ctx: &Ctx, address: &str, farms: &[Farm], kind: Option<&str>) -> anyhow::Result<Option<Farm>> {
     let mut best: Option<(DateTime<Utc>, &Farm)> = None;
     for f in farms {
-        if let Some(t) = last_text(ctx, address, f).await?
+        if let Some(t) = last_text(ctx, address, f, kind).await?
             && best.is_none_or(|(b, _)| t > b)
         {
             best = Some((t, f));
         }
     }
-    Ok(best.map_or_else(|| farms[0].clone(), |(_, f)| f.clone()))
+    Ok(best.map(|(_, f)| f.clone()))
+}
+
+/// Of `farms`, the one whose text to `address` was the last this host sent
+/// (the first when none has one).
+async fn newest(ctx: &Ctx, address: &str, farms: &[Farm]) -> anyhow::Result<Farm> {
+    Ok(newest_of(ctx, address, farms, None).await?.unwrap_or_else(|| farms[0].clone()))
+}
+
+/// [`newest`] among the farms' texts of `kind`, else among all their texts.
+async fn newest_kind(ctx: &Ctx, address: &str, farms: &[Farm], kind: &str) -> anyhow::Result<Farm> {
+    match newest_of(ctx, address, farms, Some(kind)).await? {
+        Some(f) => Ok(f),
+        None => newest(ctx, address, farms).await,
+    }
 }
 
 /// "Code 4821" (any case) as a whole code in `text`.
@@ -428,35 +448,42 @@ pub async fn route(ctx: &Ctx, msg: &MessageLog, cmd: &Command, own: Option<&User
     if own.is_some_and(|u| u.phone_verified_at.is_some()) {
         farms.push(Farm::Host);
     }
-    let to = match answer_pick(cmd) {
-        Some((Pick::Code(code), _)) => match by_code(ctx, address, code, &farms).await? {
+    let ask = |text: String| async move {
+        enqueue(
+            ctx,
+            Outbound {
+                idempotency_key: format!("reply:{}", msg.id),
+                channel: crate::inbound::reply_channel(channel).into(),
+                to: address.to_owned(),
+                text,
+                kind: "reply".into(),
+                user_id: own.map(|u| u.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+    };
+    let to = match (cmd, answer_pick(cmd)) {
+        (_, Some((Pick::Code(code), _))) => match by_code(ctx, address, code, &farms).await? {
             Some(f) => f,
             None => newest(ctx, address, &farms).await?,
         },
-        Some((_, verb)) => {
+        // A bare STOP MOVE names no farm, and a decision one farm asked about says nothing
+        // about whose move to stop: with more than one farm, the host asks.
+        (Command::StopMove(Pick::Only), _) if farms.len() > 1 => return Ok(Route::Asked(ask(WHICH_MOVE_TEXT.to_owned()).await?)),
+        // A number from a list: the farm that texted the list (a reply).
+        (Command::StopMove(Pick::Number(_)), _) => newest_kind(ctx, address, &farms, "reply").await?,
+        (_, Some((_, verb))) => {
             let asking = asked(ctx, address, &farms, now()).await?;
             match asking.as_slice() {
                 [one] => one.clone(),
                 [] => newest(ctx, address, &farms).await?,
-                _ => {
-                    let reply = enqueue(
-                        ctx,
-                        Outbound {
-                            idempotency_key: format!("reply:{}", msg.id),
-                            channel: crate::inbound::reply_channel(channel).into(),
-                            to: address.to_owned(),
-                            text: which_farm_text(verb),
-                            kind: "reply".into(),
-                            user_id: own.map(|u| u.id.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    return Ok(Route::Asked(reply));
-                }
+                _ => return Ok(Route::Asked(ask(which_farm_text(verb)).await?)),
             }
         }
-        None => newest(ctx, address, &farms).await?,
+        // OK acks an alert: the farm whose alert last reached the person.
+        (Command::Ack, None) => newest_kind(ctx, address, &farms, "alert").await?,
+        (_, None) => newest(ctx, address, &farms).await?,
     };
     match to {
         Farm::Host => Ok(Route::Host),

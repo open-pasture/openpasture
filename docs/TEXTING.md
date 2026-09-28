@@ -91,7 +91,9 @@ Worth knowing:
 - The relay texts SMS only. Email needs your own mail server.
 - STOP to the relay's number stops texts from every farm on it, as Twilio blocks the number for
   that sender. START undoes it.
-- A bare Y when two farms asked the same person gets a reply asking for the code.
+- A bare Y when two farms asked the same person gets a reply asking for the code. A bare STOP MOVE
+  from a phone on more than one farm does too (add the move's code, or stop it in the app); OK
+  goes to the farm whose alert reached you last.
 - If your server stops checking in for 15 minutes, the relay texts your owners and managers once.
 
 ### Running your own relay

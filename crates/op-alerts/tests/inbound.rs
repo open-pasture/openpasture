@@ -1134,6 +1134,20 @@ async fn relay_post(host: &notify_support::Host, key: &str, id: &str, to: &str, 
     op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
 }
 
+/// [`relay_post`] with the farm's `kind` of text.
+async fn relay_post_kind(host: &notify_support::Host, key: &str, id: &str, to: &str, text: &str, kind: &str) {
+    let (s, v) = call_with(
+        &notify_support::app(&host.ctx),
+        "POST",
+        "/v1/notify",
+        Some(json!({"idempotency_key": id, "channel": "sms", "to": to, "text": text, "kind": kind})),
+        &[("authorization", &format!("Bearer {key}"))],
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    op_alerts::notify::sender::run_once(&host.ctx, now()).await.unwrap();
+}
+
 /// The texts waiting in `key`'s inbox (taken: the next call starts after them).
 async fn take(host: &notify_support::Host, key: &str) -> Vec<String> {
     let (_, v) = inbox(host, key, "", 0).await;
@@ -1200,6 +1214,47 @@ async fn a_text_to_the_relay_reaches_only_the_farm_it_answers() {
     let r = text(&host.ctx, "sms", CODY, "status").await;
     assert_eq!((r.message.status.as_str(), r.message.error.as_deref()), ("received", None));
     assert_eq!(take(&host, &key_a).await, ["status"]);
+}
+
+/// OK answers an alert: it goes to the farm whose alert last reached the
+/// person, not to whichever farm texted last (another farm's brief).
+#[tokio::test]
+async fn ok_on_the_relay_acks_the_farm_whose_alert_asked_for_it() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    host_recipient(&host, &key_b, CODY, false).await;
+    relay_post_kind(&host, &key_a, "ntf_a1", CODY, "6 outside P3 since 06:12. Reply OK to ack", "alert").await;
+    relay_post_kind(&host, &key_b, "ntf_b1", CODY, "Heifers: STAY in P2.", "brief").await;
+    text(&host.ctx, "sms", CODY, "OK").await;
+    assert_eq!(take(&host, &key_a).await, ["OK"]);
+    assert!(take(&host, &key_b).await.is_empty());
+}
+
+/// A bare STOP MOVE says nothing about which farm's move: a decision prompt
+/// from one farm doesn't make it that farm's. With more than one farm the
+/// host asks for the move's code (or the app); with one it goes there.
+#[tokio::test]
+async fn a_bare_stop_move_on_the_relay_goes_nowhere_it_might_not_mean() {
+    let host = notify_support::Host::start().await;
+    let (_da, _farm_a, key_a) = relay_farm(&host, "Farm A").await;
+    host_recipient(&host, &key_a, CODY, false).await;
+    let r = text(&host.ctx, "sms", CODY, "STOP MOVE").await;
+    assert!(r.reply.is_none());
+    assert_eq!(take(&host, &key_a).await, ["STOP MOVE"], "one farm: it is that farm's");
+    let (_db, _farm_b, key_b) = relay_farm(&host, "Farm B").await;
+    host_recipient(&host, &key_b, CODY, false).await;
+    relay_post(&host, &key_b, "ntf_b1", CODY, "Heifers: move to P2? Reply Y or N. Code 1234", true).await;
+    let r = text(&host.ctx, "sms", CODY, "STOP MOVE").await;
+    let asked = r.reply.expect("the host asks which move");
+    assert_eq!(asked.text, "More than one farm texts you. Add the code from the move's text, like STOP MOVE 4821, or stop it in the app.");
+    assert!(op_alerts::text::septets(&asked.text) <= 160);
+    assert!(take(&host, &key_a).await.is_empty());
+    assert!(take(&host, &key_b).await.is_empty());
+    // With the code it reaches the farm whose text carried it.
+    text(&host.ctx, "sms", CODY, "STOP MOVE 1234").await;
+    assert_eq!(take(&host, &key_b).await, ["STOP MOVE 1234"]);
 }
 
 #[tokio::test]

@@ -1305,10 +1305,15 @@ later. A brief opens the reply window like an alert, and a bare Y or N to a brie
 
 **The relay's inbox** (host side). A text to the relay's number reaches only farms whose key has
 that number verified, and of those the one it answers: a Y, N, LATER or STOP MOVE with a decision's
-code goes to the farm whose text carried "Code 4821"; a bare one goes to the one farm that asked
-the person about a decision (`prompt: true`) in the last 12 h, and when more than one did, the host
-answers itself: "More than one farm asked you. Add the code from the text you mean, like Y 4821.";
-anything else goes to the farm whose text to that number was the host's last. The host's own farm
+code goes to the farm whose text carried "Code 4821"; a bare Y, N or LATER goes to the one farm
+that asked the person about a decision (`prompt: true`) in the last 12 h, and when more than one
+did, the host answers itself: "More than one farm asked you. Add the code from the text you mean,
+like Y 4821.". A bare STOP MOVE goes to the farm when the number has only one; with more, the host
+answers "More than one farm texts you. Add the code from the move's text, like STOP MOVE 4821, or
+stop it in the app." (a decision prompt says nothing about whose move it is); STOP MOVE and a
+number goes to the farm whose reply (the list) was the host's last to that number. OK goes to the
+farm whose alert (`kind: alert`) was the host's last to that number; anything else to the farm
+whose text to that number was the host's last. The host's own farm
 counts as one of them when it has a verified person with that phone; a key that only asked to
 verify the number, or was deleted, never does. STOP and START go to every key that has the
 number (Twilio opts a phone out per sender number, so STOP to the shared number stops every farm on
