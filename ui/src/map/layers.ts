@@ -1,7 +1,7 @@
 import * as maplibregl from "maplibre-gl";
 import type { Map as MLMap } from "maplibre-gl";
 import type { Paddock, Polygon } from "../api";
-import { centroid } from "../geo";
+import { interiorPoint } from "../geo";
 import { C, fc, setData } from "./base";
 
 // Paddock outlines, the active / pending / proposed boundaries. Labels are DOM
@@ -103,7 +103,7 @@ export class Labels {
 export function paddockLabels(paddocks: Paddock[], grazingId?: string, proposedId?: string) {
   return paddocks.map((p) => ({
     id: p.id,
-    at: centroid(p.geometry),
+    at: interiorPoint(p.geometry),
     text: p.name,
     tone: p.id === proposedId ? ("blaze" as const) : p.id === grazingId ? ("grass" as const) : undefined,
   }));

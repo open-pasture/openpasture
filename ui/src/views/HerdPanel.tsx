@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Paddock, type Polygon } from "../api";
-import { areaHa, centroid, inside } from "../geo";
+import { areaHa, inside, interiorPoint } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { useCan } from "../store/me";
@@ -259,7 +259,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
 }
 
 function targetPaddock(target: Polygon, paddocks: Paddock[]) {
-  const c = centroid(target);
+  const c = interiorPoint(target);
   const p = paddocks.find((p) => inside(c, p.geometry));
   return p && areaHa(target) >= areaHa(p.geometry) / 2 ? p.name : undefined;
 }
