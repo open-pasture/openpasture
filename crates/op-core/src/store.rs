@@ -24,6 +24,8 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// Environment variable for the number of SQLite connections (default [`DEFAULT_POOL`]).
 pub const POOL_ENV: &str = "OPENPASTURE_DB_POOL";
 pub const DEFAULT_POOL: u32 = 16;
+/// Bytes the WAL file is truncated to after a checkpoint (64 MB).
+pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// Connections in the pool: `OPENPASTURE_DB_POOL` when it is a whole number
 /// from 1 to 256, else [`DEFAULT_POOL`]. WAL lets readers run beside the one
@@ -49,7 +51,9 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(10));
+            .busy_timeout(Duration::from_secs(10))
+            // @L: a WAL that grew while a long read held it back is cut to this once a checkpoint catches up.
+            .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string());
         let pool = SqlitePoolOptions::new()
             .max_connections(pool_size(std::env::var(POOL_ENV).ok().as_deref()))
             .connect_with(opts)
@@ -509,18 +513,30 @@ pub fn decision_from_row(r: &SqliteRow) -> anyhow::Result<Decision> {
 /// to write fails at once with "database is locked" when another writer got
 /// in first, without waiting on the busy timeout. Waiting for the lock uses the
 /// pool's busy timeout; a still-busy database is retried a few times.
+///
+/// It starts in a task of its own (@L). sqlx's custom `BEGIN` awaits once
+/// more after the `BEGIN` has run, and a caller dropped there (a collar that
+/// gave up on its report while the lock was busy) got no `Transaction` to
+/// roll back: its pooled connection kept the write lock for good, every
+/// writer stalled on it, and every begin on it failed with "non-zero
+/// transaction depth". A task runs to its end, and a `Transaction` no one
+/// waits for any more is dropped, which rolls it back.
 pub async fn begin_immediate(pool: &SqlitePool) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-    let mut attempt = 0;
-    loop {
-        match pool.begin_with("BEGIN IMMEDIATE").await {
-            Ok(tx) => return Ok(tx),
-            Err(e) if attempt < 3 && is_busy(&e) => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0;
+        loop {
+            match pool.begin_with("BEGIN IMMEDIATE").await {
+                Ok(tx) => return Ok(tx),
+                Err(e) if attempt < 3 && is_busy(&e) => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
-    }
+    })
+    .await?
 }
 
 /// SQLITE_BUSY / SQLITE_LOCKED (and their extended codes).
