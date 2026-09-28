@@ -173,10 +173,16 @@ def main():
     sweeps = [x for x in drv if x["kind"] == "sweep"]
     if sweeps:
         print("## Sweeps (Cows, 238)\n")
-        print("| # | to | ended | minutes | steps | back line at step 1 (m) | stragglers | escapes | preview (min) |")
-        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        print("| # | to | ended | minutes | steps | back line at step 1 (m) | left when it ended (m) | m a minute | stragglers | escapes | preview (min) |")
+        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for i, s in enumerate(sweeps, 1):
-            print(f"| {i} | {s['target']} | {s['status']} | {s['minutes']} | {s.get('steps')} | {fmt(s.get('first_remaining_m'))} | {s['stragglers']} | {s['escapes']} | {fmt(s.get('preview_min'))} |")
+            first, left = s.get("first_remaining_m"), s.get("remaining_m", 0.0 if s["status"] == "done" else None)
+            pace = (first - (left or 0.0)) / s["minutes"] if first is not None and s.get("minutes") else None
+            print(f"| {i} | {s['target']} | {s['status']} | {s['minutes']} | {s.get('steps')} | {fmt(first)} | {fmt(left)} | {fmt(pace)} | {s['stragglers']} | {s['escapes']} | {fmt(s.get('preview_min'))} |")
+        done = [s for s in sweeps if s["status"] == "done" and s.get("preview_min")]
+        if done:
+            err = [(s["preview_min"] - s["minutes"]) * 100 / s["minutes"] for s in done]
+            print(f"\nPreview against finished sweeps: median {statistics.median(err):+.0f} %, from {min(err):+.0f} % to {max(err):+.0f} % ({len(done)} sweeps). A sweep still running at the next move is replaced by it (the 30 min cadence is shorter than a sweep of 120 m or more).")
         print()
     adv = [x for x in drv if x["kind"] in ("schedule", "advance")]
     errs = [x for x in drv if x["kind"] == "error"]
