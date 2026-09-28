@@ -26,6 +26,44 @@ pub const POOL_ENV: &str = "OPENPASTURE_DB_POOL";
 pub const DEFAULT_POOL: u32 = 16;
 /// Bytes the WAL file is truncated to after a checkpoint (64 MB).
 pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+/// WAL pages (4 KB) past which a commit checkpoints by itself (SQLite's
+/// default is 1,000). The server checkpoints in the background
+/// ([`spawn_checkpointer`]), so a collar report never waits for one; this
+/// is the backstop when nothing runs it (tests, tools).
+pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 16_384;
+/// How often [`spawn_checkpointer`] checkpoints.
+pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(5);
+
+/// Checkpoint the WAL every `every` (`PRAGMA wal_checkpoint(PASSIVE)`, which
+/// never waits for readers or writers), until the server shuts down. A
+/// checkpoint copies pages into the database file and syncs it; done inside
+/// a commit it made that commit (often a collar's report) wait for the disk.
+pub fn spawn_checkpointer(ctx: &crate::Ctx, every: Duration) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ctx.on_shutdown() => break,
+                _ = tick.tick() => {
+                    let started = std::time::Instant::now();
+                    match sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)").fetch_one(ctx.db()).await {
+                        Ok((busy, log, done)) => {
+                            let ms = started.elapsed().as_millis();
+                            if ms > 1000 {
+                                tracing::warn!(ms, log, done, busy, "wal checkpoint was slow");
+                            } else {
+                                tracing::debug!(ms, log, done, busy, "wal checkpoint");
+                            }
+                        }
+                        Err(e) => tracing::warn!("wal checkpoint: {e:#}"),
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Connections in the pool: `OPENPASTURE_DB_POOL` when it is a whole number
 /// from 1 to 256, else [`DEFAULT_POOL`]. WAL lets readers run beside the one
@@ -53,7 +91,9 @@ impl Store {
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(10))
             // @L: a WAL that grew while a long read held it back is cut to this once a checkpoint catches up.
-            .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string());
+            .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
+            // @L: checkpoints run from `spawn_checkpointer`; a commit only does one past 64 MB of WAL.
+            .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES.to_string());
         let pool = SqlitePoolOptions::new()
             .max_connections(pool_size(std::env::var(POOL_ENV).ok().as_deref()))
             .connect_with(opts)
