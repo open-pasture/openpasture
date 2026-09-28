@@ -281,8 +281,8 @@ surrounds the target (its centroid is about on the target), the steps close in f
 instead (the hull of the herd, buffered by `0.6 × warn_m`). The last step is sent when every
 animal in the sweep is inside the target by 1.5 m (with the sweep's own edge behind them, nobody
 needs a back line past the target's rear first). `remaining_m` is from the back line (nine in
-ten ahead) to the target's rear edge. Only animals holding the back line up (behind the next back
-line, or not held by the next step) run the 5-minute straggler clock, timed by their own fixes
+ten ahead) to the target's rear edge. Only animals holding the sweep up (the few within a stride, 0.1 ×
+`warn_m`, of the rearmost animal, or those not held by the next step) run the 5-minute straggler clock, timed by their own fixes
 (silence never counts as being stuck); moving up 1 m restarts it, and so does every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
 starts are listed as stragglers at once. When the old active boundary and the target don't touch
 (paddocks drawn with a gap), the first step spans the convex hull of both, so the herd has a way

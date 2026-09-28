@@ -21,7 +21,7 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::boundary::{NewBoundary, announce, insert_boundary};
-use crate::planner::{self, BACK_FACTOR, Frame, Plan, PlanInput, Rear, Space};
+use crate::planner::{self, Frame, Plan, PlanInput, Rear, Space};
 use crate::shape::{Prepared, prepare};
 use crate::{SendOpts, config, db};
 
@@ -201,8 +201,9 @@ pub struct MoveState<'a> {
 /// the herd ([`Rear::Follow`]): every animal is inside it, those at the back
 /// in their warning band, with room for how uncertain and how old its
 /// position is, so one lagging animal holds back only its own stretch of
-/// it. Animals whose own fixes show them among those holding the back line
-/// up for 5 minutes without moving up become stragglers; at step 0,
+/// it. Animals whose own fixes show them at the very back (within a stride
+/// of the rearmost) for 5 minutes without moving up become stragglers, a
+/// few at a time, never the rear tenth at once; at step 0,
 /// animals already outside the active boundary do.
 ///
 /// A sweep only moves on what the collars say. While half or more of the
@@ -322,11 +323,16 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
         if !due {
             break;
         }
-        let threshold = sweep.level.map(|l| l + stride);
+        // Holding it up: the few at the very back (within a stride of the
+        // rearmost), not everyone behind the step's p10 back line: dropping
+        // the rear tenth at once would fence them all out together.
+        let progress: Vec<f64> = herd.iter().map(|(_, p)| space.progress(frame, *p)).collect();
+        let rearmost = progress.iter().copied().fold(f64::INFINITY, f64::min);
+        let threshold = sweep.level.map(|_| rearmost + stride);
         let mut dropped = Vec::new();
-        for (i, (c, p)) in herd.iter().enumerate() {
-            let prog = space.progress(frame, *p);
-            let blocking = left_out.contains(&i) || threshold.is_some_and(|t| prog - BACK_FACTOR * m.warn_m < t);
+        for (i, (c, _)) in herd.iter().enumerate() {
+            let prog = progress[i];
+            let blocking = left_out.contains(&i) || threshold.is_some_and(|t| prog < t);
             let t = sweep.animals.entry(c.clone()).or_insert(Track { best: prog, since: now });
             if !blocking || prog > t.best + MOVED_UP_M {
                 t.best = t.best.max(prog);
@@ -1028,6 +1034,36 @@ mod tests {
         assert_eq!(r.stragglers, vec!["col_0".to_owned()]);
         let Next::Send { polygon, .. } = next else { panic!("the sweep goes on without it") };
         assert!(!polygon.contains(at(20.0, 20.0)));
+    }
+
+    /// 250 head scattered over the back of the paddock that stop answering
+    /// cues after the first step: only the few at the very back hold the
+    /// sweep up, so only they are dropped every five minutes, not the whole
+    /// rear tenth of the herd at once.
+    #[test]
+    fn a_stalled_sweep_of_250_drops_only_the_rearmost_few_each_5_minutes() {
+        let mut seed: u64 = 7;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let pts: Vec<[f64; 2]> = (0..250).map(|_| [10.0 + 120.0 * rnd(), 10.0 + 144.0 * rnd()]).collect();
+        let mut r = Run::new(&pts);
+        assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
+        let mut dropped_before = 0;
+        for k in 1..=48 {
+            let now = t0() + Duration::seconds(25 * k);
+            r.sit.heard = r.sit.positions.iter().map(|(c, _)| (c.clone(), now)).collect();
+            if let Next::Send { polygon, .. } = r.tick(now) {
+                let outside = r.sit.positions.iter().filter(|(_, p)| !polygon.contains(*p)).count();
+                assert!(outside <= 3, "at {} s a step leaves {outside} collars outside it at once", 25 * k);
+            }
+            if k % 12 == 0 {
+                let new = r.stragglers.len() - dropped_before;
+                assert!(new <= 3, "{new} stragglers dropped in the 5 minutes to {} s", 25 * k);
+                dropped_before = r.stragglers.len();
+            }
+        }
     }
 
     #[test]
