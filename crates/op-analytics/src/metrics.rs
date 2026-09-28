@@ -2,7 +2,7 @@
 //! percentiles, fix cadence and trends. Fed row by row so a scan never has to
 //! sit in memory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use op_core::Paddock;
 use op_geo::{LonLat, Polygon, Projection};
@@ -213,6 +213,12 @@ impl Cadence {
         self.last_t = Some(self.last_t.map_or(t, |p| p.max(t)));
     }
 
+    /// `n` gaps of `secs` seconds (whole, at least 1) counted elsewhere (@L:
+    /// the hot fixes' gaps, from SQLite).
+    pub fn add_gaps(&mut self, secs: i64, n: u64) {
+        *self.gaps.entry(secs.max(1)).or_default() += n;
+    }
+
     pub fn median_s(&self) -> Option<f64> {
         let n: u64 = self.gaps.values().sum();
         if n == 0 {
@@ -228,6 +234,50 @@ impl Cadence {
             }
         }
         None
+    }
+}
+
+// @L
+/// Accuracy values and how often each came, for percentiles without keeping
+/// every fix: keyed by centimetres (fixes carry decimetres or coarser).
+#[derive(Debug, Default, Clone)]
+pub struct Hist {
+    counts: BTreeMap<i64, u64>,
+}
+
+impl Hist {
+    pub fn add(&mut self, v: f64, n: u64) {
+        if v.is_finite() && n > 0 {
+            *self.counts.entry((v * 100.0).round() as i64).or_default() += n;
+        }
+    }
+
+    pub fn merge(&mut self, other: &Hist) {
+        for (k, n) in &other.counts {
+            *self.counts.entry(*k).or_default() += n;
+        }
+    }
+
+    /// As [`percentile`] of every value once per count.
+    pub fn percentile(&self, q: f64) -> Option<f64> {
+        let n: u64 = self.counts.values().sum();
+        if n == 0 {
+            return None;
+        }
+        let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
+        let (lo, hi) = (pos.floor() as u64, pos.ceil() as u64);
+        let at = |i: u64| {
+            let mut seen = 0;
+            for (k, c) in &self.counts {
+                seen += c;
+                if i < seen {
+                    return *k as f64 / 100.0;
+                }
+            }
+            *self.counts.keys().last().expect("not empty") as f64 / 100.0
+        };
+        let (a, b) = (at(lo), at(hi));
+        Some(a + (b - a) * (pos - lo as f64))
     }
 }
 

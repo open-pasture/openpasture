@@ -125,6 +125,7 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // @A3
     // @H
     // @L
+    op_core::store::spawn_checkpointer(&ctx, op_core::store::CHECKPOINT_EVERY);
     // @M
     // @Z
     Ok(())

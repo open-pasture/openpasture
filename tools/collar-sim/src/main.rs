@@ -72,6 +72,40 @@ struct Args {
     /// Collars report the LTE-M cell they measure (signal, quality, band).
     #[arg(long)]
     cell: bool,
+    /// Several herds in one run: `Cows=226,Steers=12` (name or id = collars).
+    /// Replaces `--herd` and `--count`.
+    #[arg(long, value_delimiter = ',', value_parser = parse_herd)]
+    herds: Vec<(String, usize)>,
+    /// Spread the collars' first fixes over this many seconds, as a herd
+    /// whose collars are switched on one after another (default: within one
+    /// fix interval).
+    #[arg(long, default_value_t = 0)]
+    ramp: u64,
+    /// Stop after this many seconds (default: run until ctrl-c).
+    #[arg(long)]
+    duration: Option<u64>,
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    #[test]
+    fn herds_take_a_name_and_a_count_each() {
+        let a = Args::try_parse_from(["collar-sim", "--herds", "Cows=238,Heifers=12", "--ramp", "60", "--duration", "10"]).unwrap();
+        assert_eq!(a.herds, vec![("Cows".to_owned(), 238), ("Heifers".to_owned(), 12)]);
+        assert_eq!((a.ramp, a.duration), (60, Some(10)));
+        assert!(Args::try_parse_from(["collar-sim", "--herds", "Cows"]).is_err());
+        let one = Args::try_parse_from(["collar-sim", "--count", "5"]).unwrap();
+        assert!(one.herds.is_empty() && one.count == 5 && one.ramp == 0 && one.duration.is_none());
+    }
+}
+
+/// `Cows=226` → `("Cows", 226)`.
+fn parse_herd(p: &str) -> Result<(String, usize), String> {
+    let (h, n) = p.rsplit_once('=').ok_or_else(|| format!("{p}: expected herd=count"))?;
+    let n: usize = n.trim().parse().map_err(|_| format!("{p}: the count is not a number"))?;
+    Ok((h.trim().to_owned(), n))
 }
 
 /// A collar this tool linked. Keys are only ever shown once, so they live here.
@@ -165,16 +199,51 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let server = args.server.trim_end_matches('/').to_owned();
     let api = Api { http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?, server: server.clone(), token: args.token.clone() };
-
     let st = api.get("/api/state").await.context("is the server running?")?;
+    let wanted: Vec<(Option<String>, usize)> =
+        if args.herds.is_empty() { vec![(args.herd.clone(), args.count)] } else { args.herds.iter().map(|(h, n)| (Some(h.clone()), *n)).collect() };
+    let total: usize = wanted.iter().map(|(_, n)| n).sum();
+    let mut tasks = Vec::new();
+    let mut first = 0;
+    for (herd, count) in wanted {
+        let started = start_herd(&api, &args, &st, herd.as_deref(), count, first, total).await?;
+        first += started.len();
+        tasks.extend(started);
+    }
+    let stop = async {
+        match args.duration {
+            Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => println!("stopping"),
+        _ = stop => println!("stopping after {} s", args.duration.unwrap_or(0)),
+        _ = futures_all(tasks) => println!("every collar has stopped"),
+    }
+    Ok(())
+}
+
+/// Link (or reuse) `count` collars on one herd and start them. `first` of
+/// `total` is where this herd's collars fall in the `--ramp` order.
+async fn start_herd(
+    api: &Api,
+    args: &Args,
+    st: &Value,
+    wanted: Option<&str>,
+    count: usize,
+    first: usize,
+    total: usize,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let server = api.server.clone();
     let farm_center: Option<LonLat> = serde_json::from_value(st["farm"]["center"].clone()).ok();
     let herds = st["herds"].as_array().cloned().unwrap_or_default();
-    let herd = match &args.herd {
-        Some(h) => herds.iter().find(|x| x["id"] == h.as_str() || x["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(h))),
+    let herd = match wanted {
+        Some(h) => herds.iter().find(|x| x["id"] == h || x["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(h))),
         None => herds.first(),
     }
     .cloned()
-    .context("no such herd; create a farm and a herd in the app first")?;
+    .with_context(|| format!("no herd {}; create a farm and a herd in the app first", wanted.unwrap_or("")))?;
     let herd_id = herd["id"].as_str().unwrap_or_default().to_owned();
     println!("herd {} ({herd_id})", herd["name"].as_str().unwrap_or(""));
 
@@ -191,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
     let area = shape.as_ref().and_then(Area::from_polygon).context("the herd has no paddock and the farm has no centre")?;
 
     // Reuse collars from earlier runs that still exist; link the rest.
-    let path = state_path(&args);
+    let path = state_path(args);
     let mut state = load_state(&path)?;
     let existing: Vec<String> = api
         .get(&format!("/api/collars?herd_id={herd_id}"))
@@ -203,10 +272,10 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     state.collars.retain(|c| c.server != server || c.herd_id != herd_id || existing.contains(&c.collar_id));
     let mut mine: Vec<Linked> = state.collars.iter().filter(|c| c.server == server && c.herd_id == herd_id).cloned().collect();
-    if mine.len() < args.count {
+    if mine.len() < count {
         let animals = api.get(&format!("/api/animals?herd_id={herd_id}")).await?;
         let mut tag = animals.as_array().into_iter().flatten().filter_map(|a| a["tag"].as_str()?.parse::<u32>().ok()).max().map_or(101, |t| t.max(100) + 1);
-        while mine.len() < args.count {
+        while mine.len() < count {
             let linked = api.post("/api/collars", json!({ "name": tag.to_string(), "herd_id": herd_id })).await?;
             let collar_id = linked["collar"]["id"].as_str().context("collar id")?.to_owned();
             api.post("/api/animals", json!({ "tag": tag.to_string(), "herd_id": herd_id, "collar_id": collar_id })).await?;
@@ -226,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
             tag += 1;
         }
     }
-    mine.truncate(args.count);
+    mine.truncate(count);
 
     // Animals resume at their last reported position.
     let last: HashMap<String, LonLat> = api
@@ -244,14 +313,12 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::new();
     for (i, l) in mine.into_iter().enumerate() {
         let start = last.get(&l.collar_id).copied();
-        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio };
+        // With --ramp, collar k of all of them boots k/total of the way through it.
+        let boot_ms = args.ramp * 1000 * (first + i) as u64 / total.max(1) as u64;
+        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio, boot_ms };
         tasks.push(tokio::spawn(run_collar(l, start, area.clone(), world.clone(), api.http.clone(), cfg)));
     }
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("stopping"),
-        _ = futures_all(tasks) => println!("every collar has stopped"),
-    }
-    Ok(())
+    Ok(tasks)
 }
 
 async fn futures_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
@@ -278,6 +345,8 @@ struct Run {
     /// This collar comes off its animal.
     drop: bool,
     radio: Option<sensors::Radio>,
+    /// Milliseconds after the start that this collar boots (`--ramp`).
+    boot_ms: u64,
 }
 
 /// The device side of the protocol for one collar.
@@ -390,7 +459,7 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
     world.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), (pos, [0.0, 0.0]));
 
     // Stagger so collars don't report in lockstep.
-    tokio::time::sleep(Duration::from_millis(rng.gen_range(0..cfg.fix_secs * 1000))).await;
+    tokio::time::sleep(Duration::from_millis(cfg.boot_ms + rng.gen_range(0..cfg.fix_secs * 1000))).await;
     let booted = chrono::Utc::now();
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.fix_secs));
     let (mut fixes, mut cues, mut episodes): (Vec<WireFix>, Vec<WireCue>, Vec<WireEpisode>) = (Vec::new(), Vec::new(), Vec::new());

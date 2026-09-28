@@ -21,12 +21,14 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::boundary::{NewBoundary, announce, insert_boundary};
-use crate::planner::{self, BACK_FACTOR, Frame, Plan, PlanInput, Space};
+use crate::planner::{self, BACK_FACTOR, Frame, Plan, PlanInput, Rear, Space};
 use crate::shape::{Prepared, prepare};
 use crate::{SendOpts, config, db};
 
-/// At most one step this often.
-pub const STEP_EVERY: Duration = Duration::seconds(30);
+/// At most one step this often: about one round of the fast config (a
+/// download, a cue at the next fix, the animal walking off it, and the
+/// report that shows it).
+pub const STEP_EVERY: Duration = Duration::seconds(25);
 /// An animal holding the sweep up this long without moving up is dropped.
 pub const STRAGGLER_AFTER: Duration = Duration::minutes(5);
 /// Fixes older than this don't count as a position.
@@ -48,8 +50,38 @@ pub const RESUME_AFTER: Duration = Duration::minutes(2);
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
 /// Counts as moving up.
 const MOVED_UP_M: f64 = 1.0;
+/// A step's back line is where nine in ten of the herd are ahead of it
+/// (see [`Rear::Follow`]): the p90 of the animals.
+pub const REAR_QUANTILE: f64 = 0.1;
+/// A sweep steps once its back line has moved up this share of `warn_m`.
+pub const SWEEP_STRIDE: f64 = 0.1;
+/// Where an animal is: its fixes this close before its newest one,
+/// averaged by accuracy (a single fix wanders by metres).
+pub const SMOOTH_WINDOW: Duration = Duration::seconds(12);
+/// Room a step leaves behind an animal per metre of uncertainty in where
+/// it is (the spread of its averaged fixes).
+pub const NOISE_MARGIN: f64 = 0.5;
+/// ... and per second since its newest fix (a grazing animal drifts).
+pub const DRIFT_M_PER_S: f64 = 0.05;
+/// The most room added for both, so an animal at the back stays inside its
+/// warning band and is cued.
+pub const EXTRA_MAX_M: f64 = 0.5;
 
-/// The smallest advance worth a new version.
+/// Where an animal is from its latest fixes `(point, accuracy_m)`: the mean
+/// weighted by `1 / accuracy²`, and its spread (`1 / sqrt(Σ 1 / accuracy²)`,
+/// metres; one fix: its accuracy).
+pub fn estimate(fixes: &[(LonLat, f64)]) -> Option<(LonLat, f64)> {
+    let (mut w, mut x, mut y) = (0.0, 0.0, 0.0);
+    for (p, acc) in fixes {
+        let wi = 1.0 / acc.max(0.5).powi(2);
+        w += wi;
+        x += wi * p[0];
+        y += wi * p[1];
+    }
+    (w > 0.0).then(|| ([x / w, y / w], 1.0 / w.sqrt()))
+}
+
+/// The smallest advance of an escape pen worth a new version.
 pub(crate) fn stride(warn_m: f64) -> f64 {
     (0.3 * warn_m).max(2.0)
 }
@@ -82,6 +114,10 @@ pub struct Sweep {
     /// When the last such hold ended: silence before it doesn't count toward [`SILENT_DROP`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_at: Option<DateTime<Utc>>,
+    /// How far the back line had to go at the first step, metres: the
+    /// sweep's length, for its pace once it is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_m: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +140,9 @@ pub struct Situation {
     /// When each of `positions` was fixed (the collar's own clock); a
     /// collar not here counts as fixed now.
     pub heard: HashMap<String, DateTime<Utc>>,
+    /// How uncertain each of `positions` is, metres (see [`estimate`]); a
+    /// collar not here counts as exact.
+    pub spread: HashMap<String, f64>,
     /// Collars with the herd when the move started (heard within
     /// [`WITH_HERD`] before it) that have no fresh fix now (last fix older
     /// than [`FRESH_FIX`]): where and when each was last fixed.
@@ -114,7 +153,16 @@ pub struct Situation {
 
 impl Default for Situation {
     fn default() -> Self {
-        Self { active: None, pending: false, paddock: None, positions: vec![], heard: HashMap::new(), silent: vec![], limits: CollarLimits::V0 }
+        Self {
+            active: None,
+            pending: false,
+            paddock: None,
+            positions: vec![],
+            heard: HashMap::new(),
+            spread: HashMap::new(),
+            silent: vec![],
+            limits: CollarLimits::V0,
+        }
     }
 }
 
@@ -147,10 +195,15 @@ pub struct MoveState<'a> {
 
 /// Decide the move's next action. The first call (step 0) sends at once:
 /// the target when the herd is already in it, else the first step. Later
-/// steps wait for the herd to move a stride up and for 30 s since the last.
-/// Animals whose own fixes show them holding the sweep up for 5 minutes
-/// without moving up become stragglers; at step 0, animals already outside
-/// the active boundary do.
+/// steps wait [`STEP_EVERY`] since the last and for the herd's back line
+/// (where nine in ten of its animals are ahead, [`REAR_QUANTILE`]) to move
+/// up [`SWEEP_STRIDE`] × `warn_m`. Each step's back edge follows the rear of
+/// the herd ([`Rear::Follow`]): every animal is inside it, those at the back
+/// in their warning band, with room for how uncertain and how old its
+/// position is, so one lagging animal holds back only its own stretch of
+/// it. Animals whose own fixes show them among those holding the back line
+/// up for 5 minutes without moving up become stragglers; at step 0,
+/// animals already outside the active boundary do.
 ///
 /// A sweep only moves on what the collars say. While half or more of the
 /// collars with the herd are silent (no fix for [`FRESH_FIX`]: the farm's
@@ -189,10 +242,18 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
     let last_fix: HashMap<&str, DateTime<Utc>> = waited.iter().map(|(c, _, at)| (c.as_str(), *at)).collect();
     let fixed_at = |c: &str| sit.heard.get(c).or_else(|| last_fix.get(c)).copied().unwrap_or(now);
     let space = Space::new(m.target);
-    let stride = stride(m.warn_m);
+    let stride = SWEEP_STRIDE * m.warn_m;
     for _ in 0..8 {
         let herd: Vec<&(String, LonLat)> = positions.iter().filter(|(c, _)| !stragglers.contains(c)).collect();
         let animals: Vec<LonLat> = herd.iter().map(|(_, p)| *p).collect();
+        // Room for how uncertain and how old each position is.
+        let extra: Vec<f64> = herd
+            .iter()
+            .map(|(c, _)| {
+                let age = (now - fixed_at(c)).num_milliseconds().max(0) as f64 / 1000.0;
+                (NOISE_MARGIN * sit.spread.get(c).copied().unwrap_or(0.0) + DRIFT_M_PER_S * age).min(EXTRA_MAX_M)
+            })
+            .collect();
         let input = PlanInput {
             target: m.target,
             previous: sit.active.as_ref(),
@@ -202,10 +263,11 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
             frame: sweep.frame,
             limits: sit.limits,
         };
-        let plan = planner::plan(&input);
+        let plan = planner::plan_with(&input, Rear::Follow { quantile: REAR_QUANTILE, extra: &extra });
         let due = m.step == 0 || sweep.last_step_at.is_none_or(|t| now - t >= STEP_EVERY);
         let send = |sweep: &mut Sweep, polygon: Polygon, last: bool, remaining_m: f64, frame: Option<Frame>, level: Option<f64>| {
             sweep.last_step_at = Some(now);
+            sweep.start_m.get_or_insert(remaining_m);
             if frame.is_some() {
                 sweep.frame = frame;
             }
@@ -240,7 +302,9 @@ pub fn advance(m: &MoveState, sit: &Situation, now: DateTime<Utc>) -> Outcome {
                         continue;
                     }
                 }
-                let ahead = sweep.level.is_none_or(|cur| s.level >= cur + stride);
+                // Its back line moved up, or its back edge did where it cues animals.
+                let ahead = sweep.level.is_none_or(|cur| s.level >= cur + stride)
+                    || sit.active.as_ref().is_some_and(|a| edge_moved_up(&space, a, &s.polygon, &animals, m.warn_m) >= stride);
                 if due && ahead && s.left_out.is_empty() {
                     let next = send(&mut sweep, s.polygon.clone(), false, s.remaining_m, Some(s.frame), Some(s.level));
                     return Outcome { next, sweep, stragglers };
@@ -343,13 +407,17 @@ pub(crate) async fn situation(
     };
     // Animals out on their own boundary are walked back by their escape.
     let escaped = crate::escapes::escaped_collars(ctx.db(), herd_id).await?;
-    let (mut positions, mut heard, mut silent) = (Vec::new(), HashMap::new(), Vec::new());
+    let recent = recent_fixes(ctx, herd_id, at).await?;
+    let (mut positions, mut heard, mut spread, mut silent) = (Vec::new(), HashMap::new(), HashMap::new(), Vec::new());
     // Parked collars are off duty; animals out on their own boundary are walked back by their escape.
     for c in db::list_collars(ctx.db(), Some(herd_id)).await?.into_iter().filter(|c| c.parked_at.is_none() && !escaped.contains(&c.id)) {
         let Some(f) = c.last_fix else { continue };
         if at - f.at <= FRESH_FIX {
+            let near: Vec<(LonLat, f64)> = recent.get(&c.id).map(|v| near_fixes(v, &f)).unwrap_or_default();
+            let (point, s) = estimate(&near).unwrap_or((f.point, f.accuracy_m));
             heard.insert(c.id.clone(), f.at);
-            positions.push((c.id, f.point));
+            spread.insert(c.id.clone(), s);
+            positions.push((c.id, point));
         } else if since.is_some_and(|s| f.at >= s - WITH_HERD) {
             silent.push((c.id, f.point, f.at));
         }
@@ -357,7 +425,88 @@ pub(crate) async fn situation(
     let limits = crate::shape::herd_limits(ctx, herd_id).await?;
     // @S: the freeze covers the move's own staged step only.
     let pending = split.staged.iter().any(|b| decision_id.is_some_and(|d| b.decision_id == d));
-    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, silent, limits })
+    Ok(Situation { active: split.active.map(|b| b.geometry), pending, paddock, positions, heard, spread, silent, limits })
+}
+
+/// The fixes [`estimate`] averages for a collar whose newest fix is
+/// `newest`: those within [`SMOOTH_WINDOW`] before it that agree with it
+/// (within twice the accuracy of either), so a walk isn't averaged away.
+pub fn near_fixes(recent: &[(DateTime<Utc>, LonLat, f64)], newest: &op_core::Fix) -> Vec<(LonLat, f64)> {
+    let proj = op_geo::Projection::new(newest.point);
+    let mut out: Vec<(LonLat, f64)> = recent
+        .iter()
+        .filter(|(t, p, acc)| {
+            let q = proj.forward(*p);
+            *t < newest.at && newest.at - *t <= SMOOTH_WINDOW && q[0].hypot(q[1]) <= 2.0 * acc.max(newest.accuracy_m)
+        })
+        .map(|(_, p, a)| (*p, *a))
+        .collect();
+    out.push((newest.point, newest.accuracy_m));
+    out
+}
+
+/// How far back [`recent_fixes`] reads: a collar reporting every minute
+/// still has its newest few fixes in it.
+const RECENT: Duration = Duration::seconds(90);
+
+/// The herd's fixes of the last [`RECENT`], per collar: `(time, point, accuracy_m)`.
+async fn recent_fixes(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Result<HashMap<String, Vec<(DateTime<Utc>, LonLat, f64)>>> {
+    let rows: Vec<(String, i64, f64, f64, f64)> = sqlx::query_as("SELECT collar_id, t, lon, lat, accuracy_m FROM fixes WHERE herd_id = ? AND t >= ?")
+        .bind(herd_id)
+        .bind((at - RECENT).timestamp_millis())
+        .fetch_all(ctx.db())
+        .await?;
+    let mut out: HashMap<String, Vec<(DateTime<Utc>, LonLat, f64)>> = HashMap::new();
+    for (c, t, lon, lat, acc) in rows {
+        out.entry(c).or_default().push((op_core::time::from_unix_ms(t), [lon, lat], acc));
+    }
+    Ok(out)
+}
+
+/// How far a step's edge moves up on the animals it cues: over those
+/// inside the new step's warning band and not yet in the target, the median
+/// of how much closer its edge is to them than the current boundary's (0
+/// when there are none). The target's own edges never move, so animals
+/// along them say nothing about the sweep.
+fn edge_moved_up(space: &Option<Space>, current: &Polygon, next: &Polygon, animals: &[LonLat], warn_m: f64) -> f64 {
+    let Some(space) = space else { return 0.0 };
+    let ring = |p: &Polygon| -> Vec<[f64; 2]> { p.outer_ring().iter().map(|q| space.local(*q)).collect() };
+    let (cur, new) = (ring(current), ring(next));
+    let mut moved: Vec<f64> = animals
+        .iter()
+        .filter(|a| space.target_margin(**a) < planner::FINISH_MARGIN_M)
+        .filter_map(|a| {
+            let q = space.local(*a);
+            let m = planner::signed_distance(q, &new);
+            (m >= 0.0 && m < warn_m).then(|| planner::signed_distance(q, &cur) - m)
+        })
+        .collect();
+    if moved.is_empty() {
+        return 0.0;
+    }
+    moved.sort_by(|a, b| a.total_cmp(b));
+    moved[moved.len() / 2]
+}
+
+/// A pass of the planner slower than this is logged as a warning.
+pub const PLAN_SLOW_MS: f64 = 150.0;
+
+/// [`advance`] on a blocking thread (a pass plans the whole herd), timed.
+/// Gives `sit` back with the outcome and the milliseconds it took.
+async fn advance_off_thread(m: &MoveState<'_>, sit: Situation, now: DateTime<Utc>) -> anyhow::Result<(Outcome, Situation, f64)> {
+    let (target, warn_m, step, sweep, stragglers) = (m.target.clone(), m.warn_m, m.step, m.sweep.clone(), m.stragglers.to_vec());
+    let (out, sit, ms) = tokio::task::spawn_blocking(move || {
+        let t = std::time::Instant::now();
+        let out = advance(&MoveState { target: &target, warn_m, step, sweep: &sweep, stragglers: &stragglers }, &sit, now);
+        (out, sit, t.elapsed().as_secs_f64() * 1000.0)
+    })
+    .await?;
+    if ms > PLAN_SLOW_MS {
+        tracing::warn!(animals = sit.positions.len(), ms = format!("{ms:.1}"), "sweep planning is slow");
+    } else {
+        tracing::debug!(animals = sit.positions.len(), ms = format!("{ms:.1}"), "sweep planned");
+    }
+    Ok((out, sit, ms))
 }
 
 /// A sweep step on its way to the collars, like every herd boundary.
@@ -417,7 +566,8 @@ pub(crate) async fn begin(
     let at = now();
     let effective_at = effective_at.map(op_protocol::wire_time::trunc_secs).filter(|t| *t > at);
     let sit = situation(ctx, herd_id, at, None, Some(at)).await?;
-    let mut out = advance(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, &sit, at);
+    let (mut out, sit, plan_ms) =
+        advance_off_thread(&MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] }, sit, at).await?;
     match &mut out.next {
         Next::Send { polygon, last: false, .. } => *polygon = prepare_step(ctx, herd_id, polygon, warn_m, hysteresis_m).await?,
         Next::Send { .. } => {}
@@ -499,7 +649,7 @@ pub(crate) async fn begin(
     if let Some(b) = &boundary {
         announce(ctx, b).await;
     }
-    log_move(&m, boundary.as_ref(), sit.positions.len());
+    log_move(&m, boundary.as_ref(), sit.positions.len(), plan_ms);
     ctx.publish(Event::Move { r#move: m.clone() });
     // A sweep: the herd's collars report and poll fast until it is over.
     if m.status == MoveStatus::Sweeping {
@@ -508,7 +658,7 @@ pub(crate) async fn begin(
     Ok(Started { r#move: m, boundary })
 }
 
-fn log_move(m: &Move, b: Option<&Boundary>, tracked: usize) {
+fn log_move(m: &Move, b: Option<&Boundary>, tracked: usize, plan_ms: f64) {
     tracing::info!(
         herd = %m.herd_id,
         r#move = %m.id,
@@ -518,6 +668,7 @@ fn log_move(m: &Move, b: Option<&Boundary>, tracked: usize) {
         remaining_m = m.remaining_m,
         tracked,
         stragglers = m.stragglers.len(),
+        plan_ms = format!("{plan_ms:.1}"),
         "move"
     );
 }
@@ -537,7 +688,7 @@ pub async fn stop_move(ctx: &Ctx, herd_id: &str) -> ApiResult<Move> {
     let Some(m) = row.map(|r| move_from_row(&r)).transpose()?.map(|r| r.m) else {
         return Err(ApiError::conflict("No move is running for this herd."));
     };
-    log_move(&m, None, 0);
+    log_move(&m, None, 0, 0.0);
     ctx.publish(Event::Move { r#move: m.clone() });
     Ok(m)
 }
@@ -570,7 +721,7 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     }
     let mut m = row.m.clone();
     let state = MoveState { target: &m.target, warn_m: row.warn_m, step: m.step, sweep: &row.sweep, stragglers: &m.stragglers };
-    let mut out = advance(&state, &sit, at);
+    let (mut out, sit, plan_ms) = advance_off_thread(&state, sit, at).await?;
     if let Next::Send { polygon, last: false, .. } = &mut out.next {
         match prepare_step(ctx, herd_id, polygon, row.warn_m, row.hysteresis_m).await {
             Ok(p) => *polygon = p,
@@ -642,7 +793,7 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
         announce(ctx, b).await;
     }
     if visible {
-        log_move(&m, boundary.as_ref(), sit.positions.len());
+        log_move(&m, boundary.as_ref(), sit.positions.len(), plan_ms);
         ctx.publish(Event::Move { r#move: m.clone() });
         return Ok(Some(m));
     }
@@ -783,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn steps_wait_for_the_herd_and_for_30_seconds() {
+    fn steps_wait_for_the_herd_and_for_25_seconds() {
         let mut r = Run::new(&[[50.0, 50.0], [80.0, 60.0], [100.0, 90.0]]);
         let Next::Send { last: false, remaining_m, .. } = r.tick(t0()) else { panic!("first step") };
         assert!(remaining_m > 100.0);
@@ -792,10 +943,68 @@ mod tests {
         // Everyone moved up, but it's only been 10 s since the step.
         r.shift(20.0, 12.0);
         assert_eq!(r.tick(t0() + Duration::seconds(10)), Next::Wait);
-        assert!(matches!(r.tick(t0() + Duration::seconds(31)), Next::Send { last: false, .. }));
-        // Less than a stride: wait.
-        r.shift(0.5, 0.3);
+        assert!(matches!(r.tick(t0() + STEP_EVERY + Duration::seconds(1)), Next::Send { last: false, .. }));
+        // Less than a stride (half a metre at 5 m): wait.
+        r.shift(0.2, 0.12);
         assert_eq!(r.tick(t0() + Duration::seconds(70)), Next::Wait);
+    }
+
+    #[test]
+    fn one_animal_lagging_at_the_back_does_not_hold_the_sweep_up() {
+        // Twenty in a bunch and one 25 m behind them that stays put.
+        let mut pts: Vec<[f64; 2]> = (0..20).map(|i| [80.0 + 3.0 * (i % 5) as f64, 60.0 + 4.0 * (i / 5) as f64]).collect();
+        pts.push([55.0, 70.0]);
+        let mut r = Run::new(&pts);
+        let lag = at(55.0, 70.0);
+        assert!(matches!(r.tick(t0()), Next::Send { last: false, .. }));
+        let mut sent = 0;
+        for k in 1..=8 {
+            let p = Projection::new(ORIGIN);
+            for (c, q) in &mut r.sit.positions {
+                if c != "col_20" {
+                    let l = p.forward(*q);
+                    *q = p.inverse([l[0] + 2.4, l[1] + 1.6]);
+                }
+            }
+            if let Next::Send { polygon, .. } = r.tick(t0() + STEP_EVERY * k) {
+                sent += 1;
+                assert!(polygon.contains(lag), "step {k} still holds the one behind");
+            }
+        }
+        assert!(sent >= 6, "the herd kept being swept: {sent} steps");
+        assert!(r.stragglers.is_empty(), "not dropped before its 5 minutes");
+    }
+
+    #[test]
+    fn where_an_animal_is_comes_from_its_latest_fixes_by_accuracy() {
+        let (p, spread) = estimate(&[([0.0, 0.0], 2.0), ([4.0, 0.0], 2.0)]).unwrap();
+        assert!((p[0] - 2.0).abs() < 1e-12 && p[1] == 0.0);
+        assert!((spread - 2.0 / 2f64.sqrt()).abs() < 1e-12);
+        // A sharper fix counts for more.
+        let (p, spread) = estimate(&[([0.0, 0.0], 1.0), ([3.0, 0.0], 3.0)]).unwrap();
+        assert!((p[0] - 0.3).abs() < 1e-12, "{p:?}");
+        assert!(spread < 1.0);
+        assert_eq!(estimate(&[([1.0, 2.0], 3.5)]), Some(([1.0, 2.0], 3.5)));
+        assert_eq!(estimate(&[]), None);
+    }
+
+    #[test]
+    fn an_uncertain_or_old_position_gets_more_room_behind_it() {
+        let pts = [[60.0, 50.0], [60.0, 90.0], [60.0, 130.0]];
+        let margin_of = |spread: f64, age_s: i64| {
+            let mut r = Run::new(&pts);
+            r.sit.spread.insert("col_1".into(), spread);
+            r.sit.heard.insert("col_1".into(), t0() - Duration::seconds(age_s));
+            let Next::Send { polygon, .. } = r.tick(t0()) else { panic!("a step") };
+            let p = Projection::new(ORIGIN);
+            crate::planner::signed_distance(p.forward(at(60.0, 90.0)), &p.forward_ring(&polygon.outer_ring()))
+        };
+        let exact = margin_of(0.0, 0);
+        assert!((exact - planner::FOLLOW_FACTOR * W).abs() < 0.05, "{exact}");
+        assert!((margin_of(1.0, 0) - exact - NOISE_MARGIN).abs() < 0.05);
+        assert!((margin_of(0.0, 10) - exact - 10.0 * DRIFT_M_PER_S).abs() < 0.05);
+        // Never so much that the animal leaves its warning band.
+        assert!((margin_of(9.0, 600) - exact - EXTRA_MAX_M).abs() < 0.05);
     }
 
     #[test]

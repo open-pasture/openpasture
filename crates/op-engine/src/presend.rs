@@ -57,6 +57,10 @@ const WEAK_MIN_CELLS: usize = 3;
 const COVERAGE_DAYS: i64 = 7;
 /// Back lines in the preview are about this far apart (m).
 pub const BACK_LINE_EVERY_M: f64 = 10.0;
+/// Pieces of a back line closer than this (m) are drawn as one.
+const BACK_LINE_JOIN_M: f64 = 60.0;
+/// A cued animal in the preview walks at most this far ahead along the sweep (m).
+const WALK_AHEAD_M: f64 = 12.0;
 /// A cued animal in the preview walks this far clear of the warning band (m).
 pub const CLEAR_OF_BAND_M: f64 = 1.0;
 /// The preview gives up past this many steps, or this many steps waiting.
@@ -253,23 +257,35 @@ async fn weak_coverage(ctx: &Ctx, sent: &Polygon, now: DateTime<Utc>, fmt: &Fmt)
 
 /// The sweep that would walk the herd into `target` (already prepared), from
 /// where its collars are now: the move driver's own planner and step rule
-/// ([`moves::advance`]) run forward, each step 30 s or more apart, with every
-/// animal a step cues (inside the warning band of its edge) walking 1 m clear
-/// of the band. `None` when the herd is already in it, has no fresh
-/// positions, or the sweep can't finish.
+/// ([`moves::advance`]) run forward, each step [`moves::STEP_EVERY`] or more
+/// apart, with every animal a step cues (inside the warning band of its edge)
+/// walking on along the sweep until 1 m clear of the band, and again at each
+/// wait while it is still in it. Its minutes are
+/// the length of the sweep over the pace ([`pace_m_per_min`]), plus half a
+/// base report interval for the first step to reach the collars. `None` when
+/// the herd is already in it, has no fresh positions, or the sweep can't
+/// finish.
 pub async fn sweep_preview(ctx: &Ctx, herd: &Herd, target: &Polygon, warn_m: f64, now: DateTime<Utc>) -> anyhow::Result<Option<SweepPreview>> {
     let sit = op_ingest::prepare::situation(ctx, &herd.id, now).await?;
-    let Some(steps) = simulate(target, warn_m, sit, now) else { return Ok(None) };
-    let per_step = seconds_per_step(ctx, &herd.id).await?;
-    let minutes = calc::round(steps.count.saturating_sub(1) as f64 * per_step / 60.0, 1);
+    let head = sit.positions.len();
+    let target = target.clone();
+    // The planner runs once a step: off the async threads.
+    let Some(steps) = tokio::task::spawn_blocking(move || simulate(&target, warn_m, sit, now)).await? else { return Ok(None) };
+    let pace = pace_m_per_min(ctx, &herd.id, head).await?;
+    let c = op_ingest::config::load(ctx).await?;
+    // The first step reaches each collar at its next report on the base cadence.
+    let first = c.report_s as f64 / 2.0 / 60.0;
+    let minutes = calc::round(first + steps.start_m / pace, 1);
     Ok(Some(SweepPreview { back_lines: steps.back_lines, minutes }))
 }
 
-/// Steps of a simulated sweep: how many boundaries it sends, and its back lines.
+/// Steps of a simulated sweep: how many boundaries it sends, its back lines,
+/// and how far its back line has to go (the first step's `remaining_m`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Simulated {
     pub count: u32,
     pub back_lines: Vec<Vec<LonLat>>,
+    pub start_m: f64,
 }
 
 /// Run [`moves::advance`] forward from `sit` (see [`sweep_preview`]). Pure.
@@ -290,7 +306,7 @@ pub fn simulate(target: &Polygon, warn_m: f64, mut sit: Situation, start: DateTi
         stragglers = out.stragglers;
         match out.next {
             Next::Send { last: true, .. } if step == 0 => return None,
-            Next::Send { last: true, .. } => return Some(Simulated { count: step + 1, back_lines }),
+            Next::Send { last: true, .. } => return Some(Simulated { count: step + 1, back_lines, start_m: sweep.start_m.unwrap_or(0.0) }),
             Next::Send { polygon, .. } => {
                 step += 1;
                 waits = 0;
@@ -301,13 +317,17 @@ pub fn simulate(target: &Polygon, warn_m: f64, mut sit: Situation, start: DateTi
                     back_lines.push(line);
                     last_level = level;
                 }
-                cue(&proj, &mut sit.positions, &polygon, warn_m, &stragglers);
+                cue(&proj, &mut sit.positions, &polygon, warn_m, sweep.frame, &stragglers);
                 sit.active = Some(polygon);
             }
             Next::Wait => {
                 waits += 1;
                 if waits > MAX_WAITS {
                     return None;
+                }
+                // Cued animals keep being cued while they stay in the band (@L).
+                if let Some(active) = sit.active.clone() {
+                    cue(&proj, &mut sit.positions, &active, warn_m, sweep.frame, &stragglers);
                 }
             }
         }
@@ -318,9 +338,9 @@ pub fn simulate(target: &Polygon, warn_m: f64, mut sit: Situation, start: DateTi
 
 type P = [f64; 2];
 
-/// Animals inside `step` within the warning band of its edge walk away from
-/// the nearest edge until 1 m clear of the band.
-fn cue(proj: &Projection, positions: &mut [(String, LonLat)], step: &Polygon, warn_m: f64, stragglers: &[String]) {
+/// Animals inside `step` within the warning band of its edge walk until 1 m
+/// clear of the band: on along the sweep, else away from the nearest edge.
+fn cue(proj: &Projection, positions: &mut [(String, LonLat)], step: &Polygon, warn_m: f64, frame: Option<Frame>, stragglers: &[String]) {
     let ring: Vec<P> = proj.forward_ring(&step.outer_ring());
     if ring.len() < 3 {
         return;
@@ -337,6 +357,17 @@ fn cue(proj: &Projection, positions: &mut [(String, LonLat)], step: &Polygon, wa
         let need = warn_m + CLEAR_OF_BAND_M - d;
         if need <= 0.0 {
             continue;
+        }
+        // Along the sweep: the shortest walk ahead that clears the band.
+        if let Some(Frame::Axis { axis }) = frame {
+            let ahead = (1..=4 * WALK_AHEAD_M as usize)
+                .map(|k| k as f64 * 0.25)
+                .map(|t| [q[0] + axis[0] * t, q[1] + axis[1] * t])
+                .find(|r| point_in_ring(*r, &ring) && nearest_edge(*r, &ring).0 >= warn_m + CLEAR_OF_BAND_M);
+            if let Some(r) = ahead {
+                *p = proj.inverse(r);
+                continue;
+            }
         }
         let moved = [q[0] + away[0] * need, q[1] + away[1] * need];
         if point_in_ring(moved, &ring) {
@@ -373,7 +404,10 @@ fn nearest_edge(q: P, ring: &[P]) -> (f64, P) {
 }
 
 /// The back line of a step: across the step at `level` along the sweep's
-/// axis (the longest piece inside it), or the step's edge when gathering.
+/// axis (the longest piece inside it, joining pieces less than
+/// [`BACK_LINE_JOIN_M`] apart: a step's back edge follows the animals, so the
+/// line leaves it at the notch behind each), or the step's edge when
+/// gathering.
 fn back_line(proj: &Projection, step: &Polygon, frame: Frame, level: f64) -> Option<Vec<LonLat>> {
     let ring: Vec<P> = proj.forward_ring(&step.outer_ring());
     if ring.len() < 3 {
@@ -400,7 +434,14 @@ fn back_line(proj: &Projection, step: &Polygon, frame: Frame, level: f64) -> Opt
         }
     }
     hits.sort_by(f64::total_cmp);
-    let (s0, s1) = hits.chunks_exact(2).map(|w| (w[0], w[1])).max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))?;
+    let mut pieces: Vec<(f64, f64)> = Vec::new();
+    for w in hits.chunks_exact(2) {
+        match pieces.last_mut() {
+            Some(last) if w[0] - last.1 < BACK_LINE_JOIN_M => last.1 = w[1],
+            _ => pieces.push((w[0], w[1])),
+        }
+    }
+    let (s0, s1) = pieces.into_iter().max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))?;
     let at = |s: f64| {
         let p = proj.inverse([axis[0] * level + across[0] * s, axis[1] * level + across[1] * s]);
         [op_geo::projection::round7(p[0]), op_geo::projection::round7(p[1])]
@@ -408,30 +449,47 @@ fn back_line(proj: &Projection, step: &Polygon, frame: Frame, level: f64) -> Opt
     Some(vec![at(s0), at(s1)])
 }
 
-/// Seconds between sweep steps: this herd's own pace over its last finished
-/// sweeps (five at most, of five steps or more), else the driver's 30 s
-/// floor plus half of what a collar waits to poll for a step and to report
-/// the walk (the fast intervals of `collars.config`).
-pub async fn seconds_per_step(ctx: &Ctx, herd_id: &str) -> anyhow::Result<f64> {
-    let floor = moves::STEP_EVERY.num_seconds() as f64;
+/// A sweep's pace, metres of back line a minute: this herd's own over its
+/// last finished sweeps (five at most, of five steps or more, that recorded
+/// their length), else [`default_pace`] for `head` animals at the fast
+/// intervals of `collars.config`.
+pub async fn pace_m_per_min(ctx: &Ctx, herd_id: &str, head: usize) -> anyhow::Result<f64> {
     let rows =
-        sqlx::query("SELECT started_at, updated_at, step FROM moves WHERE herd_id = ? AND status = 'done' AND step >= 5 ORDER BY started_at DESC LIMIT 5")
+        sqlx::query("SELECT started_at, updated_at, sweep FROM moves WHERE herd_id = ? AND status = 'done' AND step >= 5 ORDER BY started_at DESC LIMIT 5")
             .bind(herd_id)
             .fetch_all(ctx.db())
             .await?;
     let mut paces: Vec<f64> = Vec::new();
     for r in &rows {
         let (from, to) = (time::from_db(&r.try_get::<String, _>("started_at")?)?, time::from_db(&r.try_get::<String, _>("updated_at")?)?);
-        let steps = r.try_get::<i64, _>("step")?;
-        paces.push((to - from).num_milliseconds() as f64 / 1000.0 / (steps - 1) as f64);
+        let sweep: Sweep = serde_json::from_str(&r.try_get::<String, _>("sweep")?).unwrap_or_default();
+        let minutes = (to - from).num_milliseconds() as f64 / 60_000.0;
+        if let Some(m) = sweep.start_m.filter(|m| *m > 0.0 && minutes > 0.0) {
+            paces.push(m / minutes);
+        }
     }
     if !paces.is_empty() {
         paces.sort_by(f64::total_cmp);
-        return Ok(paces[paces.len() / 2].max(floor));
+        return Ok(paces[paces.len() / 2]);
     }
     let c = op_ingest::config::load(ctx).await?;
-    Ok(floor + (c.fast_poll_s + c.fast_report_s) as f64 / 2.0)
+    Ok(default_pace(head, c.fast_poll_s, c.fast_report_s))
 }
+
+/// Pace of a sweep with no history, metres a minute: measured with
+/// collar-sim at the default fast intervals (10 s), `13.1 × head^-0.23`
+/// (about 7.4 for 12 head, 4.9 for 72, 3.7 for 250); slower fast intervals
+/// slow each step's round (a step, then the poll that fetches it and the
+/// report that shows the walk) in proportion.
+pub fn default_pace(head: usize, fast_poll_s: u32, fast_report_s: u32) -> f64 {
+    let round = moves::STEP_EVERY.num_seconds() as f64 + (fast_poll_s + fast_report_s) as f64 / 2.0;
+    let default_round = moves::STEP_EVERY.num_seconds() as f64 + 10.0;
+    PACE_AT_ONE * (head.max(1) as f64).powf(-PACE_HEAD_EXPONENT) * default_round / round
+}
+
+/// [`default_pace`]'s fit: metres a minute for one animal, and how it falls with the head count.
+pub const PACE_AT_ONE: f64 = 13.1;
+pub const PACE_HEAD_EXPONENT: f64 = 0.23;
 
 /// MCP `check_boundary` (read).
 pub fn tool() -> ToolSpec {
@@ -514,9 +572,29 @@ mod tests {
         let x = |l: &Vec<LonLat>| Projection::new(O).forward(l[0])[0];
         assert!(s.back_lines.windows(2).all(|w| x(&w[1]) > x(&w[0])));
         let l = &s.back_lines[0];
-        let (a, b) = (Projection::new(O).forward(l[0]), Projection::new(O).forward(l[1]));
+        let (a, b) = (Projection::new(O).forward(l[0]), Projection::new(O).forward(*l.last().unwrap()));
         // Across the herd, whose buffered hull is the step.
         assert!((a[1] - b[1]).abs() > 3.0 * (a[0] - b[0]).abs() && (a[1] - b[1]).abs() > 20.0, "{a:?} {b:?}");
+    }
+
+    /// A herd of 250 bunched in a 50 m blob: the preview still finishes,
+    /// though the tenth of the herd at its back hardly moves each step.
+    #[test]
+    fn a_herd_of_250_gets_a_preview() {
+        let paddock = rect(0.0, 0.0, 413.0, 400.0);
+        let target = rect(270.0, 0.0, 413.0, 400.0);
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let positions = (0..250).map(|i| (format!("c{i}"), at(185.0 + 50.0 * next(), 172.0 + 57.0 * next()))).collect();
+        let sit = Situation { active: Some(paddock), positions, ..Default::default() };
+        let s = simulate(&target, 5.0, sit, time::now()).expect("a sweep");
+        assert!((60.0..=90.0).contains(&s.start_m), "the back line starts {} m from the target", s.start_m);
+        assert!(s.back_lines.len() >= 6, "{}", s.back_lines.len());
     }
 
     #[test]

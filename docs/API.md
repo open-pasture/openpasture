@@ -120,11 +120,14 @@ boundary. The server never sends an active boundary that leaves an animal outsid
   is sent as the active boundary directly and the move is `done` at once.
 - Otherwise the server runs a **sweep**. Each step is an active boundary that contains every
   animal still in the sweep and the target, clipped to the old active boundary ∪ the target. Its
-  back edge sits just behind the rearmost animal (relative to the direction from the herd toward
-  the target), so only animals at the back line are in the warning zone and the cue pushes them
-  toward the target. Sides tighten around the herd as it bunches. The next step goes out only
-  once the collars report every animal in the sweep ahead of the next back line, and at most one
-  step every 30 s. The last step is the target itself.
+  back edge follows the back of the herd: a wedge behind every animal (45°, the animal
+  `0.7 × warn_m` from both sides), and the edge is the rearmost of them, so every animal at the
+  back of the herd is in its warning zone at once and the cue pushes it on toward the target,
+  while one animal lagging behind holds back only its own stretch of the edge. Sides tighten
+  around the herd as it bunches. The next step goes out once the herd's back line (where nine in
+  ten of its animals are ahead of it) has moved up `0.1 × warn_m`, or the edge would move up that
+  much on the animals it cues, and at most one step every 25 s. The last step is the target
+  itself.
 - An animal whose fixes show it not moving up for 5 minutes becomes a **straggler**. It's dropped
   from the sweep (the next step may leave it outside, and it is never cued there; see the collar
   rule) and listed on the move for the farmer.
@@ -139,16 +142,20 @@ boundary. The server never sends an active boundary that leaves an animal outsid
   a lost collar), listed as a straggler, and the sweep goes on without it.
 - A new target replaces the running move. Stop keeps the current active boundary and ends the move.
 
-Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. The sweep
+Details. "Tracked" animals are collars in the herd with a fix from the last 10 minutes. Where an
+animal is: its fixes of the last 12 s before its newest that agree with it (within twice their
+accuracy), averaged by `1 / accuracy²` (one fix wanders by metres); the edge behind it leaves
+extra room of half that average's spread plus 0.05 m per second since the fix, at most 0.5 m, so
+it stays in its warning zone. The edge uses at most half the corners the herd's collars hold (64
+of V0's 128); past that its smallest bumps are straightened, which only moves it back. The sweep
 direction (herd centroid toward target centroid) is fixed for the whole move; when the herd
 surrounds the target (its centroid is about on the target), the steps close in from every side
-instead (the hull of the herd, buffered by `0.6 × warn_m`). A step goes out when the new back line
-is at least `max(2 m, 0.3 × warn_m)` ahead of the last. The last step is sent when every animal in
-the sweep is inside the target by `warn_m + 2` m, or when the back line has reached the target's
-rear edge and every animal is at least 1.5 m inside it. Only animals holding the sweep up (behind
-the next back line, or not held by the next step) run the 5-minute straggler clock, timed by
-their own fixes (silence never counts as being stuck); moving up 1 m restarts it, and so does
-every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
+instead (the hull of the herd, buffered by `0.6 × warn_m`). The last step is sent when every
+animal in the sweep is inside the target by 1.5 m (with the sweep's own edge behind them, nobody
+needs a back line past the target's rear first). `remaining_m` is from the back line (nine in
+ten ahead) to the target's rear edge. Only animals holding the back line up (behind the next back
+line, or not held by the next step) run the 5-minute straggler clock, timed by their own fixes
+(silence never counts as being stuck); moving up 1 m restarts it, and so does every step. Parked collars aren't tracked. Animals already outside the active boundary when a move
 starts are listed as stragglers at once. When the old active boundary and the target don't touch
 (paddocks drawn with a gap), the first step spans the convex hull of both, so the herd has a way
 across. Every step is a new boundary version under the move's decision (`decision_id`), signed
@@ -189,7 +196,7 @@ cued back without opening the paddock for the rest of the herd to follow it out.
   boundary: it went far, or its collar was moved to a herd across the farm. Such an animal stays
   outside, uncued, and the farmer sees it (the `outside` alert); a later pen is tried as its
   fixes come in.
-- The pen closes in behind the animal like a sweep step: at most every 30 s, and only once the
+- The pen closes in behind the animal like a sweep step: at most every 25 s, and only once the
   animal is `max(2 m, 0.3 × warn_m)` further along. It never gives up on its own; an animal that
   doesn't move stays held where it is.
 - When the herd's boundary changes (a sweep step, a new target), the pen is rebuilt against it at
@@ -1398,12 +1405,16 @@ Findings, most severe first:
 Targets name what a finding is about: `["collar", id]`, `["feature", id]`, `["paddock", id]`.
 
 **Sweep preview** (`sweep: true`): the move driver's own planner and step rule, run forward from
-the herd's fresh positions (escaped and parked collars left out): each step at least 30 s after
-the last, and every animal inside a step's warning band walking 1 m clear of it. `back_lines` are
-where the back of the sweep will be, first to last, about every 10 m; `minutes` is the steps times
-this herd's own seconds per step over its last finished sweeps (five at most, of five steps or
-more), else 30 s plus half the fast poll and report intervals (40 s at the defaults). No preview
-when the herd is already inside, has no fresh positions, or the sweep can't finish.
+the herd's fresh positions (escaped and parked collars left out): each step at least 25 s after
+the last, and every animal inside a step's warning band walking on along the sweep until 1 m
+clear of it (again at each wait while it is still in it). `back_lines` are where the back of the
+sweep will be, first to last, about every 10 m (across the step at its back line). `minutes` is
+the sweep's length (the first step's `remaining_m`) over the pace, plus half a base report
+interval for the first step to reach the collars. The pace is this herd's own over its last
+finished sweeps (five at most, of five steps or more: length over minutes), else `13.1 ×
+head^-0.23` metres a minute (7.4 for 12 head, 4.9 for 72, 3.7 for 250; measured with collar-sim
+at the default 10 s fast intervals), slower in proportion when the fast intervals are longer. No
+preview when the herd is already inside, has no fresh positions, or the sweep can't finish.
 
 MCP `check_boundary` (read) `{ herd_id?, geometry, warn_m?, effective_at?, sweep? }` returns the
 same `CheckResult`.
@@ -1707,6 +1718,71 @@ Alert rules (H): `drop_off` also reads a collar's IMU (`health.still_s`, `tilt_d
 texts): a collar on an animal whose fit hasn't been checked for `fleet.fit_check_days` since its
 last check (else since it was added); the brief counts them ("Fit check due: 5").
 <!-- @L -->
+
+## 250 collars (L)
+
+**Sweeps.** See "Moves: target and sweep" for the rule. Each pass of the planner runs on a
+blocking thread and is timed: `plan_ms` on every `move` log line, a warning past 150 ms (a pass
+for 250 animals takes about 1.5 ms in a debug build). The move row's `sweep` JSON gains
+`start_m`, the back line's distance to the target at the first step, so a finished sweep has a
+pace (metres a minute) for the pre-send preview.
+
+**Collar reports.** A report's fixes go in with one multi-row `INSERT` (64 rows a statement, so a
+backlog of any size fits), and so do its cues, inside the report's one short write transaction.
+
+**Write transactions.** `op_core::store::begin_immediate` starts its `BEGIN IMMEDIATE` in a task
+of its own. sqlx 0.8 awaits once more after a custom `BEGIN` has run; a request dropped there (a
+collar that gave up on its report while the lock was busy) left its pooled connection inside the
+transaction, holding the write lock for good: every writer stalled for the busy timeout, then
+every begin on that connection failed with "attempted to call begin_with at non-zero transaction
+depth" and reports got 500. A task runs to its end, and a transaction no one takes is dropped,
+which rolls it back.
+
+**SQLite.** The server checkpoints the WAL in the background (`PRAGMA wal_checkpoint(PASSIVE)`
+every second, `op_core::store::spawn_checkpointer`, started with the ingest drivers), so no commit
+does it: before, the commit that crossed 1,000 pages of WAL (usually a collar's report) copied
+and synced the pages itself and waited on the disk. A commit checkpoints by itself only past
+16,384 pages (64 MB, `WAL_AUTOCHECKPOINT_PAGES`), the backstop for tests and tools, and
+`journal_size_limit` is 64 MB (`JOURNAL_SIZE_LIMIT`): a WAL that grew while a long read held
+checkpoints back is truncated once one catches up. WAL, `NORMAL` sync and the 10 s busy timeout
+are as before.
+
+**Analytics at 250 collars.** Reads that summarise a day of 250 collars (4.3 M fixes) no longer
+stream every fix through the server:
+
+- `GET /api/analytics/health`: SQLite sums the hot fixes per collar, bucket and accuracy
+  (`routes::health_hot_sql`); accuracy percentiles come from those counts (to the centimetre,
+  exact for fixes that report decimetres). A collar's cadence, when it has none configured, is
+  the median gap over its first 2,000 fixes in the range. Parquet days are read as before.
+- `GET /api/analytics/heatmap`: SQLite counts the hot fixes per grid cell, with the same
+  arithmetic as the Parquet path (`routes::heat_hot_sql`).
+- `GET /api/analytics/behaviour`: days in Parquet are read from their files; for the hot fixes
+  after them SQLite counts each collar's fixes and sums its dwell, and the walk comes from every
+  hot fix while the range holds at most 20,000 of them, else from each collar's first fix in each
+  of at most 2,000 time buckets (at least a minute each: 1,440 a collar for a day). Distances for
+  big ranges are therefore from one fix a minute or so.
+- `GET /api/analytics/pasture` (and behaviour's dwell): one SQL pass over the hot range sorted by
+  collar (`routes::hot_dwell_sql`) instead of one pass a collar, whose interleaved rows made each
+  collar read every page of the day.
+- Per-collar reads of one request run six at a time (`routes::PARALLEL_READS`).
+- **A day in both places while the rollup deletes it is counted once.** While a scan reads a
+  day's Parquet file it learns the highest row id in it; the day's hot rows at or below it are
+  the ones the rollup has written and not yet deleted (ids never repeat), and the scan leaves
+  them out (`telemetry::Rolled`). The SQL console does the same from the files' statistics. So
+  exports, health, behaviour, heatmap and `/api/sql` count each fix once at every moment.
+
+Release build, 250 collars, a 4.32 M-fix hot day, on a machine loaded by other work (times move
+with the load): health 34 s → 6-9 s, heatmap 50 s → 2-3 s, behaviour 35 s → about 20 s (for a
+day or a week), pasture 9-15 s → 9-15 s (its one pass sorts the day; a per-collar day summary
+kept at ingest is what would make it and behaviour's dwell fast).
+
+**Dev tools.** `collar-sim --herds Cows=238,Heifers=12` runs several herds in one process (each
+with its own paddock and herd view), `--ramp <s>` spreads the collars' first fixes over that many
+seconds, `--duration <s>` stops the run. `scripts/soak.sh` runs a server, collar-sim with 250
+collars, a counting proxy for the collars' traffic, a farm webhook, a live-socket counter and one
+browser for hours, with a move every 30 minutes and a strip schedule advancing every hour, and
+writes `report.md` (latency, errors, live rate, CPU and memory, data budget, sweeps).
+
 <!-- @M -->
 <!-- @Z -->
 <!-- @X1 -->

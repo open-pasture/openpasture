@@ -34,6 +34,36 @@ pub const SIDE_EXTRA_M: f64 = 2.0;
 pub const FINISH_MARGIN_M: f64 = 1.5;
 /// Sides of the polygon standing in for a buffer circle.
 const DISC_SIDES: usize = 12;
+/// A followed back edge (see [`Rear::Follow`]) keeps each animal this
+/// share of `warn_m` from it: inside its warning band, clear of the edge by
+/// more than a fix wanders.
+pub const FOLLOW_FACTOR: f64 = 0.7;
+/// The wedge behind each animal rises this many metres forward per metre
+/// sideways (45°: an animal cued at the back walks straight ahead, off it).
+pub const FOLLOW_SLOPE: f64 = 1.0;
+/// Share of the corners a collar holds that the followed back edge may use
+/// (64 of V0's 128); beyond that, the smallest bumps of it are straightened,
+/// which only ever moves it back. Each straightened bump leaves the animals
+/// under it further from the edge, and past `warn_m` they aren't cued, so
+/// the edge gets most of the budget.
+pub const FOLLOW_CORNERS_SHARE: f64 = 0.5;
+
+/// How the back of a sweep step is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rear<'a> {
+    /// One straight back line [`BACK_FACTOR`] × `warn_m` behind the
+    /// rearmost animal (escape pens: one animal).
+    Line,
+    /// The back edge follows the herd's rear: a wedge behind every animal,
+    /// [`FOLLOW_FACTOR`] × `warn_m` from it (plus `extra`), and the edge is
+    /// the rearmost of them. Every animal at the back of the herd is in its
+    /// warning band at once, and one lagging behind holds back only its own
+    /// stretch of the edge. The step's `level` is the back line of the
+    /// `quantile` of the animals' progress (0.1: nine in ten are ahead of
+    /// it). `extra`, per animal (empty: none), is room added behind it for
+    /// how uncertain and how old its position is.
+    Follow { quantile: f64, extra: &'a [f64] },
+}
 
 /// How progress toward the target is measured, fixed for a whole move.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -130,6 +160,11 @@ impl Space {
 }
 
 pub fn plan(input: &PlanInput) -> Plan {
+    plan_with(input, Rear::Line)
+}
+
+/// [`plan`], with the back of the step drawn as `rear` says.
+pub fn plan_with(input: &PlanInput, rear_edge: Rear<'_>) -> Plan {
     let Some(space) = Space::new(input.target) else { return Plan::Hold("The target has no area.".into()) };
     let w = input.warn_m.max(0.0);
     if input.animals.is_empty() {
@@ -142,9 +177,14 @@ pub fn plan(input: &PlanInput) -> Plan {
     }
     let frame = input.frame.unwrap_or_else(|| choose_frame(&pts, &space.target));
     let progress: Vec<f64> = input.animals.iter().map(|p| space.progress(frame, *p)).collect();
-    let level = progress.iter().copied().fold(f64::INFINITY, f64::min) - BACK_FACTOR * w;
+    let level = match (rear_edge, frame) {
+        (Rear::Follow { quantile, .. }, Frame::Axis { .. }) => quantile_of(&progress, quantile),
+        _ => progress.iter().copied().fold(f64::INFINITY, f64::min),
+    } - BACK_FACTOR * w;
     let rear = space.target_rear(frame);
-    if level >= rear && in_target.iter().all(|m| *m >= FINISH_MARGIN_M) {
+    // A followed back edge holds every animal on its own: the target goes once all are in it.
+    let back_reached = matches!(rear_edge, Rear::Follow { .. }) || level >= rear;
+    if back_reached && in_target.iter().all(|m| *m >= FINISH_MARGIN_M) {
         return Plan::Target;
     }
     let remaining_m = match frame {
@@ -165,7 +205,7 @@ pub fn plan(input: &PlanInput) -> Plan {
         return Plan::Hold("The current boundary has no area.".into());
     }
     let area = gpoly(&ccw(area_ring.clone()));
-    let mut region = area.union(&target);
+    let mut region = without_crumbs(area.union(&target));
     let corridor = region.0.len() != 1;
     if corridor {
         let all: MultiPoint<f64> = area_ring.iter().chain(&space.target).map(|p| Point::new(p[0], p[1])).collect();
@@ -208,9 +248,16 @@ pub fn plan(input: &PlanInput) -> Plan {
         let mut clipped = if use_hull { hull.intersection(&region) } else { region.clone() };
         if let Frame::Axis { axis } = frame {
             let extent = extent_of(&hull, &region) * 4.0 + 100.0;
-            clipped = clipped.intersection(&half_plane(axis, level, extent));
+            let behind = match rear_edge {
+                Rear::Line => half_plane(axis, level, extent),
+                Rear::Follow { extra, .. } => {
+                    let corners = ((max_outer as f64 * FOLLOW_CORNERS_SHARE) as usize).max(8);
+                    follow_edge(axis, &pts, FOLLOW_FACTOR * w, extra, corners, extent)
+                }
+            };
+            clipped = clipped.intersection(&behind);
         }
-        let joined = clipped.union(&target);
+        let joined = without_crumbs(clipped.union(&target));
         // One piece: the one holding the target.
         let Some(piece) = joined.0.into_iter().find(|p| geo::Contains::contains(p, &inner)) else {
             outcome = Plan::Hold("The step lost the target.".into());
@@ -352,6 +399,95 @@ fn drop_flat_corners(ring: &mut Vec<P>) {
             i += 1;
         }
     }
+}
+
+/// Holes smaller than this (m²) in the ground a step may use are crumbs,
+/// not ground to keep the herd off: where the previous boundary's edge
+/// runs back and forth across the target's (the notches of a followed back
+/// edge, with a metre between two strips), the two together enclose bits
+/// of neither. Kept, they are a hole no step may have, and the move holds.
+const CRUMB_M2: f64 = 10.0;
+
+/// `m` without the holes smaller than [`CRUMB_M2`].
+fn without_crumbs(m: MultiPolygon<f64>) -> MultiPolygon<f64> {
+    use geo::Area;
+    MultiPolygon(
+        m.0.into_iter()
+            .map(|p| {
+                let (outer, holes) = p.into_inner();
+                GPoly::new(outer, holes.into_iter().filter(|h| GPoly::new(h.clone(), vec![]).unsigned_area() >= CRUMB_M2).collect())
+            })
+            .collect(),
+    )
+}
+
+/// The `q` quantile of `v` (0: the least), by nearest rank.
+fn quantile_of(v: &[f64], q: f64) -> f64 {
+    let mut s: Vec<f64> = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let i = ((s.len() as f64 - 1.0) * q.clamp(0.0, 1.0)).floor() as usize;
+    s.get(i).copied().unwrap_or(f64::NEG_INFINITY)
+}
+
+/// Everything ahead of a back edge that follows the animals (see
+/// [`Rear::Follow`]), as a big polygon: the lower envelope of a wedge
+/// behind each animal, its apex placed so the animal is `margin` (plus its
+/// `extra`) from both sides. In (sideways, forward) coordinates the wedge
+/// of an animal at `(s, u)` is `u' = u - d + k |s' - s|`, `d = margin·√(1+k²)`.
+fn follow_edge(axis: [f64; 2], pts: &[P], margin: f64, extra: &[f64], corners: usize, extent: f64) -> GPoly {
+    let k = FOLLOW_SLOPE;
+    let sec = (1.0 + k * k).sqrt();
+    let side = [-axis[1], axis[0]];
+    let mut v: Vec<(f64, f64)> =
+        pts.iter().enumerate().map(|(i, p)| (dot(*p, side), dot(*p, axis) - (margin + extra.get(i).copied().unwrap_or(0.0).max(0.0)) * sec)).collect();
+    v.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+    // Apexes no other wedge is below.
+    let n = v.len();
+    let mut keep = vec![true; n];
+    let mut best = f64::INFINITY; // min over the left of (a - k s)
+    for i in 0..n {
+        if best + k * v[i].0 <= v[i].1 {
+            keep[i] = false;
+        }
+        best = best.min(v[i].1 - k * v[i].0);
+    }
+    let mut best = f64::INFINITY; // min over the right of (a + k s)
+    for i in (0..n).rev() {
+        if best - k * v[i].0 < v[i].1 {
+            keep[i] = false;
+        }
+        best = best.min(v[i].1 + k * v[i].0);
+    }
+    let apex: Vec<(f64, f64)> = v.into_iter().zip(keep).filter(|(_, k)| *k).map(|(a, _)| a).collect();
+    let (Some(first), Some(last)) = (apex.first().copied(), apex.last().copied()) else {
+        return gpoly(&[]);
+    };
+    let (s_lo, s_hi) = (first.0 - extent, last.0 + extent);
+    let mut line: Vec<(f64, f64)> = vec![(s_lo, first.1 + k * (first.0 - s_lo))];
+    for (i, &(s, a)) in apex.iter().enumerate() {
+        line.push((s, a));
+        if let Some(&(s2, a2)) = apex.get(i + 1) {
+            let sp = (a2 - a + k * (s + s2)) / (2.0 * k);
+            line.push((sp, a + k * (sp - s)));
+        }
+    }
+    line.push((s_hi, last.1 + k * (s_hi - last.0)));
+    // Straighten the smallest bumps until the corners fit: a corner above
+    // the line between its neighbours goes, which only moves the edge back.
+    while line.len() > corners + 2 {
+        let bump = |j: usize| {
+            let ((s0, u0), (s1, u1), (s2, u2)) = (line[j - 1], line[j], line[j + 1]);
+            let chord = if s2 > s0 { u0 + (u2 - u0) * (s1 - s0) / (s2 - s0) } else { u0.min(u2) };
+            u1 - chord
+        };
+        let Some((j, _)) = (1..line.len() - 1).map(|j| (j, bump(j))).filter(|(_, b)| *b >= 0.0).min_by(|a, b| a.1.total_cmp(&b.1)) else { break };
+        line.remove(j);
+    }
+    let top = line.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max) + extent;
+    line.push((s_hi, top));
+    line.push((s_lo, top));
+    let ring: Vec<P> = line.iter().map(|&(s, u)| [axis[0] * u + side[0] * s, axis[1] * u + side[1] * s]).collect();
+    gpoly(&ccw(ring))
 }
 
 /// Everything with progress ≥ `level` along `axis`, as a big rectangle.
@@ -755,6 +891,190 @@ mod tests {
         let s = step_of(&input);
         assert!(s.corridor);
         assert!(s.left_out.is_empty());
+    }
+
+    fn follow(input: &PlanInput) -> Step {
+        match plan_with(input, Rear::Follow { quantile: 0.1, extra: &[] }) {
+            Plan::Step(s) => {
+                check_step(input, &s);
+                s
+            }
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
+    /// Distance from an animal to the step's edge, metres.
+    fn margin_in(step: &Step, a: LonLat) -> f64 {
+        signed_distance(proj().forward(a), &local(&step.polygon))
+    }
+
+    #[test]
+    fn a_followed_back_edge_holds_every_animal_and_cues_the_whole_rear() {
+        let paddock = rect(0.0, 0.0, 300.0, 200.0);
+        let target = rect(250.0, 0.0, 300.0, 200.0);
+        let herd = animals(&scatter(60, 40.0, 60.0, 110.0, 140.0));
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        let line = step_of(&input);
+        let s = follow(&input);
+        assert!(s.left_out.is_empty());
+        // Nobody closer to the edge than the followed margin (a centimetre for rounding).
+        let margins: Vec<f64> = herd.iter().map(|a| margin_in(&s, *a)).collect();
+        assert!(margins.iter().all(|m| *m >= FOLLOW_FACTOR * W - 0.01), "{margins:?}");
+        // The back of the herd is in its warning band at once, not one animal.
+        let cued = margins.iter().filter(|m| **m < W).count();
+        let cued_by_line = herd.iter().filter(|a| margin_in(&line, **a) < W).count();
+        assert!(cued >= 5 && cued > 2 * cued_by_line, "followed {cued}, line {cued_by_line}");
+        // Its level: where nine in ten are ahead.
+        let space = Space::new(&target).unwrap();
+        let mut prog: Vec<f64> = herd.iter().map(|a| space.progress(s.frame, *a)).collect();
+        prog.sort_by(|a, b| a.total_cmp(b));
+        assert!((s.level - (prog[5] - BACK_FACTOR * W)).abs() < 1e-9, "{} vs {}", s.level, prog[5]);
+    }
+
+    #[test]
+    fn a_lagging_animal_holds_back_only_its_own_stretch_of_the_edge() {
+        let paddock = rect(0.0, 0.0, 300.0, 200.0);
+        let target = rect(250.0, 0.0, 300.0, 200.0);
+        // A herd across y 40..160 at x 100..130, and one animal 30 m behind its middle.
+        let mut pts = scatter(40, 100.0, 40.0, 130.0, 160.0);
+        pts.push([70.0, 100.0]);
+        let herd = animals(&pts);
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        let line = step_of(&input);
+        let s = follow(&input);
+        let laggard = *herd.last().unwrap();
+        assert!(margin_in(&s, laggard) >= FOLLOW_FACTOR * W - 0.01, "the laggard is held");
+        // Either side of it the straight line sits back with the laggard; the followed edge doesn't.
+        for behind in [at(85.0, 70.0), at(85.0, 130.0)] {
+            assert!(line.polygon.contains(behind));
+            assert!(!s.polygon.contains(behind));
+        }
+        assert!(s.polygon.area_ha() < line.polygon.area_ha());
+    }
+
+    #[test]
+    fn room_for_an_uncertain_position_moves_the_edge_back_behind_that_animal_only() {
+        let paddock = rect(0.0, 0.0, 300.0, 200.0);
+        let target = rect(250.0, 0.0, 300.0, 200.0);
+        let herd = animals(&[[100.0, 60.0], [100.0, 100.0], [100.0, 140.0], [120.0, 100.0]]);
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        let plain = follow(&input);
+        let extra = [0.0, 1.0, 0.0, 0.0];
+        let Plan::Step(roomy) = plan_with(&input, Rear::Follow { quantile: 0.1, extra: &extra }) else { panic!("a step") };
+        check_step(&input, &roomy);
+        let (m0, m1) = (margin_in(&plain, herd[1]), margin_in(&roomy, herd[1]));
+        assert!((m1 - m0 - 1.0).abs() < 0.05, "{m0} -> {m1}");
+        for i in [0, 2] {
+            assert!((margin_in(&plain, herd[i]) - margin_in(&roomy, herd[i])).abs() < 0.05, "animal {i} keeps its margin");
+        }
+    }
+
+    #[test]
+    fn a_followed_edge_fits_what_the_collars_hold() {
+        let paddock = rect(0.0, 0.0, 400.0, 400.0);
+        let target = rect(300.0, 0.0, 400.0, 400.0);
+        let herd = animals(&scatter(250, 60.0, 80.0, 180.0, 320.0));
+        for limits in [CollarLimits::V0, CollarLimits::LEGACY] {
+            let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits };
+            let s = follow(&input);
+            assert!(s.polygon.outer_ring().len() <= limits.outer, "{} corners for {}", s.polygon.outer_ring().len(), limits.outer);
+            assert!(s.left_out.is_empty());
+        }
+    }
+
+    #[test]
+    fn stepping_forward_with_a_followed_edge_ends_with_the_target() {
+        let paddock = rect(0.0, 0.0, 300.0, 200.0);
+        let target = rect(250.0, 150.0, 300.0, 200.0);
+        let mut pts = scatter(30, 10.0, 10.0, 240.0, 190.0);
+        let mut prev = paddock.clone();
+        let mut frame = None;
+        let mut last_level = f64::NEG_INFINITY;
+        for step in 0..120 {
+            let herd = animals(&pts);
+            let input = PlanInput { target: &target, previous: Some(&prev), paddock: None, animals: &herd, warn_m: W, frame, limits: CollarLimits::V0 };
+            match plan_with(&input, Rear::Follow { quantile: 0.1, extra: &[] }) {
+                Plan::Target => {
+                    assert!(step > 3, "finished too soon");
+                    let space = Space::new(&target).unwrap();
+                    assert!(herd.iter().all(|a| space.target_margin(*a) >= FINISH_MARGIN_M));
+                    return;
+                }
+                Plan::Step(s) => {
+                    check_step(&input, &s);
+                    assert!(s.level >= last_level - 1e-9);
+                    last_level = s.level;
+                    frame = Some(s.frame);
+                    let ring = local(&s.polygon);
+                    // Animals in the warning band walk off it toward the target, staying inside.
+                    let goal = [275.0, 175.0];
+                    for p in pts.iter_mut() {
+                        if signed_distance(*p, &ring) >= W {
+                            continue;
+                        }
+                        let d = [goal[0] - p[0], goal[1] - p[1]];
+                        let len = d[0].hypot(d[1]).max(1e-9);
+                        for k in (1..=8).rev() {
+                            let q = [p[0] + d[0] / len * k as f64, p[1] + d[1] / len * k as f64];
+                            if signed_distance(q, &ring) >= 1.0 {
+                                *p = q;
+                                break;
+                            }
+                        }
+                    }
+                    prev = s.polygon;
+                }
+                Plan::Hold(why) => panic!("hold: {why}"),
+            }
+        }
+        panic!("the sweep never finished");
+    }
+
+    /// Found by stream L's soak: a sweep ended with its followed back edge
+    /// notched, one notch reaching over the metre between two strips into
+    /// the next target and its edge dipping back across the target's. The
+    /// two together enclose a crumb of ground in neither, and the next move
+    /// held ("The step would have a hole") for its whole half hour.
+    #[test]
+    fn a_notched_edge_across_the_next_target_leaves_no_crumb_to_hold_on() {
+        let previous =
+            poly(&[[0.0, 0.0], [100.0, 0.0], [100.0, 90.0], [102.5, 92.0], [100.8, 94.0], [102.4, 96.0], [100.0, 98.0], [100.0, 200.0], [0.0, 200.0]]);
+        let target = rect(101.0, 0.0, 200.0, 200.0);
+        let paddock = rect(0.0, 0.0, 200.0, 200.0);
+        let herd = animals(&scatter(40, 60.0, 40.0, 95.0, 160.0));
+        let input =
+            PlanInput { target: &target, previous: Some(&previous), paddock: Some(&paddock), animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        for rear in [Rear::Line, Rear::Follow { quantile: 0.1, extra: &[] }] {
+            match plan_with(&input, rear) {
+                Plan::Step(s) => {
+                    check_step(&input, &s);
+                    assert!(s.left_out.is_empty(), "{rear:?}: {:?}", s.left_out);
+                }
+                other => panic!("{rear:?}: expected a step, got {other:?}"),
+            }
+        }
+    }
+
+    /// The sweep driver plans on every fix while a herd moves: 250 animals
+    /// must stay far inside a report's budget, even in a debug build.
+    #[test]
+    fn planning_a_step_for_250_animals_is_fast() {
+        let paddock = rect(0.0, 0.0, 400.0, 400.0);
+        let target = rect(300.0, 0.0, 400.0, 400.0);
+        let herd = animals(&scatter(250, 60.0, 80.0, 180.0, 320.0));
+        let input = PlanInput { target: &target, previous: Some(&paddock), paddock: None, animals: &herd, warn_m: W, frame: None, limits: CollarLimits::V0 };
+        let extra = vec![0.5; herd.len()];
+        let mut ms: Vec<f64> = (0..20)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                assert!(matches!(plan_with(&input, Rear::Follow { quantile: 0.1, extra: &extra }), Plan::Step(_)));
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let p95 = ms[18];
+        eprintln!("plan for 250 animals: p50 {:.1} ms, p95 {p95:.1} ms", ms[10]);
+        assert!(p95 < 150.0, "p95 {p95:.1} ms");
     }
 
     #[test]

@@ -71,9 +71,9 @@ async fn battery_history_reads_by_collar_and_time() {
 }
 
 #[tokio::test]
-async fn pasture_sums_each_collars_dwell_by_index() {
+async fn pasture_sums_the_dwell_in_one_pass_over_the_range() {
     let (_d, ctx) = ctx().await;
-    for (herd, index) in [(true, "fixes_herd_collar_t"), (false, "fixes_collar_t")] {
+    for (herd, index) in [(true, "fixes_herd_t"), (false, "fixes_t")] {
         let p = plan(&ctx, &op_analytics::routes::hot_dwell_sql(herd)).await;
         assert!(uses(&p, index), "herd {herd}: {p}");
         assert!(!p.contains("SCAN fixes"), "herd {herd}: {p}");

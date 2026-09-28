@@ -108,10 +108,30 @@ pub enum Source {
 /// then SQLite; within each, rows are ordered by `collar_id, t`, so per collar
 /// the rows are in time order. Batches match the current SQLite schema.
 pub fn scan(ctx: &Ctx, table: &'static str, range: TimeRange, scope: Scope, source: Source) -> mpsc::Receiver<anyhow::Result<RecordBatch>> {
+    scan_in(ctx, table, range, scope, source, Order::Collar)
+}
+
+// @L
+/// How the SQLite rows of a scan come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// By `collar_id, t`: all of a collar's rows, then the next collar's.
+    Collar,
+    /// By `t`: per collar still in time order, but collars interleave. It
+    /// reads the table in about the order it was written, so a day of 250
+    /// collars costs one pass over its pages instead of one per collar (the
+    /// rows of 250 collars reporting together share every page).
+    Time,
+}
+
+/// [`scan`] with the SQLite rows in `order` (cold days are always by
+/// collar, then time, and come first, so per collar every row still comes
+/// in time order).
+pub fn scan_in(ctx: &Ctx, table: &'static str, range: TimeRange, scope: Scope, source: Source, order: Order) -> mpsc::Receiver<anyhow::Result<RecordBatch>> {
     let (tx, rx) = mpsc::channel(4);
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        if let Err(e) = scan_into(&ctx, table, range, &scope, source, &tx).await {
+        if let Err(e) = scan_into(&ctx, table, range, &scope, source, order, &tx).await {
             let _ = tx.send(Err(e)).await;
         }
     });
@@ -124,6 +144,7 @@ async fn scan_into(
     range: TimeRange,
     scope: &Scope,
     source: Source,
+    order: Order,
     tx: &mpsc::Sender<anyhow::Result<RecordBatch>>,
 ) -> anyhow::Result<()> {
     if scope.collar_ids.as_ref().is_some_and(|c| c.is_empty()) {
@@ -131,6 +152,8 @@ async fn scan_into(
     }
     let schema = table_schema(ctx.db(), table).await?;
     let (from, to) = (range.from_ms(), range.to_ms());
+    // @L: days read from Parquet, with the highest row id each file holds.
+    let mut rolled: Vec<Rolled> = Vec::new();
     if source != Source::Hot {
         let (first, last) = (date_of(from), date_of(to - 1));
         for (date, path) in list_days(ctx.data_dir(), table) {
@@ -139,17 +162,26 @@ async fn scan_into(
             }
             let arrow = schema.arrow.clone();
             let scope = scope.clone();
-            let batches = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RecordBatch>> {
+            let (batches, max_id) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<RecordBatch>, Option<i64>)> {
                 let mut out = Vec::new();
+                let mut max_id: Option<i64> = None;
                 for b in read_parquet(&path)? {
-                    let b = filter_batch(&normalize(&b, &arrow)?, from, to, &scope)?;
+                    let b = normalize(&b, &arrow)?;
+                    if let Some(ids) = Cols::new(&b).i64("id") {
+                        max_id = max_id.max(datafusion::arrow::compute::max(ids));
+                    }
+                    let b = filter_batch(&b, from, to, &scope)?;
                     if b.num_rows() > 0 {
                         out.push(b);
                     }
                 }
-                Ok(out)
+                Ok((out, max_id))
             })
             .await??;
+            if let Some(max_id) = max_id {
+                let start = crate::range::day_start_ms(date);
+                rolled.push(Rolled { from: start, to: start + 86_400_000, max_id });
+            }
             for b in batches {
                 if tx.send(Ok(b)).await.is_err() {
                     return Ok(());
@@ -158,20 +190,105 @@ async fn scan_into(
         }
     }
     if source != Source::Cold {
-        hot_scan(ctx, &schema, from, to, scope, tx).await?;
+        hot_scan(ctx, &schema, from, to, scope, order, &rolled, tx).await?;
     }
     Ok(())
 }
 
-async fn hot_scan(ctx: &Ctx, schema: &TableSchema, from: i64, to: i64, scope: &Scope, tx: &mpsc::Sender<anyhow::Result<RecordBatch>>) -> anyhow::Result<()> {
-    let mut sql = format!("SELECT {} FROM {} WHERE t >= ? AND t < ?", schema.select_list(), schema.table);
-    if scope.herd_id.is_some() {
+// @L
+/// A day in Parquet: its span and the highest row id its file holds. While
+/// the rollup deletes a day it has written (a transaction of rows at a
+/// time), those rows are still in SQLite too; ids only grow
+/// (`AUTOINCREMENT`), so a hot row of that day at or below the file's
+/// highest id is one of them, and a scan of both counts it once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rolled {
+    pub from: i64,
+    pub to: i64,
+    pub max_id: i64,
+}
+
+/// SQL keeping rows of `rolled` days out (three binds each: from, to, max id).
+pub fn not_rolled_sql(n: usize) -> String {
+    " AND NOT (t >= ? AND t < ? AND id <= ?)".repeat(n)
+}
+
+/// The days of `table` in Parquet (overlapping `range`) with their highest
+/// row id, from the files' statistics (else the id column).
+pub fn rolled_days(data_dir: &Path, table: &str, range: Option<&TimeRange>) -> anyhow::Result<Vec<Rolled>> {
+    let mut out = Vec::new();
+    for (date, path) in list_days(data_dir, table) {
+        if range.is_some_and(|r| date < date_of(r.from_ms()) || date > date_of(r.to_ms() - 1)) {
+            continue;
+        }
+        if let Some(max_id) = file_max_id(&path)? {
+            let start = crate::range::day_start_ms(date);
+            out.push(Rolled { from: start, to: start + 86_400_000, max_id });
+        }
+    }
+    Ok(out)
+}
+
+fn file_max_id(path: &Path) -> anyhow::Result<Option<i64>> {
+    use parquet::arrow::ProjectionMask;
+    use parquet::file::statistics::Statistics;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let meta = builder.metadata().clone();
+    let Some(col) = meta.file_metadata().schema_descr().columns().iter().position(|c| c.name() == "id") else { return Ok(None) };
+    let from_stats: Option<Vec<i64>> = meta
+        .row_groups()
+        .iter()
+        .map(|rg| match rg.column(col).statistics() {
+            Some(Statistics::Int64(s)) => s.max_opt().copied(),
+            _ => None,
+        })
+        .collect();
+    if let Some(v) = from_stats {
+        return Ok(v.into_iter().max());
+    }
+    let mask = ProjectionMask::leaves(meta.file_metadata().schema_descr(), [col]);
+    let mut max_id = None;
+    for b in builder.with_projection(mask).build()? {
+        let b = b?;
+        if let Some(ids) = b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+            max_id = max_id.max(datafusion::arrow::compute::max(ids));
+        }
+    }
+    Ok(max_id)
+}
+
+/// The SQL of a hot scan. By time, the collar list is only a filter (`+`
+/// keeps SQLite from walking the collar index and sorting what it found).
+/// `rolled` days' rolled rows are left out (see [`Rolled`]).
+pub fn hot_scan_sql(select: &str, table: &str, herd: bool, collars: Option<usize>, order: Order, rolled: usize) -> String {
+    let mut sql = format!("SELECT {select} FROM {table} WHERE t >= ? AND t < ?");
+    if herd {
         sql.push_str(" AND herd_id = ?");
     }
-    if let Some(ids) = &scope.collar_ids {
-        sql.push_str(&format!(" AND collar_id IN ({})", vec!["?"; ids.len()].join(",")));
+    if let Some(n) = collars {
+        let col = if order == Order::Time { "+collar_id" } else { "collar_id" };
+        sql.push_str(&format!(" AND {col} IN ({})", vec!["?"; n].join(",")));
     }
-    sql.push_str(" ORDER BY collar_id, t, id");
+    sql.push_str(&not_rolled_sql(rolled));
+    sql.push_str(match order {
+        Order::Collar => " ORDER BY collar_id, t, id",
+        Order::Time => " ORDER BY t, id",
+    });
+    sql
+}
+
+async fn hot_scan(
+    ctx: &Ctx,
+    schema: &TableSchema,
+    from: i64,
+    to: i64,
+    scope: &Scope,
+    order: Order,
+    rolled: &[Rolled],
+    tx: &mpsc::Sender<anyhow::Result<RecordBatch>>,
+) -> anyhow::Result<()> {
+    let rolled: Vec<Rolled> = rolled.iter().filter(|r| r.from < to && r.to > from).copied().collect();
+    let sql = hot_scan_sql(&schema.select_list(), &schema.table, scope.herd_id.is_some(), scope.collar_ids.as_ref().map(Vec::len), order, rolled.len());
     let mut q = sqlx::query(&sql).bind(from).bind(to);
     if let Some(h) = &scope.herd_id {
         q = q.bind(h);
@@ -180,6 +297,9 @@ async fn hot_scan(ctx: &Ctx, schema: &TableSchema, from: i64, to: i64, scope: &S
         for id in ids {
             q = q.bind(id);
         }
+    }
+    for r in &rolled {
+        q = q.bind(r.from).bind(r.to).bind(r.max_id);
     }
     let mut rows = q.fetch(ctx.db());
     let mut b = BatchBuilder::new(schema);

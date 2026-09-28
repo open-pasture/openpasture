@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::range::TimeRange;
 use crate::schema::{BatchBuilder, SQL_TABLES, TableSchema, cell_json, is_telemetry, table_schema};
-use crate::telemetry::{BATCH_ROWS, cold_files};
+use crate::telemetry::{BATCH_ROWS, Rolled, cold_files, not_rolled_sql};
 
 /// Most rows a query returns.
 pub const MAX_ROWS: usize = 10_000;
@@ -123,7 +123,14 @@ async fn run_inner(ctx: &Ctx, query: &str, max_rows: usize) -> Result<(Vec<Strin
 pub async fn provider(ctx: &Ctx, session: &SessionContext, table: &str, range: Option<&TimeRange>) -> Result<(Arc<dyn TableProvider>, bool), ApiError> {
     let schema = table_schema(ctx.db(), table).await?;
     let cap = if is_telemetry(table) { HOT_CAP } else { RECORD_CAP };
-    let (batches, cut) = load_sqlite(ctx, &schema, range, cap).await?;
+    // @L: rows the rollup has written to a day's file and not yet deleted are read from the file only.
+    let rolled = if is_telemetry(table) {
+        let (dir, t, r) = (ctx.data_dir().to_path_buf(), table.to_owned(), range.copied());
+        tokio::task::spawn_blocking(move || crate::telemetry::rolled_days(&dir, &t, r.as_ref())).await.map_err(anyhow::Error::from)??
+    } else {
+        Vec::new()
+    };
+    let (batches, cut) = load_sqlite(ctx, &schema, range, cap, &rolled).await?;
     let hot: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema.arrow.clone(), vec![batches]).map_err(df_err)?);
     if !is_telemetry(table) {
         return Ok((hot, cut));
@@ -147,12 +154,13 @@ pub async fn provider(ctx: &Ctx, session: &SessionContext, table: &str, range: O
 
 /// Read a table from SQLite into record batches, at most `cap` rows (for
 /// telemetry the newest).
-async fn load_sqlite(ctx: &Ctx, schema: &TableSchema, range: Option<&TimeRange>, cap: usize) -> Result<(Vec<RecordBatch>, bool), ApiError> {
+async fn load_sqlite(ctx: &Ctx, schema: &TableSchema, range: Option<&TimeRange>, cap: usize, rolled: &[Rolled]) -> Result<(Vec<RecordBatch>, bool), ApiError> {
     let telemetry = is_telemetry(&schema.table);
-    let mut sql = format!("SELECT {} FROM {}", schema.select_list(), schema.table);
+    let mut sql = format!("SELECT {} FROM {} WHERE 1", schema.select_list(), schema.table);
     if telemetry && range.is_some() {
-        sql.push_str(" WHERE t >= ? AND t < ?");
+        sql.push_str(" AND t >= ? AND t < ?");
     }
+    sql.push_str(&not_rolled_sql(rolled.len()));
     if telemetry {
         sql.push_str(" ORDER BY id DESC");
     }
@@ -160,6 +168,9 @@ async fn load_sqlite(ctx: &Ctx, schema: &TableSchema, range: Option<&TimeRange>,
     let mut q = sqlx::query(&sql);
     if let (true, Some(r)) = (telemetry, range) {
         q = q.bind(r.from_ms()).bind(r.to_ms());
+    }
+    for r in rolled {
+        q = q.bind(r.from).bind(r.to).bind(r.max_id);
     }
     q = q.bind(cap as i64 + 1);
     let mut rows = q.fetch(ctx.db());

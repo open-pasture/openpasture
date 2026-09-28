@@ -24,6 +24,50 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// Environment variable for the number of SQLite connections (default [`DEFAULT_POOL`]).
 pub const POOL_ENV: &str = "OPENPASTURE_DB_POOL";
 pub const DEFAULT_POOL: u32 = 16;
+/// Bytes the WAL file is truncated to after a checkpoint (64 MB).
+pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
+/// WAL pages (4 KB) past which a commit checkpoints by itself (SQLite's
+/// default is 1,000). The server checkpoints in the background
+/// ([`spawn_checkpointer`]), so a collar report never waits for one; this
+/// is the backstop when nothing runs it (tests, tools).
+pub const WAL_AUTOCHECKPOINT_PAGES: i64 = 16_384;
+/// How often [`spawn_checkpointer`] checkpoints. The WAL starts over from
+/// its beginning only when a writer finds every frame in it copied, so a
+/// checkpoint has to end before the next commit lands: every second each
+/// one has little to copy and usually does. (Every 5 s, 250 collars at the
+/// fast cadence grew the WAL to 40–50 MB.)
+pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+
+/// Checkpoint the WAL every `every` (`PRAGMA wal_checkpoint(PASSIVE)`, which
+/// never waits for readers or writers), until the server shuts down. A
+/// checkpoint copies pages into the database file and syncs it; done inside
+/// a commit it made that commit (often a collar's report) wait for the disk.
+pub fn spawn_checkpointer(ctx: &crate::Ctx, every: Duration) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ctx.on_shutdown() => break,
+                _ = tick.tick() => {
+                    let started = std::time::Instant::now();
+                    match sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)").fetch_one(ctx.db()).await {
+                        Ok((busy, log, done)) => {
+                            let ms = started.elapsed().as_millis();
+                            if ms > 1000 {
+                                tracing::warn!(ms, log, done, busy, "wal checkpoint was slow");
+                            } else {
+                                tracing::debug!(ms, log, done, busy, "wal checkpoint");
+                            }
+                        }
+                        Err(e) => tracing::warn!("wal checkpoint: {e:#}"),
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Connections in the pool: `OPENPASTURE_DB_POOL` when it is a whole number
 /// from 1 to 256, else [`DEFAULT_POOL`]. WAL lets readers run beside the one
@@ -49,7 +93,11 @@ impl Store {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(10));
+            .busy_timeout(Duration::from_secs(10))
+            // @L: a WAL that grew while a long read held it back is cut to this once a checkpoint catches up.
+            .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
+            // @L: checkpoints run from `spawn_checkpointer`; a commit only does one past 64 MB of WAL.
+            .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES.to_string());
         let pool = SqlitePoolOptions::new()
             .max_connections(pool_size(std::env::var(POOL_ENV).ok().as_deref()))
             .connect_with(opts)
@@ -509,18 +557,30 @@ pub fn decision_from_row(r: &SqliteRow) -> anyhow::Result<Decision> {
 /// to write fails at once with "database is locked" when another writer got
 /// in first, without waiting on the busy timeout. Waiting for the lock uses the
 /// pool's busy timeout; a still-busy database is retried a few times.
+///
+/// It starts in a task of its own (@L). sqlx's custom `BEGIN` awaits once
+/// more after the `BEGIN` has run, and a caller dropped there (a collar that
+/// gave up on its report while the lock was busy) got no `Transaction` to
+/// roll back: its pooled connection kept the write lock for good, every
+/// writer stalled on it, and every begin on it failed with "non-zero
+/// transaction depth". A task runs to its end, and a `Transaction` no one
+/// waits for any more is dropped, which rolls it back.
 pub async fn begin_immediate(pool: &SqlitePool) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-    let mut attempt = 0;
-    loop {
-        match pool.begin_with("BEGIN IMMEDIATE").await {
-            Ok(tx) => return Ok(tx),
-            Err(e) if attempt < 3 && is_busy(&e) => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let mut attempt = 0;
+        loop {
+            match pool.begin_with("BEGIN IMMEDIATE").await {
+                Ok(tx) => return Ok(tx),
+                Err(e) if attempt < 3 && is_busy(&e) => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
-    }
+    })
+    .await?
 }
 
 /// SQLITE_BUSY / SQLITE_LOCKED (and their extended codes).
