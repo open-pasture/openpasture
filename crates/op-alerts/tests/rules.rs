@@ -303,6 +303,23 @@ async fn decision_waiting_carries_a_code_that_stays() {
 }
 
 #[tokio::test]
+async fn a_move_over_a_paddock_with_a_pond_in_the_middle_is_named_for_it() {
+    let f = Farm::new().await;
+    // P4 with a pond where its centroid is; the MOVE names no paddock, only its shape.
+    let p4 = serde_json::json!({"type": "Polygon", "coordinates": [
+        [[-93.62, 42.0336], [-93.615, 42.0336], [-93.615, 42.0372], [-93.62, 42.0372], [-93.62, 42.0336]],
+        [[-93.6185, 42.0348], [-93.6185, 42.036], [-93.6165, 42.036], [-93.6165, 42.0348], [-93.6185, 42.0348]]]});
+    let (s, v) = f.core("POST", "/api/paddocks", Some(serde_json::json!({"name": "P4", "geometry": p4}))).await;
+    assert!(s.is_success(), "{v}");
+    let id = f.decision("MOVE", "proposed", t0() - mins(40), None).await;
+    sqlx::query("UPDATE decisions SET to_paddock_id = NULL, geometry = ? WHERE id = ?").bind(p4.to_string()).bind(&id).execute(f.ctx.db()).await.unwrap();
+    f.eval(t0()).await;
+    let a = f.open_kind("decision_waiting").await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].title, "Move to P4?");
+}
+
+#[tokio::test]
 async fn a_timer_decision_opens_at_once_and_stay_asks_to_stay() {
     let f = Farm::new().await;
     let t = t0();

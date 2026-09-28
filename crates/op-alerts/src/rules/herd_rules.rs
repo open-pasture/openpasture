@@ -17,9 +17,9 @@ fn paddock_name(paddocks: &[Paddock], id: Option<&str>) -> Option<String> {
     paddocks.iter().find(|p| Some(p.id.as_str()) == id).map(|p| p.name.clone())
 }
 
-/// The paddock a target mostly sits in: the one holding its centroid.
+/// The paddock a target mostly sits in: the one holding a point inside it.
 fn paddock_of(paddocks: &[Paddock], g: &Polygon) -> Option<String> {
-    let c = g.centroid()?;
+    let c = g.interior_point()?;
     paddocks.iter().filter(|p| p.geometry.contains(c)).min_by(|a, b| a.area_ha.total_cmp(&b.area_ha)).map(|p| p.name.clone())
 }
 

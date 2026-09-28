@@ -218,7 +218,7 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
     }
     let prepared = prepare(&ctx, &herd_id, &body.geometry, &body.opts).await?;
     let paddocks = ctx.store().list_paddocks().await?;
-    let to_paddock = prepared.geometry.centroid().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
+    let to_paddock = prepared.geometry.interior_point().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
     let decision_id = id::new_id(id::DECISION);
     let farmer = FarmerDecision { to_paddock_id: to_paddock.as_deref(), reasoning: "Boundary drawn by the farmer." };
     let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer)).await?;

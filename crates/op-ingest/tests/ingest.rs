@@ -580,6 +580,27 @@ async fn farmer_boundary_supersedes_and_moves_the_herd() {
     assert_eq!(dec_boundary.as_deref(), b["id"].as_str());
 }
 
+#[tokio::test]
+async fn a_boundary_over_a_paddock_with_a_pond_in_the_middle_moves_the_herd_there() {
+    let app = App::new().await;
+    let herd = app.herd().await;
+    // East of North, with a pond in the middle: the shape's centroid is in the pond.
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| vec![m_at(x0, y0), m_at(x1, y0), m_at(x1, y1), m_at(x0, y1), m_at(x0, y0)];
+    let mut pond = ring(300.0, -40.0, 400.0, 40.0);
+    pond.reverse();
+    let g = json!({"type": "Polygon", "coordinates": [ring(200.0, -100.0, 500.0, 100.0), pond]});
+    assert!(!poly(&g).contains(poly(&g).centroid().unwrap()), "the premise: the centroid is in the pond");
+    let (s, pad) = app.call("POST", "/api/paddocks", Some(json!({"name": "Pond", "geometry": g}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{pad}");
+    let (s, mv) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": pad["geometry"]}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{mv}");
+    let (to,): (Option<String>,) =
+        sqlx::query_as("SELECT to_paddock_id FROM decisions WHERE id = ?").bind(mv["decision_id"].as_str().unwrap()).fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(to.as_deref(), pad["id"].as_str(), "the farmer's decision names the paddock");
+    let (_, h) = app.call("GET", &format!("/api/herds/{herd}"), None).await;
+    assert_eq!(h["paddock_id"], pad["id"], "and the herd is in it on the record");
+}
+
 /// 12 collars reporting while boundaries go out: nothing fails with
 /// "database is locked" and versions stay one sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

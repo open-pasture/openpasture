@@ -140,7 +140,7 @@ pub async fn check(ctx: &Ctx, herd_id: &str, req: &CheckRequest) -> ApiResult<Ch
     };
 
     let paddocks = store.list_paddocks().await?;
-    let paddock = sent.centroid().and_then(|c| signals::paddock_at(&paddocks, c)).cloned();
+    let paddock = sent.interior_point().and_then(|c| signals::paddock_at(&paddocks, c)).cloned();
     let area_ha = sent.area_ha();
     let (head, au) = strips::feeding(Some(&herd), None);
     let m2_per_head = if head > 0 { calc::round(area_ha * 10_000.0 / head as f64, 1) } else { 0.0 };

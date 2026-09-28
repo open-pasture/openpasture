@@ -295,7 +295,7 @@ fn paddock_name(paddocks: &[Paddock], id: Option<&str>) -> Option<String> {
 fn move_target(d: &Decision, paddocks: &[Paddock]) -> String {
     paddock_name(paddocks, d.to_paddock_id.as_deref())
         .or_else(|| {
-            let c = d.geometry.as_ref()?.centroid()?;
+            let c = d.geometry.as_ref()?.interior_point()?;
             paddocks.iter().filter(|p| p.geometry.contains(c)).min_by(|a, b| a.area_ha.total_cmp(&b.area_ha)).map(|p| nm(&p.name))
         })
         .unwrap_or_else(|| "the new boundary".into())
@@ -631,7 +631,7 @@ pub async fn facts(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Vec<HerdFact
             Some(m) if m.status == MoveStatus::Sweeping => {
                 let to = decision(ctx, &m.decision_id).await?.map(|d| move_target(&d, &paddocks)).unwrap_or_else(|| {
                     m.target
-                        .centroid()
+                        .interior_point()
                         .and_then(|c| paddocks.iter().filter(|p| p.geometry.contains(c)).min_by(|a, b| a.area_ha.total_cmp(&b.area_ha)).map(|p| nm(&p.name)))
                         .unwrap_or_else(|| "the new boundary".into())
                 });

@@ -221,7 +221,7 @@ pub fn check_geometry(g: &Polygon) -> ApiResult<Polygon> {
 }
 
 fn paddock_for(paddocks: &[Paddock], g: &Polygon) -> Option<String> {
-    g.centroid().and_then(|c| signals::paddock_at(paddocks, c)).map(|p| p.id.clone())
+    g.interior_point().and_then(|c| signals::paddock_at(paddocks, c)).map(|p| p.id.clone())
 }
 
 /// Write a brain (or MCP) decision: fill a MOVE's geometry from its paddock,

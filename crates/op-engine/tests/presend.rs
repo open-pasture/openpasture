@@ -344,6 +344,22 @@ async fn short_rest_is_found_for_ground_the_herd_isnt_on() {
 }
 
 #[tokio::test]
+async fn a_paddock_with_a_pond_in_the_middle_is_the_paddock_the_check_reads() {
+    let t = T::new().await;
+    // P3, north of P1, with a pond where its centroid is.
+    let ring = |x0: f64, y0: f64, x1: f64, y1: f64| vec![at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1), at(x0, y0)];
+    let mut pond = ring(-260.0, 550.0, -150.0, 650.0);
+    pond.reverse();
+    let g = json!({ "type": "Polygon", "coordinates": [ring(-413.0, 400.0, 0.0, 800.0), pond] });
+    assert!(!polygon(&g).contains(polygon(&g).centroid().unwrap()), "the premise: the centroid is in the pond");
+    let p3 = t.ok("POST", "/api/paddocks", json!({ "name": "P3", "geometry": g })).await;
+    t.ok("PATCH", &format!("/api/paddocks/{}", p3["id"].as_str().unwrap()), json!({ "grazed_until": ts(Utc::now() - Duration::days(5)) })).await;
+    let c = t.check(json!({ "geometry": p3["geometry"] })).await;
+    assert_eq!(c["facts"]["rest_days"], 5.0, "{}", c["facts"]);
+    assert_eq!(finding(&c, "rested_short")["text"], "P3 rested 5 d");
+}
+
+#[tokio::test]
 async fn an_empty_herd_left_in_a_paddock_is_not_grazing_it() {
     // The training flow ends with every animal moved back to Cows and the
     // Training herd at 0 head, still placed in P2. P2 rested 40 days; it read

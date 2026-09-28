@@ -107,6 +107,42 @@ impl Polygon {
         Some(proj.inverse([cx / (6.0 * a), cy / (6.0 * a)]))
     }
 
+    /// A point inside the shape (inside the outer ring and outside every
+    /// hole), for asking which paddock a shape is in: the centroid when it is
+    /// inside, else the middle of the widest inside run along a few lines of
+    /// latitude across it. The centroid alone can fall outside: in the pond
+    /// of a paddock with a pond in the middle, or beside an L or a crescent.
+    pub fn interior_point(&self) -> Option<LonLat> {
+        let c = self.centroid()?;
+        if self.contains(c) {
+            return Some(c);
+        }
+        let [_, y0, _, y1] = self.bbox()?;
+        let rings: Vec<Vec<LonLat>> = self.coordinates.iter().map(|r| clean_ring(r)).collect();
+        let lines = std::iter::once(c[1]).chain((1..8).map(|k| y0 + (y1 - y0) * k as f64 / 8.0));
+        let mut best: Option<(f64, LonLat)> = None;
+        for y in lines {
+            // Where the line crosses each edge; in order, alternate runs are inside.
+            let mut xs: Vec<f64> = Vec::new();
+            for r in &rings {
+                for (i, a) in r.iter().enumerate() {
+                    let b = r[(i + 1) % r.len()];
+                    if (a[1] > y) != (b[1] > y) {
+                        xs.push(a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+                    }
+                }
+            }
+            xs.sort_by(f64::total_cmp);
+            for run in xs.chunks_exact(2) {
+                let mid = [(run[0] + run[1]) / 2.0, y];
+                if best.is_none_or(|(w, _)| run[1] - run[0] > w) && self.contains(mid) {
+                    best = Some((run[1] - run[0], mid));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
     /// `[min_lon, min_lat, max_lon, max_lat]` of the outer ring.
     pub fn bbox(&self) -> Option<[f64; 4]> {
         let outer = self.outer_ring();
@@ -196,6 +232,22 @@ mod tests {
     fn centroid_of_square() {
         let c = home().centroid().unwrap();
         assert!((c[0] + 92.405).abs() < 1e-6 && (c[1] - 38.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interior_point_is_inside_even_where_the_centroid_is_not() {
+        // A plain square: its centroid.
+        assert_eq!(home().interior_point(), home().centroid());
+        // A pond in the middle: the centroid is in the pond, the point isn't.
+        let mut pond = home();
+        pond.coordinates.push(vec![[-92.407, 38.123], [-92.403, 38.123], [-92.403, 38.127], [-92.407, 38.127], [-92.407, 38.123]]);
+        let c = pond.centroid().unwrap();
+        assert!(!pond.contains(c));
+        assert!(pond.contains(pond.interior_point().unwrap()));
+        // An L: its centroid lies in the notch.
+        let l = Polygon::from_ring(vec![[-92.41, 38.12], [-92.40, 38.12], [-92.40, 38.122], [-92.408, 38.122], [-92.408, 38.13], [-92.41, 38.13]]);
+        assert!(!l.contains(l.centroid().unwrap()));
+        assert!(l.contains(l.interior_point().unwrap()));
     }
 
     // The live-check paddock near Ames (about 16.5 ha), counter-clockwise.
