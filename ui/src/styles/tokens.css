@@ -1,14 +1,26 @@
-/* Identical to openpasture-web/assets/landing.css :root. Change them there first. */
-@font-face{font-family:'DM Sans';font-style:normal;font-weight:100 1000;font-display:swap;src:url('/fonts/dm-sans-latin-wght.woff2') format('woff2')}
-@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400;font-display:swap;src:url('/fonts/jetbrains-mono-latin-400.woff2') format('woff2')}
+/* The app's design tokens. Warm neutral surfaces, one accent (grass), the brand's blaze for the
+   mark and warnings. Surfaces step up in lightness: app < view < raised < popover. */
+@font-face{font-family:'Inter';font-style:normal;font-weight:100 900;font-display:swap;src:url('/fonts/inter-var.woff2') format('woff2')}
+@font-face{font-family:'Geist Mono';font-style:normal;font-weight:100 900;font-display:swap;src:url('/fonts/geist-mono-var.woff2') format('woff2')}
 
 :root{
-  --bg:#0B0C09;--bg2:#111310;--panel:#181B14;--panel2:#20241B;--line:#22261C;--line2:#333A2A;
-  --fg:#F3F2EA;--fg2:#B7B8A6;--fg3:#838674;--ink:#0C1606;
+  /* surfaces */
+  --bg:#0B0B0A;--bg2:#121211;--panel:#191917;--panel2:#20201E;
+  --line:#232321;--line2:#302F2C;
+  /* text */
+  --fg:#EDECE8;--fg2:#A3A29C;--fg3:#6F6E69;--ink:#0C1606;
+  /* accent and states */
   --grass:#9FD760;--grass2:#B3E27C;--moss:#142110;--moss2:#1D3016;--leaf:#4F8A2A;
   --blaze:#FF6A2B;--blaze2:#FF7F4D;--live:#9FD760;--red:#E5484D;
-  --sans:'DM Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
-  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
-  /* the site's "down" colour, used for warning collars */
   --warn:#F0936C;
+  /* floating things over the map and popovers */
+  --glass:rgba(22,22,20,.78);--glass2:rgba(26,26,24,.9);
+  --hover:rgba(255,255,255,.05);--active:rgba(255,255,255,.08);
+  --ring:rgba(159,215,96,.45);
+  --shadow:0 1px 0 rgba(255,255,255,.04) inset,0 8px 24px -8px rgba(0,0,0,.6),0 2px 6px -2px rgba(0,0,0,.4);
+  --shadow-pop:0 1px 0 rgba(255,255,255,.05) inset,0 24px 64px -16px rgba(0,0,0,.75),0 4px 12px -4px rgba(0,0,0,.5);
+  --r-sm:6px;--r:8px;--r-lg:12px;--r-xl:14px;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,'Segoe UI',sans-serif;
+  --mono:'Geist Mono','SF Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --side:232px;
 }

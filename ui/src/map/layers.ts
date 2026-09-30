@@ -5,7 +5,7 @@ import { interiorPoint } from "../geo";
 import { C, fc, setData } from "./base";
 
 // Paddock outlines, the active / pending / proposed boundaries. Labels are DOM
-// markers so they can use JetBrains Mono without a glyph server.
+// markers so they can use the mono font without a glyph server.
 //
 // Overlay slots are invisible anchor layers; an overlay adds its layers before one
 // (map.addLayer(layer, ctx.beforeId(slot))) so it lands at that height:

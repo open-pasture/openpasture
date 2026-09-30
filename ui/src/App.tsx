@@ -4,8 +4,8 @@ import "./features";
 import { joinCode } from "./features/j/signin";
 import { guarded, shortcuts, topbar, views } from "./registry";
 import { start, store, useStore } from "./store";
-import { useCan } from "./store/me";
-import { Input, Mark } from "./ui";
+import { useCan, useMe } from "./store/me";
+import { Icon, Input, Mark } from "./ui";
 import { typing, useHash, useKey } from "./util";
 
 const FirstRun = lazy(() => import("./views/FirstRun").then((m) => ({ default: m.FirstRun })));
@@ -51,17 +51,23 @@ export function App() {
   const cur = nav.find((v) => v.id === view) ?? nav[0];
   return (
     <div className="shell">
-      <header className="topbar">
-        <a className="brand" href="#/map"><Mark />{state.farm.name}</a>
+      <header className="topbar side">
+        <a className="brand" href="#/map"><Mark /><span className="bname">{state.farm.name}</span></a>
         <nav aria-label="Views">
           {nav.map((v) => (
-            <a key={v.id} href={`#/${v.id}`} aria-current={cur?.id === v.id ? "page" : undefined}>{v.label}</a>
+            <a key={v.id} href={`#/${v.id}`} aria-current={cur?.id === v.id ? "page" : undefined}>
+              {v.icon && <Icon name={v.icon} size={14} accent="currentColor" className="nicon" />}
+              <span className="nlabel">{v.label}</span>
+              <kbd>{v.key.toUpperCase()}</kbd>
+            </a>
           ))}
         </nav>
+        <Herds onPick={() => { if (cur && cur.id !== "map" && cur.id !== "herd") go("map"); }} />
         <div className="tright">
           {bar.map((t) => guarded(t.id, <t.Item />))}
           {!up && <span className="offline mono">offline</span>}
         </div>
+        <You />
       </header>
       <main>
         <Suspense fallback={null}>
@@ -69,6 +75,41 @@ export function App() {
         </Suspense>
       </main>
     </div>
+  );
+}
+
+// The farm's herds, as a list to switch between (the desktop sidebar only).
+function Herds({ onPick }: { onPick: () => void }) {
+  const herds = useStore((s) => s.state?.herds ?? []);
+  const herdId = useStore((s) => s.herdId);
+  if (herds.length < 2) return null;
+  return (
+    <ul className="herds" aria-label="Herds">
+      {herds.map((h) => (
+        <li key={h.id}>
+          <button type="button" aria-current={h.id === herdId ? "true" : undefined}
+            onClick={() => { store.setHerd(h.id); onPick(); }}>
+            <span className="hn">{h.name}</span>
+            <span className="mono hc">{h.count}</span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// Who is reading, at the foot of the sidebar.
+function You() {
+  const m = useMe();
+  if (!m) return null;
+  const role = m.role.slice(0, 1).toUpperCase() + m.role.slice(1);
+  const name = m.user?.name ?? role;
+  return (
+    <a className="whoami" href="#/settings">
+      <span className="av" aria-hidden="true">{name.slice(0, 1).toUpperCase()}</span>
+      <span className="yn">{name}</span>
+      {m.user && <span className="yr">{role}</span>}
+    </a>
   );
 }
 

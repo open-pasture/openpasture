@@ -35,8 +35,10 @@ select.input.editin{padding-right:22px}
 .kv .input.editin{width:180px;text-align:right}
 
 /* animal page: facts and actions beside the track */
-.apage{display:grid;grid-template-columns:minmax(320px,400px) minmax(0,1fr);height:100%;min-height:0}
-.aside{overflow:auto;padding:16px 20px 40px;border-right:1px solid var(--line);display:grid;align-content:start;gap:20px}
+.apage{display:grid;grid-template-columns:minmax(360px,440px) minmax(0,1fr);height:100%;min-height:0}
+.aside{overflow:auto;padding:16px 20px 40px;border-right:1px solid var(--line);display:grid;align-content:start;gap:20px;min-width:0}
+.aside>*{min-width:0}
+.aside .tbl{display:block;overflow-x:auto}
 .back{font-size:12px;color:var(--fg3);justify-self:start}
 .back:hover{color:var(--fg)}
 .afacts{display:grid;gap:10px}
@@ -55,7 +57,7 @@ select.input.editin{padding-right:22px}
 .amap{position:relative;min-width:0}
 .amap .map{position:absolute;inset:0}
 .amap .over{position:absolute;top:12px;left:12px;z-index:2}
-.amap .over .seg{background:rgba(11,12,9,.85)}
+.amap .over .seg{background:var(--glass)}
 
 /* collar cards: 3 across, 4 down, one sheet per page */
 .cards{display:grid;gap:24px}

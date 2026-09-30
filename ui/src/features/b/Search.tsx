@@ -57,6 +57,8 @@ export function SearchBox() {
     return (
       <button type="button" className="bfind" aria-label="Search" title="Search (/)" onClick={() => searchOpen.set(true)}>
         <Glass />
+        <span className="blabel" aria-hidden="true">Search</span>
+        <kbd aria-hidden="true">/</kbd>
       </button>
     );
 
@@ -80,7 +82,7 @@ export function SearchBox() {
   };
   return (
     <div className="bsearch" ref={box} role="search">
-      <input className="input sm" autoFocus spellCheck={false} autoComplete="off" placeholder="Find" aria-label="Find"
+      <input className="input sm" autoFocus spellCheck={false} autoComplete="off" placeholder="Find an animal, paddock, collar or note" aria-label="Find"
         value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onKey} />
       {hits.length > 0 && (
         <ul className="bhits" role="listbox" aria-label="Found">

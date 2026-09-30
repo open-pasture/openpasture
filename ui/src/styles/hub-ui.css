@@ -4,12 +4,12 @@
 .tright{margin-left:auto;display:flex;align-items:center;gap:16px}
 
 /* map: the Draw menu, a tool's footer box, the Layers menu */
-.tools .menuwrap .btn.quiet{background:rgba(11,12,9,.82);backdrop-filter:blur(6px)}
-.tools .menu kbd{float:right;margin-left:24px;font-size:11px;line-height:20px}
+.tools .menuwrap .btn.quiet{background:var(--glass);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3)}
+.tools .menu kbd{margin-left:auto;padding-left:4px}
 .toolfoot:empty{display:none}
-.toolfoot{position:absolute;top:calc(100% + 8px);left:0;width:320px;display:grid;gap:8px;padding:12px;border-radius:12px;border:1px solid var(--line2);background:rgba(11,12,9,.88);backdrop-filter:blur(6px);animation:fade .15s both}
+.toolfoot{position:absolute;top:calc(100% + 8px);left:0;width:320px;display:grid;gap:8px;padding:12px;border-radius:12px;border:1px solid var(--line2);background:var(--glass);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3);animation:fade .15s both}
 .layersmenu{position:absolute;left:12px;bottom:12px;z-index:2}
-.layersmenu .btn.quiet{background:rgba(11,12,9,.82);backdrop-filter:blur(6px)}
+.layersmenu .btn.quiet{background:var(--glass);backdrop-filter:blur(14px) saturate(1.3);-webkit-backdrop-filter:blur(14px) saturate(1.3)}
 .layersmenu .menu{top:auto;bottom:calc(100% + 6px)}
 .layersmenu .menu button{display:flex;align-items:center;gap:10px}
 
@@ -30,7 +30,7 @@
 
 /* check */
 .check{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--fg2);line-height:20px}
-.check .box{width:14px;height:14px;border:1px solid var(--line2);border-radius:3px;display:grid;place-items:center;flex:none;background:var(--bg2);transition:background .15s,border-color .15s}
+.check .box{width:15px;height:15px;border:1px solid var(--line2);border-radius:4px;display:grid;place-items:center;flex:none;background:var(--bg);box-shadow:inset 0 1px 2px rgba(0,0,0,.3);transition:background .15s,border-color .15s}
 .check[aria-checked=true] .box{background:var(--grass);border-color:var(--grass);color:var(--ink)}
 .check:hover:not(:disabled) .box{border-color:var(--fg3)}
 .check:disabled{opacity:.45}
@@ -62,9 +62,9 @@
 .tblw .tbl td{overflow:hidden;text-overflow:ellipsis}
 .tblw .tbl tr.gap td{padding:0;border:0}
 .tblw .tbl th.sel,.tblw .tbl td.sel{padding-right:0}
-.tblw .tbl tr[aria-selected=true] td{background:var(--bg2)}
+.tblw .tbl tr[aria-selected=true] td{background:rgba(159,215,96,.07)}
 .tblw .tbl tr.click{cursor:pointer}
-.tblw .tbl tr.click:hover td{background:var(--bg2);color:var(--fg)}
+.tblw .tbl tr.click:hover td{background:var(--hover);color:var(--fg)}
 .sorth{color:inherit;font:inherit;display:inline-flex;align-items:center;gap:8px}
 .sorth:hover,.sorth[data-dir]{color:var(--fg)}
 .sorth[data-dir]::after{content:"";width:4px;height:4px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:translateY(-1px) rotate(45deg)}

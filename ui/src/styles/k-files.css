@@ -10,6 +10,6 @@
 .kfiles-errs p{font-size:11.5px;line-height:18px}
 .kfiles-preview .acts{justify-content:flex-end}
 .kfiles-list tbody tr{cursor:pointer}
-.kfiles-list tbody tr:hover td,.kfiles-list tr.on td{color:var(--fg);background:var(--bg2)}
+.kfiles-list tbody tr:hover td,.kfiles-list tr.on td{color:var(--fg);background:var(--hover)}
 .kfiles-list td.kfiles-del{text-align:right;padding-top:2px;padding-bottom:2px}
 .kfiles-fsa{margin-top:-4px}

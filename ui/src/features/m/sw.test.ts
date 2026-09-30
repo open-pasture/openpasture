@@ -109,9 +109,9 @@ describe("the service worker", () => {
     const page = await request("/", { mode: "navigate" });
     expect(await (page as Response).text()).toBe(`net ${ORIGIN}/`);
     await request("/assets/index-Ab12.js");
-    await request("/fonts/dm-sans-latin-wght.woff2");
+    await request("/fonts/inter-var.woff2");
     await request("/icons/icon-192.png");
-    expect(kept().sort()).toEqual([`${ORIGIN}/`, `${ORIGIN}/assets/index-Ab12.js`, `${ORIGIN}/favicon.svg`, `${ORIGIN}/fonts/dm-sans-latin-wght.woff2`, `${ORIGIN}/icons/icon-192.png`, `${ORIGIN}/manifest.webmanifest`]);
+    expect(kept().sort()).toEqual([`${ORIGIN}/`, `${ORIGIN}/assets/index-Ab12.js`, `${ORIGIN}/favicon.svg`, `${ORIGIN}/fonts/inter-var.woff2`, `${ORIGIN}/icons/icon-192.png`, `${ORIGIN}/manifest.webmanifest`]);
     expect(kept().some((k) => /\/(api|mcp|collar|v1|hooks)(\/|$|\?)/.test(new URL(k).pathname))).toBe(false);
   });
 
@@ -133,7 +133,7 @@ describe("the service worker", () => {
   });
 
   test("files kept under the same name are refreshed; hashed assets are kept as they are", async () => {
-    for (const p of ["/icons/icon-192.png", "/fonts/dm-sans-latin-wght.woff2", "/manifest.webmanifest", "/favicon.svg", "/assets/index-Ab12.js"]) await request(p);
+    for (const p of ["/icons/icon-192.png", "/fonts/inter-var.woff2", "/manifest.webmanifest", "/favicon.svg", "/assets/index-Ab12.js"]) await request(p);
     net.version = 2;
     for (const p of ["/icons/icon-192.png", "/manifest.webmanifest"]) {
       // The kept copy at once, the new one fetched for next time.

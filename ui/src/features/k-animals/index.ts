@@ -9,7 +9,7 @@ import { kAnimals } from "../../api/k-animals";
 import { each } from "./herd";
 import "../../styles/k-animals.css";
 
-views.register({ id: "herd", label: "Herd", key: "h", order: 20, View: lazy(() => import("./HerdView").then((m) => ({ default: m.HerdView }))) });
+views.register({ id: "herd", label: "Herd", key: "h", order: 20, icon: "navherd", View: lazy(() => import("./HerdView").then((m) => ({ default: m.HerdView }))) });
 printPages.register({ id: "cards", Page: lazy(() => import("./Cards").then((m) => ({ default: m.CardsPage }))) });
 
 // Move and park need a choice (which herd, why); the Herd view asks for it.

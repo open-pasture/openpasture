@@ -16,6 +16,7 @@ import {
   type ReactNode,
 } from "react";
 import type { Animal, Collar, Paddock, Polygon, Role, User } from "./api";
+import type { IconName } from "./ui/icons";
 import { atLeast, me } from "./store/me";
 
 export type { Role } from "./api";
@@ -131,7 +132,7 @@ export interface Section<P> {
 export type Lazy<P> = ComponentType<P>;
 
 // Top nav. `rest` is the hash after the view: "#/herd/214" gives the herd view "214".
-export interface ViewItem { id: string; label: string; key: string; order: number; minRole?: Role; View: Lazy<{ rest: string }> }
+export interface ViewItem { id: string; label: string; key: string; order: number; minRole?: Role; icon?: IconName; View: Lazy<{ rest: string }> }
 export const views = createRegistry<ViewItem>("views");
 
 // Right-hand herd panel. Built-in blocks sit at HERD_PANEL orders; sections go between them.

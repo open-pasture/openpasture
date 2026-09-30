@@ -6,9 +6,9 @@ import { tools } from "../../map/tools";
 import "../../styles/hub-ui.css";
 
 // Map views pull in MapLibre and terra-draw; every view loads on demand.
-views.register({ id: "map", label: "Map", key: "m", order: 10, View: lazy(() => import("../../views/MapView").then((m) => ({ default: m.MapView }))) });
-views.register({ id: "data", label: "Data", key: "d", order: 30, View: lazy(() => import("../../views/Data").then((m) => ({ default: m.DataView }))) });
-views.register({ id: "settings", label: "Settings", key: "s", order: 40, View: lazy(() => import("../../views/Settings").then((m) => ({ default: m.SettingsView }))) });
+views.register({ id: "map", label: "Map", key: "m", order: 10, icon: "navmap", View: lazy(() => import("../../views/MapView").then((m) => ({ default: m.MapView }))) });
+views.register({ id: "data", label: "Data", key: "d", order: 30, icon: "navdata", View: lazy(() => import("../../views/Data").then((m) => ({ default: m.DataView }))) });
+views.register({ id: "settings", label: "Settings", key: "s", order: 40, icon: "navgear", View: lazy(() => import("../../views/Settings").then((m) => ({ default: m.SettingsView }))) });
 
 // Boundaries go to collars, so a herd without any has nothing to send one to.
 tools.register({
