@@ -3,6 +3,10 @@
 //! every six hours after that, and from openpasture > Check for Updates…
 //! Installing swaps the .app in place, then the app restarts through the
 //! normal exit, so the server shuts down cleanly first.
+//!
+//! The UI's sidebar has an update button too. It calls [`update_status`] and
+//! [`update_check`] over IPC; `capabilities/server-ui.json` lets the pages the
+//! embedded server serves call those two commands and nothing else.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +27,28 @@ const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 pub struct Updates {
     busy: AtomicBool,
     later: Mutex<Option<String>>,
+    /// The newer version the last check found, until one finds none.
+    available: Mutex<Option<String>>,
+}
+
+/// What the sidebar's update button shows.
+#[derive(serde::Serialize)]
+pub struct Status {
+    version: String,
+    available: Option<String>,
+    busy: bool,
+}
+
+#[tauri::command]
+pub fn update_status(app: AppHandle) -> Status {
+    let state = app.state::<Updates>();
+    Status { version: app.package_info().version.to_string(), available: state.available.lock().unwrap().clone(), busy: state.busy.load(Ordering::SeqCst) }
+}
+
+/// The sidebar's update button: the same as Check for Updates….
+#[tauri::command]
+pub fn update_check(app: AppHandle) {
+    check_now(&app);
 }
 
 /// The default menu with Check for Updates… under About in the app menu.
@@ -67,6 +93,7 @@ async fn check(app: &AppHandle, asked: bool) {
     };
     match found {
         Ok(Some(update)) => {
+            state.available.lock().unwrap().replace(update.version.clone());
             let put_off = state.later.lock().unwrap().as_deref() == Some(update.version.as_str());
             if asked || !put_off {
                 offer(app, update).await;
@@ -74,6 +101,7 @@ async fn check(app: &AppHandle, asked: bool) {
         }
         Ok(None) => {
             tracing::info!("no update");
+            state.available.lock().unwrap().take();
             if asked {
                 let version = app.package_info().version.to_string();
                 say(app, "You're up to date", format!("openpasture {version} is the newest version."), MessageDialogKind::Info).await;

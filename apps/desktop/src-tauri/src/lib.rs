@@ -37,6 +37,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Server(Mutex::new(None)))
         .manage(updater::Updates::default())
+        .invoke_handler(tauri::generate_handler![updater::update_status, updater::update_check])
         .menu(updater::menu)
         .on_menu_event(|app, event| {
             if event.id() == updater::MENU_ID {

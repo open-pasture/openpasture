@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "server-ui",
+  "description": "The UI the embedded server serves may check for updates, and nothing else.",
+  "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:*", "http://localhost:*"] },
+  "permissions": ["allow-update-status", "allow-update-check"]
+}

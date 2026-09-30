@@ -5032,6 +5032,7 @@ dependencies = [
  "anyhow",
  "op-core",
  "op-server",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

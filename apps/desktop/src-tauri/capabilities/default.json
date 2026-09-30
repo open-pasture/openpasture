@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The bundled loading page. The UI itself is served by the embedded server and uses no Tauri IPC.",
+  "description": "The bundled loading page. The UI itself is served by the embedded server; its only IPC is in server-ui.json.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }
