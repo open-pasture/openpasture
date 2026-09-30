@@ -23,13 +23,16 @@ fn inputs() -> Vec<f64> {
     v.extend((0..=40).map(|i| 28.0 + f64::from(i) * 0.125)); // around 100 ft (30.48 m)
     v.extend((0..=40).map(|i| 95.0 + f64::from(i) * 0.25)); // around 100 m
     // Nine orders of magnitude from a fixed-seed xorshift, every fifth negative.
+    // Only exact arithmetic: powf differs in the last bit between macOS and
+    // glibc, and the file has to match on both.
+    const DECADES: [f64; 9] = [1e-3, 1e-2, 1e-1, 1.0, 1e1, 1e2, 1e3, 1e4, 1e5];
     let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
     for i in 0..120 {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        let u = (s >> 11) as f64 / (1u64 << 53) as f64;
-        let x = 10f64.powf(u * 9.0 - 3.0);
+        let u = (s >> 11) as f64 / (1u64 << 53) as f64 * 9.0;
+        let x = (1.0 + u.fract() * 9.0) * DECADES[u as usize];
         v.push(if i % 5 == 0 { -x } else { x });
     }
     v

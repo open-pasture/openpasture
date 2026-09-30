@@ -1,7 +1,8 @@
 //! The openpasture desktop app. It runs the server in-process on 127.0.0.1
 //! (settings port, 7878 by default, or a free port if that one is taken) and
 //! shows one window on the server's URL, so the UI and API are same-origin.
-//! Quitting shuts the server down gracefully.
+//! Quitting shuts the server down gracefully. Updates come from the GitHub
+//! releases (see `updater`).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,6 +10,8 @@ use std::sync::Mutex;
 use anyhow::Context;
 use op_server::{ServeOptions, ServerHandle};
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+mod updater;
 
 const MAIN: &str = "main";
 /// The UI's `--bg`. Set on the window and webview so there is no white flash.
@@ -30,7 +33,16 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Server(Mutex::new(None)))
+        .manage(updater::Updates::default())
+        .menu(updater::menu)
+        .on_menu_event(|app, event| {
+            if event.id() == updater::MENU_ID {
+                updater::check_now(app);
+            }
+        })
         .setup(move |app| {
             let window = WebviewWindowBuilder::new(app, MAIN, WebviewUrl::App("index.html".into()))
                 .title("openpasture")
@@ -40,6 +52,9 @@ pub fn run() {
                 .theme(Some(tauri::Theme::Dark))
                 .background_color(BG)
                 .build()?;
+
+            // Checked even when the server fails to start: an update may fix it.
+            updater::start(app.handle());
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
