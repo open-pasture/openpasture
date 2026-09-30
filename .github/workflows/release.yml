@@ -32,17 +32,21 @@ jobs:
       APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
       APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
       KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      # Signs the update the installed apps download (see docs/RELEASING.md).
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       # Never ship an unsigned app: stop here if any signing secret is missing.
-      - name: Check Apple signing secrets
+      - name: Check signing secrets
         run: |
           missing=()
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID \
-                      APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD; do
+                      APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD \
+                      TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
             [ -n "${!name}" ] || missing+=("$name")
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error title=Apple signing secrets missing::Missing secrets: ${missing[*]}. The macOS app is only released signed and notarized. Add them as described in docs/RELEASING.md, then re-run this job."
+            echo "::error title=Signing secrets missing::Missing secrets: ${missing[*]}. The macOS app and its updates are only released signed (and the app notarized). Add them as described in docs/RELEASING.md, then re-run this job."
             exit 1
           fi
 
@@ -90,12 +94,14 @@ jobs:
 
       # Tauri signs with APPLE_SIGNING_IDENTITY (the config's "-" is only for
       # local builds) and notarizes the .app with the API key, then staples it.
+      # It then packs the stapled .app as openpasture.app.tar.gz for the
+      # updater and signs that with TAURI_SIGNING_PRIVATE_KEY.
       - name: Build, sign and notarize
         working-directory: apps/desktop
         run: |
           # Tauri would import APPLE_CERTIFICATE into a second keychain; it is imported above.
           unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-          config=$(jq -nc --arg id "$APPLE_SIGNING_IDENTITY" '{bundle: {macOS: {signingIdentity: $id}}}')
+          config=$(jq -nc --arg id "$APPLE_SIGNING_IDENTITY" '{bundle: {createUpdaterArtifacts: true, macOS: {signingIdentity: $id}}}')
           bunx @tauri-apps/cli@^2 build --target universal-apple-darwin --bundles app,dmg --config "$config"
 
       - name: Sign, notarize and staple the DMG
@@ -112,6 +118,23 @@ jobs:
           xcrun stapler staple out/openpasture-macos.dmg
           cp out/openpasture-macos.dmg "out/openpasture-${version}-macos-universal.dmg"
 
+      # The installed apps read latest.json from releases/latest; it points
+      # at this tag's archive. A universal build serves both architectures.
+      - name: Update archive and latest.json
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive=target/universal-apple-darwin/release/bundle/macos/openpasture.app.tar.gz
+          [ -f "$archive" ] && [ -f "$archive.sig" ] || { echo "::error::No signed updater archive at $archive"; exit 1; }
+          cp "$archive" out/openpasture-macos.app.tar.gz
+          cp "$archive.sig" out/openpasture-macos.app.tar.gz.sig
+          url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/openpasture-macos.app.tar.gz"
+          jq -n --arg version "$version" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg sig "$(cat "$archive.sig")" --arg url "$url" \
+            '{version: $version, notes: "openpasture \($version)", pub_date: $date,
+              platforms: {"darwin-aarch64": {signature: $sig, url: $url}, "darwin-x86_64": {signature: $sig, url: $url}}}' \
+            > out/latest.json
+          cat out/latest.json
+
       - name: Verify
         run: |
           app=target/universal-apple-darwin/release/bundle/macos/openpasture.app
@@ -122,11 +145,19 @@ jobs:
           xcrun stapler validate "$app"
           spctl --assess --type open --context context:primary-signature --verbose=4 out/openpasture-macos.dmg
           xcrun stapler validate out/openpasture-macos.dmg
+          # The app inside the update archive is the notarized, stapled one.
+          mkdir "$RUNNER_TEMP/update" && tar -xzf out/openpasture-macos.app.tar.gz -C "$RUNNER_TEMP/update"
+          codesign --verify --deep --strict "$RUNNER_TEMP/update/openpasture.app"
+          xcrun stapler validate "$RUNNER_TEMP/update/openpasture.app"
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-desktop
-          path: out/*.dmg
+          path: |
+            out/*.dmg
+            out/openpasture-macos.app.tar.gz
+            out/openpasture-macos.app.tar.gz.sig
+            out/latest.json
           if-no-files-found: error
 
       - name: Remove keychain and key
@@ -296,7 +327,7 @@ jobs:
           cat > notes.md <<NOTES
           openpasture ${version}.
 
-          - macOS app (Apple Silicon and Intel, signed and notarized): \`openpasture-macos.dmg\`
+          - macOS app (Apple Silicon and Intel, signed and notarized): \`openpasture-macos.dmg\`. Installed apps offer this update themselves.
           - Server binaries with \`collar-sim\`: \`openpasture-server-<os>-<arch>.tar.gz\` for linux-x64, linux-arm64, macos-arm64, macos-x64
           - Docker: \`docker pull ${IMAGE}:${version}\`
 

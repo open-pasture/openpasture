@@ -21,8 +21,11 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
 
 [lints]
 workspace = true

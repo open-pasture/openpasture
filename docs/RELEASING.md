@@ -9,6 +9,7 @@ A release is a tag push. `.github/workflows/release.yml` then builds, in paralle
 | `openpasture-server-linux-arm64.tar.gz` | Ubuntu 22.04 arm64 (native runner) |
 | `openpasture-server-macos-arm64.tar.gz`, `openpasture-server-macos-x64.tar.gz` | macOS |
 | `ghcr.io/open-pasture/openpasture:<version>` and `:latest` | native amd64 and arm64 runners, one multi-arch manifest |
+| `openpasture-macos.app.tar.gz`, `.sig` and `latest.json` | the macOS job: the same notarized app, packed and signed for the in-app updater |
 | `SHA256SUMS` | all of the above files |
 
 Each tarball holds `openpasture`, `collar-sim`, `LICENSE` and a `README.md`. The Linux builds
@@ -19,7 +20,22 @@ moves then too. Because the macOS file name never changes,
 `https://github.com/open-pasture/openpasture/releases/latest/download/openpasture-macos.dmg`
 always points at the newest app.
 
-The macOS job refuses to run without the Apple secrets below: it fails at its first step and
+## In-app updates
+
+The installed app reads
+`https://github.com/open-pasture/openpasture/releases/latest/download/latest.json` about ten
+seconds after launch and every six hours, and when you pick **openpasture > Check for
+Updates…**. When a newer version is published it asks **Update** or **Later**; Update downloads
+`openpasture-macos.app.tar.gz`, checks its signature against the public key in
+`tauri.conf.json`, replaces the app in place, and restarts it. Later keeps the background check
+quiet about that version until the next launch; the menu item still offers it. Debug builds
+never check.
+
+So publishing a release is all it takes: once the GitHub release is out, every installed app
+that has the updater picks it up. Pre-releases don't move `releases/latest`, so apps never
+offer them. 0.1.0 has no updater; people on it download the DMG once more.
+
+The macOS job refuses to run without the Apple and updater secrets below: it fails at its first step and
 names the missing ones. There is no unsigned fallback.
 
 ## Cut a release
@@ -150,6 +166,29 @@ gh secret list -R $REPO
 Then delete `developer-id.p12.b64` and keep `developer-id.p12` and the `.p8` somewhere safe
 (a password manager). `GITHUB_TOKEN` covers the release and the Docker push; no other secret is
 needed.
+
+### 5. Updater signing key
+
+The updates are signed with a minisign key, separate from Apple's. The public half is
+`plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.conf.json`; installed apps accept
+only archives signed by the private half. To make one:
+
+```
+bunx @tauri-apps/cli@^2 signer generate -w updater.key -p "<password>" --ci
+gh secret set TAURI_SIGNING_PRIVATE_KEY          -R $REPO < updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R $REPO --body "<password>"
+```
+
+and put the contents of `updater.key.pub` in `tauri.conf.json`. Keep `updater.key` and the
+password with the Apple files. If they are lost, a new key needs a new public key in the app,
+so everyone installed then has to download the DMG by hand once.
+
+| Secret | What it is |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | The contents of `updater.key` |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Its password |
+
+Local builds don't make the update archive, so they need neither.
 
 ### Checking a signed build
 
