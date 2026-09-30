@@ -1049,7 +1049,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "collar-sim"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4756,7 +4756,7 @@ checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "op-alerts"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "op-analytics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4813,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "op-brain"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4833,7 +4833,7 @@ dependencies = [
 
 [[package]]
 name = "op-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4846,7 +4846,7 @@ dependencies = [
 
 [[package]]
 name = "op-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "op-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4902,7 +4902,7 @@ dependencies = [
 
 [[package]]
 name = "op-geo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "geo",
  "serde",
@@ -4912,7 +4912,7 @@ dependencies = [
 
 [[package]]
 name = "op-import"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "op-ingest"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4961,7 +4961,7 @@ dependencies = [
 
 [[package]]
 name = "op-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4975,7 +4975,7 @@ dependencies = [
 
 [[package]]
 name = "op-reports"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4998,7 +4998,7 @@ dependencies = [
 
 [[package]]
 name = "op-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5027,7 +5027,7 @@ dependencies = [
 
 [[package]]
 name = "openpasture-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "op-core",
