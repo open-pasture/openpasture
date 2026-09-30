@@ -56,7 +56,10 @@ async fn rows_carry_the_trend_days_left_and_daily_battery() {
     );
     assert_eq!(a["trend_pct_day"], json!(-3.0));
     let battery = a["battery"].as_f64().unwrap();
-    assert_eq!(a["days_left"].as_f64().unwrap(), (battery / 0.03 * 10.0).round() / 10.0);
+    // Rounded to 0.1 from the fitted slope, which is only near -0.03, so it
+    // can round the other way from battery / 0.03 at a .x5 boundary.
+    let days_left = a["days_left"].as_f64().unwrap();
+    assert!((days_left - battery / 0.03).abs() < 0.06, "{days_left} vs {}", battery / 0.03);
     let daily = a["daily"].as_array().unwrap();
     assert_eq!(daily.len(), 14);
     assert!(daily[..9].iter().all(Value::is_null), "{daily:?}");
