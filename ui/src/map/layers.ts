@@ -24,8 +24,10 @@ const anchor = (map: MLMap, id: Slot) => {
 export function addFarmLayers(map: MLMap) {
   for (const id of ["paddocks", "swept", "escapes", "active", "target", "back", "chevrons", "pending", "proposed", "draft"]) setData(map, id, fc([]));
   anchor(map, "slot-fill");
-  map.addLayer({ id: "paddocks-fill", type: "fill", source: "paddocks", paint: { "fill-color": C.fg, "fill-opacity": ["case", ["boolean", ["feature-state", "hover"], false], 0.05, 0] } });
-  map.addLayer({ id: "paddocks-line", type: "line", source: "paddocks", paint: { "line-color": C.fg, "line-opacity": 0.32, "line-width": 1 } });
+  map.addLayer({ id: "paddocks-fill", type: "fill", source: "paddocks", paint: { "fill-color": C.fg, "fill-opacity": ["case", ["boolean", ["feature-state", "hover"], false], 0.08, 0] } });
+  // A hovered paddock (on the map, or its row in the desktop sidebar) shows its edge clearly.
+  const lit = ["boolean", ["feature-state", "hover"], false] as maplibregl.ExpressionSpecification;
+  map.addLayer({ id: "paddocks-line", type: "line", source: "paddocks", paint: { "line-color": C.fg, "line-opacity": ["case", lit, 0.85, 0.32], "line-width": ["case", lit, 1.75, 1] } });
   // A move: the ground behind the back line fades back into the imagery.
   map.addLayer({ id: "swept-fill", type: "fill", source: "swept", paint: { "fill-color": C.bg, "fill-opacity": 0, "fill-opacity-transition": { duration: 700, delay: 0 } } });
   anchor(map, "slot-zones");

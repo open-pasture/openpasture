@@ -53,7 +53,7 @@ function useGroups(): { group: string; order: number; node: ReactNode }[] {
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <section className="srow">
+    <section className="srow" data-outline={label}>
       <h2>{label}</h2>
       <div>{children}</div>
     </section>

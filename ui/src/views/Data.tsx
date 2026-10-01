@@ -35,7 +35,7 @@ export function DataView() {
   const added = dataSections.use().map((d) => ({
     key: `section:${d.id}`, order: d.order,
     // A section with nothing to show renders nothing, and its label goes with it (CSS).
-    node: <section className="dsec" aria-label={d.label}><h2>{d.label}</h2><div className="dsec-body">{guarded(d.id, <d.Section herdId={herdId} from={from} to={to} />)}</div></section>,
+    node: <section className="dsec" aria-label={d.label} data-outline={d.label}><h2>{d.label}</h2><div className="dsec-body">{guarded(d.id, <d.Section herdId={herdId} from={from} to={to} />)}</div></section>,
   }));
 
   return (
@@ -46,11 +46,12 @@ export function DataView() {
         {sqlOk && <Menu align="right" trigger={<span className="btn quiet sm">Export</span>}
           items={EXPORTS.map(([table, format]) => ({ label: <span className="mono">{table}.{format}</span>, onSelect: () => download(table, format, from, to) }))} />}
       </div>
+      {/* Each block marked for the desktop sidebar's outline; an empty one has no height and drops out. */}
       {interleave([
-        { key: "health", order: DATA.health, node: <Health herdId={herdId} from={from} to={to} /> },
-        { key: "replay", order: DATA.replay, node: <Replay herdId={herdId} from={from} to={to} /> },
-        { key: "pasture", order: DATA.pasture, node: <Pasture herdId={herdId} /> },
-        { key: "sql", order: DATA.sql, node: sqlOk && sqlRole && <Sql /> },
+        { key: "health", order: DATA.health, node: <div data-outline="Health"><Health herdId={herdId} from={from} to={to} /></div> },
+        { key: "replay", order: DATA.replay, node: <div data-outline="Replay"><Replay herdId={herdId} from={from} to={to} /></div> },
+        { key: "pasture", order: DATA.pasture, node: <div data-outline="Pasture"><Pasture herdId={herdId} /></div> },
+        { key: "sql", order: DATA.sql, node: sqlOk && sqlRole && <div data-outline="SQL"><Sql /></div> },
       ], added)}
     </div>
   );

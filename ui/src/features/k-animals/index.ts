@@ -2,14 +2,18 @@
 // bulk actions. Animals changing anywhere refreshes the store.
 
 import { lazy } from "react";
-import { herdBulk, printPages, views } from "../../registry";
+import { herdBulk, printPages, sidebars, views } from "../../registry";
 import { store } from "../../store";
 import { kAnimalsSlice } from "../../store/k-animals";
 import { kAnimals } from "../../api/k-animals";
 import { each } from "./herd";
 import "../../styles/k-animals.css";
 
-views.register({ id: "herd", label: "Herd", key: "h", order: 20, icon: "navherd", View: lazy(() => import("./HerdView").then((m) => ({ default: m.HerdView }))) });
+const herdView = () => import("./HerdView");
+views.register({ id: "herd", label: "Herd", key: "h", order: 20, icon: "navherd", preload: herdView, View: lazy(() => herdView().then((m) => ({ default: m.HerdView }))) });
+// On the desktop, beside the Herd view: the animals, to step between their pages.
+const herdSidebar = () => import("./Sidebar");
+sidebars.register({ id: "herd", preload: herdSidebar, Sidebar: lazy(() => herdSidebar().then((m) => ({ default: m.AnimalsSidebar }))) });
 printPages.register({ id: "cards", Page: lazy(() => import("./Cards").then((m) => ({ default: m.CardsPage }))) });
 
 // Move and park need a choice (which herd, why); the Herd view asks for it.

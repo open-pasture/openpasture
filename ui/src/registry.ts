@@ -132,8 +132,20 @@ export interface Section<P> {
 export type Lazy<P> = ComponentType<P>;
 
 // Top nav. `rest` is the hash after the view: "#/herd/214" gives the herd view "214".
-export interface ViewItem { id: string; label: string; key: string; order: number; minRole?: Role; icon?: IconName; View: Lazy<{ rest: string }> }
+// On the desktop the herd panel sits beside every view but those with `side: false`, and
+// `preload` (the View's own import) fetches its code ahead, so a tab opens without waiting on
+// the network.
+export interface ViewItem { id: string; label: string; key: string; order: number; minRole?: Role; icon?: IconName; side?: false; preload?: () => Promise<unknown>; View: Lazy<{ rest: string }> }
 export const views = createRegistry<ViewItem>("views");
+
+// The desktop sidebar beside a view (shell/Bench.tsx), one per view id; a view without one
+// shows the farm's. `rest` is the view's, as its View gets it.
+export interface SidebarItem { id: string; minRole?: Role; preload?: () => Promise<unknown>; Sidebar: ComponentType<{ rest: string }> }
+export const sidebars = createRegistry<SidebarItem>("sidebars");
+
+// The farm sidebar under its paddocks. Built-in blocks sit at FARM_SIDE orders.
+export const FARM_SIDE = { paddocks: 50 } as const;
+export const farmSide = createRegistry<Section<{ herdId?: string }>>("farmSide");
 
 // Right-hand herd panel. Built-in blocks sit at HERD_PANEL orders; sections go between them.
 export const HERD_PANEL = { decision: 20, escapes: 40, collars: 60, addCollar: 70 } as const;
@@ -189,8 +201,10 @@ export interface ToolFooterProps {
 }
 export const toolFooter = createRegistry<Section<ToolFooterProps>>("toolFooter");
 
-// Right end of the top bar, before "offline".
-export interface TopbarItem { id: string; order: number; minRole?: Role; Item: ComponentType }
+// Right end of the top bar, before "offline". On the desktop these sit in the left rail, in the
+// status bar along the foot with `at: "status"`, or nowhere with `at: "phone"` (the desktop
+// shows the same thing its own way).
+export interface TopbarItem { id: string; order: number; minRole?: Role; at?: "status" | "phone"; Item: ComponentType }
 export const topbar = createRegistry<TopbarItem>("topbar");
 
 // #/print/<id>/<rest>: white paper, no app chrome.

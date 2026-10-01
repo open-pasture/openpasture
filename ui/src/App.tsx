@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { getToken, setToken } from "./api";
 import "./features";
 import { joinCode } from "./features/j/signin";
@@ -7,6 +7,9 @@ import { start, store, useStore } from "./store";
 import { useCan, useMe } from "./store/me";
 import { Icon, Input, Mark } from "./ui";
 import { typing, useHash, useKey } from "./util";
+import { usePhone } from "./features/m/phone";
+import { Bench } from "./shell/Bench";
+import { UpdateButton } from "./shell/UpdateButton";
 
 const FirstRun = lazy(() => import("./views/FirstRun").then((m) => ({ default: m.FirstRun })));
 const Print = lazy(() => import("./views/Print").then((m) => ({ default: m.Print })));
@@ -25,6 +28,7 @@ export function App() {
   const keys = shortcuts.use();
   // Setting up the farm writes it, which managers and owners do.
   const setsUp = useCan("manager");
+  const phone = usePhone();
 
   useKey((e) => {
     if (typing(e)) return;
@@ -49,6 +53,7 @@ export function App() {
 
   // An unknown view shows the first one (the map).
   const cur = nav.find((v) => v.id === view) ?? nav[0];
+  if (!phone) return <Bench nav={nav} cur={cur} view={view} rest={rest} />;
   return (
     <div className="shell">
       <header className="topbar side">
@@ -98,38 +103,6 @@ function Herds({ onPick }: { onPick: () => void }) {
         </li>
       ))}
     </ul>
-  );
-}
-
-// The desktop app's updater, over the two commands its capability allows the served UI.
-// In a browser there is no updater, so nothing shows.
-type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
-interface UpdateStatus { version: string; available?: string | null; busy: boolean }
-const tauriInvoke = (): Invoke | undefined =>
-  (window as unknown as { __TAURI_INTERNALS__?: { invoke?: Invoke } }).__TAURI_INTERNALS__?.invoke;
-
-function UpdateButton() {
-  const [invoke] = useState(tauriInvoke);
-  const [st, setSt] = useState<UpdateStatus>();
-  const refresh = useCallback(() => {
-    invoke?.("update_status").then((s) => setSt(s as UpdateStatus), () => setSt(undefined));
-  }, [invoke]);
-  const busy = !!st?.busy;
-  useEffect(() => {
-    if (!invoke) return;
-    refresh();
-    // Quick while a check or install runs; the app's own check runs every six hours.
-    const t = setInterval(refresh, busy ? 1000 : 60_000);
-    return () => clearInterval(t);
-  }, [invoke, refresh, busy]);
-  if (!invoke || !st) return null;
-  const title = busy ? "Checking for updates" : st.available ? `Update to openpasture ${st.available}` : `openpasture ${st.version}. Check for updates`;
-  return (
-    <button type="button" className={"upd" + (st.available ? " on" : "")} disabled={busy} title={title} aria-label={title}
-      onClick={() => invoke?.("update_check").then(() => setTimeout(refresh, 250), () => {})}>
-      <Icon name="navup" size={12} accent="currentColor" />
-      <span>{st.available ? "Update" : busy ? "Checking" : st.version}</span>
-    </button>
   );
 }
 

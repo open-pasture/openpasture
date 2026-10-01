@@ -39,7 +39,7 @@ export function AlertsTopbar() {
       <button type="button" className="atrigger" aria-expanded={open} aria-haspopup="dialog" title="Alerts (A)"
         onClick={() => alertList.set({ open: !open })}>
         {n > 0 && <i className={"dot " + (critical ? "crit" : "warn")} />}
-        {n > 0 && <span className="mono">{n} open</span>}
+        {n > 0 && <span className="mono">{n}<span className="aword"> open</span></span>}
       </button>
       {open && (
         <div className="alist esc" role="dialog" aria-label="Alerts">

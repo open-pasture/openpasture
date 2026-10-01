@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { api, type Autonomy, type Decision, type Herd, type NewCollar, type Paddock, type Polygon } from "../api";
 import { areaHa, inside, interiorPoint } from "../geo";
 import { guarded, HERD_PANEL, herdMenu, herdPanel, interleave, sectionNodes, useSections } from "../registry";
@@ -16,9 +16,12 @@ const TIMER_STEPS = [15, 30, 60, 120, 240, 480];
 export const LIST_UP_TO = 30;
 const mins = (m: number) => (m >= 60 && m % 60 === 0 ? `${m / 60}h` : `${m}m`);
 
-export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, onHoverCollar }: {
+// `desk`: the desktop shell's top (shell/Desk.tsx: what openpasture is doing, what it needs) in
+// place of the decision, the escapes and the alert rows, and the herd's name, which the sidebar
+// shows there.
+export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, onHoverCollar, desk }: {
   onChange: () => void; changing: boolean; onFocusCollar: (id: string) => void; onFocusCollars: (ids: string[]) => void;
-  onHoverCollar: (id?: string) => void;
+  onHoverCollar: (id?: string) => void; desk?: ReactNode;
 }) {
   const state = useStore((s) => s.state)!;
   const herdId = useStore((s) => s.herdId);
@@ -36,7 +39,8 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const [openItem, setOpenItem] = useState<string>();
   const menu = herdMenu.use();
   const panelProps = { herdId: herdId ?? "" };
-  const sections = useSections(herdPanel, panelProps);
+  // The desk asks about alerts itself.
+  const sections = useSections(herdPanel, panelProps).filter((x) => !(desk && x.id === "alerts"));
   useEffect(() => setOpenItem(undefined), [herdId]);
   // Controls show only to roles that may use them: hands stop moves and let animals go,
   // managers decide, answer and set up.
@@ -224,7 +228,8 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
           </li>
         )}
         {rows.map((c) => (
-          <li key={c.id} data-state={c.state} data-behind={behindSet.has(c.id) || undefined}>
+          <li key={c.id} data-state={c.state} data-behind={behindSet.has(c.id) || undefined}
+            data-heard={heard(c.last_seen, calm)} style={{ "--b": c.battery ?? 0 } as CSSProperties}>
             <button type="button" onClick={() => onFocusCollar(c.id)} onMouseEnter={() => onHoverCollar(c.id)}
               onFocus={() => onHoverCollar(c.id)} onBlur={() => onHoverCollar(undefined)}>
               <span className="cn">{c.label}</span>
@@ -236,6 +241,21 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
       </ul>
   );
 
+  if (desk) return (
+    <aside className="panel desk" aria-label="Herd">
+      {menu.length > 0 && (
+        <div className="pmenu">
+          <Menu align="right" trigger={<span className="pdots" aria-label="Herd menu">···</span>}
+            items={menu.map((m) => ({ label: m.label, current: m.id === openItem, onSelect: () => setOpenItem(m.id === openItem ? undefined : m.id) }))} />
+        </div>
+      )}
+      {interleave([
+        { key: "desk", order: 0, node: desk },
+        { key: "collars", order: HERD_PANEL.collars, node: list },
+        { key: "addCollar", order: HERD_PANEL.addCollar, node: manage && <AddCollar herdId={herd.id} /> },
+      ], [...(item ? [{ key: "item", order: 1, node: <div className="hitem">{guarded(item.id, <item.Item herdId={herd.id} />)}</div> }] : []), ...sectionNodes(sections, panelProps)])}
+    </aside>
+  );
   return (
     <aside className="panel" aria-label="Herd">
       {(state.herds.length > 1 || menu.length > 0) && (
@@ -258,14 +278,20 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   );
 }
 
-function targetPaddock(target: Polygon, paddocks: Paddock[]) {
+// How lately a collar was heard: "now" within ten minutes, "lately" within the hour, else "long".
+function heard(lastSeen: string | undefined, now: number): "now" | "lately" | "long" {
+  const ms = lastSeen ? now - Date.parse(lastSeen) : Infinity;
+  return ms < 10 * 60_000 ? "now" : ms < 60 * 60_000 ? "lately" : "long";
+}
+
+export function targetPaddock(target: Polygon, paddocks: Paddock[]) {
   const c = interiorPoint(target);
   const p = paddocks.find((p) => inside(c, p.geometry));
   return p && areaHa(target) >= areaHa(p.geometry) / 2 ? p.name : undefined;
 }
 
 // The reasoning, two lines until clicked.
-function Why({ text }: { text: string }) {
+export function Why({ text }: { text: string }) {
   const ref = useRef<HTMLParagraphElement>(null);
   const [open, setOpen] = useState(false);
   const [more, setMore] = useState(false);

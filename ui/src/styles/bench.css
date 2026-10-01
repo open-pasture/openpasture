@@ -1,0 +1,320 @@
+/* The desktop shell (shell/Bench.tsx): rail, paddocks, tabs over the view, herd panel, status line.
+   Panes meet at hairlines; the view is the one lighter surface. Tokens from tokens.css. */
+
+.bench{display:grid;height:100%;grid-template-columns:52px auto minmax(0,1fr) auto;grid-template-rows:minmax(0,1fr) 26px;background:var(--bg)}
+.bench>.rail,.bench>.bside,.bench>.bmain,.bench>.bright{grid-row:1;min-height:0}
+.bench>.rail{grid-column:1}
+.bench>.bside{grid-column:2}
+.bench>.bmain{grid-column:3}
+.bench>.bright{grid-column:4}
+.bench>.bstatus{grid-column:1/-1;grid-row:2}
+
+/* ---- rail ---- */
+.rail{display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 0;border-right:1px solid var(--line)}
+.rmark{display:grid;place-items:center;width:36px;height:36px;margin-bottom:8px;border-radius:var(--r)}
+.rmark:hover{background:var(--hover)}
+.rail{position:relative}
+.ritem{position:relative;z-index:1;display:grid;place-items:center;width:36px;height:36px;border-radius:var(--r);color:var(--fg3);transition:color .15s,background .15s}
+.rind{position:absolute;left:0;top:52px;width:2px;height:20px;margin-top:8px;border-radius:0 2px 2px 0;background:var(--grass);transition:transform .28s cubic-bezier(.2,.8,.2,1)}
+.ritem:hover{color:var(--fg);background:var(--hover)}
+.ritem[aria-current]{color:var(--fg);background:var(--active);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+.rletter{font-size:13px;font-weight:600}
+.rtools{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:4px}
+.rail .bfind{width:36px;height:36px;border-radius:var(--r)}
+.rail .bfind .blabel,.rail .bfind kbd{display:none}
+.rail .alertbtn{display:block}
+.rail .atrigger{width:36px;height:36px;margin:0;padding:0;justify-content:center;gap:5px;border-radius:var(--r);font-size:11.5px}
+.rail .atrigger .aword{display:none}
+.rail .alertbtn .dot{width:6px;height:6px;border-radius:2px;margin:0}
+.rail .alist{top:auto;bottom:0;left:calc(100% + 12px);right:auto}
+.ryou{display:grid;place-items:center;width:26px;height:26px;margin:6px 0 2px;border-radius:50%;background:var(--panel2);border:1px solid var(--line2);color:var(--fg);font-size:11px;font-weight:600}
+.ryou:hover{border-color:var(--fg3)}
+
+/* search: the rail's glass opens a command palette */
+.bench .bsearch{position:fixed;top:14vh;left:0;right:0;margin:0 auto;width:min(600px,calc(100vw - 48px));z-index:60;background:var(--glass2);backdrop-filter:blur(20px) saturate(1.4);-webkit-backdrop-filter:blur(20px) saturate(1.4);border:1px solid var(--line2);border-radius:var(--r-xl);box-shadow:0 0 0 100vmax rgba(0,0,0,.45),var(--shadow-pop);animation:pop .16s cubic-bezier(.2,.8,.2,1) both}
+.bench .bsearch .input{height:52px;border:0;background:transparent;box-shadow:none;font-size:15px;padding:0 18px;border-radius:var(--r-xl)}
+.bench .bsearch .input:focus{box-shadow:none}
+.bench .bhits{position:static;border:0;border-top:1px solid var(--line);border-radius:0 0 var(--r-xl) var(--r-xl);background:transparent;box-shadow:none;padding:6px;max-height:50vh;animation:none}
+.bench .bhits button{height:36px;align-items:center;padding:0 12px;border-radius:var(--r)}
+
+/* ---- sidebar ---- */
+.bside{width:252px;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.bsbody{flex:1;min-height:0;display:flex;flex-direction:column;animation:fade .2s both}
+.hswrap{display:block;margin:8px 8px 6px;flex:none}
+.hswrap .menuwrap{display:block}
+.hswrap .menutrigger{display:block;width:100%}
+.hsw{display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border:1px solid var(--line);border-radius:var(--r);background:var(--bg2);text-align:left;transition:border-color .15s,background .15s}
+a.hswrap:hover .hsw,.hswrap .menutrigger:hover .hsw,.hswrap .menutrigger[aria-expanded=true] .hsw{border-color:var(--line2);background:var(--panel)}
+.hswn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;font-weight:600;letter-spacing:-.012em}
+.hswc{font-size:11px;color:var(--fg3)}
+.hsw .px{color:var(--fg3);transform:rotate(90deg);transition:transform .15s}
+.hswrap .menutrigger[aria-expanded=true] .hsw .px{transform:rotate(-90deg)}
+.hswrap .menu{left:0;right:0;min-width:0}
+.hswrap .menu .hn{flex:1}
+
+/* the farm: paddocks as they lie, who is on them, how long the others have rested */
+.plist{flex:0 1 auto;min-height:0;overflow:auto;padding:2px 8px 12px;display:grid;align-content:start;gap:1px}
+.plist button{position:relative;display:grid;grid-template-columns:30px minmax(0,1fr) auto;grid-template-rows:18px 16px;column-gap:10px;align-items:center;width:100%;padding:7px 8px 9px;border-radius:var(--r);text-align:left;transition:background .15s}
+.plist button:hover,.plist button[data-lit]{background:var(--hover)}
+.plist button[aria-current]{background:var(--active);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+.pshape{grid-row:1/3;width:30px;height:30px;display:block;overflow:visible}
+.pshape path{fill:rgba(237,236,232,.05);stroke:var(--fg3);stroke-width:1.25;stroke-linejoin:round;vector-effect:non-scaling-stroke;transition:stroke .15s,fill .15s}
+.plist button:hover .pshape path,.plist button[data-lit] .pshape path,.plist button[aria-current] .pshape path{stroke:var(--fg);fill:rgba(237,236,232,.09)}
+.plist button[data-tone=grass] .pshape path{fill:rgba(159,215,96,.16);stroke:var(--grass)}
+.plist button[data-tone=blaze] .pshape path{fill:rgba(255,106,43,.1);stroke:var(--blaze);stroke-dasharray:2 2}
+.pn{font-size:13px;font-weight:500;color:var(--fg2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pa{font-size:11px;color:var(--fg3);text-align:right}
+.plist button:hover .pn,.plist button[data-lit] .pn,.plist button[aria-current] .pn{color:var(--fg)}
+.pm{grid-column:2/4;display:flex;align-items:center;gap:8px;font-size:11px;color:var(--fg3);min-width:0;white-space:nowrap;overflow:hidden}
+.pm [data-tone=grass]{color:var(--grass)}
+.pm [data-tone=fg]{color:var(--fg2)}
+.pm [data-tone=blaze]{color:var(--blaze)}
+.plive{width:6px;height:6px;border-radius:50%;background:var(--fg3);flex:none}
+.plive[data-mine]{background:var(--grass);animation:breathe 2.4s ease-in-out infinite}
+.pbar{position:absolute;left:48px;right:8px;bottom:4px;height:2px;border-radius:1px;background:var(--line);overflow:hidden}
+.pbar i{position:absolute;left:0;top:0;bottom:0;border-radius:1px;background:linear-gradient(90deg,var(--leaf),var(--grass));opacity:.75;transition:width .6s cubic-bezier(.2,.8,.2,1)}
+@keyframes breathe{0%,100%{box-shadow:0 0 0 0 rgba(159,215,96,.4)}50%{box-shadow:0 0 0 4px rgba(159,215,96,0)}}
+
+/* the herd's recent calls, a thread down a hairline */
+.fcalls{flex:0 100 auto;min-height:0;overflow:hidden;list-style:none;margin:0 8px;padding:10px 0 8px;border-top:1px solid var(--line)}
+.fcalls li>*{position:relative;display:grid;grid-template-columns:14px minmax(0,1fr);row-gap:2px;width:100%;padding:6px 8px 6px 4px;border-radius:var(--r);text-align:left}
+.fcalls li>button:hover{background:var(--hover)}
+.fcalls li>* i{grid-row:1/3;position:relative;width:14px;align-self:stretch}
+.fcalls li>* i::before{content:"";position:absolute;left:5px;top:6px;width:5px;height:5px;border-radius:1.5px;background:var(--fg3)}
+.fcalls li:not(:last-child)>* i::after{content:"";position:absolute;left:7px;top:15px;bottom:-12px;width:1px;background:rgba(255,255,255,.1)}
+.fcalls li[data-status=applied]>* i::before{background:var(--grass)}
+.fcalls li[data-status=proposed]>* i::before{background:var(--blaze);box-shadow:0 0 0 3px rgba(255,106,43,.15)}
+.fcalls li[data-status=failed]>* i::before{background:var(--red)}
+.fcw{font-size:12.5px;line-height:17px;color:var(--fg2);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.fcalls li:first-child .fcw{color:var(--fg)}
+.fcm{grid-column:2;display:flex;gap:8px;font-size:10.5px;color:var(--fg3)}
+.fcm [data-status=applied]{color:var(--grass)}
+.fcm [data-status=proposed]{color:var(--blaze)}
+.fcm [data-status=failed]{color:var(--red)}
+
+/* the farm's foot: the weather where the herd is */
+.fweather{flex:none;margin:auto 8px 8px;padding:12px 12px 10px;border-top:1px solid var(--line)}
+.fwnow{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.fwnow b{font-size:22px;font-weight:500;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.fwnow span{font-size:11px;color:var(--fg3)}
+.fweather ul{display:grid;gap:4px;font-size:11px;color:var(--fg3)}
+.fweather li{display:grid;grid-template-columns:40px 28px 1fr 28px 44px;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+.fwd{color:var(--fg2)}
+.fwlo{text-align:right}
+.fwhi{color:var(--fg2)}
+.fwp{text-align:right;color:#8FB8DE}
+.fwr{position:relative;height:3px;border-radius:2px;background:var(--line)}
+.fwr i{position:absolute;top:0;bottom:0;border-radius:2px;background:linear-gradient(90deg,#8FB8DE,var(--grass) 55%,var(--blaze2))}
+.fwr b{position:absolute;top:50%;width:7px;height:7px;margin:-3.5px 0 0 -3.5px;border-radius:50%;background:var(--fg);box-shadow:0 0 0 2px var(--bg)}
+
+/* outline: the view's sections */
+.olist{flex:1;min-height:0;overflow:auto;padding:6px 8px 12px;display:grid;align-content:start;gap:1px}
+.olist button{position:relative;display:flex;align-items:center;width:100%;height:30px;padding:0 12px 0 14px;border-radius:var(--r);color:var(--fg3);font-size:13px;text-align:left;transition:color .15s,background .15s}
+.olist button::before{content:"";position:absolute;left:4px;top:9px;bottom:9px;width:2px;border-radius:1px;background:var(--grass);opacity:0;transform:scaleY(.4);transition:opacity .2s,transform .2s}
+.olist button:hover{color:var(--fg);background:var(--hover)}
+.olist button[aria-current]{color:var(--fg)}
+.olist button[aria-current]::before{opacity:1;transform:none}
+
+/* animals: filter, then one row each */
+.alistside{flex:1;min-height:0;display:flex;flex-direction:column}
+.afilter{flex:none;display:grid;gap:8px;padding:0 8px 8px}
+.afilter .input{width:100%}
+.achips{display:flex;gap:2px;flex-wrap:wrap}
+.achips button{display:flex;align-items:center;gap:6px;height:24px;padding:0 8px;border-radius:6px;font-size:12px;color:var(--fg3);transition:color .15s,background .15s}
+.achips button .mono{font-size:10.5px;color:var(--fg3)}
+.achips button:hover{color:var(--fg);background:var(--hover)}
+.achips button[aria-selected=true]{color:var(--fg);background:var(--active)}
+.achips button[data-f=out] .mono,.achips button[data-f=near] .mono,.achips button[data-f=low] .mono{color:var(--warn)}
+.arows{flex:1;min-height:0;overflow:auto;padding:0 8px 12px}
+.arows a{display:grid;grid-template-columns:8px auto minmax(0,1fr) auto;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:var(--r);font-size:13px;color:var(--fg2);transition:background .12s,color .12s}
+.arows a:hover{background:var(--hover);color:var(--fg)}
+.arows a[aria-current]{background:var(--active);color:var(--fg);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+.ast{width:6px;height:6px;border-radius:2px;background:var(--line2)}
+.arows a[data-state=inside] .ast{background:var(--grass);opacity:.8}
+.arows a[data-state=warning] .ast{background:var(--warn)}
+.arows a[data-state=outside] .ast{background:var(--red);box-shadow:0 0 0 3px rgba(229,72,77,.18)}
+.atag{font-size:12px}
+.aname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg3);font-size:12.5px}
+.abat{font-size:11px;color:var(--fg3)}
+.abat.low{color:var(--warn)}
+.anone{padding:12px 10px;font-size:11.5px;color:var(--fg3)}
+
+/* ---- tabs and the view ---- */
+.bmain{display:flex;flex-direction:column;min-width:0}
+.btabs{display:flex;align-items:stretch;height:38px;flex:none;border-bottom:1px solid var(--line)}
+.tlist{display:flex;min-width:0;flex:1;overflow-x:auto;scrollbar-width:none}
+.tlist::-webkit-scrollbar{display:none}
+.tab{position:relative;display:flex;align-items:center;gap:8px;min-width:120px;max-width:220px;flex:0 1 180px;padding:0 10px 0 14px;border-right:1px solid var(--line);color:var(--fg3);font-size:12.5px;font-weight:500;transition:color .15s,background .15s}
+.tab:hover{color:var(--fg2);background:var(--hover)}
+.tab[aria-selected=true]{color:var(--fg);background:var(--bg2);margin-bottom:-1px}
+.tab[aria-selected=true]::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:var(--grass);opacity:.7}
+.tab .tl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx{display:grid;place-items:center;width:18px;height:18px;border-radius:5px;color:var(--fg3);opacity:0;transition:opacity .12s}
+.tab:hover .tx,.tab[aria-selected=true] .tx{opacity:1}
+.tx:hover{background:var(--active);color:var(--fg)}
+.tside,.tnav{display:grid;place-items:center;width:38px;flex:none;color:var(--fg3);border-left:1px solid var(--line);transition:color .15s,background .15s}
+.tnav{border-left:0;border-right:1px solid var(--line)}
+.tside:hover,.tnav:hover{color:var(--fg);background:var(--hover)}
+.tside[aria-pressed=true],.tnav[aria-pressed=true]{color:var(--fg2)}
+.bmain>main{flex:1;min-height:0;position:relative;overflow:hidden;background:var(--bg2)}
+.bview{position:absolute;inset:0;animation:fade .18s both}
+
+/* the map: nothing floats over it on the right any more */
+.bench .mapview{display:block;position:relative;height:100%}
+.bench .mapwrap{position:absolute;inset:0}
+.bench .mapview .sheet{right:12px}
+.bench .mapview .maplibregl-ctrl-bottom-right{right:0}
+
+/* ---- herd panel ---- */
+.bright{width:320px;min-width:0;display:flex}
+.bright>.panel{flex:1;min-width:0;background:var(--bg)}
+.bright>.panel:empty{display:none}
+
+/* ---- status ---- */
+.bstatus{display:flex;align-items:center;gap:18px;padding:0 12px;border-top:1px solid var(--line);font-size:11px;color:var(--fg3);white-space:nowrap;overflow:hidden;font-variant-numeric:tabular-nums}
+.bconn{display:flex;align-items:center;gap:7px}
+.bconn i{width:6px;height:6px;border-radius:50%;background:var(--red);box-shadow:0 0 0 3px rgba(229,72,77,.16)}
+.bconn.up i{background:var(--grass);box-shadow:0 0 0 3px rgba(159,215,96,.14)}
+.bconn.up i.beat{animation:beat .9s ease-out}
+@keyframes beat{0%{box-shadow:0 0 0 0 rgba(159,215,96,.7)}100%{box-shadow:0 0 0 7px rgba(159,215,96,0)}}
+.bwarn{height:20px;padding:0 6px;margin:0 -6px;border-radius:5px;color:var(--warn);font-family:var(--mono);font-size:11px}
+.bwarn:hover{background:var(--hover)}
+.bstatus b{font-weight:400;color:var(--fg2)}
+.bstatus b.ok{color:var(--grass)}
+.bgap{flex:1}
+.bstatus .upd{display:flex;align-items:center;gap:6px;height:20px;padding:0 6px;margin-right:-6px;border-radius:5px;color:var(--fg3);font-family:var(--mono);font-size:11px}
+.bstatus .upd:hover:not(:disabled){background:var(--hover);color:var(--fg)}
+.bstatus .upd.on{color:var(--ink);background:var(--grass);font-family:var(--sans);font-weight:600}
+
+/* ---- the desk: openpasture at work, at the top of the herd panel ---- */
+.panel.desk{position:relative}
+.panel.desk>*{padding-left:16px;padding-right:16px}
+.pmenu{position:absolute;top:12px;right:10px;z-index:3;padding:0!important}
+.pdots{display:grid;place-items:center;width:28px;height:24px;border-radius:6px;color:var(--fg3);font-size:13px;letter-spacing:1px}
+.pmenu .menutrigger:hover .pdots,.pmenu .menutrigger[aria-expanded=true] .pdots{background:var(--hover);color:var(--fg)}
+
+/* the pilot: what it is doing now */
+.pilot{flex:none;padding-top:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.pline{display:flex;align-items:baseline;gap:10px;padding-right:28px;font-size:15px;font-weight:550;letter-spacing:-.015em;line-height:1.35}
+.pline>span{min-width:0}
+.prem{margin-left:8px;font-size:12px;font-weight:400;letter-spacing:0;color:var(--fg3)}
+.pilot[data-tone=busy] .prem{color:var(--grass)}
+.pdot{position:relative;top:-1px;width:7px;height:7px;border-radius:50%;flex:none;background:var(--grass);animation:breathe 2.4s ease-in-out infinite}
+.pilot[data-tone=busy] .pdot{animation:breathe 1s ease-in-out infinite}
+.pilot[data-tone=warn] .pdot{background:var(--warn);animation:none;box-shadow:0 0 0 3px rgba(240,147,108,.18)}
+.pilot[data-tone=warn] .pline{color:var(--warn)}
+
+.vitals{margin:12px 0 0 17px}
+.vbar{display:flex;gap:2px;height:4px;border-radius:2px;overflow:hidden}
+.vbar i{min-width:3px;border-radius:1px;transition:flex-grow .6s cubic-bezier(.2,.8,.2,1)}
+.vbar [data-k=in]{background:var(--grass);opacity:.8}
+.vbar [data-k=near]{background:var(--warn)}
+.vbar [data-k=out]{background:var(--red)}
+.vbar [data-k=quiet]{background:repeating-linear-gradient(-45deg,var(--line2) 0 2px,transparent 2px 4px);box-shadow:inset 0 0 0 1px var(--line2)}
+.vkey{display:flex;gap:12px;margin-top:6px;font-size:11px}
+.vkey button{color:var(--fg3);padding:0;border-radius:4px}
+.vkey button:not(:disabled):hover{color:var(--fg)}
+.vkey [data-k=in]{color:var(--fg2);cursor:default}
+.vkey [data-k=near]{color:var(--warn)}
+.vkey [data-k=out]{color:var(--red)}
+
+.plog{margin:10px 0 0 17px;font-size:11px;line-height:18px;color:var(--fg3)}
+.plog li{animation:fade .3s both}
+.plog li:last-child{color:var(--fg2)}
+.pjobs{display:grid;gap:2px;margin:10px 0 0 9px}
+.pjobs li{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.pjobs.solo{display:flex;justify-content:flex-end;margin-left:0}
+.pjob{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 8px;border-radius:7px;font-size:12.5px;color:var(--warn);text-align:left}
+.pjob:hover{background:var(--hover)}
+.pjob .mono{font-size:11.5px;color:var(--fg3)}
+.prules{display:flex;align-items:center;flex-wrap:wrap;gap:4px 14px;margin:12px 0 0 17px;font-size:11px;color:var(--fg3)}
+.pmode{display:inline-flex;align-items:center;gap:6px;color:var(--fg2)}
+.prules .menutrigger{padding:2px 6px;margin:-2px -6px;border-radius:5px}
+.prules .menutrigger:hover,.prules .menutrigger[aria-expanded=true]{background:var(--hover)}
+.prules .menutrigger:hover .pmode{color:var(--fg)}
+.pmode .px{transform:rotate(90deg);color:var(--fg3)}
+.prules .menu{font-family:var(--sans);min-width:220px}
+
+/* asks: only what it needs from the farmer */
+.asks{flex:none;padding-top:16px;padding-bottom:16px;border-bottom:1px solid var(--line);scroll-margin:8px;overflow:auto;max-height:64%}
+.asks[data-none]{padding-top:12px;padding-bottom:12px}
+.asks.pinged{animation:ping 1s ease-out}
+@keyframes ping{0%{box-shadow:inset 3px 0 0 var(--blaze)}100%{box-shadow:inset 3px 0 0 transparent}}
+.calm{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--fg3)}
+.calm .px{color:var(--grass)}
+.said{font-size:12.5px;color:var(--grass);margin-bottom:12px;animation:rise .25s both}
+.ask{animation:rise .3s cubic-bezier(.2,.8,.2,1) both}
+.ask h3{display:flex;align-items:baseline;gap:10px;font-size:15.5px;font-weight:550;letter-spacing:-.016em;line-height:1.35}
+.ask h3 .mark{flex:none;position:relative;top:1px}
+.aherd{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--fg3);margin-right:2px}
+.ask[data-sev=critical] h3{color:var(--fg)}
+.aask{margin:6px 0 0 22px;font-size:13px;line-height:20px;color:var(--fg2)}
+.aask .mono{font-size:11px;color:var(--fg3)}
+.ask .why{margin:6px 0 0 22px;font-size:13px;line-height:20px;color:var(--fg2);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.ask .why.open{display:block}
+.ask .why.more{cursor:pointer}
+.awho{display:block;max-width:calc(100% - 20px);margin:8px 0 0 16px;padding:3px 6px;border-radius:6px;font-size:11.5px;color:var(--fg3);text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.awho:hover{background:var(--hover);color:var(--fg)}
+.ask[data-sev=critical] .awho{color:var(--warn)}
+.aroute{display:flex;align-items:center;gap:10px;margin:10px 0 2px 22px}
+.arp{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--fg2)}
+.arp .pshape{width:26px;height:26px}
+.arp .pshape path{stroke:var(--grass);fill:rgba(159,215,96,.14)}
+.arp.to .pshape path{stroke:var(--blaze);fill:rgba(255,106,43,.1);stroke-dasharray:2 2}
+.arrow{position:relative;width:26px;height:1px;background:var(--fg3)}
+.arrow::after{content:"";position:absolute;right:0;top:-3px;width:5px;height:5px;border-top:1px solid var(--fg3);border-right:1px solid var(--fg3);transform:rotate(45deg)}
+.atimer{margin:12px 0 0 22px}
+.atimer p{font-size:11.5px;color:var(--fg2);font-variant-numeric:tabular-nums}
+.adrain{display:block;height:2px;margin-top:6px;border-radius:1px;background:var(--line);overflow:hidden}
+.adrain i{display:block;height:100%;background:var(--blaze);transition:width 1s linear}
+.aerr{margin:8px 0 0 22px;font-size:12px;color:var(--red)}
+.aerr.dim{color:var(--fg3)}
+.answers{display:flex;align-items:center;gap:6px;margin:14px 0 0 22px}
+.areply{display:grid;gap:0;margin:12px 0 0 22px}
+.areply .input{width:100%}
+.areply .answers{margin-left:0;margin-top:10px}
+.amore{margin:14px 0 0 12px;padding-top:10px;border-top:1px dashed var(--line2);display:grid;gap:1px}
+.amore button{display:flex;align-items:center;gap:9px;width:100%;padding:5px 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.amore button:hover{background:var(--hover);color:var(--fg)}
+.amore i{width:5px;height:5px;border-radius:1.5px;background:var(--fg3);flex:none}
+.amore [data-rank=high] i{background:var(--red)}
+
+/* watching: what the farmer said they'd see to */
+.watch{flex:none;padding-top:8px!important;padding-bottom:8px!important;border-bottom:1px solid var(--line)}
+.watch li{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--fg3)}
+.watch .wt{display:flex;align-items:center;gap:9px;flex:1;min-width:0;padding:4px 0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--fg3)}
+.watch .wt:hover{color:var(--fg)}
+.watch i{width:9px;height:9px;flex:none;border-radius:50%;border:1px solid var(--fg3);position:relative}
+.watch i::after{content:"";position:absolute;inset:2px;border-radius:50%;background:var(--fg3)}
+.watch li[data-sev=critical] i{border-color:var(--warn)}
+.watch li[data-sev=critical] i::after{background:var(--warn)}
+.watch .mono{font-size:10.5px}
+.watch .wr{font-size:10.5px;color:var(--fg3);padding:2px 5px;border-radius:4px;opacity:0;transition:opacity .15s}
+.watch li:hover .wr{opacity:1}
+.watch .wr:hover{background:var(--hover);color:var(--fg)}
+
+/* collars: battery as a hairline, a collar not heard from lately fades */
+.bright .collars button{position:relative}
+.bright .collars button>span:nth-child(2)::after{content:"";position:absolute;right:52px;bottom:3px;width:44px;height:2px;border-radius:1px;background:linear-gradient(90deg,var(--fg3) calc(var(--b) * 100%),var(--line) 0);opacity:.6}
+.bright .collars li[data-heard=lately] button{opacity:.75}
+.bright .collars li[data-heard=long] button{opacity:.45}
+.bright .collars li[data-heard=long] .cn::after{content:"";display:inline-block;width:4px;height:4px;margin-left:6px;border-radius:50%;background:var(--fg3);vertical-align:middle}
+.bright .collars .low::after{background:linear-gradient(90deg,var(--warn) calc(var(--b) * 100%),var(--line) 0)!important}
+
+/* the rail's asks: how many things need you; beats once when one arrives */
+.rasks{display:grid;place-items:center;position:relative;width:36px;height:36px;border-radius:var(--r);color:var(--fg)}
+.rasks:hover{background:var(--hover)}
+.rasks i{position:absolute;top:8px;right:8px;width:6px;height:6px;border-radius:2px;background:var(--blaze)}
+.rasks[data-high] i{background:var(--red)}
+.rasks .mono{font-size:12px}
+.rasks.beat i{animation:beat-blaze 1s ease-out 2}
+@keyframes beat-blaze{0%{box-shadow:0 0 0 0 rgba(255,106,43,.7)}100%{box-shadow:0 0 0 8px rgba(255,106,43,0)}}
+
+/* the farm sidebar: the herd's thirty days on each paddock, the next call atop the thread */
+.pstrip{position:absolute;left:48px;right:8px;bottom:4px;height:2px;border-radius:1px;background:var(--line);overflow:hidden}
+.pstrip i{position:absolute;top:0;bottom:0;border-radius:1px;background:var(--grass);opacity:.8}
+.fcalls li[data-status=next]>* i::before{background:transparent;box-shadow:inset 0 0 0 1px var(--fg3)}
+.fcalls li[data-status=running]>* i::before{background:var(--grass);animation:breathe 1s ease-in-out infinite}
+.fcalls li[data-status=next] .fcw,.fcalls li[data-status=running] .fcw{color:var(--fg2)}
+.fcalls li[data-status=next]+li .fcw{color:var(--fg)}
+.fcalls li:first-child[data-status=next] .fcw{color:var(--fg2)}

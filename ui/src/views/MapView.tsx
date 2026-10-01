@@ -23,6 +23,7 @@ import { touchUI, usePhone } from "../features/m/phone";
 import { pickAnimal } from "../features/m/select";
 import { picked } from "../store/m";
 import { HerdPanel } from "./HerdPanel";
+import { mapAsk, mapState } from "../shell/bus";
 
 type Mode =
   | { k: "idle" }
@@ -153,11 +154,15 @@ export function MapView() {
       hover = f?.id as number | undefined;
       if (hover !== undefined) m.setFeatureState({ source: "paddocks", id: hover }, { hover: true });
       m.getCanvas().style.cursor = "pointer";
+      // The desktop sidebar lights the same paddock.
+      const pid = f?.properties?.id as string | undefined;
+      if (mapState.get().hoverPaddock !== pid) mapState.patch({ hoverPaddock: pid });
     });
     m.on("mouseleave", "paddocks-fill", () => {
       if (hover !== undefined) m.setFeatureState({ source: "paddocks", id: hover }, { hover: false });
       hover = undefined;
       m.getCanvas().style.cursor = "";
+      mapState.patch({ hoverPaddock: undefined });
     });
     m.on("click", "paddocks-fill", (e: MapMouseEvent & { features?: GeoJSON.Feature[] }) => {
       if (modeRef.current.k !== "idle" || animalAt(e) || unpicked) return;
@@ -332,6 +337,49 @@ export function MapView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shownKey, begin, cancel]);
 
+  const focusCollar = (id: string) => {
+    const p = animals.current?.where(id);
+    pickAnimal(id);
+    if (p && map) map.easeTo({ center: p, duration: 600 });
+  };
+  const focusCollars = (ids: string[]) => {
+    pickAnimal(ids.length === 1 ? ids[0] : null);
+    flyTo(ids);
+  };
+
+  // On the desktop the herd panel and the paddock list sit outside this view and ask through the
+  // shell's bus; an ask made before the map loaded waits for it.
+  const asked = mapAsk.use((v) => v);
+  const litPaddock = useRef<number>(undefined);
+  useEffect(() => {
+    if (!map || !asked) return;
+    const a = asked.ask;
+    mapAsk.set(null);
+    if (a.k === "paddock") {
+      const p = store.get().state?.paddocks.find((x) => x.id === a.id);
+      if (!p || modeRef.current.k !== "idle") return;
+      setSheet({ k: "paddock", id: p.id });
+      fitPolys(map, [p.geometry], { top: 96, bottom: 96, left: 96, right: 340 }, true);
+    } else if (a.k === "collar") focusCollar(a.id);
+    else if (a.k === "collars") focusCollars(a.ids);
+    else if (a.k === "hover") hover(a.id);
+    else if (a.k === "hoverPaddock") {
+      // Feature ids are the paddocks' places in the list, from 1 (map/layers.ts).
+      const i = store.get().state?.paddocks.findIndex((p) => p.id === a.id) ?? -1;
+      if (litPaddock.current !== undefined) map.setFeatureState({ source: "paddocks", id: litPaddock.current }, { hover: false });
+      litPaddock.current = i >= 0 ? i + 1 : undefined;
+      if (litPaddock.current !== undefined) map.setFeatureState({ source: "paddocks", id: litPaddock.current }, { hover: true });
+    }
+    else if (a.k === "change") change();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, asked]);
+  useEffect(() => {
+    mapState.patch({ on: true });
+    return () => mapState.set({ on: false, changing: false });
+  }, []);
+  useEffect(() => mapState.patch({ changing: mode.k === "change" }), [mode.k]);
+  useEffect(() => mapState.patch({ paddock: sheet?.k === "paddock" ? sheet.id : undefined }), [sheet]);
+
   const sheetPad = sheet?.k === "paddock" ? state.paddocks.find((p) => p.id === sheet.id) : undefined;
   const active = mode.k === "tool" ? shown.find((t) => t.id === mode.id) : undefined;
   // One context per tool run, so a tool's effects don't re-run on every render.
@@ -371,14 +419,7 @@ export function MapView() {
           {sheet?.k === "node" && sheet.node}
         </Sheet>
       </div>
-      <HerdPanel onChange={change} changing={mode.k === "change"} onFocusCollar={(id) => {
-        const p = animals.current?.where(id);
-        pickAnimal(id);
-        if (p && map) map.easeTo({ center: p, duration: 600 });
-      }} onFocusCollars={(ids) => {
-        pickAnimal(ids.length === 1 ? ids[0] : null);
-        flyTo(ids);
-      }} onHoverCollar={hover} />
+      {phone && <HerdPanel onChange={change} changing={mode.k === "change"} onFocusCollar={focusCollar} onFocusCollars={focusCollars} onHoverCollar={hover} />}
     </div>
   );
 }

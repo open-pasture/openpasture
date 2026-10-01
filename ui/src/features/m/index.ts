@@ -17,7 +17,7 @@ const later = <P extends object>(C: ComponentType<P>) => (p: P) => createElement
 // Before anything else draws: the grab sits above the herd name (phone only; it loads on use).
 const SheetGrab = lazy(() => import("./Sheet").then((m) => ({ default: m.SheetGrab })));
 herdPanel.register({ id: "m-sheet", order: 0, Section: later(SheetGrab) });
-topbar.register({ id: "m-age", order: 90, Item: OfflineAge });
+topbar.register({ id: "m-age", order: 90, at: "status", Item: OfflineAge });
 
 const PushHere = lazy(() => import("./Push").then((m) => ({ default: m.PushHere })));
 settingsSections.register({ id: "m-push", group: "You", label: "Alerts on this phone", order: 47, Section: later(PushHere) });

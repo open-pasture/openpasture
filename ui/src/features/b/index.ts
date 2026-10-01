@@ -5,7 +5,7 @@
 import { createElement, lazy, Suspense, type ComponentType } from "react";
 import { api } from "../../api";
 import { layers, overlays, type Overlay, type OverlayCtx, type OverlayHandle } from "../../map/overlays";
-import { animalPage, dataSections, paddockSheet, search, settingsSections, shortcuts, topbar, views } from "../../registry";
+import { animalPage, dataSections, farmSide, paddockSheet, search, settingsSections, shortcuts, topbar, views } from "../../registry";
 import { store } from "../../store";
 import { bboxOf, layerData, searchOpen, show, startB } from "../../store/b";
 import "../../styles/b.css";
@@ -55,6 +55,11 @@ settingsSections.register({
 paddockSheet.register({ id: "b-facts", order: 20, Section: lazySection(() => import("./Paddock").then((m) => m.PaddockFacts)) });
 paddockSheet.register({ id: "b-height", order: 25, Section: lazySection(() => import("./Paddock").then((m) => m.PaddockHeight)) });
 paddockSheet.register({ id: "b-weather", order: 30, Section: lazySection(() => import("./Paddock").then((m) => m.PaddockWeather)) });
+
+// ---- the desktop farm sidebar, under the paddocks: the herd's recent calls, the weather ----------
+
+farmSide.register({ id: "b-calls", order: 70, Section: lazySection(() => import("./FarmCalls").then((m) => m.FarmCalls)) });
+farmSide.register({ id: "b-weather", order: 90, Section: lazySection(() => import("./FarmWeather").then((m) => m.FarmWeather)) });
 
 // ---- layers ---------------------------------------------------------------------------------------
 

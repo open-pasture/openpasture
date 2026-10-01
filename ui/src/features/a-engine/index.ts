@@ -16,7 +16,8 @@ import { AlertsTopbar } from "./Topbar";
 store.on("alert", (e) => applyAlert(e.alert));
 store.on("resync", () => void loadAlerts());
 
-topbar.register({ id: "alerts", order: 10, Item: AlertsTopbar });
+// On the desktop the rail's asks (shell/Desk.tsx) carry alerts, with the herd's waiting call.
+topbar.register({ id: "alerts", order: 10, at: "phone", Item: AlertsTopbar });
 shortcuts.register({
   id: "alerts", key: "a",
   when: () => alerts.get().list.length > 0,
