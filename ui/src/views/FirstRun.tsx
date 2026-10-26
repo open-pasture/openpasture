@@ -7,6 +7,10 @@ import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setPaddocks } from "../map/layers";
 import { createDraw, current, type Draw } from "../map/draw";
 import { Button, Icon, Input, Mark, Segmented } from "../ui";
+import { Story } from "./Story";
+
+// Flint Hills, Kansas: open rangeland under the first question.
+const RANGE: LonLat = [-96.476, 38.59];
 
 type Step = "name" | "place" | "paddock" | "herd";
 const STEPS: Step[] = ["name", "place", "paddock", "herd"];
@@ -33,7 +37,7 @@ export function FirstRun() {
   stepRef.current = step;
 
   useEffect(() => {
-    const m = createMap(el.current!, state.farm ? { center: state.farm.center, zoom: 16 } : { zoom: 3.2, center: [-96, 38] });
+    const m = createMap(el.current!, state.farm ? { center: state.farm.center, zoom: 16 } : { zoom: 15.8, center: RANGE });
     map.current = m;
     onLoad(m, () => {
       addFarmLayers(m);
@@ -91,6 +95,8 @@ export function FirstRun() {
 
   const toPlace = () => {
     if (!name.trim()) return;
+    // Pull back from the range so they can find their own place.
+    map.current?.flyTo({ center: [-96, 38], zoom: 3.2, duration: 1800 });
     setStep("place");
   };
 
@@ -128,6 +134,7 @@ export function FirstRun() {
     <div className="first" data-step={step}>
       <div ref={el} className="map" />
       <div className="veil" />
+      {!state.farm && <Story active={step === "name"} />}
       <div className="corner">
         <Mark size={18} />
         <span className="dots" aria-label={`Step ${STEPS.indexOf(step) + 1} of 4`}>
@@ -138,7 +145,7 @@ export function FirstRun() {
       {step === "name" && (
         <form className="q center" onSubmit={(e) => { e.preventDefault(); toPlace(); }}>
           <Input big autoFocus placeholder="Farm name" aria-label="Farm name" value={name} onChange={(e) => setName(e.target.value)} />
-          <button className="go" type="submit" aria-label="Next" disabled={!name.trim()}><Icon name="arrow" size={15} /></button>
+          <button className="go start" type="submit" disabled={!name.trim()}>Start</button>
         </form>
       )}
 
