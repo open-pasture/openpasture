@@ -32,7 +32,8 @@ async fn farm(n: usize) -> Farm {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let info = ServerInfo { data_dir: dir.path().into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None };
-    let app = build_app(ctx.clone(), info, false);
+    let token = ctx.settings().await.unwrap().server.app_token;
+    let app = as_owner(build_app(ctx.clone(), info, false), token);
     let herd = Herd {
         id: "herd_1".into(),
         name: "Cows".into(),
@@ -51,6 +52,17 @@ async fn farm(n: usize) -> Farm {
         collars.push(serde_json::from_value(v["collar"].clone()).unwrap());
     }
     Farm { _dir: dir, ctx, app, herd: herd.id, collars }
+}
+
+/// Every request signed with the app token, as an owner's client does.
+fn as_owner(app: Router, token: String) -> Router {
+    app.layer(axum::middleware::map_request(move |mut req: Request<Body>| {
+        let bearer = format!("Bearer {token}");
+        async move {
+            req.headers_mut().entry("authorization").or_insert(bearer.parse().unwrap());
+            req
+        }
+    }))
 }
 
 async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -224,12 +236,16 @@ async fn cues_go_out_together_in_the_order_they_came() {
     assert_eq!(items[0]["collar_id"], f.collars[0].id.as_str());
     assert_eq!(of(&msgs, "collar").len(), 1, "the new collar goes out whole");
 
-    // A collar linked where this bus didn't hear it (another server on the
-    // same data dir here; a bulk link in practice): its herd comes from the database.
-    let other = Ctx::open(f._dir.path()).await.unwrap();
-    let info = ServerInfo { data_dir: f._dir.path().into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None };
-    let (_, v) = call(&build_app(other, info, false), "POST", "/api/collars", Some(json!({ "herd_id": f.herd, "name": "unheard" }))).await;
-    let late = v["collar"]["id"].as_str().unwrap().to_owned();
+    // A collar linked where this bus didn't hear it (a bulk link written
+    // straight to the database): its herd comes from the database.
+    let late = "col_unheard".to_owned();
+    sqlx::query("INSERT INTO collars (id, name, herd_id, created_at) VALUES (?, 'unheard', ?, ?)")
+        .bind(&late)
+        .bind(&f.herd)
+        .bind(op_core::time::to_db(&t0))
+        .execute(f.ctx.db())
+        .await
+        .unwrap();
     f.ctx.publish(Event::Cue { collar_id: late.clone(), at: t0, level: 1, margin_m: 1.0, kind: Some("warn".into()), ring: None });
     let msgs = gather(&mut ws, Duration::from_millis(1200)).await;
     assert_eq!(of(&msgs, "cue_batch")[0]["items"][0]["collar_id"], late.as_str());
@@ -385,5 +401,27 @@ async fn a_changed_role_closes_the_socket_so_it_reconnects_as_the_new_one() {
     let patch = op_core::users::UserPatch { role: Some(Role::Manager), name: None, phone: None, email: None, disabled: None };
     op_core::people::update_person(&ctx, &user.id, patch).await.unwrap();
     assert!(closed_within(&mut ws, op_server::live::SESSION_CHECK + Duration::from_secs(2)).await);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_token_rides_in_the_subprotocol_not_the_url() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let handle = op_server::serve(op_server::ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
+    let token = handle.ctx().settings().await.unwrap().server.app_token;
+    let ws_url = format!("{}/api/live", handle.url().replace("http://", "ws://"));
+    let from_elsewhere = |protocols: &str| {
+        let mut req = ws_url.as_str().into_client_request().unwrap();
+        req.headers_mut().insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        if !protocols.is_empty() {
+            req.headers_mut().insert("sec-websocket-protocol", protocols.parse().unwrap());
+        }
+        req
+    };
+    let (_ws, res) = tokio_tungstenite::connect_async(from_elsewhere(&format!("openpasture, openpasture.token.{token}"))).await.unwrap();
+    assert_eq!(res.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()), Some("openpasture"), "the server picks the plain one");
+    assert!(tokio_tungstenite::connect_async(from_elsewhere("openpasture, openpasture.token.wrong")).await.is_err(), "a wrong token is refused");
+    assert!(tokio_tungstenite::connect_async(from_elsewhere("")).await.is_err(), "no token from elsewhere is refused");
     handle.shutdown().await.unwrap();
 }

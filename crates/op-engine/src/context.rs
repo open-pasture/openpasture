@@ -240,6 +240,7 @@ pub async fn assemble(ctx: &Ctx, herd: &Herd, fetch_land: bool, log: &(dyn Fn(St
         "history": history.iter().map(history_entry).collect::<Vec<_>>(),
         "units": ctx.settings().await?.units,
         "schedule": schedule,
+        "farm_rules": crate::rules::for_context(ctx).await?,
     });
     Ok(Assembled {
         context,

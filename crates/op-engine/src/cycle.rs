@@ -16,7 +16,9 @@ use op_core::{
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::{context, db, knowledge, signals, skills};
+use op_ingest::gate::{self, Sender, SenderKind};
+
+use crate::{context, db, knowledge, rules, signals, skills};
 
 /// A brain gets this long before the decision fails.
 const BRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -53,19 +55,14 @@ async fn activity(ctx: &Ctx, kind: &str, source: &str, title: String, d: &Decisi
 }
 
 /// The URL a brain's MCP client uses: the brain tools only
-/// (`ctx.tools().brain_tools()`). On a loopback URL the request is local and
-/// needs no token. Otherwise the URL carries a token minted for this run only
-/// (`/mcp?scope=brain` and nothing else, listing and calling only the brain
-/// tools, gone when the returned guard drops); the CLI brains take it out of
-/// the URL and hand it to the CLI through the environment or a 0600 file,
-/// never argv.
+/// (`ctx.tools().brain_tools()`). It carries a token minted for this run
+/// only (`/mcp?scope=brain` and nothing else, listing and calling only the
+/// brain tools, gone when the returned guard drops), on loopback too: being
+/// on this machine grants nothing. The CLI brains take it out of the URL and
+/// hand it to the CLI through the environment or a 0600 file, never argv.
 pub fn brain_mcp_url(ctx: &Ctx) -> (String, Option<op_core::BrainToken>) {
     crate::tools::register_tools(ctx);
     let base = ctx.local_url();
-    let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|p| base.starts_with(p));
-    if loopback {
-        return (format!("{base}/mcp?scope=brain"), None);
-    }
     let token = ctx.mint_brain_token(BRAIN_TIMEOUT + Duration::from_secs(60), ctx.tools().brain_tools());
     (format!("{base}/mcp?scope=brain&token={}", token.as_str()), Some(token))
 }
@@ -184,6 +181,7 @@ async fn run(ctx: &Ctx, mut d: Decision, herd: Herd) -> anyhow::Result<()> {
         d.model = out.model.clone();
     }
     d.inputs = json!({
+        "rules": out.rules.as_deref().map(str::trim).filter(|r| !r.is_empty()),
         "from_paddock_id": a.current_paddock_id,
         "position_source": a.context["position_source"],
         "land_report_ids": a.land_report_ids,
@@ -264,15 +262,28 @@ pub async fn record(ctx: &Ctx, mut d: Decision, herd: &Herd) -> anyhow::Result<D
 
     d.status = DecisionStatus::Proposed;
     d.error = None;
-    if acts(&d) && herd.autonomy == Autonomy::Timer {
+    // The safety gate and the farm's rules: anything doubtful waits for a person.
+    let automatic = herd.autonomy != Autonomy::Propose;
+    let clean = if acts(&d) && rules::reviewed(&d) {
+        let r = rules::review(ctx, &d, herd, automatic).await?;
+        let clean = r.clean;
+        d.inputs["review"] = json!(r);
+        clean
+    } else {
+        true
+    };
+    if acts(&d) && herd.autonomy == Autonomy::Timer && clean {
         d.apply_at = Some(time::now() + chrono::Duration::minutes(herd.timer_minutes as i64));
     }
     db::update(ctx, &d).await?;
     supersede(ctx, &d.herd_id, &d.id).await?;
     activity(ctx, "decision.proposed", d.source.as_db().as_str(), format!("Decision: {}", d.action.map(|a| a.as_db()).unwrap_or_default()), &d, None).await;
+    if acts(&d) && automatic && !clean {
+        activity(ctx, "decision.held", "system", "Held for the farmer".into(), &d, None).await;
+    }
 
-    if acts(&d) && herd.autonomy == Autonomy::Auto {
-        return apply_claimed(ctx, &d.id, None, None).await;
+    if acts(&d) && herd.autonomy == Autonomy::Auto && clean {
+        return apply_claimed(ctx, &d.id, None, None, Sender::of(SenderKind::Auto)).await;
     }
     Ok(d)
 }
@@ -306,26 +317,27 @@ async fn claim(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>) -> 
     Ok(n.rows_affected() == 1)
 }
 
-/// Claim a proposed decision and send its boundary. `by` answered it (none for the timer).
-async fn apply_claimed(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>, by: Option<&Actor>) -> anyhow::Result<Decision> {
+/// Claim a proposed decision and send its boundary. `by` answered it (none
+/// for the timer); `sender` is who the safety gate sees sending it.
+async fn apply_claimed(ctx: &Ctx, id: &str, farmer: Option<(&Value, DateTime<Utc>)>, by: Option<&Actor>, sender: Sender) -> anyhow::Result<Decision> {
     if !claim(ctx, id, farmer).await? {
         let d = db::get(ctx, id).await?.ok_or_else(|| anyhow::anyhow!("decision {id} vanished"))?;
         anyhow::bail!(ApiError::conflict(format!("This decision is {} now.", d.status.as_db())).message);
     }
     let d = db::get(ctx, id).await?.ok_or_else(|| anyhow::anyhow!("decision {id} vanished"))?;
     ctx.publish(Event::Decision { decision: d.clone() });
-    apply_by(ctx, d, by).await
+    apply_by(ctx, d, by, sender).await
 }
 
 /// Start a move toward the decision's boundary (the target) and mark the
 /// decision applied. The move's steps go out under this decision. Failures
-/// leave it failed with a short error.
-pub async fn apply(ctx: &Ctx, d: Decision) -> anyhow::Result<Decision> {
-    apply_by(ctx, d, None).await
+/// (the safety gate's refusal among them) leave it failed with a short error.
+pub async fn apply(ctx: &Ctx, d: Decision, sender: Sender) -> anyhow::Result<Decision> {
+    apply_by(ctx, d, None, sender).await
 }
 
 /// [`apply`], for a farmer's answer: `payload.by` on the activity names them.
-async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Result<Decision> {
+async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>, sender: Sender) -> anyhow::Result<Decision> {
     // @S: HOLD shifts the herd's schedule by one cadence.
     if d.action == Some(DecisionAction::Hold) {
         match crate::schedules::hold_herd(ctx, &d.herd_id).await {
@@ -352,7 +364,8 @@ async fn apply_by(ctx: &Ctx, mut d: Decision, by: Option<&Actor>) -> anyhow::Res
         db::update(ctx, &d).await?;
         return Ok(d);
     };
-    match op_ingest::start_move(ctx, &d.herd_id, geometry, op_ingest::SendOpts::default(), &d.id).await {
+    let opts = op_ingest::SendOpts { sender, ..Default::default() };
+    match op_ingest::start_move(ctx, &d.herd_id, geometry, opts, &d.id).await {
         Ok(started) => {
             // Only the status: the move's steps write `boundary_id` as they go.
             let row = sqlx::query("UPDATE decisions SET status = 'applied', apply_at = NULL, error = NULL WHERE id = ? RETURNING *")
@@ -403,11 +416,29 @@ pub enum Response {
 /// farmer's boundary (the brain's stays in `inputs.proposed_geometry`) and
 /// sends it; reject stops it. A farmer's note becomes a farm lesson. `actor`
 /// answered: stored as `inputs.farmer_response.by`, named in the activity.
+/// Nothing confirmed: see [`respond_confirmed`].
 pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Polygon>, note: Option<String>, actor: Actor) -> ApiResult<Decision> {
+    respond_confirmed(ctx, id, action, geometry, note, actor, vec![]).await
+}
+
+/// [`respond`], with the hard findings the person confirms by code. An
+/// approval or change the safety gate refuses (a hard finding not named in
+/// `confirm`, a no-go zone) is 409 with the findings, and the decision
+/// still waits.
+pub async fn respond_confirmed(
+    ctx: &Ctx,
+    id: &str,
+    action: Response,
+    geometry: Option<Polygon>,
+    note: Option<String>,
+    actor: Actor,
+    confirm: Vec<String>,
+) -> ApiResult<Decision> {
     let d = db::get(ctx, id).await?.ok_or_else(|| ApiError::not_found("No such decision."))?;
     if d.status != DecisionStatus::Proposed {
         return Err(ApiError::conflict(format!("This decision is {}; there is nothing to answer.", d.status.as_db())));
     }
+    let sender = Sender::answered_by(actor.clone(), confirm);
     let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
     let at = time::now();
     let paddocks = ctx.store().list_paddocks().await?;
@@ -430,7 +461,7 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
             if n.rows_affected() != 1 {
                 return Err(ApiError::conflict("This decision changed while you were answering."));
             }
-            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?
+            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor), sender.clone()).await.map_err(|e| ApiError::conflict(short(&e)))?
         }
         Response::Reject => {
             let d = answer(ctx, id, DecisionStatus::Rejected, &resp, at).await?;
@@ -442,9 +473,15 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
             activity(ctx, "decision.approved", "farmer", "Decision approved".into(), &d, Some(&actor)).await;
             d
         }
-        Response::Approve => apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?,
+        Response::Approve => {
+            if let Some(g) = &d.geometry {
+                gate_preview(ctx, &d.herd_id, g, &sender).await?;
+            }
+            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor), sender.clone()).await.map_err(|e| ApiError::conflict(short(&e)))?
+        }
         Response::Modify => {
             let g = check_geometry(&geometry.ok_or_else(|| ApiError::bad_request("A change needs the farmer's boundary (geometry)."))?)?;
+            gate_preview(ctx, &d.herd_id, &g, &sender).await?;
             resp["geometry"] = json!(g);
             // Record the farmer's boundary on the decision before claiming it.
             let mut m = d.clone();
@@ -467,7 +504,7 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
             if n.rows_affected() != 1 {
                 return Err(ApiError::conflict("This decision changed while you were answering."));
             }
-            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor)).await.map_err(|e| ApiError::conflict(short(&e)))?
+            apply_claimed(ctx, id, Some((&resp, at)), Some(&actor), sender.clone()).await.map_err(|e| ApiError::conflict(short(&e)))?
         }
     };
 
@@ -510,12 +547,50 @@ async fn answer(ctx: &Ctx, id: &str, status: DecisionStatus, resp: &Value, at: D
     Ok(d)
 }
 
+/// What the safety gate would make of a person sending `g` now: its refusal
+/// (409 with the findings) before anything is claimed.
+async fn gate_preview(ctx: &Ctx, herd_id: &str, g: &Polygon, sender: &Sender) -> ApiResult<()> {
+    let prepared = op_ingest::prepare(ctx, herd_id, g, &op_ingest::SendOpts::default()).await?;
+    let v = gate::judge(&prepared.findings, sender);
+    if v.allowed { Ok(()) } else { Err(gate::refusal(&v)) }
+}
+
+/// The timer's turn: the decision is reviewed again first (the map and the
+/// rules may have changed while it waited). Not clean: it stops counting
+/// down and waits for a person, the reasons on it.
+async fn still_clean(ctx: &Ctx, d: &Decision) -> anyhow::Result<bool> {
+    let Some(herd) = ctx.store().get_herd(&d.herd_id).await? else { return Ok(false) };
+    if !rules::reviewed(d) {
+        return Ok(true);
+    }
+    let r = rules::review(ctx, d, &herd, true).await?;
+    if r.clean {
+        return Ok(true);
+    }
+    let row =
+        sqlx::query("UPDATE decisions SET apply_at = NULL, inputs = json_set(inputs, '$.review', json(?)) WHERE id = ? AND status = 'proposed' RETURNING *")
+            .bind(json!(r).to_string())
+            .bind(&d.id)
+            .fetch_optional(ctx.db())
+            .await?;
+    if let Some(row) = row {
+        let held = op_core::store::decision_from_row(&row)?;
+        ctx.publish(Event::Decision { decision: held.clone() });
+        activity(ctx, "decision.held", "system", "Held for the farmer".into(), &held, None).await;
+        tracing::info!(decision = %d.id, reasons = ?r.reasons, "timer decision held for the farmer");
+    }
+    Ok(false)
+}
+
 /// Apply timer decisions whose time has come.
 pub async fn apply_due(ctx: &Ctx) -> anyhow::Result<()> {
     let now = time::now();
     for d in db::with_status(ctx, DecisionStatus::Proposed).await? {
         if acts(&d) && d.apply_at.is_some_and(|t| t <= now) {
-            match apply_claimed(ctx, &d.id, None, None).await {
+            if !still_clean(ctx, &d).await? {
+                continue;
+            }
+            match apply_claimed(ctx, &d.id, None, None, Sender::of(SenderKind::Timer)).await {
                 Ok(d) => tracing::info!(decision = %d.id, status = %d.status.as_db(), "timer decision applied"),
                 Err(e) => tracing::debug!("timer apply skipped: {e:#}"),
             }

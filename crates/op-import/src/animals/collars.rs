@@ -33,7 +33,11 @@ pub fn router() -> Router<Ctx> {
 pub struct Linked {
     pub collar: Collar,
     pub key: String,
-    pub endpoint: String,
+    /// The collar address; absent until one is set, with `no_endpoint` saying why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_endpoint: Option<String>,
     pub public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -130,11 +134,20 @@ async fn bulk(
     )
     .await
     .map_err(IntoResponse::into_response)?;
-    let (endpoint, public_key) = (op_ingest::collar_endpoint(&ctx), ctx.public_key_b64());
+    let endpoint = op_ingest::collar_endpoint(&ctx).await.map_err(|e| ApiError::from(e).into_response())?;
+    let no_endpoint = endpoint.is_none().then(|| op_ingest::NO_COLLAR_ADDRESS.to_owned());
+    let public_key = ctx.public_key_b64();
     let collars: Vec<Linked> = made
         .into_iter()
         .zip(plan)
-        .map(|((collar, key), (_, a))| Linked { collar, key, endpoint: endpoint.clone(), public_key: public_key.clone(), tag: a.map(|a| a.tag) })
+        .map(|((collar, key), (_, a))| Linked {
+            collar,
+            key,
+            endpoint: endpoint.clone(),
+            no_endpoint: no_endpoint.clone(),
+            public_key: public_key.clone(),
+            tag: a.map(|a| a.tag),
+        })
         .collect();
     let batch_id = id::new_id(BATCH);
     ctx.publish(Event::AnimalsChanged { herd_id: Some(herd.id.clone()) });
@@ -239,5 +252,7 @@ async fn rekey(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String
         payload["by"] = json!(by);
     }
     super::log(&ctx, "collar.rekeyed", format!("New key for {}", collar.name), payload, vec![("collar".into(), collar.id.clone())]).await;
-    Ok(Json(Linked { endpoint: op_ingest::collar_endpoint(&ctx), public_key: ctx.public_key_b64(), collar, key, tag }))
+    let endpoint = op_ingest::collar_endpoint(&ctx).await?;
+    let no_endpoint = endpoint.is_none().then(|| op_ingest::NO_COLLAR_ADDRESS.to_owned());
+    Ok(Json(Linked { endpoint, no_endpoint, public_key: ctx.public_key_b64(), collar, key, tag }))
 }

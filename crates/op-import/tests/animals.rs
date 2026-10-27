@@ -573,7 +573,9 @@ async fn bulk_linked_keys_work_on_the_collar_endpoint() {
     assert_eq!(collars.len(), 3);
     assert_eq!((collars[0]["tag"].as_str(), collars[0]["collar"]["name"].as_str()), (Some("214"), Some("C-0001")));
     assert!(collars[2].get("tag").is_none());
-    assert_eq!(collars[0]["endpoint"], format!("{}/collar/v1", app.ctx.base_url()));
+    // No collar address yet: no endpoint, and why.
+    assert!(collars[0].get("endpoint").is_none());
+    assert_eq!(collars[0]["no_endpoint"], op_ingest::NO_COLLAR_ADDRESS);
     assert_eq!(collars[0]["public_key"], app.ctx.public_key_b64());
     for c in collars {
         assert_eq!(app.report(c["key"].as_str().unwrap(), "2026-09-26T10:00:00Z").await, StatusCode::OK);
@@ -629,17 +631,19 @@ async fn a_new_key_shuts_out_the_old_one_and_only_the_owner_can_make_it() {
 }
 
 #[tokio::test]
-async fn cards_need_the_public_https_url_and_the_current_key() {
+async fn cards_need_the_collar_address_and_the_current_key() {
     let app = App::new().await;
     let herd = app.herd_of(2).await;
     let items = json!({"items": herd.iter().map(|(t, c, k)| json!({"collar_id": c, "key": k, "tag": t})).collect::<Vec<_>>()});
     let (s, e) = app.json("POST", "/api/cards", items.clone()).await;
-    assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some("Cards need the server's public URL (Settings, Server): it goes into every collar.")));
-    app.ctx.update_settings(&json!({"server": {"public_url": "http://192.168.1.20:7878"}})).await.unwrap();
+    assert_eq!((s, e["error"].as_str()), (StatusCode::CONFLICT, Some(op_ingest::NO_COLLAR_ADDRESS)));
+    // A public URL isn't a collar address, and a collar address must be https.
+    app.ctx.update_settings(&json!({"server": {"public_url": "https://farm.example.com"}})).await.unwrap();
     let (s, _) = app.json("POST", "/api/cards", items.clone()).await;
     assert_eq!(s, StatusCode::CONFLICT);
+    assert!(app.ctx.update_settings(&json!({"server": {"collar_url": "http://192.168.1.20:7878"}})).await.is_err());
 
-    app.ctx.update_settings(&json!({"server": {"public_url": "https://farm.example.com/"}})).await.unwrap();
+    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com/"}})).await.unwrap();
     let (s, v) = app.json("POST", "/api/cards", items).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v.as_array().unwrap().len(), 2);
@@ -655,7 +659,7 @@ async fn cards_need_the_public_https_url_and_the_current_key() {
 #[tokio::test]
 async fn a_card_decodes_to_the_provisioning_payload() {
     let app = App::new().await;
-    app.ctx.update_settings(&json!({"server": {"public_url": "https://farm.example.com"}})).await.unwrap();
+    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com"}})).await.unwrap();
     let herd = app.herd_of(1).await;
     let (_, collar, key) = &herd[0];
     let (s, v) = app.json("POST", "/api/cards", json!({"items": [{"collar_id": collar, "key": key}]})).await;

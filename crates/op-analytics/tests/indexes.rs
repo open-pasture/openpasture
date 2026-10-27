@@ -42,7 +42,8 @@ async fn the_rollup_finds_reads_and_deletes_a_day_by_index() {
         let p = plan(&ctx, &op_analytics::rollup::delete_sql(table)).await;
         assert!(uses(&p, &format!("{table}_t")), "{table}: {p}");
         let p = plan(&ctx, &format!("SELECT collar_id FROM {table} WHERE collar_id > ? ORDER BY collar_id LIMIT 1")).await;
-        assert!(uses(&p, &format!("{table}_collar_t")), "{table}: {p}");
+        // Any index led by collar_id will do (cues also have the unique `cues_collar_t_kind`).
+        assert!(uses(&p, &format!("{table}_collar_t")) || uses(&p, &format!("{table}_collar_t_kind")), "{table}: {p}");
     }
 }
 

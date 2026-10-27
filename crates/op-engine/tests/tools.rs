@@ -72,9 +72,9 @@ fn brain_prompt_is_unchanged_for_the_existing_tools() {
 async fn the_decision_brain_gets_the_registry_brain_tools() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Ctx::open(dir.path()).await.unwrap();
-    // Loopback: no token.
+    // Loopback: a token too (being on this machine grants nothing).
     let (url, token) = op_engine::cycle::brain_mcp_url(&ctx);
-    assert!(url.ends_with("/mcp?scope=brain") && token.is_none());
+    assert!(url.contains("/mcp?scope=brain&token=") && token.is_some());
     // Off loopback: a token carrying the brain tools.
     ctx.set_local_url("http://192.168.1.2:7878");
     let (url, token) = op_engine::cycle::brain_mcp_url(&ctx);

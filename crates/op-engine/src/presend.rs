@@ -17,7 +17,9 @@
 //!   running the move driver's own [`moves::advance`] on the herd's current
 //!   positions: back lines about every 10 m and the minutes it takes.
 //!
-//! The check never blocks sending; only a shape that can't be sent is 400.
+//! The check itself refuses nothing (only a shape that can't be sent is
+//! 400); `gate` says what the safety gate will: the critical findings a
+//! person has to confirm by code to send it, and those nobody may.
 
 use axum::extract::{Path, State};
 use axum::routing::post;
@@ -123,6 +125,17 @@ pub struct CheckResult {
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep: Option<SweepPreview>,
+    /// What the safety gate makes of a person sending it: the hard findings
+    /// they would have to confirm (`confirm`), and those nobody may send (`never`).
+    pub gate: Gate,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Gate {
+    #[serde(default)]
+    pub confirm: Vec<String>,
+    #[serde(default)]
+    pub never: Vec<String>,
 }
 
 async fn route(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJson(req): ApiJson<CheckRequest>) -> ApiResult<Json<CheckResult>> {
@@ -133,7 +146,7 @@ async fn route(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJson(req)
 pub async fn check(ctx: &Ctx, herd_id: &str, req: &CheckRequest) -> ApiResult<CheckResult> {
     let store = ctx.store();
     let herd = store.get_herd(herd_id).await?.ok_or_else(|| ApiError::not_found("No such herd."))?;
-    let opts = SendOpts { warn_m: req.warn_m, hysteresis_m: None, effective_at: req.effective_at };
+    let opts = SendOpts { warn_m: req.warn_m, effective_at: req.effective_at, ..Default::default() };
     let prepared = op_ingest::prepare(ctx, herd_id, &req.geometry, &opts).await?;
     let sent = prepared.geometry;
     let now = time::now();
@@ -204,7 +217,9 @@ pub async fn check(ctx: &Ctx, herd_id: &str, req: &CheckRequest) -> ApiResult<Ch
         vertices: sent.total_vertices(),
         holes: sent.coordinates.len().saturating_sub(1),
     };
-    Ok(CheckResult { sent, legacy, facts, findings, sweep })
+    let v = op_ingest::gate::judge(&findings, &op_ingest::gate::Sender::of(op_ingest::gate::SenderKind::Farmer));
+    let gate = Gate { confirm: v.confirm, never: v.never };
+    Ok(CheckResult { sent, legacy, facts, findings, sweep, gate })
 }
 
 fn finding(code: &str, severity: Severity, text: String, geometry: Option<Value>, targets: Vec<(String, String)>) -> Finding {

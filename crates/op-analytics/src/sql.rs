@@ -4,6 +4,12 @@
 //! tables and hot telemetry are read from SQLite into memory tables (capped);
 //! cold telemetry is a Parquet listing table, unioned with the hot rows so
 //! `fixes` and `cues` look like one table each.
+//!
+//! One query can't take the server down: the session has no table functions
+//! (`range`, `generate_series`), its operators share a [`MEMORY_LIMIT`] pool
+//! (a query past it fails, "resources exhausted"), at most [`AT_ONCE`]
+//! queries run at a time (others wait up to [`QUEUE_WAIT`], then 503), and
+//! each has [`TIMEOUT`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +21,8 @@ use datafusion::datasource::MemTable;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::execution::context::SQLOptions;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DfStatement;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures::{StreamExt, TryStreamExt};
@@ -30,6 +37,14 @@ use crate::telemetry::{BATCH_ROWS, Rolled, not_rolled_sql};
 /// Most rows a query returns.
 pub const MAX_ROWS: usize = 10_000;
 pub const TIMEOUT: Duration = Duration::from_secs(20);
+/// Memory one query's joins, sorts and aggregates may hold.
+pub const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+/// Queries running at once.
+pub const AT_ONCE: usize = 2;
+/// How long a query waits for its turn.
+pub const QUEUE_WAIT: Duration = Duration::from_secs(5);
+
+static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(AT_ONCE);
 /// Most rows read into memory from SQLite per record table.
 const RECORD_CAP: usize = 100_000;
 /// Most hot telemetry rows read into memory per table (newest kept). Hot
@@ -72,6 +87,9 @@ fn df_err(e: datafusion::error::DataFusionError) -> ApiError {
 pub async fn run(ctx: &Ctx, query: &str, max_rows: usize) -> Result<SqlResult, ApiError> {
     let started = Instant::now();
     let max_rows = max_rows.clamp(1, MAX_ROWS);
+    let Ok(Ok(_slot)) = tokio::time::timeout(QUEUE_WAIT, SLOTS.acquire()).await else {
+        return Err(ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Other queries are running. Try again in a moment."));
+    };
     match tokio::time::timeout(TIMEOUT, run_inner(ctx, query, max_rows)).await {
         Ok(Ok((columns, rows, truncated))) => Ok(SqlResult { columns, rows, ms: started.elapsed().as_millis() as u64, truncated }),
         Ok(Err(e)) => Err(e),
@@ -82,8 +100,19 @@ pub async fn run(ctx: &Ctx, query: &str, max_rows: usize) -> Result<SqlResult, A
     }
 }
 
+/// A session for one query: memory capped, no table functions.
+fn session() -> Result<SessionContext, ApiError> {
+    let runtime = RuntimeEnvBuilder::new().with_memory_limit(MEMORY_LIMIT, 1.0).build_arc().map_err(df_err)?;
+    let session = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let functions: Vec<String> = session.state().table_functions().keys().cloned().collect();
+    for f in functions {
+        session.deregister_udtf(&f);
+    }
+    Ok(session)
+}
+
 async fn run_inner(ctx: &Ctx, query: &str, max_rows: usize) -> Result<(Vec<String>, Vec<Vec<Value>>, bool), ApiError> {
-    let session = SessionContext::new();
+    let session = session()?;
     let state = session.state();
     let stmt = state.sql_to_statement(query, &Dialect::Generic).map_err(df_err)?;
     check_read_only(&stmt)?;
@@ -203,6 +232,15 @@ mod tests {
         let s = SessionContext::new().state();
         let stmt = s.sql_to_statement(q, &Dialect::Generic).map_err(df_err)?;
         check_read_only(&stmt)
+    }
+
+    #[tokio::test]
+    async fn a_session_has_no_table_functions_and_a_memory_cap() {
+        let s = session().unwrap();
+        assert!(s.state().table_functions().is_empty());
+        let e = s.sql("SELECT count(*) FROM range(1, 10000000000)").await.err().expect("no range()");
+        assert!(e.to_string().contains("range"), "{e}");
+        assert!(matches!(s.runtime_env().memory_pool.memory_limit(), datafusion::execution::memory_pool::MemoryLimit::Finite(n) if n == MEMORY_LIMIT));
     }
 
     #[test]

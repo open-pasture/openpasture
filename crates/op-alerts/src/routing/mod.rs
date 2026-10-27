@@ -243,7 +243,8 @@ pub async fn route(ctx: &Ctx, now: DateTime<Utc>) -> anyhow::Result<Report> {
             .iter()
             .map(store::row_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
-    let follow = drop_answered(ctx, follow, now).await?;
+    // Follow-ups go to people only: none for the simulator's collars.
+    let follow: Vec<Row> = drop_answered(ctx, follow, now).await?.into_iter().filter(|r| !simulated(&r.alert)).collect();
     if due.is_empty() && follow.is_empty() {
         return Ok(report);
     }
@@ -323,6 +324,11 @@ async fn place_of(ctx: &Ctx, alerts: &[&Alert]) -> anyhow::Result<Option<String>
         },
         _ => Ok(None),
     }
+}
+
+/// The engine marked it as about simulated collars only (`op_core::sim`).
+pub fn simulated(a: &Alert) -> bool {
+    a.data.get("simulated").and_then(Value::as_bool) == Some(true)
 }
 
 fn decision_of(a: &Alert) -> Option<String> {
@@ -418,7 +424,9 @@ async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now
     let mut held = false;
     let mut sent = false;
     for p in first {
-        let todo: Vec<&Alert> = rows.iter().map(|r| &r.alert).filter(|a| !told.contains(&(a.id.clone(), p.user.id.clone()))).collect();
+        // Alerts about the simulator's collars reach no person (the webhook still gets them, marked).
+        let todo: Vec<&Alert> =
+            rows.iter().map(|r| &r.alert).filter(|a| !simulated(a) && !told.contains(&(a.id.clone(), p.user.id.clone()))).collect();
         if todo.is_empty() {
             continue;
         }

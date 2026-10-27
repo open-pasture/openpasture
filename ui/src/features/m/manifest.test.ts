@@ -7,6 +7,9 @@ import { join } from "node:path";
 const UI = join(import.meta.dir, "../../..");
 const pub = (p: string) => join(UI, "public", p.replace(/^\//, ""));
 
+// The app's background, --bg in the design tokens: the install and the page use the same.
+const BG = /--bg:(#[0-9A-Fa-f]{6})/.exec(readFileSync(join(UI, "src/styles/tokens.css"), "utf8"))![1];
+
 // Width and height from a PNG's IHDR.
 function pngSize(file: string): [number, number] {
   const b = readFileSync(file);
@@ -22,8 +25,8 @@ test("the manifest names the app, starts on the map, installs standalone in the 
   expect(m.start_url).toBe("/#/map");
   expect(m.scope).toBe("/");
   expect(m.display).toBe("standalone");
-  expect(m.background_color).toBe("#0B0C09");
-  expect(m.theme_color).toBe("#0B0C09");
+  expect(m.background_color).toBe(BG);
+  expect(m.theme_color).toBe(BG);
 });
 
 test("icons are the sizes they say: 192 and 512, and maskable", () => {
@@ -45,7 +48,7 @@ test("icons are the sizes they say: 192 and 512, and maskable", () => {
 test("the page links the manifest, sets the theme colour and fills the screen past the notch", () => {
   const html = readFileSync(join(UI, "index.html"), "utf8");
   expect(html).toContain('<link rel="manifest" href="/manifest.webmanifest" />');
-  expect(html).toContain('<meta name="theme-color" content="#0B0C09" />');
+  expect(html).toContain(`<meta name="theme-color" content="${BG}" />`);
   expect(html).toMatch(/name="viewport" content="[^"]*viewport-fit=cover/);
   expect(html).toContain('<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />');
   expect(existsSync(pub("sw.js"))).toBe(true);

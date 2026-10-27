@@ -278,7 +278,9 @@ async fn n_on_a_stay_holds_today_s_strip_and_y_keeps_the_schedule() {
     let shifted = opens(&after);
     for (a, b) in before.iter().zip(&shifted) {
         assert_eq!(a.0, b.0);
-        assert_eq!(local(a.1 + Duration::days(1)), local(b.1), "one cadence later, same local time");
+        // A calendar day in the farm's zone, so a DST change keeps the local hour.
+        let (a, b) = (a.1.with_timezone(&chicago()), b.1.with_timezone(&chicago()));
+        assert_eq!((a.date_naive() + Duration::days(1), a.time()), (b.date_naive(), b.time()), "one cadence later, same local time");
     }
     assert_eq!(after.iter().filter(|m| m["skipped"] == "held").count(), 1);
     let status = t.ok("GET", &format!("/api/herds/{}/boundary", f.herd), None).await;

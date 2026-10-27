@@ -3,7 +3,7 @@
 //!
 //! A day streams through: its rows are read per collar in `(collar_id, t, id)`
 //! order, [`CHUNK_ROWS`] at a time, merged with the day's existing file (if an
-//! earlier run or a late fix left one, deduplicated by row), and written one
+//! earlier run or a late fix left one, deduplicated as [`Dedupe`] says), and written one
 //! Parquet row group per chunk; pasture dwell is summed on the same stream. At
 //! 250 collars and a fix every 5 s a day is 4.3 M fixes, so nothing ever holds
 //! the whole day. Once the file is durable the rows leave SQLite in short
@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use crate::metrics::{Dwell, DwellAgg, DwellKey, PaddockIndex};
 use crate::range::{date_of, day_start_ms};
 use crate::schema::{BatchBuilder, Cols, TELEMETRY_TABLES, TableSchema, normalize, table_schema};
-use crate::telemetry::{BATCH_ROWS, day_path, each_fix, writer_props};
+use crate::telemetry::{BATCH_ROWS, day_path, each_fix, list_days, writer_props};
 
 /// Setting key: days of telemetry kept in SQLite (default 3, at least 1).
 pub const HOT_DAYS_KEY: &str = "analytics.hot_days";
@@ -49,6 +49,100 @@ const DELETE_PAUSE: Duration = Duration::from_millis(25);
 const DELETE_PAUSE_LONG: Duration = Duration::from_millis(100);
 /// A delete transaction longer than this halves the next one.
 const DELETE_SLOW: Duration = Duration::from_millis(60);
+
+/// Setting key: how long raw telemetry is kept ([`Retention`]).
+pub const RETENTION_KEY: &str = "analytics.retention";
+/// The shortest retention accepted, in days.
+pub const MIN_RETENTION_DAYS: u32 = 7;
+
+/// Days of raw rows kept per table, in SQLite or Parquet alike; `None`
+/// (the default) keeps them for good. Day summaries (dwell, coverage,
+/// battery, welfare marks) and episodes are kept whatever this says. The
+/// welfare record and grazing reports read raw cues and fixes, so a short
+/// retention shortens what those can cover.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Retention {
+    #[serde(default)]
+    pub fixes_days: Option<u32>,
+    #[serde(default)]
+    pub cues_days: Option<u32>,
+    #[serde(default)]
+    pub health_days: Option<u32>,
+}
+
+impl Retention {
+    pub fn days(&self, table: &str) -> Option<u32> {
+        match table {
+            "fixes" => self.fixes_days,
+            "cues" => self.cues_days,
+            "health" => self.health_days,
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, days) in [("fixes_days", self.fixes_days), ("cues_days", self.cues_days), ("health_days", self.health_days)] {
+            if days.is_some_and(|d| d < MIN_RETENTION_DAYS) {
+                return Err(format!("{name} must be at least {MIN_RETENTION_DAYS} days, or null to keep everything."));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The stored retention. An unreadable value is an error, so nothing is
+/// deleted on a guess.
+pub async fn retention(ctx: &Ctx) -> anyhow::Result<Retention> {
+    Ok(ctx.store().get_setting::<Retention>(RETENTION_KEY).await.context("reading analytics.retention")?.unwrap_or_default())
+}
+
+/// What [`prune`] removed from one table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    pub table: &'static str,
+    pub days: usize,
+    pub rows: u64,
+}
+
+/// Delete raw telemetry older than its retention: whole Parquet days before
+/// the cutoff day, and SQLite rows before it (when retention is shorter than
+/// the hot days).
+pub async fn prune(ctx: &Ctx, keep: &Retention, now: DateTime<Utc>) -> anyhow::Result<Vec<Pruned>> {
+    let mut done = Vec::new();
+    for table in TELEMETRY_TABLES {
+        let Some(days) = keep.days(table) else { continue };
+        let cutoff = now.date_naive().checked_sub_days(Days::new(days as u64)).unwrap_or(now.date_naive());
+        let mut gone_days = 0;
+        for (date, path) in list_days(ctx.data_dir(), table) {
+            if date >= cutoff {
+                continue;
+            }
+            let dir = path.parent().unwrap_or(&path).to_path_buf();
+            let removed = if dir.is_dir() { std::fs::remove_dir_all(&dir) } else { std::fs::remove_file(&path) };
+            match removed {
+                Ok(()) => gone_days += 1,
+                Err(e) => tracing::warn!(file = %dir.display(), "removing expired telemetry: {e}"),
+            }
+        }
+        let sql = format!("DELETE FROM {table} WHERE id IN (SELECT id FROM {table} WHERE t < ? LIMIT ?)");
+        let mut rows = 0;
+        loop {
+            let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+            let n = sqlx::query(&sql).bind(day_start_ms(cutoff)).bind(DELETE_ROWS).execute(&mut *tx).await?.rows_affected();
+            tx.commit().await?;
+            rows += n;
+            if n < DELETE_ROWS as u64 {
+                break;
+            }
+            tokio::time::sleep(DELETE_PAUSE).await;
+        }
+        if gone_days > 0 || rows > 0 {
+            tracing::info!(table, days = gone_days, rows, before = %cutoff, "expired raw telemetry removed");
+        }
+        done.push(Pruned { table, days: gone_days, rows });
+    }
+    Ok(done)
+}
 
 pub async fn hot_days(ctx: &Ctx) -> u32 {
     match ctx.store().get_setting::<u32>(HOT_DAYS_KEY).await {
@@ -96,7 +190,8 @@ async fn roll_day(ctx: &Ctx, table: &'static str, date: NaiveDate) -> anyhow::Re
     let (tx, rx) = mpsc::channel::<anyhow::Result<RecordBatch>>(2);
     let arrow = schema.arrow.clone();
     let path2 = path.clone();
-    let writer = tokio::task::spawn_blocking(move || write_day(&path2, arrow, rx, paddocks));
+    let dedupe = Dedupe::of(table);
+    let writer = tokio::task::spawn_blocking(move || write_day(&path2, arrow, rx, paddocks, dedupe));
 
     let n = match read_day(ctx, &schema, ds, de, max_id, &tx).await {
         Ok(n) => n,
@@ -210,11 +305,36 @@ async fn delete_day(ctx: &Ctx, table: &str, ds: i64, de: i64, max_id: i64) -> an
     }
 }
 
-/// Sort key of a row: collar (bytes), time, id.
+/// Which rows of the day file and the fresh rows are the same record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dedupe {
+    /// The same row id: rows an earlier run wrote but stopped before deleting.
+    Row,
+    /// One fix per collar per instant: a resent report stored again after
+    /// its day was rolled keeps the copy already in the file.
+    Time,
+    /// One cue per collar, instant and kind.
+    TimeKind,
+}
+
+impl Dedupe {
+    /// Matches the unique keys on `fixes` and `cues` (migration 0890).
+    pub fn of(table: &str) -> Self {
+        match table {
+            "fixes" => Dedupe::Time,
+            "cues" => Dedupe::TimeKind,
+            _ => Dedupe::Row,
+        }
+    }
+}
+
+/// Sort key of a row: collar (bytes), time, id; and the cue kind, if any.
 struct Keys {
     collar: StringArray,
     t: Int64Array,
     id: Int64Array,
+    kind: Option<StringArray>,
+    margin: Option<datafusion::arrow::array::Float64Array>,
 }
 
 impl Keys {
@@ -224,7 +344,18 @@ impl Keys {
             collar: c.str("collar_id").context("telemetry without collar_id")?.clone(),
             t: c.i64("t").context("telemetry without t")?.clone(),
             id: c.i64("id").context("telemetry without id")?.clone(),
+            kind: c.str("kind").cloned(),
+            margin: c.f64("margin_m").cloned(),
         })
+    }
+
+    /// The cue kind, derived from the margin for cues from before protocol
+    /// v1 as readers do (outside past the line, else warn).
+    fn kind(&self, i: usize) -> Option<&str> {
+        match self.kind.as_ref().filter(|k| k.is_valid(i)) {
+            Some(k) => Some(k.value(i)),
+            None => self.margin.as_ref().filter(|m| m.is_valid(i)).map(|m| if m.value(i) < 0.0 { "outside" } else { "warn" }),
+        }
     }
 
     fn key(&self, i: usize) -> (&[u8], i64, i64) {
@@ -262,6 +393,13 @@ impl<I: Iterator<Item = anyhow::Result<RecordBatch>>> Cursor<I> {
         self.cur.as_ref().map(|(slot, k)| (*slot, self.row, k.key(self.row)))
     }
 
+    /// Whether the current row is the collar and instant given, and its kind.
+    fn at(&self, collar: &[u8], t: i64) -> Option<Option<String>> {
+        let (_, k) = self.cur.as_ref()?;
+        let (c, rt, _) = k.key(self.row);
+        (c == collar && rt == t).then(|| k.kind(self.row).map(str::to_owned))
+    }
+
     fn step(&mut self, held: &mut Vec<RecordBatch>) -> anyhow::Result<()> {
         self.row += 1;
         let len = self.cur.as_ref().map_or(0, |(slot, _)| held[*slot].num_rows());
@@ -277,6 +415,7 @@ fn write_day(
     arrow: SchemaRef,
     mut fresh: mpsc::Receiver<anyhow::Result<RecordBatch>>,
     paddocks: Option<PaddockIndex>,
+    dedupe: Dedupe,
 ) -> anyhow::Result<Option<HashMap<DwellKey, DwellAgg>>> {
     let dir = path.parent().context("parquet path has no parent")?;
     std::fs::create_dir_all(dir)?;
@@ -297,7 +436,7 @@ fn write_day(
             if path.is_file() {
                 let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.with_batch_size(BATCH_ROWS).build()?;
                 let old = reader.map(|b| b.map_err(anyhow::Error::from).and_then(|b| normalize(&b, &arrow)));
-                merge(old, fresh_rows, &mut emit)?;
+                merge(old, fresh_rows, dedupe, &mut emit)?;
             } else {
                 // Nothing to merge with: the fresh rows already come in order.
                 for b in fresh_rows {
@@ -324,8 +463,9 @@ fn write_day(
 
 /// Merge two inputs sorted by `(collar_id, t, id)` into chunks of
 /// [`CHUNK_ROWS`], keeping one copy of a row both hold (an earlier run that
-/// stopped before its deletes).
-fn merge<A, B>(a: A, b: B, emit: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>) -> anyhow::Result<()>
+/// stopped before its deletes) and, by `dedupe`, of a fix or cue both hold
+/// under different ids (`a`'s copy is kept).
+fn merge<A, B>(a: A, b: B, dedupe: Dedupe, emit: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>) -> anyhow::Result<()>
 where
     A: Iterator<Item = anyhow::Result<RecordBatch>>,
     B: Iterator<Item = anyhow::Result<RecordBatch>>,
@@ -337,6 +477,32 @@ where
     b.advance(&mut held)?;
     let mut picks: Vec<(usize, usize)> = Vec::with_capacity(CHUNK_ROWS);
     loop {
+        let group = match (a.head(), b.head()) {
+            (Some((_, _, ka)), Some((_, _, kb))) if dedupe != Dedupe::Row && (ka.0, ka.1) == (kb.0, kb.1) => Some((ka.0.to_vec(), ka.1)),
+            _ => None,
+        };
+        if let Some((collar, t)) = group {
+            // The same collar and instant in both: all of a's rows there,
+            // then b's that aren't already held.
+            let mut kinds = Vec::new();
+            while let Some(kind) = a.at(&collar, t) {
+                let (slot, row, _) = a.head().expect("a row");
+                picks.push((slot, row));
+                kinds.push(kind);
+                a.step(&mut held)?;
+            }
+            while let Some(kind) = b.at(&collar, t) {
+                let (slot, row, _) = b.head().expect("a row");
+                if dedupe == Dedupe::TimeKind && !kinds.contains(&kind) {
+                    picks.push((slot, row));
+                }
+                b.step(&mut held)?;
+            }
+            if picks.len() >= CHUNK_ROWS {
+                flush_picks(&mut picks, &mut held, &mut a, &mut b, emit)?;
+            }
+            continue;
+        }
         let ha = a.head().map(|(slot, row, _)| (slot, row));
         let hb = b.head().map(|(slot, row, _)| (slot, row));
         let order = match (a.head(), b.head()) {
@@ -397,20 +563,33 @@ where
     Ok(())
 }
 
-/// Hourly rollup (and once at start) until shutdown.
+/// How often the rollup (and then retention) runs.
+pub const ROLLUP_EVERY: Duration = Duration::from_secs(3600);
+
+/// Hourly rollup, then retention (and once at start), until shutdown.
 pub fn spawn_rollup(ctx: Ctx) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    ctx.supervise("analytics.rollup", Some(ROLLUP_EVERY), |ctx| async move {
+        let mut tick = tokio::time::interval(ROLLUP_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ctx.on_shutdown() => break,
                 _ = tick.tick() => {
+                    ctx.beat("analytics.rollup");
                     let keep = hot_days(&ctx).await;
                     match rollup(&ctx, keep, op_core::time::now()).await {
                         Ok(days) if !days.is_empty() => tracing::info!(days = days.len(), "telemetry rollup done"),
                         Ok(_) => {}
                         Err(e) => tracing::warn!("telemetry rollup failed: {e:#}"),
+                    }
+                    match retention(&ctx).await {
+                        Ok(r) if r != Retention::default() => {
+                            if let Err(e) = prune(&ctx, &r, op_core::time::now()).await {
+                                tracing::warn!("telemetry retention failed: {e:#}");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("telemetry retention skipped: {e:#}"),
                     }
                 }
             }
@@ -458,11 +637,58 @@ mod tests {
         let old = vec![batch(&[("a", 1, 1), ("a", 5, 3)]), batch(&[]), batch(&[("b", 2, 2)])];
         let fresh = vec![batch(&[("a", 3, 9), ("a", 5, 3)]), batch(&[("b", 1, 7), ("c", 0, 8)])];
         let mut out = Vec::new();
-        merge(old.into_iter().map(Ok), fresh.into_iter().map(Ok), &mut |b| {
+        merge(old.into_iter().map(Ok), fresh.into_iter().map(Ok), Dedupe::Row, &mut |b| {
             out.push(b);
             Ok(())
         })
         .unwrap();
         assert_eq!(rows(&out), [("a", 1, 1), ("a", 3, 9), ("a", 5, 3), ("b", 1, 7), ("b", 2, 2), ("c", 0, 8)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec());
+    }
+
+    fn cue_batch(rows: &[(&str, i64, i64, Option<&str>)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("collar_id", DataType::Utf8, true),
+            Field::new("t", DataType::Int64, true),
+            Field::new("kind", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn merged(old: Vec<RecordBatch>, fresh: Vec<RecordBatch>, dedupe: Dedupe) -> Vec<(String, i64, i64)> {
+        let mut out = Vec::new();
+        merge(old.into_iter().map(Ok), fresh.into_iter().map(Ok), dedupe, &mut |b| {
+            out.push(b);
+            Ok(())
+        })
+        .unwrap();
+        rows(&out)
+    }
+
+    #[test]
+    fn a_fix_resent_after_its_day_rolled_keeps_the_rolled_copy() {
+        // The file holds a's fixes at t 1 and 5; a resend stored them again as ids 8 and 9.
+        let old = vec![batch(&[("a", 1, 1), ("a", 5, 3)]), batch(&[("b", 2, 2)])];
+        let fresh = vec![batch(&[("a", 1, 8), ("a", 3, 7), ("a", 5, 9)]), batch(&[("b", 2, 2), ("c", 0, 10)])];
+        assert_eq!(
+            merged(old, fresh, Dedupe::Time),
+            [("a", 1, 1), ("a", 3, 7), ("a", 5, 3), ("b", 2, 2), ("c", 0, 10)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec()
+        );
+    }
+
+    #[test]
+    fn a_resent_cue_is_one_cue_but_another_kind_at_the_same_instant_is_kept() {
+        let old = vec![cue_batch(&[("a", 5, 1, Some("warn")), ("a", 6, 2, None)])];
+        let fresh = vec![cue_batch(&[("a", 5, 7, Some("outside")), ("a", 5, 8, Some("warn")), ("a", 6, 9, None)])];
+        assert_eq!(merged(old, fresh, Dedupe::TimeKind), [("a", 5, 1), ("a", 5, 7), ("a", 6, 2)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec());
     }
 }

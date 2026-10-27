@@ -14,7 +14,13 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir "$stage/$name"
 cp "$bin/openpasture" "$bin/collar-sim" "$stage/$name/"
-cp "$root/LICENSE" "$stage/$name/LICENSE"
+cp "$root/LICENSE" "$root/NOTICE" "$stage/$name/"
+# Written by scripts/third-party-notices.py; release builds always have it.
+if [ -f "$root/THIRD-PARTY-NOTICES" ]; then
+  cp "$root/THIRD-PARTY-NOTICES" "$stage/$name/"
+else
+  echo "warning: no THIRD-PARTY-NOTICES (scripts/third-party-notices.py); not for distribution" >&2
+fi
 cp "$root/packaging/README-server.md" "$stage/$name/README.md"
 
 mkdir -p "$root/out"

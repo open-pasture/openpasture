@@ -38,6 +38,8 @@ export interface CheckResult {
   facts: CheckFacts;
   findings: Finding[];
   sweep?: SweepPreview;
+  // The safety gate: critical findings a person must confirm by code to send it, and those nobody may send.
+  gate?: { confirm: string[]; never: string[] };
 }
 
 export const fApi = {

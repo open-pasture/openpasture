@@ -67,7 +67,8 @@ impl App {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::open(dir.path()).await.unwrap();
-        let router = op_core::router().merge(op_ingest::router()).with_state(ctx.clone());
+        let router =
+            op_core::with_identity(op_core::router().merge(op_ingest::router()), op_core::Identity::owner(op_core::Via::Local)).with_state(ctx.clone());
         Self { _dir: dir, ctx, router }
     }
 
@@ -534,8 +535,8 @@ async fn an_escape_ends_with_copies_for_that_collar_alone() {
     let v2 = app.download(&b_key, "have=1&free=15").await.unwrap();
 
     // A walks out and stays out: its own pen, which keeps the herd's hole.
-    let t = now + Duration::seconds(5);
-    app.report(&a_key, json!({"fixes": [fix_at(m_at(150.0, 230.0), t)]})).await;
+    let t = now + Duration::seconds(60);
+    app.report(&a_key, json!({"fixes": [fix_at(m_at(150.0, 230.0), t), fix_at(m_at(150.0, 231.0), t + Duration::seconds(30))]})).await;
     op_ingest::escapes::scan(&app.ctx, t + Duration::seconds(60)).await.unwrap();
     let pen = app.download(&a_key, "have=2&free=14").await.unwrap();
     assert_eq!((pen.version, pen.collar_id.as_deref(), pen.holes.len()), (3, Some(a.as_str()), 1));
@@ -602,8 +603,11 @@ async fn configs_follow_herd_url_moves_and_escapes() {
     assert!(c1.command_id.starts_with("cfg_"));
     assert!(config_of(&app.report(&key, device(Some(1))).await).is_none(), "current");
 
-    // The public URL changes: a new endpoint, on the next report.
+    // A public URL alone isn't a collar address.
     app.ctx.update_settings(&json!({"server": {"public_url": "https://farm.example.com"}})).await.unwrap();
+    assert!(config_of(&app.report(&key, device(Some(1))).await).is_none(), "still current");
+    // The collar address is set: a new endpoint, on the next report.
+    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com"}})).await.unwrap();
     let c2 = config_of(&app.report(&key, device(Some(1))).await).unwrap();
     assert_eq!((c2.version, c2.endpoint.as_deref()), (2, Some("https://farm.example.com/collar/v1")));
 
@@ -660,8 +664,10 @@ async fn an_escape_alone_opens_a_fast_window() {
     app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
     let before = app.slots(&id).await["config"].clone();
     assert!(before.get("fast_until").is_none(), "{before}");
-    app.report(&key, json!({"fixes": [fix_at(m_at(150.0, 230.0), now + Duration::seconds(5))]})).await;
-    op_ingest::escapes::scan(&app.ctx, now + Duration::seconds(70)).await.unwrap();
+    // Walked out a minute later, two fixes out.
+    let out = [fix_at(m_at(150.0, 230.0), now + Duration::seconds(60)), fix_at(m_at(150.0, 231.0), now + Duration::seconds(90))];
+    app.report(&key, json!({ "fixes": out })).await;
+    op_ingest::escapes::scan(&app.ctx, now + Duration::seconds(125)).await.unwrap();
     let after = app.slots(&id).await["config"].clone();
     assert_eq!(after["version"].as_u64(), Some(before["version"].as_u64().unwrap() + 1));
     assert!(after["fast_until"].is_string());
@@ -852,7 +858,7 @@ async fn the_new_herds_boundary_refused_before_the_herd_change_arrived_is_offere
     app.call("PATCH", &format!("/api/collars/{}", fw.id), Some(json!({"herd_id": b}))).await;
     // It polls before it reports, so before its config names herd B.
     let refused = fw.poll(&app, now).await.expect("B's boundary");
-    assert_eq!((refused.status, refused.code), (op_protocol::AckStatus::Rejected, Some(op_protocol::RejectCode::WrongHerd)));
+    assert_eq!((refused.status, refused.code), (op_protocol::AckStatus::Rejected.into(), Some(op_protocol::RejectCode::WrongHerd)));
     // Its reports bring the config naming B, and then B's fence.
     fw.sync(&app, now).await;
     assert_eq!(fw.store.active().unwrap().cmd.herd_id.as_deref(), Some(b.as_str()));
@@ -903,8 +909,10 @@ async fn a_collar_that_lost_its_boundary_in_effect_gets_it_again_above_the_stage
 
 /// An animal of `herd` out at `(x, y)` for a minute: the escape scan's pen, if any.
 async fn out_a_minute(app: &App, herd: &str, (id, key): &(String, String), x: f64, y: f64) -> Option<BoundaryCommand> {
-    let t = Utc::now();
-    app.report(key, json!({"fixes": [fix_at(m_at(x, y), t)]})).await;
+    // Two fixes out, a minute after its last (a pen needs a believable walk out, not a jump).
+    let last: Option<i64> = sqlx::query_scalar("SELECT MAX(t) FROM fixes WHERE collar_id = ?").bind(id).fetch_one(app.ctx.db()).await.unwrap();
+    let t = last.map_or_else(Utc::now, |ms| op_core::time::from_unix_ms(ms) + Duration::seconds(60)).max(Utc::now());
+    app.report(key, json!({"fixes": [fix_at(m_at(x, y), t), fix_at(m_at(x, y + 1.0), t + Duration::seconds(30))]})).await;
     op_ingest::escapes::scan(&app.ctx, t + Duration::seconds(61)).await.unwrap();
     let pen = app.download(key, "have=1&free=15").await;
     let open = app.status(herd).await["escapes"].as_array().map_or(0, |e| e.iter().filter(|e| e["collar_id"] == json!(id)).count());

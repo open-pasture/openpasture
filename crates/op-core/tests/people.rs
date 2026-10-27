@@ -282,20 +282,18 @@ async fn the_owner_acts_as_the_owner_person() {
 }
 
 #[tokio::test]
-async fn the_app_token_is_the_owners_to_see() {
+async fn no_read_shows_the_app_token() {
     let (_dir, ctx) = ctx().await;
-    let token = ctx.settings().await.unwrap().server.app_token;
-    for (id, shown) in
-        [(owner(), true), (as_role(Role::Owner), true), (as_role(Role::Manager), false), (as_role(Role::Hand), false), (as_role(Role::Viewer), false)]
-    {
+    for id in [owner(), as_role(Role::Owner), as_role(Role::Manager), as_role(Role::Hand), as_role(Role::Viewer)] {
         let app = app(&ctx, id.clone());
         let (_, s) = call(&app, "GET", "/api/settings", None).await;
         let (_, st) = call(&app, "GET", "/api/state", None).await;
-        let want = if shown { token.as_str() } else { "" };
-        assert_eq!(s["server"]["app_token"], want, "{id:?} settings");
-        assert_eq!(st["settings"]["server"]["app_token"], want, "{id:?} state");
+        assert_eq!(s["server"]["app_token"], "", "{id:?} settings");
+        assert_eq!(st["settings"]["server"]["app_token"], "", "{id:?} state");
         assert_eq!(s["server"]["port"], 7878, "the rest stays");
     }
+    // The owner reveals it on purpose (op-server); it stays in the settings.
+    assert!(ctx.settings().await.unwrap().server.app_token.len() >= 16);
 }
 
 #[tokio::test]

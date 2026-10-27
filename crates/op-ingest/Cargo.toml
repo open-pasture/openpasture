@@ -10,6 +10,8 @@ repository.workspace = true
 op-core.workspace = true
 op-protocol.workspace = true
 op-geo.workspace = true
+# The herd network's uplink hook (op-fleet depends on op-core alone).
+op-fleet.workspace = true
 axum.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

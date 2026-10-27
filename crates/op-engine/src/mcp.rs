@@ -34,10 +34,11 @@ pub struct Caller {
     pub scope: ToolScope,
 }
 
-/// A registry tool as MCP shows it.
-pub fn to_mcp(t: &ToolSpec) -> Tool {
+/// A registry tool as MCP shows it on `ctx`'s farm: write tools carry the farm's rules.
+pub fn to_mcp(ctx: &Ctx, t: &ToolSpec) -> Tool {
     let schema = Arc::new(t.input_schema.as_object().cloned().unwrap_or_default());
-    let mut tool = Tool::new(t.name, t.description, schema);
+    let description = if t.read { t.description.to_owned() } else { format!("{}{}", t.description, crate::rules::description_tail(ctx)) };
+    let mut tool = Tool::new(t.name, description, schema);
     tool.annotations = Some(if t.read { ToolAnnotations::new().read_only(true) } else { ToolAnnotations::new().read_only(false).destructive(false) });
     tool
 }
@@ -45,7 +46,7 @@ pub fn to_mcp(t: &ToolSpec) -> Tool {
 /// Every registered tool, as MCP shows it.
 pub fn tools(ctx: &Ctx) -> Vec<Tool> {
     crate::tools::register_tools(ctx);
-    ctx.tools().list().iter().map(to_mcp).collect()
+    ctx.tools().list().iter().map(|t| to_mcp(ctx, t)).collect()
 }
 
 #[derive(Clone)]
@@ -60,7 +61,7 @@ impl Server {
 
     /// What `caller` may list.
     pub fn listed(&self, caller: &Caller) -> Vec<Tool> {
-        self.ctx.tools().listed_for(&caller.identity, &caller.scope).iter().map(to_mcp).collect()
+        self.ctx.tools().listed_for(&caller.identity, &caller.scope).iter().map(|t| to_mcp(&self.ctx, t)).collect()
     }
 }
 
@@ -79,7 +80,7 @@ impl ServerHandler for Server {
         imp.title = Some("openpasture".into());
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(imp)
-            .with_instructions("Farm tools for openpasture: the farm, paddocks, herds, collar positions, boundaries, grazing signals, land reports, knowledge and decisions. Every boundary comes from a recorded decision and the herd's autonomy setting.")
+            .with_instructions("Farm tools for openpasture: the farm, paddocks, herds, collar positions, boundaries, grazing signals, land reports, knowledge and decisions. Every boundary comes from a recorded decision and the herd's autonomy setting, and passes the server's safety gate. Follow the farm's own rules (list_farm_rules) and keep out of its no-go zones (list_features).")
     }
 
     // Claude Code 2.1 negotiates the stateless 2026-07-28 revision through
@@ -160,9 +161,9 @@ fn service(ctx: &Ctx) -> StreamableHttpService<Server, LocalSessionManager> {
 }
 
 /// `/mcp`: resolve the caller from the guard's [`Identity`] (500 without
-/// one) and hand the request to rmcp's streamable HTTP service.
-/// `?scope=brain` narrows any caller to the brain: [`Identity::brain`] with a
-/// brain token's allowlist, else the registry's brain tools.
+/// one) and hand the request to rmcp's streamable HTTP service. A brain
+/// token is [`Identity::brain`] with its allowlist; `?scope=brain` narrows
+/// any other caller to the registry's brain tools, under their own role.
 pub async fn handler(State(ctx): State<Ctx>, mut req: Request) -> Response {
     let Some(identity) = req.extensions().get::<Identity>().cloned() else {
         return ApiError::internal("Identity missing").into_response();
@@ -170,10 +171,12 @@ pub async fn handler(State(ctx): State<Ctx>, mut req: Request) -> Response {
     crate::tools::register_tools(&ctx);
     let brain_scope = req.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "scope=brain"));
     let token_scope = req.extensions().get::<ToolScope>().cloned();
-    let caller = if brain_scope {
-        Caller { identity: Identity::brain(), scope: token_scope.unwrap_or_else(|| ToolScope::Only(ctx.tools().brain_tools())) }
-    } else {
-        Caller { identity, scope: token_scope.unwrap_or(ToolScope::Full) }
+    // Only a brain token is the brain; anyone else asking for the brain's
+    // scope keeps their own identity (and role) over the brain's tools.
+    let caller = match (identity.via, token_scope) {
+        (op_core::Via::Brain, Some(scope)) => Caller { identity, scope },
+        (_, _) if brain_scope => Caller { identity, scope: ToolScope::Only(ctx.tools().brain_tools()) },
+        (_, scope) => Caller { identity, scope: scope.unwrap_or(ToolScope::Full) },
     };
     req.extensions_mut().insert(caller);
     let svc = service(&ctx);

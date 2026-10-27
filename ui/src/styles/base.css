@@ -95,3 +95,8 @@ select.input{appearance:none;width:auto;padding-right:1.8rem;background-image:li
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 @keyframes pop{from{opacity:0;transform:scale(.97) translateY(-2px)}to{opacity:1;transform:none}}
+/* A failed write, in place (shell/ActionError.tsx). */
+.acterr{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;margin:6px 0 0;font-size:12px;line-height:1.4;color:var(--red)}
+.acterr-retry{all:unset;cursor:pointer;color:var(--fg2);text-decoration:underline;text-underline-offset:2px}
+.acterr-retry:hover{color:var(--fg)}
+.acterr-retry:disabled{opacity:.5;cursor:default}

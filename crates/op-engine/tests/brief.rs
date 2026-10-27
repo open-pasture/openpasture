@@ -539,6 +539,8 @@ async fn a_question_reads_the_brief_through_the_real_tools() {
     expected.push("get_morning_brief");
     // @F: the pre-send check is a read tool too.
     expected.push("check_boundary");
+    // The farm's rules are read too.
+    expected.push("list_farm_rules");
     // @S: the schedule is a read tool too; schedule_strips (a write) is never offered.
     expected.push("get_schedule");
     assert_eq!(offered, expected, "the read tools, never run_sql or propose_boundary");

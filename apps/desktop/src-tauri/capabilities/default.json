@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The bundled loading page. The UI itself is served by the embedded server; its only IPC is in server-ui.json.",
+  "description": "The bundled loading page. The UI itself is served by the embedded server; once it is up, lib.rs grants that origin (and no other port) the update commands as the server-ui capability.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

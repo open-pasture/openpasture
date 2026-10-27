@@ -12,10 +12,12 @@ use crate::brief::BriefRegistry;
 use crate::domain::Settings;
 use crate::event::Event;
 use crate::identity::Identity;
+use crate::instance::{self, DirLock};
 use crate::secrets::Secrets;
 use crate::store::Store;
+use crate::tasks::Tasks;
 use crate::tools::{RegistryRunner, ToolRegistry, ToolRunner};
-use crate::{keys, patch, settings};
+use crate::{keys, settings};
 
 /// Everything a crate needs, cheap to clone. Handlers get it as
 /// `State(ctx): State<Ctx>`.
@@ -40,6 +42,11 @@ struct Inner {
     tools: ToolRegistry,
     /// Lines other crates add to the morning brief.
     brief_lines: BriefRegistry,
+    /// Supervised background jobs.
+    tasks: Tasks,
+    /// The data dir's lock, held while this `Ctx` (or a later one in this
+    /// process that took it over) lives.
+    _lock: Arc<DirLock>,
 }
 
 /// Room for bursts of collar reports before a slow `/api/live` client lags.
@@ -73,18 +80,21 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 impl Ctx {
-    /// Open the data directory: database (with migrations), secrets, server
+    /// Open the data directory: take its lock (one server per data dir, see
+    /// [`instance`]), then the database (with migrations), secrets, server
     /// key and settings (created with defaults on first run).
     pub async fn open(data_dir: impl Into<PathBuf>) -> anyhow::Result<Ctx> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let lock = instance::acquire(&data_dir, Box::new(move || !*shutdown_rx.borrow()))?;
+        instance::write_server_file(&data_dir, &instance::this_process())?;
         let store = Store::open(&data_dir).await?;
-        // @X1 paddock areas stored before op-geo measured rings whichever way they wind.
+        // Paddock areas stored before op-geo measured rings whichever way they wind.
         crate::area_repair::repair_paddock_areas(store.pool()).await?;
         let signing_key = keys::load_or_create(&data_dir)?;
         let secrets = Secrets::new(&data_dir);
         let (events, _) = broadcast::channel(EVENT_BUS_CAPACITY);
-        let (shutdown, _) = watch::channel(false);
         let ctx = Ctx(Arc::new(Inner {
             store,
             events,
@@ -97,6 +107,8 @@ impl Ctx {
             scheduler_wake: tokio::sync::Notify::new(),
             tools: ToolRegistry::default(),
             brief_lines: BriefRegistry::default(),
+            tasks: Tasks::default(),
+            _lock: lock,
         }));
         let s = ctx.settings().await?;
         ctx.set_local_url(format!("http://127.0.0.1:{}", s.server.port));
@@ -170,21 +182,22 @@ impl Ctx {
     }
 
     /// Current settings. Created with defaults (and a fresh app token) the
-    /// first time.
+    /// first time. Stored settings that can't be read are an error, never
+    /// replaced: replacing them would mint a new app token and lock out every
+    /// phone and integration (see [`settings::repair`]).
     pub async fn settings(&self) -> anyhow::Result<Settings> {
-        let store = self.store();
-        if let Some(v) = store.get_setting_json(settings::KEY).await? {
-            // Fill fields added after the row was written from the defaults.
-            let mut full = serde_json::to_value(Settings::default())?;
-            patch::merge(&mut full, &v);
-            if let Ok(s) = serde_json::from_value::<Settings>(full) {
-                return Ok(s);
-            }
-            tracing::warn!("stored settings are unreadable; resetting to defaults");
+        let read = || sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?").bind(settings::KEY).fetch_optional(self.db());
+        if let Some(raw) = read().await? {
+            return settings::parse_stored(&raw);
         }
-        let s = Settings::default();
-        store.set_setting(settings::KEY, &s).await?;
-        Ok(s)
+        // Two first reads at once keep the same token: the second insert does nothing.
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
+            .bind(settings::KEY)
+            .bind(serde_json::to_string(&Settings::default())?)
+            .execute(self.db())
+            .await?;
+        let raw = read().await?.context("settings row missing after insert")?;
+        settings::parse_stored(&raw)
     }
 
     pub async fn save_settings(&self, s: &Settings) -> anyhow::Result<()> {
@@ -201,14 +214,10 @@ impl Ctx {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT value FROM settings WHERE key = ?").bind(settings::KEY).fetch_optional(&mut *tx).await.map_err(anyhow::Error::from)?;
         let current = match row {
-            Some((v,)) => {
-                let mut full = serde_json::to_value(Settings::default()).map_err(anyhow::Error::from)?;
-                patch::merge(&mut full, &serde_json::from_str(&v).map_err(anyhow::Error::from)?);
-                serde_json::from_value::<Settings>(full).map_err(anyhow::Error::from)?
-            }
+            Some((v,)) => settings::parse_stored(&v)?,
             None => Settings::default(),
         };
-        let next: Settings = patch::apply(&current, partial, &[])?;
+        let next: Settings = crate::patch::apply(&current, partial, &[])?;
         settings::validate(&next).map_err(crate::ApiError::bad_request)?;
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(settings::KEY)
@@ -266,6 +275,11 @@ impl Ctx {
     /// Resolves when [`Ctx::wake_scheduler`] is called. For the scheduler loop.
     pub async fn scheduler_woken(&self) {
         self.0.scheduler_wake.notified().await;
+    }
+
+    /// The supervised background jobs (see [`Ctx::supervise`]).
+    pub fn tasks(&self) -> &Tasks {
+        &self.0.tasks
     }
 
     /// Ask background tasks to stop. Called by the server on shutdown.

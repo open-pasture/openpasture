@@ -2,14 +2,14 @@
 //! command, carried in the reply to its report.
 //!
 //! A collar's config is worked out from the farm's state: its herd, the
-//! endpoint (`server.public_url` when it is `https://`), the report and poll
+//! endpoint (the collar address, `server.collar_url`), the report and poll
 //! cadence from the `collars.config` setting, and a fast window while its
 //! herd's move sweeps or its own escape runs. When that differs from the
-//! stored one it gets a new version: on a herd change, a public URL change,
+//! stored one it gets a new version: on a herd change, a collar address change,
 //! a move or escape starting (and running on past its fast window), and a
 //! change to `collars.config`. The routes that cause those refresh the
 //! affected collars at once; every report from a collar with the `config`
-//! cap checks again, so nothing is missed (a public URL change shows up on
+//! cap checks again, so nothing is missed (a collar address change shows up on
 //! the next report).
 //!
 //! A collar reports the version it holds (`device.config_version`) and gets
@@ -91,12 +91,24 @@ async fn put_config(State(ctx): State<Ctx>, ApiJson(body): ApiJson<CollarsConfig
     Ok(Json(body))
 }
 
-/// Where collars should report: the public URL, only when it is `https://`
-/// (a collar refuses anything else). `None` keeps the one it has.
-fn endpoint(ctx: &Ctx) -> Option<String> {
-    let base = ctx.base_url();
-    let e = format!("{base}/collar/v1");
-    (base.starts_with("https://") && e.len() <= MAX_ENDPOINT_BYTES).then_some(e)
+/// Why a collar gets no endpoint: there is no collar address yet.
+pub const NO_COLLAR_ADDRESS: &str =
+    "Collars need an https address that reaches this server, and this one has none yet. Set the collar address in Settings, Server.";
+
+/// Where collars reach this server: the collar address (`server.collar_url`)
+/// plus `/collar/v1`. Never this machine's own URL: a collar can't reach
+/// loopback and talks only to https. `None` until a collar address is set
+/// (configs then keep the endpoint a collar has; links and cards say why,
+/// [`NO_COLLAR_ADDRESS`]).
+pub async fn collar_endpoint(ctx: &Ctx) -> anyhow::Result<Option<String>> {
+    let url = ctx.settings().await?.server.collar_url;
+    Ok(url.filter(|u| op_core::settings::collar_url_problem(u).is_none()).map(|u| format!("{}/collar/v1", u.trim_end_matches('/'))).filter(|e| e.len() <= MAX_ENDPOINT_BYTES))
+}
+
+/// A new collar address goes into every collar that takes configs, now (or
+/// on its next report if that fails).
+pub async fn collar_address_changed(ctx: &Ctx) {
+    refresh_quietly(ctx, Scope::All).await;
 }
 
 /// When the fast window should reach at least, for something `remaining_m`
@@ -256,7 +268,7 @@ pub(crate) struct Inputs {
 
 impl Inputs {
     pub async fn read(ctx: &Ctx) -> anyhow::Result<Self> {
-        Ok(Self { cadence: load(ctx).await?, endpoint: endpoint(ctx) })
+        Ok(Self { cadence: load(ctx).await?, endpoint: collar_endpoint(ctx).await? })
     }
 
     /// `d` for one collar, given its herd's running move and its own open escape.

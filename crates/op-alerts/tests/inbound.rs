@@ -197,12 +197,14 @@ fn form<'a>(sid: &'a str, from: &'a str, body: &'a str) -> Vec<(&'a str, &'a str
 async fn the_webhook_takes_only_what_twilio_signed_over_the_public_url() {
     let t = farm().await;
     let ctx = t.ctx();
-    let (dec, _) = proposal(&t, &t.f.herd).await;
+    let (dec, code) = proposal(&t, &t.f.herd).await;
     asked(&t, MIA, mins(5), &dec).await;
     let path = "/hooks/twilio/sms?farm=cows";
     let signed_url = "https://farm.example/hooks/twilio/sms?farm=cows";
     let s1 = sid();
-    let params = form(&s1, MIA, "Y");
+    // Approving needs the decision's code.
+    let yes = format!("Y {code}");
+    let params = form(&s1, MIA, &yes);
     let good = twilio_sig(TOKEN, signed_url, &params);
 
     // No public URL yet: texts come in by polling, the webhook refuses.
@@ -255,7 +257,9 @@ async fn the_webhook_takes_only_what_twilio_signed_over_the_public_url() {
     let sig3 = twilio_sig(TOKEN, "https://farm.example/hooks/twilio/whatsapp", &p3);
     assert_eq!(hook(ctx, "/hooks/twilio/whatsapp", "farm.example", &p3, Some(&sig3)).await.0, StatusCode::NO_CONTENT);
     let r = replies_to(ctx, CODY).await;
-    assert_eq!(r.iter().map(|m| m.channel.as_str()).collect::<Vec<_>>(), ["sms", "whatsapp"]);
+    // Cody, the owner, was told of Mia's approval by text first.
+    assert!(r[0].text.starts_with(&format!("Mia approved by text from {MIA}: Cows: move to P2")), "{}", r[0].text);
+    assert_eq!(r.iter().map(|m| m.channel.as_str()).collect::<Vec<_>>(), ["sms", "sms", "whatsapp"]);
     // Another Twilio account's request, even correctly signed: no.
     let s4 = sid();
     let mut p4 = form(&s4, CODY, "status");
@@ -313,12 +317,13 @@ async fn polling_takes_a_y_from_twilio_once_without_a_public_url() {
     let (s, v) = call(&notify_support::app(ctx), "PUT", "/api/notify/channels", Some(json!({"twilio_api_base": list.url}))).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(inbound::mode(ctx).await.unwrap(), inbound::Mode::Polling);
-    let (dec, _) = proposal(&t, &t.f.herd).await;
+    let (dec, code) = proposal(&t, &t.f.herd).await;
     asked(&t, MIA, mins(5), &dec).await;
+    let yes = format!("Y {code}");
 
     // Yesterday's "Y" (before checking began) is never acted on.
     let start = now();
-    list.add(&sid(), MIA, "Y", start - Duration::hours(3), "inbound");
+    list.add(&sid(), MIA, &yes, start - Duration::hours(3), "inbound");
     assert_eq!(inbound::poll::run_once(ctx, start).await.unwrap(), 0);
     assert_eq!(decision_status(ctx, &dec).await.0, "proposed");
     let (path, query, auth) = list.queries.lock().unwrap()[0].clone();
@@ -331,7 +336,7 @@ async fn polling_takes_a_y_from_twilio_once_without_a_public_url() {
 
     // A new "Y", one of our own outbound texts in the list, and a stranger.
     let y = sid();
-    list.add(&y, MIA, "Y", start + Duration::seconds(5), "inbound");
+    list.add(&y, MIA, &yes, start + Duration::seconds(5), "inbound");
     list.add(&sid(), FROM, "Cows: move to P2?", start + Duration::seconds(6), "outbound-api");
     list.add(&sid(), "+15005550006", "hello", start + Duration::seconds(7), "inbound");
     assert_eq!(inbound::poll::run_once(ctx, start + Duration::seconds(10)).await.unwrap(), 2);
@@ -405,8 +410,11 @@ async fn each_command_answers_in_words_and_roles_are_kept() {
     assert!(again[0].text.contains("Reply Y or N") && again[0].text.ends_with(&format!("Code {code}")), "{}", again[0].text);
     assert!(op_alerts::inbound::reminders::run_due(ctx, now() + mins(90)).await.unwrap().is_empty());
 
-    // Sí approves, as the manager, by text.
-    assert_eq!(reply(&t, MIA, "Sí").await, "Approved. Cows moving to P2.");
+    // A bare Sí gets the code back; Sí and the code approves, as the manager, by text.
+    let bare = reply(&t, MIA, "Sí").await;
+    assert!(bare.starts_with(&format!("To approve, reply Y {code}. Cows: move to P2")), "{bare}");
+    assert_eq!(decision_status(ctx, &dec).await.0, "proposed");
+    assert_eq!(reply(&t, MIA, &format!("Sí {code}")).await, "Approved. Cows moving to P2.");
     let (status, inputs) = decision_status(ctx, &dec).await;
     assert_eq!(status, "applied");
     assert_eq!(inputs["farmer_response"]["action"], "approve");
@@ -555,9 +563,9 @@ async fn a_bare_y_answers_only_the_decision_its_text_asked_about() {
     assert_eq!(decision_status(ctx, &p2).await.0, "superseded");
     let asking = reply_sent(ctx, MIA).await;
     assert_eq!(asking.decision_id.as_deref(), Some(p3.as_str()));
-    // Now she has seen P3: her next Y answers it.
-    assert_eq!(reply(&t, MIA, "y").await, "Approved. Cows moving to P3.");
-    assert_eq!(decision_status(ctx, &p3).await.0, "applied");
+    // Now she has seen P3: her next Y is about it, but P3 was never texted with a code, so only the app approves it.
+    assert_eq!(reply(&t, MIA, "y").await, "Cows: move to P3 has no code to approve by text. Approve it in the app, or reply N.");
+    assert_eq!(decision_status(ctx, &p3).await.0, "proposed");
 
     // Another herd's proposal that was never texted to her.
     let t = farm().await;
@@ -593,13 +601,15 @@ async fn a_bare_y_after_texts_about_two_waiting_decisions_gets_the_list() {
     let heifers = h["id"].as_str().unwrap().to_owned();
     // Both herds' decision texts reached Mia (or both herds' briefs at 06:30).
     let (cows, cows_code) = proposal(&t, &t.f.herd).await;
-    let (hf, _) = proposal(&t, &heifers).await;
+    let (hf, hf_code) = proposal(&t, &heifers).await;
     asked(&t, MIA, mins(12), &cows).await;
     asked(&t, MIA, mins(10), &hf).await;
     // Her bare "y" could mean either: nothing is decided, she gets the numbered list.
     assert_eq!(reply(&t, MIA, "y").await, "2 decisions waiting. 1. Cows: move to P2. 2. Heifers: move to P2. Reply Y or N and the number, like Y 1.");
     assert_eq!((decision_status(ctx, &cows).await.0, decision_status(ctx, &hf).await.0), ("proposed".into(), "proposed".into()));
-    assert_eq!(reply(&t, MIA, "y 2").await, "Approved. Heifers moving to P2.");
+    // A list number names it; approving it still needs its code.
+    assert!(reply(&t, MIA, "y 2").await.starts_with(&format!("To approve, reply Y {hf_code}. Heifers: move to P2")));
+    assert_eq!(reply(&t, MIA, &format!("y {hf_code}")).await, "Approved. Heifers moving to P2.");
     assert_eq!(decision_status(ctx, &cows).await.0, "proposed");
     // A second bare "n" (a resent text, or meant for the Heifers) still decides nothing: it names the Cows' decision with its code.
     let r = reply(&t, MIA, "n").await;

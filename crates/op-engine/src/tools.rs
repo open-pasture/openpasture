@@ -55,7 +55,7 @@ pub fn specs() -> Vec<ToolSpec> {
         brain_read("list_paddocks", "Every paddock: id, name, status, area in hectares, GeoJSON geometry, notes, last grazed.", schema(json!({}), &[])),
         brain_read(
             "get_herd",
-            "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars.",
+            "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars. A collar with simulated: true is run by the simulator, not worn by an animal.",
             schema(json!({ "herd_id": herd_prop() }), &[]),
         ),
         brain_read("get_herd_positions", "Latest fix and fence state for each collar in the herd.", schema(json!({ "herd_id": herd_prop() }), &[])),
@@ -91,20 +91,25 @@ pub fn specs() -> Vec<ToolSpec> {
             schema(json!({ "herd_id": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }), &[]),
         ),
         brain_read("get_decision", "One decision by id.", schema(json!({ "decision_id": { "type": "string" } }), &["decision_id"])),
-        brain_read(
-            "run_sql",
-            "Read-only SQL over fixes, cues, acks, boundaries, decisions, collars, animals, paddocks, herds. Times: `t` is unix ms.",
-            schema(json!({ "query": { "type": "string" }, "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000 } }), &["query"]),
-        ),
+        // A manager's, as `POST /api/sql` is; a brain run gets it with its token.
+        ToolSpec {
+            min_role: Role::Manager,
+            ..brain_read(
+                "run_sql",
+                "Read-only SQL over fixes, cues, acks, boundaries, decisions, collars, animals, paddocks, herds. Times: `t` is unix ms.",
+                schema(json!({ "query": { "type": "string" }, "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000 } }), &["query"]),
+            )
+        },
         ToolSpec {
             name: "propose_boundary",
-            description: "Propose moving a herd: a paddock, a GeoJSON Polygon boundary, or both, with plain reasons. Recorded as a decision; the herd's autonomy decides whether it waits for the farmer, runs on a timer, or goes to the collars now.",
+            description: "Propose moving a herd: a paddock, a GeoJSON Polygon boundary, or both, with plain reasons and how it follows the farm's rules (list_farm_rules). Recorded as a decision; the herd's autonomy decides whether it waits for the farmer, runs on a timer, or goes to the collars now, but only when the safety gate and the rule review find nothing: otherwise it waits for the farmer with the reasons.",
             input_schema: schema(
                 json!({
                     "herd_id": herd_prop(),
                     "to_paddock_id": { "type": "string", "description": "Paddock to move to. Its shape is the boundary unless geometry is given." },
-                    "geometry": { "type": "object", "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners." },
+                    "geometry": { "type": "object", "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners. Never across a road or the farm boundary, never into a no-go zone." },
                     "reasoning": { "type": "string", "description": "Two to four short lines, each a reason tied to a fact." },
+                    "rules": { "type": "string", "description": "How the proposal follows each farm rule. Without it, it never goes to the collars on its own." },
                     "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
                 }),
                 &["reasoning"],
@@ -133,6 +138,7 @@ pub fn specs() -> Vec<ToolSpec> {
         // @C
         // @F
         crate::presend::tool(),
+        crate::rules::tool(),
         // @S
         crate::schedules::get_schedule_spec(),
         crate::schedules::schedule_strips_spec(),
@@ -262,7 +268,7 @@ async fn propose(ctx: &Ctx, a: &Value, client: Option<String>, by: op_core::Acto
         reasoning: Some(reasoning),
         confidence: a.get("confidence").and_then(Value::as_f64).map(|c| c.clamp(0.0, 1.0)),
         need: None,
-        inputs: json!({ "via": "mcp", "by": by, "from_paddock_id": current, "position_source": source }),
+        inputs: json!({ "via": "mcp", "by": by, "from_paddock_id": current, "position_source": source, "rules": arg_str(a, "rules") }),
         apply_at: None,
         boundary_id: None,
         error: None,
@@ -275,7 +281,13 @@ async fn propose(ctx: &Ctx, a: &Value, client: Option<String>, by: op_core::Acto
     let message = match (d.status, d.apply_at) {
         (DecisionStatus::Failed, _) => format!("Not recorded as a move: {}", d.error.clone().unwrap_or_default()),
         (DecisionStatus::Proposed, Some(at)) => format!("Proposed. It goes to the collars at {} unless the farmer stops it.", time::to_db(&at)),
-        (DecisionStatus::Proposed, None) => "Proposed. It waits for the farmer to approve, change, or reject it.".into(),
+        (DecisionStatus::Proposed, None) => match d.inputs["review"]["reasons"].as_array().filter(|r| !r.is_empty()) {
+            Some(r) => format!(
+                "Proposed. It waits for the farmer to approve, change, or reject it: {}",
+                r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")
+            ),
+            None => "Proposed. It waits for the farmer to approve, change, or reject it.".into(),
+        },
         (DecisionStatus::Applied, _) => "Move started (the herd is on auto): the collars get the target, or a sweep of boundaries that walks the herd into it. Check get_boundary_status for the move and acks.".into(),
         (s, _) => format!("Decision is {}.", op_core::DbEnum::as_db(&s)),
     };

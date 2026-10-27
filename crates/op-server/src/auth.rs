@@ -1,65 +1,70 @@
 //! Who may use the app API and MCP.
 //!
-//! A request is *local* only when it comes from this machine (loopback peer),
-//! names this machine in `Host` (127.0.0.1, localhost or [::1], any port), and
-//! carries no proxy forwarding headers. Tunnels (cloudflared, Tailscale Funnel)
-//! connect from loopback too, but they keep the public Host and add forwarding
-//! headers, so their traffic is never local. Everything that isn't local needs
-//! `Authorization: Bearer <app token>` (or `?token=` for the WebSocket). A
-//! brain gets a short-lived token that only opens `/mcp?scope=brain`.
+//! Every `/api` and `/mcp` request names who it is with a token in
+//! `Authorization: Bearer …`. Where a request comes from grants nothing: a
+//! reverse proxy on this machine (nginx's default `proxy_pass` rewrites
+//! `Host` and adds no forwarding headers) makes every internet request look
+//! local, so being local is no credential. The owner on this machine signs
+//! in with a one-time code instead (the desktop app's launch, the URL
+//! `openpasture serve` prints; [`crate::session`]).
 //!
-//! Local requests carry ambient authority, so a browser page from another
-//! origin must not use it: unsafe methods and the WebSocket upgrade are refused
-//! when `Origin` is another site. Requests with a valid token don't depend on
-//! ambient authority and skip that check.
+//! The tokens:
+//! - the app token (`openpasture token`; revealed only on purpose): the owner, `app_token`;
+//! - an owner session (`opo_…`, from a one-time code): the owner, `local`;
+//! - a person's own token (`opu_…`, from a sign-in link): that person, with their role;
+//! - a brain run's token (`opb_…`): only `/mcp?scope=brain`, read tools only;
+//! - a factory station's token (op-fleet): its own routes.
+//!
+//! Sign-ins run out ([`op_core::people::TOKEN_IDLE_DAYS`] unused,
+//! [`op_core::people::TOKEN_MAX_DAYS`] old). A token in the query string
+//! (`?token=`) only counts on the two routes a browser or an MCP client
+//! can't give headers to: the `/api/live` WebSocket (which also takes it as a
+//! `Sec-WebSocket-Protocol` value, see [`crate::live`]) and `/mcp`. Anywhere
+//! else it would end up in proxy and access logs.
+//!
+//! A peer that sends [`AUTH_FAILURES_PER_MINUTE`] wrong tokens in a minute
+//! gets 429 until the minute is up.
 //!
 //! Collar endpoints (`/collar/v1`) use collar keys (op-ingest); `/v1/decide`
-//! uses hosted keys (op-brain).
+//! uses hosted keys (op-brain). Everything outside `/api` and `/mcp` is
+//! anonymous here (those endpoints authenticate themselves).
 //!
-//! Every request leaves the guard with an [`Identity`] in its extensions:
-//! the app token and local requests are the owner (`app_token` / `local`), a
-//! brain token is [`Identity::brain`] with its tool allowlist as a
-//! [`ToolScope`], and everything outside `/api` and `/mcp` is anonymous
-//! (those endpoints authenticate themselves).
-//!
-//! A person's own token (`opu_…`, from a sign-in link) is that person, with
-//! their role; a revoked or unknown one is 401 even from this machine. The app
-//! token and local requests act as the owner person when the owner added
-//! themselves to People. Every identity then passes [`crate::policy`]: a role
-//! too low for the request is 403. Accepting a sign-in link needs no token and
-//! is limited to a few tries a minute per peer.
+//! The owner acts as the owner person when they added themselves to People.
+//! Every identity then passes [`crate::policy`]: a role too low for the
+//! request is 403. The few requests that need no sign-in (accepting a
+//! sign-in link, trading a one-time code) are limited to a few tries a
+//! minute per peer.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use op_core::people::{self, SessionToken};
 use op_core::tools::ToolScope;
 use op_core::{ApiError, Ctx, Identity, Via};
 
-use crate::policy;
+use crate::{policy, session};
 
 /// Origins of the Vite dev server, allowed when dev CORS is on.
 pub const DEV_ORIGINS: [&str; 2] = ["http://localhost:5173", "http://127.0.0.1:5173"];
-
-/// Headers a reverse proxy or tunnel adds. Any of them means "not local".
-const FORWARDING_HEADERS: [&str; 6] = ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "cf-connecting-ip", "x-real-ip"];
+/// Wrong tokens one peer may send in a minute.
+pub const AUTH_FAILURES_PER_MINUTE: usize = 30;
 
 #[derive(Clone)]
 pub struct AuthState {
     pub ctx: Ctx,
-    /// Also accept the Vite dev origins.
-    pub dev: bool,
     /// Requests that need no sign-in (accepting a sign-in link), per peer.
     pub open: Arc<policy::RateLimit>,
+    /// Wrong tokens, per peer.
+    pub failed: Arc<policy::RateLimit>,
 }
 
 impl AuthState {
-    pub fn new(ctx: Ctx, dev: bool) -> Self {
-        Self { ctx, dev, open: Arc::default() }
+    pub fn new(ctx: Ctx) -> Self {
+        Self { ctx, open: Arc::default(), failed: Arc::new(policy::RateLimit::new(AUTH_FAILURES_PER_MINUTE)) }
     }
 }
 
@@ -67,52 +72,9 @@ fn protected(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/mcp" || path.starts_with("/mcp/")
 }
 
-/// Host without the port, lowercased. `[::1]:7878` -> `[::1]`.
-fn host_name(host: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    if host.starts_with('[') {
-        return host.split_once(']').map(|(h, _)| format!("{h}]")).unwrap_or(host);
-    }
-    host.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h.to_owned()).unwrap_or(host)
-}
-
-fn loopback_host(host: &str) -> bool {
-    matches!(host_name(host).as_str(), "127.0.0.1" | "localhost" | "[::1]")
-}
-
-/// The request came from this machine, for this machine, not through a proxy.
-pub fn is_local(peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
-    let Some(peer) = peer else { return false };
-    let peer_ip = match peer.ip() {
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
-        ip => ip,
-    };
-    if !peer_ip.is_loopback() {
-        return false;
-    }
-    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return false };
-    if !loopback_host(host) {
-        return false;
-    }
-    let proxied = headers.keys().any(|k| {
-        let k = k.as_str();
-        FORWARDING_HEADERS.contains(&k) || k.starts_with("tailscale-")
-    });
-    !proxied
-}
-
-/// `Origin` is absent (not a browser), or the same host and port as `Host`,
-/// or a dev origin when allowed.
-pub fn origin_ok(headers: &HeaderMap, dev: bool) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else { return true };
-    let Ok(origin) = origin.to_str() else { return false };
-    let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
-    if dev && DEV_ORIGINS.contains(&origin.as_str()) {
-        return true;
-    }
-    let authority = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"));
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).map(|h| h.trim().to_ascii_lowercase());
-    matches!((authority, host), (Some(a), Some(h)) if a == h)
+/// The routes a token may come in the query string on.
+fn query_token_route(path: &str) -> bool {
+    path == "/api/live" || path == "/mcp" || path.starts_with("/mcp/")
 }
 
 fn given_token(req: &Request) -> Option<String> {
@@ -121,8 +83,14 @@ fn given_token(req: &Request) -> Option<String> {
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(|v| v.trim().to_owned());
-    bearer.or_else(|| req.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token="))).map(str::to_owned))
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let query = || {
+        query_token_route(req.uri().path())
+            .then(|| req.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token="))).map(str::to_owned))
+            .flatten()
+    };
+    bearer.or_else(|| crate::live::protocol_token(req.headers())).or_else(query)
 }
 
 pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
@@ -131,53 +99,80 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
         req.extensions_mut().insert(Identity::anonymous());
         return next.run(req).await;
     }
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let peer = policy::peer_key(peer, req.headers());
     if policy::is_open(req.method(), path) {
-        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-        if !st.open.allow(policy::peer_key(peer, req.headers())) {
-            return ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many tries. Wait a minute and try again.").into_response();
+        if !st.open.allow(peer) {
+            return too_many();
         }
         req.extensions_mut().insert(Identity::anonymous());
         return next.run(req).await;
     }
+    if st.failed.full(peer) {
+        return too_many();
+    }
     let brain_scope = (path == "/mcp" || path.starts_with("/mcp/")) && req.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "scope=brain"));
 
-    if let Some(given) = given_token(&req) {
-        let app_token = match st.ctx.settings().await {
-            Ok(s) => s.server.app_token,
-            Err(e) => return ApiError::from(e).into_response(),
+    let Some(given) = given_token(&req) else {
+        return ApiError::unauthorized("Sign in first: open the sign-in link from this machine, or use a token.").into_response();
+    };
+    let app_token = match st.ctx.settings().await {
+        Ok(s) => s.server.app_token,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    if eq(given.as_bytes(), app_token.as_bytes()) {
+        let identity = people::with_owner_person(&st.ctx, Identity::owner(Via::AppToken)).await;
+        return admit(req, next, identity).await;
+    }
+    if brain_scope && let Some(tools) = st.ctx.check_brain_token(&given) {
+        req.extensions_mut().insert(ToolScope::Only(tools));
+        return admit(req, next, Identity::brain()).await;
+    }
+    if given.starts_with(session::SESSION_PREFIX) {
+        return match session::session_for_token(&st.ctx, &given).await {
+            Ok(Some(id)) => {
+                req.extensions_mut().insert(session::OwnerSession(id));
+                let identity = session::owner_identity(&st.ctx).await;
+                admit(req, next, identity).await
+            }
+            Ok(None) => failed(&st, peer, "This sign-in has run out. Open the app again, or run openpasture sign-in."),
+            Err(e) => ApiError::from(e).into_response(),
         };
-        if eq(given.as_bytes(), app_token.as_bytes()) {
-            let identity = people::with_owner_person(&st.ctx, Identity::owner(Via::AppToken)).await;
-            return admit(req, next, identity).await;
-        }
-        if brain_scope && let Some(tools) = st.ctx.check_brain_token(&given) {
-            req.extensions_mut().insert(ToolScope::Only(tools));
-            return admit(req, next, Identity::brain()).await;
-        }
-        if given.starts_with(people::TOKEN_PREFIX) {
-            return match people::session_for_token(&st.ctx, &given).await {
-                Ok(Some(session)) => {
-                    req.extensions_mut().insert(SessionToken(session.token_id));
-                    admit(req, next, session.identity).await
+    }
+    if given.starts_with(people::TOKEN_PREFIX) {
+        return match people::session_for_token(&st.ctx, &given).await {
+            Ok(Some(s)) => {
+                req.extensions_mut().insert(SessionToken(s.token_id));
+                admit(req, next, s.identity).await
+            }
+            Ok(None) => failed(&st, peer, "This sign-in no longer works. Ask the owner for a new link."),
+            Err(e) => ApiError::from(e).into_response(),
+        };
+    }
+    // A factory station's token (op-fleet): its five routes only.
+    if given.starts_with(op_fleet::stations::TOKEN_PREFIX) {
+        return match op_fleet::stations::admit(&st.ctx, &given, req.method(), req.uri().path()).await {
+            Ok(identity) => admit(req, next, identity).await,
+            Err(e) => {
+                if e.status == StatusCode::UNAUTHORIZED {
+                    st.failed.allow(peer);
                 }
-                Ok(None) => ApiError::unauthorized("This sign-in no longer works. Ask the owner for a new link.").into_response(),
-                Err(e) => ApiError::from(e).into_response(),
-            };
-        }
-        // A stale app token from the browser falls through to the local check.
+                e.into_response()
+            }
+        };
     }
+    failed(&st, peer, "Wrong token.")
+}
 
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-    if !is_local(peer, req.headers()) {
-        return ApiError::unauthorized("Missing or wrong app token.").into_response();
-    }
-    let upgrade = req.headers().get(header::UPGRADE).is_some();
-    let unsafe_method = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if (upgrade || unsafe_method) && !origin_ok(req.headers(), st.dev) {
-        return ApiError::new(StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
-    }
-    let identity = people::with_owner_person(&st.ctx, Identity::owner(Via::Local)).await;
-    admit(req, next, identity).await
+fn failed(st: &AuthState, peer: std::net::IpAddr, msg: &str) -> Response {
+    st.failed.allow(peer);
+    ApiError::unauthorized(msg).into_response()
+}
+
+fn too_many() -> Response {
+    let mut r = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many tries. Wait a minute and try again.").into_response();
+    r.headers_mut().insert(header::RETRY_AFTER, axum::http::HeaderValue::from_static("60"));
+    r
 }
 
 /// Let the identity in if its role may make this request (403 otherwise).
@@ -200,43 +195,22 @@ pub fn is_loopback(bind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::body::Body;
 
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_str(v).unwrap());
+    fn req(uri: &str, auth: Option<&str>) -> Request {
+        let mut b = axum::http::Request::builder().uri(uri);
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
         }
-        h
+        b.body(Body::empty()).unwrap()
     }
 
     #[test]
-    fn local_needs_loopback_peer_host_and_no_proxy() {
-        let lo: Option<SocketAddr> = Some("127.0.0.1:5000".parse().unwrap());
-        let lo6: Option<SocketAddr> = Some("[::1]:5000".parse().unwrap());
-        let lan: Option<SocketAddr> = Some("192.168.1.5:5000".parse().unwrap());
-        assert!(is_local(lo, &headers(&[("host", "127.0.0.1:7878")])));
-        assert!(is_local(lo, &headers(&[("host", "localhost")])));
-        assert!(is_local(lo6, &headers(&[("host", "[::1]:7878")])));
-        assert!(!is_local(None, &headers(&[("host", "127.0.0.1:7878")])));
-        assert!(!is_local(lan, &headers(&[("host", "127.0.0.1:7878")])));
-        assert!(!is_local(lo, &headers(&[])));
-        assert!(!is_local(lo, &headers(&[("host", "evil.example:7878")])), "DNS rebinding");
-        assert!(!is_local(lo, &headers(&[("host", "farm.example.com")])), "tunnel keeps the public host");
-        assert!(!is_local(lo, &headers(&[("host", "127.0.0.1.evil.example")])));
-        for h in ["x-forwarded-for", "forwarded", "cf-connecting-ip", "tailscale-user-login", "x-forwarded-host"] {
-            assert!(!is_local(lo, &headers(&[("host", "127.0.0.1:7878"), (h, "1.2.3.4")])), "{h}");
-        }
-    }
-
-    #[test]
-    fn origin_must_match_host() {
-        assert!(origin_ok(&headers(&[("host", "127.0.0.1:7878")]), false));
-        assert!(origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "http://127.0.0.1:7878")]), false));
-        assert!(!origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "http://evil.example")]), false));
-        assert!(!origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "http://127.0.0.1:9999")]), false));
-        assert!(!origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "null")]), false));
-        assert!(!origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "http://localhost:5173")]), false));
-        assert!(origin_ok(&headers(&[("host", "127.0.0.1:7878"), ("origin", "http://localhost:5173")]), true));
+    fn a_query_token_counts_only_where_headers_cant_go() {
+        assert_eq!(given_token(&req("/api/live?token=abc", None)).as_deref(), Some("abc"));
+        assert_eq!(given_token(&req("/mcp?scope=brain&token=abc", None)).as_deref(), Some("abc"));
+        assert_eq!(given_token(&req("/api/settings?token=abc", None)), None, "it would land in access logs");
+        assert_eq!(given_token(&req("/api/settings?token=abc", Some("Bearer xyz"))).as_deref(), Some("xyz"));
+        assert_eq!(given_token(&req("/api/state", Some("Bearer "))), None);
     }
 }

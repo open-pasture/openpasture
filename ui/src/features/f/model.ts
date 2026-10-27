@@ -41,7 +41,7 @@ type FC = GeoJSON.FeatureCollection;
 const fc = (features: GeoJSON.Feature[]): FC => ({ type: "FeatureCollection", features });
 const feat = (geometry: GeoJSON.Geometry, properties: GeoJSON.GeoJsonProperties = {}): GeoJSON.Feature => ({ type: "Feature", properties, geometry });
 
-const HATCHED = new Set(["overlaps_exclusion", "overlaps_hazard", "crosses_farm_boundary"]);
+const HATCHED = new Set(["overlaps_exclusion", "overlaps_hazard", "crosses_farm_boundary", "enters_no_go"]);
 const CROSSED = new Set(["crosses_road", "crosses_neighbour_line"]);
 
 export interface Drawing {

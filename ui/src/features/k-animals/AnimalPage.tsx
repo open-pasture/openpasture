@@ -12,6 +12,7 @@ import { keepBatch } from "../../store/k-animals";
 import { Button, Copy, Input, Menu, Segmented } from "../../ui";
 import { useUnits } from "../../units";
 import { age, useNow } from "../../util";
+import { SIMULATED } from "../../sim";
 import { Edit, type EditField } from "./Edit";
 import { battery, cardsPossible, day, reasonWord, REASONS, resolve, spareCollars } from "./herd";
 
@@ -66,6 +67,7 @@ function Facts({ animal, collar, herdName }: { animal?: Animal; collar?: Collar;
         {animal?.name && <span className="aname"><Edit a={animal} field="name" can={canEdit} onError={setErr} /></span>}
       </h1>
       {animal?.removed_at && <p className="mono dim">{reasonWord(animal.removed_reason)} {day(animal.removed_at)}</p>}
+      {collar?.simulated && <p className="mono dim" title="Run by the simulator: no animal wears this collar">{SIMULATED}</p>}
       <ul className="kv">
         {!animal?.name && row("name", "name")}
         {row("EID", "eid")}
@@ -90,7 +92,7 @@ function Actions({ animal, collar }: { animal?: Animal; collar?: Collar }) {
   const isOwner = useCan("owner");
   const animals = useStore((s) => s.animals);
   const collars = useStore((s) => s.collars);
-  const publicUrl = useStore((s) => s.state?.settings.server.public_url);
+  const collarUrl = useStore((s) => s.state?.settings.server.collar_url);
   const [open, setOpen] = useState<"remove" | "rekey">();
   const [reason, setReason] = useState<RemovedReason>("sold");
   const [date, setDate] = useState(() => new Date().toLocaleDateString("en-CA"));
@@ -120,7 +122,7 @@ function Actions({ animal, collar }: { animal?: Animal; collar?: Collar }) {
   });
   const rekey = () => act(async () => {
     const k = await kAnimals.rekey(collar!.id);
-    if (cardsPossible(publicUrl)) {
+    if (cardsPossible(collarUrl)) {
       const id = `key-${collar!.id}-${Date.now()}`;
       keepBatch(id, [k]);
       location.hash = `/print/cards/${id}`;
@@ -130,7 +132,7 @@ function Actions({ animal, collar }: { animal?: Animal; collar?: Collar }) {
   if (keyed)
     return (
       <section className="aacts keyed">
-        <Copy label="endpoint" value={keyed.endpoint} />
+        {keyed.endpoint ? <Copy label="endpoint" value={keyed.endpoint} /> : <p className="dim">{keyed.no_endpoint}</p>}
         <Copy label="key" value={keyed.key} />
         <Copy label="public key" value={keyed.public_key} />
         <Button small kind="plain" onClick={() => setKeyed(undefined)}>Done</Button>

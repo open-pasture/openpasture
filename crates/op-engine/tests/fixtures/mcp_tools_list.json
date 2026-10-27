@@ -28,7 +28,7 @@
     },
     {
       "name": "get_herd",
-      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars.",
+      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars. A collar with simulated: true is run by the simulator, not worn by an animal.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -212,7 +212,7 @@
     },
     {
       "name": "propose_boundary",
-      "description": "Propose moving a herd: a paddock, a GeoJSON Polygon boundary, or both, with plain reasons. Recorded as a decision; the herd's autonomy decides whether it waits for the farmer, runs on a timer, or goes to the collars now.",
+      "description": "Propose moving a herd: a paddock, a GeoJSON Polygon boundary, or both, with plain reasons and how it follows the farm's rules (list_farm_rules). Recorded as a decision; the herd's autonomy decides whether it waits for the farmer, runs on a timer, or goes to the collars now, but only when the safety gate and the rule review find nothing: otherwise it waits for the farmer with the reasons. Every proposal must follow the farm's rules and stay out of its no-go zones; the server's safety gate refuses any boundary that crosses a road or the farm boundary or takes in a no-go zone or a hard hazard, and a rule review holds anything doubtful for the farmer.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -226,11 +226,15 @@
           },
           "geometry": {
             "type": "object",
-            "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners."
+            "description": "GeoJSON Polygon, [longitude, latitude], 3-128 corners. Never across a road or the farm boundary, never into a no-go zone."
           },
           "reasoning": {
             "type": "string",
             "description": "Two to four short lines, each a reason tied to a fact."
+          },
+          "rules": {
+            "type": "string",
+            "description": "How the proposal follows each farm rule. Without it, it never goes to the collars on its own."
           },
           "confidence": {
             "type": "number",
@@ -278,7 +282,7 @@
     },
     {
       "name": "get_herd",
-      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars.",
+      "description": "A herd: species, count, animal units, autonomy, the paddock it is in (and how we know), and its collars. A collar with simulated: true is run by the simulator, not worn by an animal.",
       "inputSchema": {
         "type": "object",
         "properties": {

@@ -233,37 +233,56 @@ pub async fn spawn(ctx: Ctx) -> anyhow::Result<()> {
     let global = Arc::new(Semaphore::new(MAX_CLAIMED));
     let mut wakes: HashMap<&'static str, Arc<Notify>> = HashMap::new();
     for kind in CHANNELS {
-        let wake = Arc::new(Notify::new());
-        wakes.insert(kind, wake.clone());
-        tokio::spawn(worker(ctx.clone(), kind, wake, global.clone()));
+        wakes.insert(kind, Arc::new(Notify::new()));
     }
-    // A newly queued message wakes its channel's worker at once.
-    let mut rx = ctx.subscribe();
-    let c = ctx.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = c.on_shutdown() => break,
-                ev = rx.recv() => match ev {
-                    Ok(Event::Message { message }) if message.direction == "out" && message.status == "queued" => {
-                        if let Some(w) = wakes.get(message.channel.as_str()) {
-                            w.notify_one();
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => wakes.values().for_each(|w| w.notify_one()),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
+    let wakes = Arc::new(wakes);
+    // The workers run as one job: a panic in one restarts them all.
+    let w = wakes.clone();
+    ctx.supervise("notify.workers", None, move |ctx| {
+        let (wakes, global) = (w.clone(), global.clone());
+        async move {
+            let mut set = tokio::task::JoinSet::new();
+            for kind in CHANNELS {
+                set.spawn(worker(ctx.clone(), kind, wakes[kind].clone(), global.clone()));
+            }
+            while let Some(done) = set.join_next().await {
+                if let Err(e) = done
+                    && e.is_panic()
+                {
+                    std::panic::resume_unwind(e.into_panic());
+                }
             }
         }
     });
-    let c = ctx.clone();
-    tokio::spawn(async move {
+    // A newly queued message wakes its channel's worker at once.
+    ctx.supervise("notify.wakes", None, move |c| {
+        let mut rx = c.subscribe();
+        let wakes = wakes.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    _ = c.on_shutdown() => break,
+                    ev = rx.recv() => match ev {
+                        Ok(Event::Message { message }) if message.direction == "out" && message.status == "queued" => {
+                            if let Some(w) = wakes.get(message.channel.as_str()) {
+                                w.notify_one();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => wakes.values().for_each(|w| w.notify_one()),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        }
+    });
+    ctx.supervise("notify.status", Some(Duration::from_secs(5)), |c| async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 _ = c.on_shutdown() => break,
                 _ = tick.tick() => {
+                    c.beat("notify.status");
                     if let Err(e) = poll_statuses(&c, now()).await {
                         tracing::warn!("reading Twilio delivery status: {e:#}");
                     }

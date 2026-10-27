@@ -45,6 +45,9 @@ async fn require_herd(ctx: &Ctx, herd_id: &str) -> ApiResult<()> {
 struct NewCollar {
     name: Option<String>,
     herd_id: String,
+    /// Linked by the simulator (`simulation/collar-sim`); never cleared.
+    #[serde(default)]
+    simulated: bool,
 }
 
 #[derive(Serialize)]
@@ -52,13 +55,12 @@ struct Linked {
     collar: Collar,
     /// Shown once. Only its hash is stored.
     key: String,
-    endpoint: String,
+    /// The collar address; absent until one is set, with `no_endpoint` saying why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_endpoint: Option<&'static str>,
     public_key: String,
-}
-
-/// Where collars talk to this server: `{base_url}/collar/v1`.
-fn endpoint(ctx: &Ctx) -> String {
-    format!("{}/collar/v1", ctx.base_url())
 }
 
 fn clean_name(name: &str) -> ApiResult<String> {
@@ -83,17 +85,22 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
     let collar_id = id::new_id(id::COLLAR);
     let key = keys::new_collar_key();
     db::insert_collar(ctx.db(), &collar_id, &name, &body.herd_id, &keys::hash_key(&key)).await?;
+    if body.simulated {
+        sqlx::query("UPDATE collars SET simulated = 1 WHERE id = ?").bind(&collar_id).execute(ctx.db()).await?;
+    }
     let collar = find(&ctx, &collar_id).await?;
     tracing::info!(collar = %collar.id, "collar linked");
     ctx.publish(Event::Collar { collar: collar.clone() });
-    Ok((StatusCode::CREATED, Json(Linked { collar, key, endpoint: endpoint(&ctx), public_key: ctx.public_key_b64() })))
+    let endpoint = crate::config::collar_endpoint(&ctx).await?;
+    let no_endpoint = endpoint.is_none().then_some(crate::config::NO_COLLAR_ADDRESS);
+    Ok((StatusCode::CREATED, Json(Linked { collar, key, endpoint, no_endpoint, public_key: ctx.public_key_b64() })))
 }
 
 /// PATCH writes only what was sent (`name`, `herd_id`, `animal_id`), so a
 /// report landing at the same time keeps its telemetry.
 async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
-    let immutable = ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason"];
+    let immutable = ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason", "simulated"];
     let mut next: Collar = patch::apply(&current, &body, &immutable)?;
     next.name = clean_name(&next.name)?;
     if next.herd_id != current.herd_id {
@@ -214,11 +221,6 @@ async fn post_park(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body)
 
 async fn post_unpark(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<Collar>> {
     Ok(Json(unpark_collar(&ctx, &id).await?))
-}
-
-/// Where collars talk to this server: `{base_url}/collar/v1`.
-pub fn collar_endpoint(ctx: &Ctx) -> String {
-    endpoint(ctx)
 }
 
 /// Take a collar off duty: charging, on the shelf, in repair. It raises no

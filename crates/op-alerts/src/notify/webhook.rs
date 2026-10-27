@@ -98,6 +98,7 @@ impl Channel for Webhook {
     }
 
     async fn send(&self, msg: &MessageLog) -> Result<Delivery, ChannelError> {
+        op_core::net::guard_url(&self.url).await.map_err(ChannelError::Fail)?;
         let body = serde_json::to_vec(&self.body(msg).await).map_err(|e| ChannelError::Fail(e.to_string()))?;
         let sig = signature(&self.secret, chrono::Utc::now().timestamp(), &body);
         let res = http()

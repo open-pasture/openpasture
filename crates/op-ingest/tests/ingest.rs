@@ -15,7 +15,8 @@ impl App {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::open(dir.path()).await.unwrap();
-        let router = op_core::router().merge(op_ingest::router()).with_state(ctx.clone());
+        let router =
+            op_core::with_identity(op_core::router().merge(op_ingest::router()), op_core::Identity::owner(op_core::Via::Local)).with_state(ctx.clone());
         Self { _dir: dir, ctx, router }
     }
 
@@ -93,7 +94,9 @@ async fn linking_and_device_auth() {
     assert!(id.starts_with("col_"));
     assert_eq!(v["collar"]["name"], "Bench");
     assert_eq!(v["collar"]["state"], "unknown");
-    assert!(v["endpoint"].as_str().unwrap().ends_with("/collar/v1"));
+    // No collar address yet: no endpoint, and a sentence saying why (never this machine's own URL).
+    assert!(v.get("endpoint").is_none(), "{v}");
+    assert_eq!(v["no_endpoint"], op_ingest::NO_COLLAR_ADDRESS);
     assert_eq!(v["public_key"], app.ctx.public_key_b64());
     // Only the hash is stored.
     let (stored,): (String,) = sqlx::query_as("SELECT key_hash FROM collars WHERE id = ?").bind(&id).fetch_one(app.ctx.db()).await.unwrap();
@@ -1008,7 +1011,8 @@ async fn sweeping_moves_resume_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (herd, collars) = {
         let ctx = Ctx::open(dir.path()).await.unwrap();
-        let router = op_core::router().merge(op_ingest::router()).with_state(ctx.clone());
+        let router =
+            op_core::with_identity(op_core::router().merge(op_ingest::router()), op_core::Identity::owner(op_core::Via::Local)).with_state(ctx.clone());
         let app = App { _dir: tempfile::tempdir().unwrap(), ctx, router };
         let (herd, collars) = app.sweep_herd(4).await;
         app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
@@ -1056,7 +1060,8 @@ async fn an_escaped_animal_gets_its_own_boundary_and_is_handed_back() {
     let (s, _) = app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
     assert_eq!(s, StatusCode::CREATED);
     let herd_v = app.active(&herd).await["active"]["version"].as_u64().unwrap() as u32;
-    let now = chrono::Utc::now();
+    // The walk out comes after its last fix in, at a walk (a jump gets no pen).
+    let now = chrono::Utc::now() + chrono::Duration::seconds(120);
 
     // Out for 30 s: the collar's own cue is still the thing to wait on.
     app.fix(a_key, m_at(150.0, 230.0), now - chrono::Duration::seconds(30)).await;
@@ -1116,11 +1121,13 @@ async fn a_farmer_can_let_an_escaped_animal_go() {
     let (herd, collars) = app.sweep_herd(1).await;
     let (a, a_key) = &collars[0];
     app.call("POST", &format!("/api/herds/{herd}/boundary"), Some(json!({"geometry": m_rect(0.0, 0.0, 300.0, 200.0)}))).await;
-    let now = chrono::Utc::now();
+    // The walk out comes after its last fix in, at a walk (a jump gets no pen).
+    let now = chrono::Utc::now() + chrono::Duration::seconds(120);
+    app.fix(a_key, m_at(150.0, 229.0), now - chrono::Duration::seconds(30)).await;
     app.fix(a_key, m_at(150.0, 230.0), now - chrono::Duration::seconds(90)).await;
     app.fix(a_key, m_at(150.0, 231.0), now).await;
     // Out since its first new fix outside (the backfilled one doesn't start the clock).
-    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(60)).await.unwrap();
+    op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(30)).await.unwrap();
 
     let (s, e) = app.call("POST", &format!("/api/collars/{a}/escape/stop"), None).await;
     assert_eq!(s, StatusCode::OK, "{e}");
@@ -1135,6 +1142,7 @@ async fn a_farmer_can_let_an_escaped_animal_go() {
     // In, then out again for a minute: a new escape.
     app.fix(a_key, m_at(150.0, 150.0), now + chrono::Duration::seconds(20)).await;
     app.fix(a_key, m_at(150.0, 230.0), now + chrono::Duration::seconds(30)).await;
+    app.fix(a_key, m_at(150.0, 231.0), now + chrono::Duration::seconds(60)).await;
     op_ingest::escapes::scan(&app.ctx, now + chrono::Duration::seconds(100)).await.unwrap();
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM escapes WHERE status = 'returning'").fetch_one(app.ctx.db()).await.unwrap();
     assert_eq!(n, 1);

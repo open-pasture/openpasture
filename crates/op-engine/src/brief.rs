@@ -1,7 +1,7 @@
 //! The morning brief: each herd's call for today from the decision record,
-//! in a few plain lines. Ported from the archived kit
-//! (`skills/morning-brief/SKILL.md`, `briefing/engine.py::build_brief`). No
-//! LLM: the same record always gives the same brief.
+//! in a few plain lines. Ported from the archived kit's morning brief
+//! (`briefing/engine.py::build_brief`). No LLM: the same record always gives
+//! the same brief.
 //!
 //! Lines, in order:
 //! 1. The call: "Cows: MOVE to P4 (30.6 ac)." / "Cows: STAY in P3." /

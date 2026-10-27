@@ -68,6 +68,9 @@ pub struct DecisionOutput {
     pub confidence: f64,
     /// For NEEDS_INFO: what is missing.
     pub need: Option<String>,
+    /// How the decision follows the farm's rules; none when the farm has none.
+    #[serde(default)]
+    pub rules: Option<String>,
     pub model: Option<String>,
 }
 

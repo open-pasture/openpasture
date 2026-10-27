@@ -59,7 +59,8 @@ impl App {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::open(dir.path()).await.unwrap();
-        let router = op_core::router().merge(op_ingest::router()).with_state(ctx.clone());
+        let router =
+            op_core::with_identity(op_core::router().merge(op_ingest::router()), op_core::Identity::owner(op_core::Via::Local)).with_state(ctx.clone());
         Self { _dir: dir, ctx, router }
     }
 
@@ -498,8 +499,8 @@ async fn an_escape_leaves_the_schedule_staged_and_hands_its_copies_back() {
     assert_eq!(a.store.staged().len(), 15);
 
     // A walks out of strip 1 and stays out: its own pen drops its staged slots.
-    let t = Utc::now() + Duration::seconds(5);
-    app.report(&a, json!({"fixes": [fix(m_at(25.0, 230.0), t)]})).await;
+    let t = Utc::now() + Duration::seconds(60);
+    app.report(&a, json!({"fixes": [fix(m_at(25.0, 230.0), t), fix(m_at(25.0, 231.0), t + Duration::seconds(30))]})).await;
     op_ingest::escapes::scan(&app.ctx, t + Duration::seconds(60)).await.unwrap();
     let got = app.sync(&mut a, t + Duration::seconds(61)).await;
     assert_eq!(got.len(), 1, "the pen");

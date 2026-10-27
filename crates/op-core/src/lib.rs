@@ -7,12 +7,16 @@ pub mod domain;
 pub mod error;
 pub mod event;
 pub mod id;
+pub mod instance;
 pub mod keys;
+pub mod net;
 pub mod patch;
 mod routes;
 pub mod secrets;
 pub mod settings;
+pub mod sim;
 pub mod store;
+pub mod tasks;
 pub mod time;
 pub mod tz;
 // @HUB

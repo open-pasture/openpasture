@@ -260,7 +260,7 @@ async fn sweep_steps_keep_the_exclusion_holes_and_end_on_the_prepared_target() {
 }
 
 #[tokio::test]
-async fn hazards_roads_lines_water_and_the_farm_boundary_are_found_never_enforced() {
+async fn hazards_roads_lines_water_and_the_farm_boundary_are_found_and_change_no_shape() {
     let app = App::new().await;
     let target = poly(0.0, 0.0, 300.0, 200.0);
     let before = app.prepare(&target, None).await;
@@ -272,8 +272,11 @@ async fn hazards_roads_lines_water_and_the_farm_boundary_are_found_never_enforce
     app.feature(json!({"kind": "farm_boundary", "geometry": {"type": "Polygon", "coordinates": [rect(-100.0, -100.0, 290.0, 300.0)]}})).await;
     let p = app.prepare(&target, None).await;
     assert_eq!(p.geometry, before.geometry, "nothing but exclusions changes the shape");
-    assert_eq!(codes(&p.findings), ["crosses_road", "overlaps_hazard", "crosses_neighbour_line", "crosses_farm_boundary", "no_water"], "critical first");
+    assert_eq!(codes(&p.findings), ["crosses_road", "crosses_farm_boundary", "overlaps_hazard", "crosses_neighbour_line", "no_water"], "critical first");
+    // The road and the farm boundary are what the safety gate refuses.
     assert_eq!(find(&p.findings, "crosses_road").severity, Severity::Critical);
+    assert_eq!(find(&p.findings, "crosses_farm_boundary").severity, Severity::Critical);
+    assert_eq!(find(&p.findings, "overlaps_hazard").severity, Severity::Warning);
     assert_eq!(find(&p.findings, "crosses_road").text, "Crosses county road");
     assert_eq!(find(&p.findings, "overlaps_hazard").text, "Takes in old well");
     assert_eq!(find(&p.findings, "crosses_neighbour_line").text, "Crosses the neighbour line");

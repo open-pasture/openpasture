@@ -208,6 +208,9 @@ pub struct Collar {
     pub parked_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked_reason: Option<ParkReason>,
+    /// Run by the simulator, not on an animal (the `sim` cap). Never cleared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -472,6 +475,11 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    /// Where collars reach this server, `https://` and not this machine. It
+    /// goes into every collar, so op-server checks it reaches this server
+    /// before saving it (`PUT /api/server/collar-address`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collar_url: Option<String>,
     pub app_token: String,
 }
 

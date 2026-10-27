@@ -9,6 +9,7 @@ mod collars;
 mod db;
 mod device;
 pub mod escapes;
+pub mod gate;
 pub mod moves;
 pub mod planner;
 // @HUB
@@ -16,6 +17,7 @@ pub mod planner;
 // @E-lib
 // @E-srv
 pub mod config;
+pub use config::{NO_COLLAR_ADDRESS, collar_endpoint};
 pub mod margins;
 pub mod shape;
 pub mod slots;
@@ -24,7 +26,7 @@ pub mod slots;
 // @A-notify
 // @D
 // @K-animals
-pub use collars::{NewLinked, collar_endpoint, collar_key_matches, create_linked_collars, link_collar, park_collar, rekey_collar, unpark_collar};
+pub use collars::{NewLinked, collar_key_matches, create_linked_collars, link_collar, park_collar, rekey_collar, unpark_collar};
 // @K-files
 // @I
 // @B
@@ -41,13 +43,14 @@ pub mod schedule;
 // @L
 // @M
 // @Z
+pub mod wire_log;
 
 use op_core::Ctx;
 
 pub use boundary::{SendOpts, boundary_status, move_herd_on_record, send_boundary, supersede_proposals};
 pub use collars::latest_positions;
 pub use escapes::{current_escapes, stop_escape};
-pub use moves::{Started, current_move, start_move, stop_move};
+pub use moves::{Started, current_move, start_move, start_move_gated, stop_move};
 // @E-srv
 pub use boundary::announce_activations;
 pub use db::{HerdBoundaries, herd_boundaries, sql};
@@ -89,6 +92,8 @@ pub fn router() -> axum::Router<Ctx> {
         // @L
         // @M
         // @Z
+        wire_log::router(),
+        gate::router(),
     ] {
         app = app.merge(part);
     }

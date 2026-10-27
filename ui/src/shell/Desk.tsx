@@ -11,6 +11,7 @@ import { ageText, collarsOf, since } from "../features/a-engine/model";
 import { behindOf, collarLabels, outOf, store, useStore } from "../store";
 import { alerts, applyAlert } from "../store/a-engine";
 import { undrawn } from "../store/live";
+import { useAction } from "../store/action";
 import { useCan } from "../store/me";
 import { createSlice } from "../store/slice";
 import { Button, Icon, Input, Mark, Menu } from "../ui";
@@ -18,6 +19,8 @@ import { useUnits } from "../units";
 import { clock, useNow } from "../util";
 import { targetPaddock, Why } from "../views/HerdPanel";
 import { alertWords, asksOf, decisionAnswers, decisionAsk, inWords, minutesToCall, scheduleNext, watched, type Ask } from "./asks";
+import { herdWord, SIMULATED, simulatedAlert } from "../sim";
+import { ActionError } from "./ActionError";
 import { Shape } from "./Farm";
 
 // A collar that hasn't reported in this long reads as quiet in the herd's bar.
@@ -60,7 +63,9 @@ function Pilot({ herdId, onFocusCollar, onFocusCollars }: DeskProps) {
   const now = useNow(1000);
   const u = useUnits();
   const tend = useCan("hand");
-  const [busy, setBusy] = useState(false);
+  // Stop the move, Let go: busy while it goes, the reason in place if it doesn't.
+  const act = useAction((f: () => Promise<unknown>) => f(), { after: () => store.refreshHerd() });
+  const busy = act.busy;
   const herd = state.herds.find((h) => h.id === herdId);
   if (!herd) return null;
 
@@ -93,15 +98,6 @@ function Pilot({ herdId, onFocusCollar, onFocusCollars }: DeskProps) {
     line = <>Holding {herd.name} in {pad(herd.paddock_id) ?? "its boundary"}{day !== undefined && <span className="prem mono">day {day}</span>}</>;
   }
 
-  const act = async (f: () => Promise<unknown>) => {
-    setBusy(true);
-    try {
-      await f();
-      await store.refreshHerd();
-    } finally {
-      setBusy(false);
-    }
-  };
   const log = running ? (logs[running.id] ?? []).slice(-3) : [];
 
   return (
@@ -114,7 +110,7 @@ function Pilot({ herdId, onFocusCollar, onFocusCollars }: DeskProps) {
           {sweeping && behind.length > 0 && (
             <li>
               <button type="button" className="pjob" onClick={() => onFocusCollars(behind)}>{behind.length} behind the sweep</button>
-              {tend && <Button small kind="plain" disabled={busy} onClick={() => act(() => api.stopMove(herdId))}>Stop the move</Button>}
+              {tend && <Button small kind="plain" disabled={busy} onClick={() => act.run(() => api.stopMove(herdId))}>Stop the move</Button>}
             </li>
           )}
           {out.map((e) => (
@@ -122,14 +118,15 @@ function Pilot({ herdId, onFocusCollar, onFocusCollars }: DeskProps) {
               <button type="button" className="pjob" onClick={() => onFocusCollar(e.collar_id)}>
                 Bringing {names.get(e.collar_id) ?? "a collar"} back{e.remaining_m >= 1 && <span className="mono"> {u.len(e.remaining_m)}</span>}
               </button>
-              {tend && <Button small kind="plain" disabled={busy} onClick={() => act(() => api.stopEscape(e.collar_id))}>Let go</Button>}
+              {tend && <Button small kind="plain" disabled={busy} onClick={() => act.run(() => api.stopEscape(e.collar_id))}>Let go</Button>}
             </li>
           ))}
         </ul>
       ) : null}
       {sweeping && !behind.length && tend && (
-        <div className="pjobs solo"><Button small kind="plain" disabled={busy} onClick={() => act(() => api.stopMove(herdId))}>Stop the move</Button></div>
+        <div className="pjobs solo"><Button small kind="plain" disabled={busy} onClick={() => act.run(() => api.stopMove(herdId))}>Stop the move</Button></div>
       )}
+      <ActionError action={act} />
       <Rules herd={herd} now={now} />
     </section>
   );
@@ -145,6 +142,7 @@ function daysIn(decisions: readonly Decision[], herd: Herd, now: number): number
 // The herd's collars as one bar: inside, near the edge, outside, and quiet (not heard from).
 function Vitals({ collars, now, onFocus }: { collars: Collar[]; now: number; onFocus: (ids: string[]) => void }) {
   if (!collars.length) return null;
+  const sim = herdWord(collars);
   const quiet = collars.filter((c) => !c.last_seen || now - Date.parse(c.last_seen) > QUIET_MS);
   const heard = collars.filter((c) => !quiet.includes(c));
   const groups = [
@@ -162,6 +160,7 @@ function Vitals({ collars, now, onFocus }: { collars: Collar[]; now: number; onF
         {groups.map((g) => g.ids.length > 0 && (
           <button key={g.k} type="button" data-k={g.k} disabled={g.k === "in"} onClick={() => onFocus(g.ids)}>{g.ids.length} {g.word}</button>
         ))}
+        {sim && <span className="sim">{sim}</span>}
       </p>
     </div>
   );
@@ -178,8 +177,10 @@ function Rules({ herd, now }: { herd: Herd; now: number }) {
     timer: `Moves ${mins(herd.timer_minutes)} after asking`,
     auto: "Moves on its own",
   };
-  const set = (patch: Partial<Herd>) => void api.updateHerd(herd.id, patch).then(() => store.refresh());
+  const update = useAction((patch: Partial<Herd>) => api.updateHerd(herd.id, patch), { after: () => store.refresh() });
+  const set = (patch: Partial<Herd>) => void update.run(patch);
   return (
+    <>
     <div className="prules mono">
       {manage ? (
         <Menu trigger={<span className="pmode">{words[herd.autonomy]}<Icon name="chev" size={5} /></span>} items={[
@@ -190,6 +191,8 @@ function Rules({ herd, now }: { herd: Herd; now: number }) {
       ) : <span className="pmode">{words[herd.autonomy]}</span>}
       {left !== undefined && <span>next call {settings!.decision_time.slice(0, 5)}, {inWords(left)}</span>}
     </div>
+    <ActionError action={update} />
+    </>
   );
 }
 
@@ -250,9 +253,13 @@ function DecisionAsk({ d, changing, onChange, onSaid }: DeskProps & { d: Decisio
   const state = useStore((s) => s.state)!;
   const manage = useCan("manager");
   const now = useNow(1000);
-  const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState("");
-  const [err, setErr] = useState<string>();
+  const answering = useAction(async (f: () => Promise<unknown>, said: string) => {
+    await f();
+    onSaid(said);
+    await store.refreshHerd();
+  });
+  const busy = answering.busy;
   const herd = state.herds.find((h) => h.id === d.herd_id);
   const pad = (id?: string) => state.paddocks.find((x) => x.id === id);
   const q = decisionAsk(d, herd?.name ?? "the herd", (id) => pad(id)?.name, herd?.paddock_id);
@@ -261,19 +268,7 @@ function DecisionAsk({ d, changing, onChange, onSaid }: DeskProps & { d: Decisio
   const to = d.action === "MOVE" ? pad(d.to_paddock_id) : undefined;
   const sched = scheduleNext(d);
 
-  const answer = async (f: () => Promise<unknown>, said: string) => {
-    setBusy(true);
-    setErr(undefined);
-    try {
-      await f();
-      onSaid(said);
-      await store.refreshHerd();
-    } catch (e) {
-      setErr((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const answer = (f: () => Promise<unknown>, said: string) => answering.run(f, said);
   const approve = () => answer(() => api.respond(d.id, { action: "approve" }),
     d.action === "MOVE" ? `Moving ${herd?.name} to ${to?.name ?? "the new boundary"}.` : d.action === "STAY" ? `${herd?.name} stays in ${from?.name ?? "place"}.` : "Done.");
   const reject = () => answer(() => api.respond(d.id, { action: "reject" }), d.action === "NEEDS_INFO" ? "Skipped. It'll decide without that." : "Holding. Nothing changes.");
@@ -308,7 +303,7 @@ function DecisionAsk({ d, changing, onChange, onSaid }: DeskProps & { d: Decisio
           <span className="adrain"><i style={{ width: `${total > 0 ? (left / total) * 100 : 0}%` }} /></span>
         </div>
       )}
-      {err && <p className="aerr">{err}</p>}
+      <ActionError action={answering} className="aerr" />
       {manage && d.action === "NEEDS_INFO" ? (
         <form className="areply" onSubmit={(e) => { e.preventDefault(); send(); }}>
           <Input value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Tell openpasture" aria-label="Reply" disabled={busy} />
@@ -336,22 +331,16 @@ function AlertAsk({ a, herdId, onSaid }: { a: Alert; herdId: string; onSaid: (s:
   const all = useStore((s) => s.collars);
   const animals = useStore((s) => s.animals);
   const now = useNow(15_000);
-  const [busy, setBusy] = useState(false);
+  const answering = useAction(async (f: (id: string) => Promise<Alert>, said: string) => {
+    applyAlert(await f(a.id));
+    onSaid(said);
+  });
+  const act = (f: (id: string) => Promise<Alert>, said: string) => void answering.run(f, said);
+  const busy = answering.busy;
   const w = alertWords(a.kind);
   const other = a.herd_id && a.herd_id !== herdId ? herds.find((h) => h.id === a.herd_id) : undefined;
   const names = collarLabels(all, animals);
   const who = collarsOf(a).map((id) => names.get(id) ?? "").filter(Boolean);
-  const act = async (f: (id: string) => Promise<Alert>, said: string) => {
-    setBusy(true);
-    try {
-      applyAlert(await f(a.id));
-      onSaid(said);
-    } catch {
-      /* the live event or the next load shows where it stands */
-    } finally {
-      setBusy(false);
-    }
-  };
 
   // Another herd's waiting call: answered in that herd.
   if (a.kind === "decision_waiting") {
@@ -364,7 +353,7 @@ function AlertAsk({ a, herdId, onSaid }: { a: Alert; herdId: string; onSaid: (s:
   }
   return (
     <article className="ask" data-kind="alert" data-sev={a.severity}>
-      <h3><Mark size={12} />{other && <span className="aherd">{other.name}</span>}{a.title}</h3>
+      <h3><Mark size={12} />{other && <span className="aherd">{other.name}</span>}{a.title}{simulatedAlert(a) && <i className="sim">{SIMULATED}</i>}</h3>
       <p className="aask">{w.ask || a.body}<span className="mono"> {ageText(since(a), now)}</span></p>
       {who.length > 0 && (
         <button type="button" className="awho mono" title="Show on the map" onClick={() => focusAlert(a)}>
@@ -378,6 +367,7 @@ function AlertAsk({ a, herdId, onSaid }: { a: Alert; herdId: string; onSaid: (s:
           {w.show && who.length > 0 && <Button small kind="plain" onClick={() => focusAlert(a)}>{w.show}</Button>}
         </div>
       ) : null}
+      <ActionError action={answering} className="aerr" />
     </article>
   );
 }
@@ -387,6 +377,7 @@ function AlertAsk({ a, herdId, onSaid }: { a: Alert; herdId: string; onSaid: (s:
 function Watching({ herdId }: { herdId: string }) {
   const list = alerts.use((s) => s.list);
   const hand = useCan("hand");
+  const resolve = useAction(async (id: string) => applyAlert(await alertsApi.resolve(id)));
   const now = useNow(15_000);
   const rows = watched(list, herdId);
   if (!rows.length) return null;
@@ -398,9 +389,10 @@ function Watching({ herdId }: { herdId: string }) {
             <i aria-hidden="true" />{a.title}
           </button>
           <span className="mono">{ageText(since(a), now)}</span>
-          {hand && <button type="button" className="wr mono" onClick={() => void alertsApi.resolve(a.id).then(applyAlert, () => {})}>resolve</button>}
+          {hand && <button type="button" className="wr mono" disabled={resolve.busy} onClick={() => void resolve.run(a.id)}>resolve</button>}
         </li>
       ))}
+      {resolve.error && <li><ActionError action={resolve} /></li>}
     </ul>
   );
 }

@@ -53,6 +53,15 @@ pub const INVITE_DAYS: i64 = 7;
 const CACHE_TTL: Duration = Duration::from_secs(30);
 /// `user_tokens.last_used` is written at most this often per token.
 const LAST_USED_EVERY: Duration = Duration::from_secs(60);
+/// A sign-in unused this long stops working.
+pub const TOKEN_IDLE_DAYS: i64 = 30;
+/// A sign-in this old stops working, used or not.
+pub const TOKEN_MAX_DAYS: i64 = 180;
+
+/// Whether a sign-in made at `created` and last used at `used` has run out at `at`.
+pub fn token_expired(created: DateTime<Utc>, used: Option<DateTime<Utc>>, at: DateTime<Utc>) -> bool {
+    at - created > chrono::Duration::days(TOKEN_MAX_DAYS) || at - used.unwrap_or(created).max(created) > chrono::Duration::days(TOKEN_IDLE_DAYS)
+}
 
 // ---- records ----------------------------------------------------------------------------
 
@@ -487,7 +496,8 @@ async fn touch_token(ctx: &Ctx, token_id: &str) {
 }
 
 /// The person an `opu_` token signs in, as a `user_token` identity. `None`
-/// for a malformed, unknown or revoked token, or a disabled person.
+/// for a malformed, unknown, revoked or expired token ([`token_expired`]),
+/// or a disabled person.
 pub async fn session_for_token(ctx: &Ctx, token: &str) -> anyhow::Result<Option<Session>> {
     let token = token.trim();
     if !is_token_shape(token) {
@@ -515,12 +525,16 @@ pub async fn session_for_token(ctx: &Ctx, token: &str) -> anyhow::Result<Option<
 
     let generation = with_cache(ctx, |c| c.generation);
     let row = sqlx::query(
-        "SELECT t.id AS token_id, t.last_used, u.id AS user_id, u.name, u.role FROM user_tokens t JOIN users u ON u.id = t.user_id
+        "SELECT t.id AS token_id, t.created_at, t.last_used, u.id AS user_id, u.name, u.role FROM user_tokens t JOIN users u ON u.id = t.user_id
          WHERE t.token_hash = ? AND t.revoked_at IS NULL AND u.disabled_at IS NULL",
     )
     .bind(&hash)
     .fetch_optional(ctx.db())
     .await?;
+    let row = match row {
+        Some(r) if !token_expired(from_db(&r.try_get::<String, _>("created_at")?)?, opt_from_db(r.try_get("last_used")?)?, now()) => Some(r),
+        _ => None,
+    };
     let Some(row) = row else {
         with_cache(ctx, |c| c.tokens.remove(&hash));
         return Ok(None);
@@ -585,11 +599,10 @@ pub async fn with_owner_person(ctx: &Ctx, mut identity: Identity) -> Identity {
     identity
 }
 
-/// `GET /api/settings` and `/api/state` show the app token to owners only.
-pub fn redact_settings(identity: &Identity, s: &mut Settings) {
-    if !identity.can(Role::Owner) {
-        s.server.app_token.clear();
-    }
+/// No read shows the app token, the owner's included: it is revealed only by
+/// the owner's explicit `POST /api/settings/app-token/reveal` (op-server).
+pub fn redact_settings(_identity: &Identity, s: &mut Settings) {
+    s.server.app_token.clear();
 }
 
 /// How an actor reads on a record: their name; the owner for the app token or

@@ -553,8 +553,25 @@ async fn advance_off_thread(m: &MoveState<'_>, sit: Situation, now: DateTime<Utc
 
 /// A sweep step on its way to the collars, like every herd boundary.
 async fn prepare_step(ctx: &Ctx, herd_id: &str, polygon: &Polygon, warn_m: f64, hysteresis_m: f64) -> ApiResult<Prepared> {
-    let opts = SendOpts { warn_m: Some(warn_m), hysteresis_m: Some(hysteresis_m), effective_at: None };
+    let opts = SendOpts { warn_m: Some(warn_m), hysteresis_m: Some(hysteresis_m), ..Default::default() };
     prepare(ctx, herd_id, polygon, &opts).await
+}
+
+/// A step about to be stored passes the safety gate as a sweep step,
+/// carrying what a person confirmed for the move's target. `findings` are
+/// the step's own (from [`prepare_step`]); the last step is the target
+/// itself, checked against the map as it is now.
+async fn gate_step(ctx: &Ctx, herd_id: &str, decision_id: &str, out: &Outcome, findings: Vec<op_core::check::Finding>, confirm: &[String]) -> ApiResult<()> {
+    let Next::Send { polygon, last, .. } = &out.next else { return Ok(()) };
+    let findings = if *last {
+        let holeless = crate::shape::herd_collars(ctx.db(), herd_id).await?.iter().any(|c| c.parked.is_none() && !c.caps.holds_holes());
+        crate::prepare::map_only(ctx, polygon, now(), holeless).await?
+    } else {
+        findings
+    };
+    let sender = crate::gate::Sender { kind: crate::gate::SenderKind::Sweep, by: None, confirm: confirm.to_vec() };
+    let check = crate::gate::Check { herd_id, geometry: polygon, findings: &findings, sender: &sender, decision_id: Some(decision_id), collar_id: None };
+    crate::gate::pass(ctx, &check).await.map(|_| ())
 }
 
 /// How many of `animals` a prepared step leaves without the room the plan
@@ -601,13 +618,13 @@ async fn next_step(
     mut sit: Situation,
     now: DateTime<Utc>,
     hysteresis_m: f64,
-) -> ApiResult<Option<(Outcome, Situation, f64)>> {
+) -> ApiResult<Option<(Outcome, Situation, f64, Vec<op_core::check::Finding>)>> {
     let mut total_ms = 0.0;
     for _ in 0..FIT_TRIES {
         let (mut out, back, ms) = advance_off_thread(m, sit, now).await?;
         sit = back;
         total_ms += ms;
-        let Next::Send { polygon, last: false, .. } = &mut out.next else { return Ok(Some((out, sit, total_ms))) };
+        let Next::Send { polygon, last: false, .. } = &mut out.next else { return Ok(Some((out, sit, total_ms, vec![]))) };
         let prepared = prepare_step(ctx, herd_id, polygon, m.warn_m, hysteresis_m).await?;
         let animals: Vec<LonLat> = sit
             .positions
@@ -618,7 +635,7 @@ async fn next_step(
         let short = short_of_room(&prepared.excluded, &prepared.geometry, &sit.fits, &animals, m.warn_m);
         if short == 0 {
             *polygon = prepared.geometry;
-            return Ok(Some((out, sit, total_ms)));
+            return Ok(Some((out, sit, total_ms, prepared.findings)));
         }
         let planned = polygon.outer_ring().len();
         let added = prepared.excluded.outer_ring().len().saturating_sub(planned);
@@ -654,19 +671,33 @@ pub struct Started {
 
 /// Start a move toward `target` under `decision_id`, replacing any running
 /// move for the herd (it is marked stopped). Sends the target at once when
-/// the herd is already in it, else the first sweep step.
+/// the herd is already in it, else the first sweep step. The target passes
+/// the safety gate as `opts.sender` first.
 pub async fn start_move(ctx: &Ctx, herd_id: &str, target: Polygon, opts: SendOpts, decision_id: &str) -> anyhow::Result<Started> {
-    let go = async {
-        if ctx.store().get_herd(herd_id).await?.is_none() {
-            return Err(ApiError::not_found("No such herd."));
-        }
-        let prepared = prepare(ctx, herd_id, &target, &opts).await?;
-        begin(ctx, herd_id, prepared, opts.effective_at, decision_id, None).await
-    };
-    go.await.map_err(|e| anyhow::anyhow!(e.message))
+    start_move_gated(ctx, herd_id, target, opts, decision_id).await.map_err(|e| anyhow::anyhow!(e.message))
 }
 
-/// Start a move toward a prepared target (see [`start_move`]).
+/// [`start_move`], keeping the gate's refusal (409 with its findings) as it is.
+pub async fn start_move_gated(ctx: &Ctx, herd_id: &str, target: Polygon, opts: SendOpts, decision_id: &str) -> ApiResult<Started> {
+    if ctx.store().get_herd(herd_id).await?.is_none() {
+        return Err(ApiError::not_found("No such herd."));
+    }
+    let prepared = prepare(ctx, herd_id, &target, &opts).await?;
+    let check = crate::gate::Check {
+        herd_id,
+        geometry: &prepared.geometry,
+        findings: &prepared.findings,
+        sender: &opts.sender,
+        decision_id: Some(decision_id),
+        collar_id: None,
+    };
+    crate::gate::pass(ctx, &check).await?;
+    let confirm = if opts.sender.kind.is_person() { opts.sender.confirm.clone() } else { vec![] };
+    begin(ctx, herd_id, prepared, opts.effective_at, decision_id, None, &confirm).await
+}
+
+/// Start a move toward a prepared target that passed the gate (see
+/// [`start_move`]). Its sweep steps carry `confirm`, what a person confirmed for it.
 pub(crate) async fn begin(
     ctx: &Ctx,
     herd_id: &str,
@@ -674,6 +705,7 @@ pub(crate) async fn begin(
     effective_at: Option<DateTime<Utc>>,
     decision_id: &str,
     farmer: Option<FarmerDecision<'_>>,
+    confirm: &[String],
 ) -> ApiResult<Started> {
     if ctx.store().get_herd(herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
@@ -686,7 +718,13 @@ pub(crate) async fn begin(
     let positions = sit.positions.len();
     let first = MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] };
     let (mut out, plan_ms) = match next_step(ctx, herd_id, &first, sit, at, hysteresis_m).await? {
-        Some((out, _, ms)) => (out, ms),
+        // The target itself (the herd is in it) passed the gate already; a first step passes now.
+        Some((out, _, ms, findings)) => {
+            if matches!(out.next, Next::Send { last: false, .. }) {
+                gate_step(ctx, herd_id, decision_id, &out, findings, confirm).await?;
+            }
+            (out, ms)
+        }
         // No first step keeps every animal inside its collar's fence yet: the driver tries again as the herd moves.
         None => {
             tracing::warn!(herd = %herd_id, "first sweep step not sent: no step keeps every animal inside the fence its collar holds");
@@ -845,7 +883,13 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     let mut m = row.m.clone();
     let state = MoveState { target: &m.target, warn_m: row.warn_m, step: m.step, sweep: &row.sweep, stragglers: &m.stragglers };
     let (mut out, sit, plan_ms) = match next_step(ctx, herd_id, &state, sit, at, row.hysteresis_m).await {
-        Ok(Some(v)) => v,
+        Ok(Some((out, sit, ms, findings))) => {
+            let confirm = crate::gate::confirmed_for(ctx, &m.decision_id).await?;
+            if let Err(e) = gate_step(ctx, herd_id, &m.decision_id, &out, findings, &confirm).await {
+                return refused_step(ctx, &row.m, at, &e.message).await;
+            }
+            (out, sit, ms)
+        }
         Ok(None) => {
             tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: no step keeps every animal inside the fence its collar holds");
             return Ok(None);
@@ -924,6 +968,35 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     Ok(None)
 }
 
+/// The gate refused a sweep step: the move stops where it is (the active
+/// boundary stays) and says why, once.
+async fn refused_step(ctx: &Ctx, m: &Move, at: DateTime<Utc>, why: &str) -> anyhow::Result<Option<Move>> {
+    let row = sqlx::query("UPDATE moves SET status = 'stopped', updated_at = ? WHERE id = ? AND status = 'sweeping' RETURNING *")
+        .bind(to_db(&at))
+        .bind(&m.id)
+        .fetch_optional(ctx.db())
+        .await?;
+    let Some(stopped) = row.map(|r| move_from_row(&r)).transpose()?.map(|r| r.m) else { return Ok(None) };
+    tracing::warn!(herd = %m.herd_id, r#move = %m.id, "move stopped: the safety gate refused its next step: {why}");
+    let _ = ctx
+        .store()
+        .record_event(&op_core::ActivityEvent {
+            id: id::new_id(id::EVENT),
+            kind: "move.refused".into(),
+            source: "system".into(),
+            occurred_at: at,
+            recorded_at: at,
+            title: "Move stopped by the safety gate".into(),
+            body: Some(why.to_owned()),
+            payload: serde_json::json!({ "move_id": m.id, "decision_id": m.decision_id }),
+            targets: vec![("herd".into(), m.herd_id.clone()), ("decision".into(), m.decision_id.clone())],
+        })
+        .await
+        .inspect_err(|e| tracing::warn!("activity log: {e:#}"));
+    ctx.publish(Event::Move { r#move: stopped.clone() });
+    Ok(Some(stopped))
+}
+
 async fn sweeping_herds(ctx: &Ctx) -> anyhow::Result<HashSet<String>> {
     let rows = sqlx::query("SELECT herd_id FROM moves WHERE status = 'sweeping'").fetch_all(ctx.db()).await?;
     Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
@@ -953,7 +1026,7 @@ async fn restart_clocks(ctx: &Ctx) -> anyhow::Result<()> {
 /// to once a second per herd) and looks at every sweeping move every 5 s.
 /// Picks up moves left sweeping by a restart.
 pub fn spawn_driver(ctx: Ctx) {
-    tokio::spawn(async move {
+    ctx.clone().supervise("ingest.moves", Some(std::time::Duration::from_secs(1)), |ctx| async move {
         if let Err(e) = restart_clocks(&ctx).await {
             tracing::warn!("resuming moves: {e:#}");
         }
@@ -973,6 +1046,7 @@ pub fn spawn_driver(ctx: Ctx) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 _ = tick.tick() => {
+                    ctx.beat("ingest.moves");
                     if n % 5 == 0 {
                         match sweeping_herds(&ctx).await {
                             Ok(s) => sweeping = s,

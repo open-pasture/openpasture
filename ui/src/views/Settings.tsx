@@ -1,8 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { api, type Brain, type BrainTest, type HostedKey, type NewHostedKey, type SecretName, type SecretStatus, type Settings } from "../api";
+import { api, type Brain, type BrainTest, type CollarAddressCheck, type CollarAddressStep, type HostedKey, type NewHostedKey, type SecretName, type SecretStatus, type Settings } from "../api";
 import { guarded, interleave, SETTINGS, settingsSections, type SettingsSection } from "../registry";
+import { useAction } from "../store/action";
 import { useCan } from "../store/me";
+import { loadServer, useServer } from "../store/server";
+import { ActionError } from "../shell/ActionError";
+import { isDesktop } from "../shell/desktop";
 import { Button, Copy, Input } from "../ui";
+import { AppToken } from "../features/rules/AppToken";
 
 export function SettingsView() {
   // The built-in rows write owner-only settings and secrets.
@@ -199,17 +204,83 @@ function Secret({ name, set, placeholder, onSaved, plain }: {
 
 function Server({ settings, onSaved }: { settings: Settings; onSaved: (s: Settings) => void }) {
   const [s, setS] = useState(settings.server);
-  const dirty = s.bind !== settings.server.bind || s.port !== settings.server.port || (s.public_url ?? "") !== (settings.server.public_url ?? "");
-  const save = async () => onSaved(await api.updateSettings({ server: { bind: s.bind, port: s.port, public_url: s.public_url?.trim() || null } }));
+  const info = useServer();
+  // The desktop app keeps the server on this computer (127.0.0.1); collars reach it through the collar address.
+  const desktop = isDesktop();
+  const dirty = (!desktop && s.bind !== settings.server.bind) || s.port !== settings.server.port || (s.public_url ?? "") !== (settings.server.public_url ?? "");
+  const save = useAction(
+    () => api.updateSettings({ server: { ...(desktop ? {} : { bind: s.bind }), port: s.port, public_url: s.public_url?.trim() || null } }),
+    { after: (next) => { onSaved(next); void loadServer(true); } },
+  );
+  const restart = info && (info.port !== settings.server.port || (!desktop && info.bind !== settings.server.bind));
   return (
-    <form className="server" onSubmit={(e) => { e.preventDefault(); void save(); }}>
+    <div className="server">
+      <form className="server" onSubmit={(e) => { e.preventDefault(); void save.run(); }}>
+        <div className="line">
+          {!desktop && <Input mono value={s.bind} onChange={(e) => setS({ ...s, bind: e.target.value })} aria-label="Address" className="grow" />}
+          <Input mono value={String(s.port)} inputMode="numeric" onChange={(e) => setS({ ...s, port: Number(e.target.value.replace(/\D/g, "")) || 0 })} aria-label="Port" className="port" />
+        </div>
+        {info && (
+          <p className="mono dim saddr">
+            <span>{info.bind}:{info.port}</span>
+            {info.lan_url && <span>{info.lan_url.replace(/^https?:\/\//, "")} on the network</span>}
+            {restart && <span>the new address applies when openpasture restarts</span>}
+          </p>
+        )}
+        <Input mono value={s.public_url ?? ""} placeholder="Public URL" onChange={(e) => setS({ ...s, public_url: e.target.value })} aria-label="Public URL" />
+        <ActionError action={save} />
+        {dirty && <div className="line"><Button small kind="primary" type="submit" disabled={save.busy}>Save</Button></div>}
+      </form>
+      <CollarAddress saved={settings.server.collar_url} suggest={settings.server.public_url} onSaved={(collar_url) => onSaved({ ...settings, server: { ...settings.server, collar_url } })} />
+      <AppToken />
+    </div>
+  );
+}
+
+const STEP_WORD: Record<CollarAddressStep, string> = { address: "address", dns: "name", https: "https", server: "this server" };
+
+// Where collars reach this server. Checked (the name, https, and that it really is this server)
+// before it can be used, then confirmed: it goes into every collar, and a wrong one costs a day
+// of silence before collars fall back.
+function CollarAddress({ saved, suggest, onSaved }: { saved?: string; suggest?: string; onSaved: (url?: string) => void }) {
+  const [url, setUrl] = useState(saved ?? "");
+  const [checked, setChecked] = useState<CollarAddressCheck>();
+  const typed = url.trim().replace(/\/+$/, "");
+  const check = useAction((u: string) => api.checkCollarAddress(u), { after: (c) => setChecked(c) });
+  const use = useAction((u: string | null) => api.setCollarAddress(u), {
+    after: (r) => {
+      setChecked(undefined);
+      onSaved(r.collar_url);
+      void loadServer(true);
+    },
+  });
+  const same = typed === (saved ?? "");
+  const fresh = checked && checked.url === typed;
+  return (
+    <form className="caddr" onSubmit={(e) => { e.preventDefault(); if (typed) void check.run(typed); }}>
       <div className="line">
-        <Input mono value={s.bind} onChange={(e) => setS({ ...s, bind: e.target.value })} aria-label="Address" className="grow" />
-        <Input mono value={String(s.port)} inputMode="numeric" onChange={(e) => setS({ ...s, port: Number(e.target.value.replace(/\D/g, "")) || 0 })} aria-label="Port" className="port" />
+        <Input mono value={url} placeholder={suggest?.startsWith("https://") ? suggest : "Collar address, https://"} aria-label="Collar address" className="grow"
+          onChange={(e) => { setUrl(e.target.value); setChecked(undefined); check.clear(); use.clear(); }} />
+        {typed && !same && <Button small type="submit" disabled={check.busy}>{check.busy ? "Checking" : "Check"}</Button>}
+        {!typed && saved && <Button small kind="plain" disabled={use.busy} onClick={() => void use.run(null)}>Remove</Button>}
       </div>
-      <Input mono value={s.public_url ?? ""} placeholder="Public URL" onChange={(e) => setS({ ...s, public_url: e.target.value })} aria-label="Public URL" />
-      <Copy label="token" value={settings.server.app_token} secret />
-      {dirty && <div className="line"><Button small kind="primary" type="submit">Save</Button></div>}
+      {!typed && !saved && <p className="dim cnote">Collars need an https address that reaches this computer, such as a named tunnel or your own domain.</p>}
+      {fresh && (
+        <p className="mono csteps">
+          {(["address", "dns", "https", "server"] as const).map((k) => (
+            <span key={k} data-ok={checked.passed.includes(k) || undefined} data-failed={checked.failed === k || undefined}>{STEP_WORD[k]}</span>
+          ))}
+        </p>
+      )}
+      {fresh && checked.problem && <p className="err cnote">{checked.problem}</p>}
+      {fresh && checked.ok && (
+        <div className="cconfirm">
+          <p className="cnote">Every collar gets <span className="mono">{checked.endpoint}</span> in its next config. If it stops reaching this server, collars go quiet for up to a day before they fall back.</p>
+          <div className="line"><Button small kind="primary" disabled={use.busy} onClick={() => void use.run(checked.url)}>Use for collars</Button></div>
+        </div>
+      )}
+      <ActionError action={check} />
+      <ActionError action={use} />
     </form>
   );
 }

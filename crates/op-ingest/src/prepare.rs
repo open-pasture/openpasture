@@ -9,14 +9,24 @@
 //! already keeps out (a prepared boundary coming back through: a sweep step,
 //! a reissue) is left alone, so preparing twice changes nothing.
 //!
+//! No-go zones are exclusions that are always in effect: they are cut out or
+//! made holes the same way.
+//!
 //! **Findings** from the map and the collars: the exclusions it overlapped
-//! (`overlaps_exclusion`), hazards it takes in, roads, neighbour lines and the
+//! (`overlaps_exclusion`), no-go zones it still takes in (`enters_no_go`:
+//! one that covers all of it, or a hole the herd's collars that can't hold
+//! holes won't keep), hazards it takes in, roads, neighbour lines and the
 //! farm boundary it crosses, water inside it or none, collars offline,
 //! animals that end up in a new hole or outside it, and, for a staged
 //! boundary, collars with no room for it yet. Hazards, roads, neighbour
 //! lines, water and the farm boundary never change the shape. Geometry on a
 //! finding is GeoJSON to draw: the overlap, the part past the farm boundary,
 //! the road inside, the water, the collars' last fixes.
+//!
+//! The critical findings are the ones [`crate::gate`] refuses: a road or the
+//! farm boundary crossed, a no-go zone or a hard hazard (`props.hard`) taken
+//! in, all of it in an exclusion, and no water inside when the farm requires
+//! it ([`crate::gate::GateSettings`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -74,7 +84,7 @@ pub(crate) async fn exclude(ctx: &Ctx, geometry: &Polygon, limits: &CollarLimits
     let mut pending = Vec::new();
     if let Some(loc) = Local::new(geometry) {
         let target = loc.poly(geometry);
-        for f in found.into_iter().filter(|f| f.kind == FeatureKind::Exclusion) {
+        for f in found.into_iter().filter(|f| matches!(f.kind, FeatureKind::Exclusion | FeatureKind::NoGo)) {
             let Some(p) = f.geometry.polygon() else { continue };
             let overlap = target.intersection(&loc.poly(&p));
             if overlap.unsigned_area() >= OVERLAP_M2 {
@@ -111,12 +121,12 @@ pub(crate) async fn findings(
     warn_m: f64,
 ) -> ApiResult<Vec<Finding>> {
     let mut out = Vec::new();
-    for p in &excluded.placed {
-        out.push(exclusion_finding(p));
-    }
+    out.extend(excluded.placed.iter().filter_map(exclusion_finding));
     let Some(loc) = Local::new(sent) else { return Ok(out) };
     let features = op_core::features::list_features(ctx, None, None, Some(at)).await?;
-    out.extend(map_findings(&loc, sent, &features));
+    let rules =
+        MapRules { holeless: herd.iter().any(|c| c.parked.is_none() && !c.caps.holds_holes()), require_water: crate::gate::settings(ctx).await?.require_water };
+    out.extend(map_findings(&loc, sent, &features, rules));
 
     let t = now();
     let collars = db::list_collars(ctx.db(), Some(herd_id)).await?;
@@ -189,25 +199,53 @@ fn capital(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
-fn exclusion_finding(p: &Placed) -> Finding {
-    let name = name_or(&p.feature, "exclusion");
+fn exclusion_finding(p: &Placed) -> Option<Finding> {
+    // A no-go zone left in the shape is `enters_no_go` (map_findings); one kept out is just that.
+    if p.feature.kind == FeatureKind::NoGo && p.placement == Placement::Drop {
+        return None;
+    }
+    let name = name_or(&p.feature, if p.feature.kind == FeatureKind::NoGo { "no-go zone" } else { "exclusion" });
     let (severity, text) = match p.placement {
         // Covers all of it (nothing would be left to graze), so the collars don't keep it out.
-        Placement::Drop => (Severity::Warning, format!("All of it lies in {}", if p.feature.name.is_some() { name } else { "an exclusion".into() })),
+        Placement::Drop => (Severity::Critical, format!("All of it lies in {}", if p.feature.name.is_some() { name } else { "an exclusion".into() })),
         _ => (Severity::Info, format!("{} kept out", capital(&name))),
     };
-    Finding { code: "overlaps_exclusion".into(), severity, text, geometry: p.overlap.clone(), targets: vec![("feature".into(), p.feature.id.clone())] }
+    Some(Finding { code: "overlaps_exclusion".into(), severity, text, geometry: p.overlap.clone(), targets: vec![("feature".into(), p.feature.id.clone())] })
 }
 
-/// Hazards, roads, neighbour lines, the farm boundary and water against the sent shape.
-fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature]) -> Vec<Finding> {
+/// What the map checks need beyond the features: whether some of the herd's
+/// collars enforce the outer ring alone (they don't keep a no-go hole), and
+/// whether the farm requires water inside every boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct MapRules {
+    pub holeless: bool,
+    pub require_water: bool,
+}
+
+/// No-go zones, hazards, roads, neighbour lines, the farm boundary and water against the sent shape.
+fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: MapRules) -> Vec<Finding> {
     let mut out = Vec::new();
     let shape = loc.poly(sent);
+    // What a collar that can't hold holes enforces: the outer ring alone.
+    let ring = rules.holeless.then(|| loc.poly(&Polygon::from_ring(sent.outer_ring()))).filter(|_| sent.coordinates.len() > 1);
     let target = |f: &MapFeature| vec![("feature".to_owned(), f.id.clone())];
     let mut waters = 0;
     let mut water_inside = Vec::new();
     for f in features {
         match (f.kind, &f.geometry) {
+            (FeatureKind::NoGo, FeatureGeometry::Polygon(rings)) => {
+                let zone = loc.rings(rings);
+                let name = name_or(f, "a no-go zone");
+                let overlap = shape.intersection(&zone);
+                let (overlap, text) = if overlap.unsigned_area() >= OVERLAP_M2 {
+                    (overlap, format!("Takes in {name}"))
+                } else if let Some(r) = ring.as_ref().map(|r| r.intersection(&zone)).filter(|o| o.unsigned_area() >= OVERLAP_M2) {
+                    (r, format!("Collars that can't hold holes take in {name}"))
+                } else {
+                    continue;
+                };
+                out.push(Finding { code: "enters_no_go".into(), severity: Severity::Critical, text, geometry: loc.to_geojson(&overlap), targets: target(f) });
+            }
             (FeatureKind::Hazard, g) => {
                 let area = match g {
                     FeatureGeometry::Point(c) => match f.props.get("radius_m").and_then(Value::as_f64).filter(|r| r.is_finite() && *r > 0.0) {
@@ -223,9 +261,10 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature]) -> Vec<Fin
                         Some(n) => format!("Takes in {n}"),
                         None => "Takes in a hazard".into(),
                     };
+                    let hard = f.props.get("hard").and_then(Value::as_bool).unwrap_or(false);
                     out.push(Finding {
                         code: "overlaps_hazard".into(),
-                        severity: Severity::Warning,
+                        severity: if hard { Severity::Critical } else { Severity::Warning },
                         text,
                         geometry: loc.to_geojson(&overlap),
                         targets: target(f),
@@ -249,7 +288,7 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature]) -> Vec<Fin
                 if past.unsigned_area() >= OVERLAP_M2 {
                     out.push(Finding {
                         code: "crosses_farm_boundary".into(),
-                        severity: Severity::Warning,
+                        severity: Severity::Critical,
                         text: "Goes past the farm boundary".into(),
                         geometry: loc.to_geojson(&past),
                         targets: target(f),
@@ -278,10 +317,22 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature]) -> Vec<Fin
     }
     // Only a farm that has mapped its water can say none is inside.
     if waters > 0 && water_inside.is_empty() {
-        out.push(Finding { code: "no_water".into(), severity: Severity::Warning, text: "No water inside".into(), geometry: None, targets: vec![] });
+        let severity = if rules.require_water { Severity::Critical } else { Severity::Warning };
+        out.push(Finding { code: "no_water".into(), severity, text: "No water inside".into(), geometry: None, targets: vec![] });
     }
     out.extend(water_inside);
     out
+}
+
+/// The map findings alone for `shape` at `at`: no exclusions applied and no
+/// collars looked at. What the gate needs for a sweep step, an escape pen and
+/// a staged boundary taking effect. `holeless`: the collars it goes to
+/// enforce the outer ring alone.
+pub(crate) async fn map_only(ctx: &Ctx, shape: &Polygon, at: DateTime<Utc>, holeless: bool) -> anyhow::Result<Vec<Finding>> {
+    let Some(loc) = Local::new(shape) else { return Ok(vec![]) };
+    let features = op_core::features::list_features(ctx, None, None, Some(at)).await?;
+    let rules = MapRules { holeless, require_water: crate::gate::settings(ctx).await?.require_water };
+    Ok(map_findings(&loc, shape, &features, rules))
 }
 
 type At<'a> = (&'a str, LonLat);
@@ -415,9 +466,8 @@ fn multipoint(points: impl Iterator<Item = LonLat>) -> Option<Value> {
     (!pts.is_empty()).then(|| json!({ "type": "MultiPoint", "coordinates": pts }))
 }
 
-/// Local metres about a shape's first corner, for areas, overlaps and clipping.
 /// How much of `of` (0 to 1) lies inside `within`, holes counted.
-pub(crate) fn share_inside(of: &Polygon, within: &Polygon) -> f64 {
+pub fn share_inside(of: &Polygon, within: &Polygon) -> f64 {
     let Some(loc) = Local::new(of) else { return 0.0 };
     let a = loc.poly(of);
     let area = a.unsigned_area();
@@ -427,6 +477,7 @@ pub(crate) fn share_inside(of: &Polygon, within: &Polygon) -> f64 {
     a.intersection(&loc.poly(within)).unsigned_area() / area
 }
 
+/// Local metres about a shape's first corner, for areas, overlaps and clipping.
 struct Local {
     proj: Projection,
 }
@@ -534,38 +585,60 @@ mod tests {
         f.iter().map(|f| f.code.as_str()).collect()
     }
 
+    const OPEN: MapRules = MapRules { holeless: false, require_water: false };
+
     #[test]
-    fn roads_hazards_water_and_the_farm_boundary_are_found_not_enforced() {
+    fn roads_the_farm_boundary_and_hard_hazards_are_critical() {
         let sent = Polygon::from_ring(rect(0.0, 0.0, 200.0, 100.0));
         let loc = Local::new(&sent).unwrap();
         let road = feature(FeatureKind::Road, FeatureGeometry::LineString(vec![at(-50.0, 50.0), at(250.0, 50.0)]), Some("county road"), json!({}));
         let well = feature(FeatureKind::Hazard, FeatureGeometry::Point(at(20.0, 20.0)), Some("old well"), json!({ "radius_m": 10.0 }));
         let farm = feature(FeatureKind::FarmBoundary, FeatureGeometry::Polygon(vec![rect(-10.0, -10.0, 150.0, 110.0)]), None, json!({}));
         let trough = feature(FeatureKind::Water, FeatureGeometry::Point(at(500.0, 500.0)), Some("north trough"), json!({}));
-        let f = map_findings(&loc, &sent, &[road.clone(), well, farm, trough.clone()]);
+        let f = map_findings(&loc, &sent, &[road.clone(), well, farm, trough.clone()], OPEN);
         assert_eq!(codes(&f), ["crosses_road", "overlaps_hazard", "crosses_farm_boundary", "no_water"]);
-        assert_eq!(f[0].severity, Severity::Critical);
+        let sev: Vec<Severity> = f.iter().map(|f| f.severity).collect();
+        assert_eq!(sev, [Severity::Critical, Severity::Warning, Severity::Critical, Severity::Warning]);
         assert_eq!(f[0].text, "Crosses county road");
         assert_eq!(f[0].geometry.as_ref().unwrap()["type"], "LineString");
         assert_eq!(f[1].text, "Takes in old well");
         // The part past the farm boundary: 50 x 100 m.
         let past = f[2].geometry.as_ref().unwrap();
         assert_eq!(past["type"], "Polygon");
+        // A hazard marked hard is critical; water is when the farm requires it.
+        let pit = feature(FeatureKind::Hazard, FeatureGeometry::Point(at(20.0, 20.0)), Some("pit"), json!({ "radius_m": 10.0, "hard": true }));
+        let f = map_findings(&loc, &sent, &[pit, trough.clone()], MapRules { require_water: true, ..OPEN });
+        assert_eq!(codes(&f), ["overlaps_hazard", "no_water"]);
+        assert!(f.iter().all(|f| f.severity == Severity::Critical));
         // Water inside: ringed, and no "no water".
         let pond = feature(FeatureKind::Water, FeatureGeometry::Point(at(100.0, 80.0)), Some("pond"), json!({}));
-        let f = map_findings(&loc, &sent, &[trough, pond]);
+        let f = map_findings(&loc, &sent, &[trough, pond], OPEN);
         assert_eq!(codes(&f), ["water_inside"]);
         assert_eq!(f[0].text, "Pond inside");
-        // No water mapped at all: nothing said about water.
-        assert!(map_findings(&loc, &sent, &[road]).iter().all(|f| !f.code.contains("water")));
+        // No water mapped at all: nothing said about water, required or not.
+        assert!(map_findings(&loc, &sent, &[road], MapRules { require_water: true, ..OPEN }).iter().all(|f| !f.code.contains("water")));
     }
 
     #[test]
-    fn a_road_alongside_is_not_a_crossing() {
+    fn a_no_go_zone_taken_in_is_critical_and_a_hole_counts_only_for_collars_that_hold_holes() {
+        let zone = rect(80.0, 30.0, 120.0, 70.0);
+        let creek = feature(FeatureKind::NoGo, FeatureGeometry::Polygon(vec![zone.clone()]), Some("creek"), json!({}));
+        // Drawn over it: taken in.
         let sent = Polygon::from_ring(rect(0.0, 0.0, 200.0, 100.0));
         let loc = Local::new(&sent).unwrap();
-        let road = feature(FeatureKind::Road, FeatureGeometry::LineString(vec![at(-50.0, 110.0), at(250.0, 110.0)]), None, json!({}));
-        assert!(map_findings(&loc, &sent, &[road]).is_empty());
+        let f = map_findings(&loc, &sent, std::slice::from_ref(&creek), OPEN);
+        assert_eq!(codes(&f), ["enters_no_go"]);
+        assert_eq!((f[0].severity, f[0].text.as_str()), (Severity::Critical, "Takes in creek"));
+        // Made a hole: kept out, unless some collars enforce the outer ring alone.
+        let holed = Polygon::from_rings(rect(0.0, 0.0, 200.0, 100.0), [zone]);
+        let loc = Local::new(&holed).unwrap();
+        assert!(map_findings(&loc, &holed, std::slice::from_ref(&creek), OPEN).is_empty());
+        let f = map_findings(&loc, &holed, std::slice::from_ref(&creek), MapRules { holeless: true, ..OPEN });
+        assert_eq!(codes(&f), ["enters_no_go"]);
+        assert!(f[0].text.starts_with("Collars that can't hold holes"));
+        // Clear of it: nothing.
+        let away = Polygon::from_ring(rect(300.0, 0.0, 400.0, 100.0));
+        assert!(map_findings(&Local::new(&away).unwrap(), &away, &[creek], OPEN).is_empty());
     }
 
     #[test]

@@ -28,7 +28,9 @@ One Rust server with the web UI built in. The desktop app runs that server for y
 | Server, macOS Intel | [openpasture-server-macos-x64.tar.gz](https://github.com/open-pasture/openpasture/releases/latest/download/openpasture-server-macos-x64.tar.gz) |
 | Docker | `ghcr.io/open-pasture/openpasture` |
 
-Checksums are in `SHA256SUMS` on each [release](https://github.com/open-pasture/openpasture/releases).
+The desktop app is macOS only for now; the server runs on Linux and macOS. Checksums are in
+`SHA256SUMS` on each [release](https://github.com/open-pasture/openpasture/releases), and what
+changed in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Run the server
 
@@ -37,6 +39,9 @@ mkdir openpasture && cd openpasture
 tar xzf ../openpasture-server-linux-x64.tar.gz
 ./openpasture serve --bind 0.0.0.0 --port 7878
 ```
+
+`--bind 0.0.0.0` listens on every network the machine is on. Behind a reverse proxy or tunnel,
+keep the default `127.0.0.1` instead (see `docs/SELF-HOSTING.md`).
 
 Open `http://<host>:7878`. On the machine itself (`127.0.0.1`) no token is needed. From anywhere
 else the app asks for its token once:
@@ -63,24 +68,27 @@ For a farm: an https address for collars and phones, systemd, backups and upgrad
 
 ## Try it with simulated collars
 
-Until you have a collar, `collar-sim` (in the server tarball, or `cargo run -p collar-sim`)
-speaks the real collar protocol. In the app, name the farm, draw a paddock and create a herd.
-Then:
+Until you have a collar, `collar-sim`, the simulator (in the server tarball, or
+`simulation/collar-sim`), speaks the real collar protocol on a farm of its own:
 
 ```
-./collar-sim --server http://127.0.0.1:7878 --count 12
+./collar-sim farm
 ```
 
-Twelve collars link to the herd and start reporting. Draw a boundary, send it, and watch the acks
-come in and the herd walk into it. Add `--token <app token>` for a server on another machine.
+It starts a throwaway server on port 7991 with "Simulated farm", two paddocks and a herd of
+twelve simulated collars, and prints the address. Draw a boundary, send it, and watch the acks
+come in and the herd walk into it. The app marks every simulated collar "Simulated", reports
+leave them out, and the simulator refuses port 7878 and any data dir with real collars. See
+`simulation/README.md`.
 
 ## Build from source
 
-Needs Rust (stable) and [bun](https://bun.sh).
+Needs Rust (rustup installs the version pinned in `rust-toolchain.toml`) and
+[bun](https://bun.sh).
 
 ```
 cd ui && bun install && bun run build && cd ..
-cargo build --release -p op-cli -p collar-sim     # target/release/openpasture, collar-sim
+cargo build --release -p op-cli -p collar-sim     # target/release/openpasture, collar-sim (the simulator)
 cargo test --workspace
 
 bun run desktop:build                             # the macOS app, Apple Silicon
@@ -90,11 +98,21 @@ bun run desktop:release                           # universal .app and .dmg
 The server embeds `ui/dist` at build time; if it is missing, the build runs bun for you.
 Releases are cut by pushing a tag; see `docs/RELEASING.md`.
 
-Docs: `docs/SELF-HOSTING.md` (running it for a farm), `docs/TEXTING.md` (Twilio, email, webhook,
-push, the relay), `docs/API.md` (HTTP API, collar protocol, events, MCP tools), `docs/PLAN.md`
-(design).
+## Docs
+
+- [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md): running it for a farm
+- [`docs/TEXTING.md`](docs/TEXTING.md): Twilio, email, webhook, push, the relay
+- [`docs/api/`](docs/api/README.md): the APIs, by what you're building (HTTP, live feed, MCP,
+  fleet, and the collar protocol in [opencollar](https://github.com/open-pasture/opencollar))
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): how it's built; [`docs/PLAN.md`](docs/PLAN.md):
+  the original decisions
+- [`docs/RELEASING.md`](docs/RELEASING.md), [`CONTRIBUTING.md`](CONTRIBUTING.md),
+  [`SECURITY.md`](SECURITY.md)
 
 ## Licence
 
 The app is [AGPL-3.0](LICENSE). `op-protocol` and `op-geo` are Apache-2.0, so collar firmware
-and other software can use the protocol and geometry without the AGPL.
+and other software can use the protocol and geometry without the AGPL. See [`NOTICE`](NOTICE);
+every release lists the third-party code it ships, with licences, in `THIRD-PARTY-NOTICES`.
+
+Found a security problem? Report it privately: [`SECURITY.md`](SECURITY.md).

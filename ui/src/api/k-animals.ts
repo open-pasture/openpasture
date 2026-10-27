@@ -14,7 +14,8 @@ export interface ImportPreview {
 }
 export interface ImportResult { created: number; updated: number; unchanged: number; total: number; errors: RowError[] }
 // A collar with what setting it up needs. The key is shown once.
-export interface LinkedCollar { collar: Collar; key: string; endpoint: string; public_key: string; tag?: string }
+// endpoint is the collar address; absent until one is set, with no_endpoint saying why.
+export interface LinkedCollar { collar: Collar; key: string; endpoint?: string; no_endpoint?: string; public_key: string; tag?: string }
 export interface Batch { batch_id: string; collars: LinkedCollar[] }
 export interface Card { collar_id: string; qr_svg: string }
 // Imported position history (K-files), [lon, lat, unix seconds].

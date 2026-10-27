@@ -414,8 +414,14 @@ async fn get_settings(State(ctx): State<Ctx>, identity: crate::Identity) -> ApiR
     Ok(Json(settings))
 }
 
-async fn put_settings(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Settings>> {
-    Ok(Json(ctx.update_settings(&body).await?))
+/// The app token isn't set here: it changes only by `POST /api/settings/app-token/rotate`.
+async fn put_settings(State(ctx): State<Ctx>, identity: crate::Identity, ApiJson(mut body): ApiJson<Value>) -> ApiResult<Json<Settings>> {
+    if let Some(server) = body.get_mut("server").and_then(Value::as_object_mut) {
+        server.remove("app_token");
+    }
+    let mut settings = ctx.update_settings(&body).await?;
+    crate::people::redact_settings(&identity, &mut settings);
+    Ok(Json(settings))
 }
 
 // Secrets
@@ -439,6 +445,10 @@ async fn put_secret(State(ctx): State<Ctx>, Path(name): Path<String>, ApiJson(bo
     }
     if value.len() > 8192 {
         return Err(ApiError::bad_request("The value is too long."));
+    }
+    // Hosted: a typed URL reaches the public internet only.
+    if name.ends_with("_url") {
+        crate::net::guard_url(value).await.map_err(ApiError::bad_request)?;
     }
     ctx.secrets().set(&name, value)?;
     tracing::info!(secret = %name, "secret set");

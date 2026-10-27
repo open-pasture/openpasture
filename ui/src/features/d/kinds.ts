@@ -18,6 +18,8 @@ export interface KindSpec {
 
 export const KINDS: KindSpec[] = [
   { kind: "exclusion", label: "Exclusion", shapes: ["Polygon"], order: 20, key: "x" },
+  // Kept out of every boundary for good; the server refuses any that would take it in.
+  { kind: "no_go", label: "No-go zone", shapes: ["Polygon"], order: 25 },
   { kind: "water", label: "Water", shapes: ["Point", "Polygon"], order: 30 },
   { kind: "gate", label: "Gate", shapes: ["Point"], order: 40 },
   { kind: "shade", label: "Shade", shapes: ["Point", "Polygon"], order: 50 },

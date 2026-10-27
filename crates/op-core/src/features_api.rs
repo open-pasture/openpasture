@@ -1,5 +1,5 @@
 //! Map feature routes (docs/API.md "Map features"): list, create, read,
-//! change and delete exclusions, water, gates, shade, hazards, roads,
+//! change and delete exclusions, no-go zones, water, gates, shade, hazards, roads,
 //! neighbour lines and the farm boundary, plus the `list_features` MCP tool.
 //!
 //! Types, the table, validation of a new feature and the reads live in
@@ -47,7 +47,7 @@ impl Filter {
 
 fn parse_kind(s: &str) -> ApiResult<FeatureKind> {
     FeatureKind::from_db(s)
-        .map_err(|_| ApiError::bad_request(format!("Unknown kind {s}. Use exclusion, water, gate, shade, hazard, road, neighbour_line or farm_boundary.")))
+        .map_err(|_| ApiError::bad_request(format!("Unknown kind {s}. Use exclusion, no_go, water, gate, shade, hazard, road, neighbour_line or farm_boundary.")))
 }
 
 async fn list(State(ctx): State<Ctx>, Query(q): Query<HashMap<String, String>>) -> ApiResult<Json<Vec<MapFeature>>> {
@@ -106,6 +106,9 @@ pub async fn update_feature(ctx: &Ctx, id: &str, body: &Value) -> ApiResult<MapF
     {
         return Err(ApiError::bad_request("active_until must be after active_from."));
     }
+    if f.kind == FeatureKind::NoGo && (f.active_from.is_some() || f.active_until.is_some()) {
+        return Err(ApiError::bad_request(crate::features::NO_GO_LASTS));
+    }
     f.name = clean_text(f.name, 200, "name")?;
     f.notes = clean_text(f.notes, 2000, "note")?;
     f.updated_at = time::now();
@@ -153,11 +156,11 @@ fn clean_text(s: Option<String>, max: usize, what: &str) -> ApiResult<Option<Str
 pub fn tool() -> ToolSpec {
     ToolSpec {
         name: "list_features",
-        description: "Map features: exclusions (ground kept out of every boundary sent while they are active), water, gates, shade, hazards, roads, neighbour lines and the farm boundary. Each has a kind, an optional name, GeoJSON geometry ([longitude, latitude]), the paddock it belongs to (none = farm-wide), notes, and an optional active window (active_from inclusive, active_until exclusive).",
+        description: "Map features: exclusions (ground kept out of every boundary sent while they are active), no-go zones (ground the farmer keeps out for good: no boundary may ever take one in), water, gates, shade, hazards (hard ones, props.hard, may not be taken in), roads, neighbour lines and the farm boundary. A boundary that crosses a road or the farm boundary is refused unless a person confirms it. Each has a kind, an optional name, GeoJSON geometry ([longitude, latitude]), the paddock it belongs to (none = farm-wide), notes, and an optional active window (active_from inclusive, active_until exclusive).",
         input_schema: json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "enum": ["exclusion", "water", "gate", "shade", "hazard", "road", "neighbour_line", "farm_boundary"] },
+                "kind": { "type": "string", "enum": ["exclusion", "no_go", "water", "gate", "shade", "hazard", "road", "neighbour_line", "farm_boundary"] },
                 "paddock_id": { "type": "string", "description": "Only this paddock's features (farm-wide ones have no paddock)." },
                 "active": { "type": "boolean", "description": "Only those in effect now." }
             },

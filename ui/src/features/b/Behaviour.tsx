@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { api, type Animal, type Behaviour as Row, type Collar } from "../../api";
 import type { DataSectionProps } from "../../registry";
 import { useStore } from "../../store";
+import { useRead } from "../../store/reads";
 import { Spark } from "../../ui/Spark";
 import { Table, type Column } from "../../ui/Table";
 import { num, useUnits, type Fmt } from "../../units";
@@ -26,18 +27,12 @@ function columns(u: Fmt, label: (r: Row) => string): Column<Row>[] {
 export function Behaviour({ herdId, from, to }: DataSectionProps) {
   const u = useUnits();
   const collars = useStore((s) => s.collars);
-  const [rows, setRows] = useState<Row[]>([]);
-  useEffect(() => {
-    if (!herdId) return;
-    let on = true;
-    api.behaviour({ herd_id: herdId, from, to }).then((r) => on && setRows(r), () => on && setRows([]));
-    return () => {
-      on = false;
-    };
-  }, [herdId, from, to]);
+  // Cancelled when the range or herd changes, or the view is left.
+  const read = useRead(herdId ? () => api.behaviour({ herd_id: herdId, from, to }) : null, [herdId, from, to]);
   const label = useMemo(() => (r: Row) => r.tag ?? r.name ?? collars.find((c) => c.id === r.collar_id)?.name ?? r.collar_id, [collars]);
   const cols = useMemo(() => columns(u, label), [u, label]);
-  const shown = rows.filter((r) => r.fixes > 0);
+  const shown = (read.data ?? []).filter((r) => r.fixes > 0);
+  if (read.error && !read.data) return <p className="err">{read.error}</p>;
   if (!shown.length) return null;
   return (
     <div className="bbehave">
@@ -47,23 +42,18 @@ export function Behaviour({ herdId, from, to }: DataSectionProps) {
   );
 }
 
-// The animal page: the same, for one animal over the last week.
+// The animal page: the same, for one animal over the last week. Only its collar's fixes are
+// read (the herd's take ~20 s at 250 collars), and the read stops if the page is left.
 export function AnimalBehaviour({ animal, collar }: { animal?: Animal; collar?: Collar }) {
   const u = useUnits();
   const herdId = animal?.herd_id ?? collar?.herd_id;
   const collarId = collar?.id ?? animal?.collar_id;
-  const [row, setRow] = useState<Row | null>(null);
-  useEffect(() => {
-    if (!herdId) return;
-    let on = true;
-    api.behaviour({ herd_id: herdId, from: "-7d", to: "now" }).then(
-      (rows) => on && setRow(rows.find((r) => (collarId && r.collar_id === collarId) || (animal && r.animal_id === animal.id)) ?? null),
-      () => on && setRow(null),
-    );
-    return () => {
-      on = false;
-    };
-  }, [herdId, collarId, animal]);
+  const animalId = animal?.id;
+  const rows = useRead(
+    herdId ? () => api.behaviour({ herd_id: herdId, collar_id: collarId, from: "-7d", to: "now" }) : null,
+    [herdId, collarId],
+  );
+  const row = rows.data?.find((r) => (collarId && r.collar_id === collarId) || (animalId && r.animal_id === animalId)) ?? null;
   if (!row || row.fixes === 0) return null;
   return (
     <ul className="kv bbehave1">

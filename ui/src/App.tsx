@@ -41,8 +41,10 @@ export function App() {
     }
   }, [nav, keys]);
 
-  // A sign-in link opens before any sign-in: it is one.
+  // A sign-in link opens before any sign-in: it is one. #/signin/<code> is this machine's owner
+  // (the desktop app's launch, the URL openpasture serve prints).
   if (view === "join") return <Suspense fallback={null}><Join code={rest} /></Suspense>;
+  if (view === "signin") return <Suspense fallback={null}><Join code={rest} owner /></Suspense>;
   if (needToken) return <TokenPrompt />;
   if (!ready) return <div className="boot"><Mark size={22} /></div>;
   if (!state) return <div className="boot"><Mark size={22} /><p className="mono dim">{error}</p></div>;
@@ -121,15 +123,17 @@ function You() {
   );
 }
 
-// The app token, a person's own token, or a sign-in link pasted whole. Empty tries again
-// without one (this machine needs none).
+// The app token, a person's own token, or a sign-in link pasted whole (a person's, or this
+// machine's from openpasture sign-in).
 function TokenPrompt() {
   const [v, setV] = useState("");
-  // A person's token that was just refused was revoked: forget it.
+  // A sign-in that was just refused was revoked or ran out: forget it.
   useEffect(() => {
-    if (getToken().startsWith("opu_")) setToken("");
+    if (getToken().startsWith("opu_") || getToken().startsWith("opo_")) setToken("");
   }, []);
   const submit = () => {
+    const owner = /#\/signin\/([0-9a-f]{32})\b/i.exec(v.trim());
+    if (owner) return location.replace(`#/signin/${owner[1].toLowerCase()}`);
     const code = joinCode(v);
     if (code) return location.replace(`#/join/${code}`);
     setToken(v.trim());

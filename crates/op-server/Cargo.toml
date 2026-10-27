@@ -22,10 +22,16 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 futures.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
 # @HUB
 op-alerts.workspace = true
 op-import.workspace = true
 op-reports.workspace = true
+op-fleet.workspace = true
 # @HUB-UI
 # @E-lib
 # @E-srv

@@ -6,6 +6,7 @@ import { store } from "../../store";
 import { useDefaultWarn } from "../../store/h";
 import { Button } from "../../ui";
 import { attempt } from "../../util";
+import { useGate } from "../../features/rules";
 import { current } from "../drawn";
 import { ToolFooter, useDrawing, type ToolProps } from "../tools";
 
@@ -23,15 +24,17 @@ export function BoundaryTool({ map, draw, herdId, ctx, done }: ToolProps) {
   // A herd in training mode gets its training warn when the send names none (H).
   const defaultWarn = useDefaultWarn(herdId) ?? DEFAULT_WARN_M;
   useWarnBand(map, ctx, drawn ? polygon : undefined, opts.warn_m ?? defaultWarn);
+  // The safety gate may hold it: its findings show under Send, to send anyway by name.
+  const gate = useGate();
 
   const send = () => {
     const g = current(draw);
     if (!g || !herdId) return;
-    return attempt(async () => {
-      await api.sendBoundary(herdId, { geometry: g, ...opts });
+    return attempt(() => gate.run(async (confirm) => {
+      await api.sendBoundary(herdId, { geometry: g, ...opts, confirm });
       done();
       await store.refresh();
-    }, { busy: setBusy, failed: setErr });
+    }), { busy: setBusy, failed: setErr });
   };
 
   if (!drawn)
@@ -49,6 +52,7 @@ export function BoundaryTool({ map, draw, herdId, ctx, done }: ToolProps) {
         <Button small kind="primary" type="submit" disabled={busy}>Send</Button>
         {err && <span className="mono err ferr">{err}</span>}
       </form>
+      {gate.panel}
       {herdId && <ToolFooter tool="boundary" geometry={polygon} herdId={herdId} opts={opts} />}
     </>
   );

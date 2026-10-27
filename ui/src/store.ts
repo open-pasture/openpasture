@@ -4,6 +4,7 @@
 import { useSyncExternalStore } from "react";
 import { api, ApiError, live, onUnauthorized, type Animal, type AppState, type BoundaryStatus, type Collar, type Decision, type Escape, type LiveEvent, type LiveEventOf, type LiveEventType, type Move, type PositionItem } from "./api";
 import "./api/p";
+import { onSlow, scoped } from "./api/http";
 import { loadMe } from "./store/me";
 import { applyAcks, applyCollar, applyPositions, indexById, labels } from "./store/live";
 import { perKey } from "./util";
@@ -13,6 +14,8 @@ export interface Store {
   error?: string;
   needToken: boolean;
   up: boolean;
+  // A write or store read has waited more than a few seconds for the server.
+  slow?: boolean;
   state: AppState | null;
   herdId?: string;
   collars: Collar[];
@@ -22,7 +25,7 @@ export interface Store {
   logs: Record<string, string[]>;
 }
 
-let s: Store = { ready: false, needToken: false, up: false, state: null, collars: [], animals: [], boundary: {}, decisions: [], logs: {} };
+let s: Store = { ready: false, needToken: false, up: false, slow: false, state: null, collars: [], animals: [], boundary: {}, decisions: [], logs: {} };
 const subs = new Set<() => void>();
 type FixEvent = LiveEventOf<"fix">;
 const fixSubs = new Set<(e: FixEvent) => void>();
@@ -135,7 +138,7 @@ async function refresh() {
         }
       }, FIRST_READ_WAIT_MS);
   try {
-    const [state] = await Promise.all([api.state(), loadMe()]);
+    const [state] = await scoped({ lane: "core" }, () => Promise.all([api.state(), loadMe()]));
     const herdId = s.herdId && state.herds.some((h) => h.id === s.herdId) ? s.herdId : state.herds[0]?.id;
     showingCopy = false;
     set({ state, herdId, ready: true, error: undefined });
@@ -156,12 +159,14 @@ async function refresh() {
 async function refreshHerd() {
   const herd = s.herdId;
   // Each part stands alone, so one missing route doesn't blank the rest.
-  const [collars, animals, decisions, boundary] = await Promise.all([
-    api.collars().catch(() => s.collars),
-    api.animals().catch(() => s.animals),
-    herd ? api.decisions(herd, 20).catch(() => s.decisions) : Promise.resolve([] as Decision[]),
-    herd ? api.boundary(herd).catch(() => undefined) : Promise.resolve(undefined),
-  ]);
+  const [collars, animals, decisions, boundary] = await scoped({ lane: "core" }, () =>
+    Promise.all([
+      api.collars().catch(() => s.collars),
+      api.animals().catch(() => s.animals),
+      herd ? api.decisions(herd, 20).catch(() => s.decisions) : Promise.resolve([] as Decision[]),
+      herd ? api.boundary(herd).catch(() => undefined) : Promise.resolve(undefined),
+    ]),
+  );
   set({ collars, animals, decisions, boundary: herd && boundary ? { ...s.boundary, [herd]: boundary } : s.boundary });
 }
 
@@ -171,18 +176,33 @@ function refreshSoon() {
   herdTimer = setTimeout(() => void refreshHerd(), 800);
 }
 
-// One refetch per herd at a time: several herds sweep at once.
+// One refetch per herd at a time: several herds sweep at once. Only the herd's boundary
+// status: a sweep sends a boundary event per step, and the farm record doesn't change with them.
 const boundaryTimers = perKey<string>();
 function refreshBoundarySoon(herd: string) {
   boundaryTimers.set(herd, 120, async () => {
     try {
-      const b = await api.boundary(herd);
+      const b = await scoped({ lane: "core" }, () => api.boundary(herd));
       set({ boundary: { ...s.boundary, [herd]: b } });
-      if (s.state) set({ state: { ...s.state, ...(await api.state()) } });
     } catch {
       /* next event retries */
     }
   });
+}
+
+// The farm record (which paddock each herd is in, paddock status) changes when a decision
+// is answered or a move starts, ends or stops, not on every step.
+let stateTimer: ReturnType<typeof setTimeout> | undefined;
+function refreshStateSoon() {
+  clearTimeout(stateTimer);
+  stateTimer = setTimeout(async () => {
+    try {
+      const state = await scoped({ lane: "core" }, () => api.state());
+      if (s.state) set({ state: { ...s.state, ...state } });
+    } catch {
+      /* the next change or reconnect refetches */
+    }
+  }, 500);
 }
 
 function emit(e: LiveEvent) {
@@ -253,12 +273,14 @@ function onEvent(e: LiveEvent) {
       const decisions = [d, ...s.decisions.filter((x) => x.id !== d.id)].sort((a, b) => b.created_at.localeCompare(a.created_at));
       set({ decisions });
       refreshBoundarySoon(d.herd_id);
+      refreshStateSoon();
       break;
     }
     case "move": {
       // The move rides on the boundary status. Steps also send a boundary event, which refetches.
       const m = e.move;
       const b = s.boundary[m.herd_id];
+      if (!b?.move || b.move.id !== m.id || b.move.status !== m.status) refreshStateSoon();
       if (b) set({ boundary: { ...s.boundary, [m.herd_id]: { ...b, move: m } } });
       else refreshBoundarySoon(m.herd_id);
       break;
@@ -290,9 +312,11 @@ function connectLive() {
 
 export function start() {
   onUnauthorized(() => set({ needToken: true }));
+  const offSlow = onSlow((slow) => set({ slow }));
   void refresh();
   connectLive();
   return () => {
+    offSlow();
     stopLive?.();
     stopLive = undefined;
   };

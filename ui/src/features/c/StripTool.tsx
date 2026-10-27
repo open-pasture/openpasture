@@ -11,6 +11,7 @@ import { useUnits } from "../../units";
 import { centroid } from "../../geo";
 import { C, fc, setData } from "../../map/base";
 import { ToolFooter, type ToolProps } from "../../map/tools";
+import { useGate } from "../rules";
 import { bearing, facts, handleAt, labelAt, lengthwise, snap, tetherFrom } from "./strips";
 
 type By = "count" | "width" | "days";
@@ -39,6 +40,8 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
   const [sel, setSel] = useState(0);
   const [layout, setLayout] = useState<Layout>();
   const [busy, setBusy] = useState(false);
+  // The safety gate may hold a strip: its findings show under the facts, to send anyway by name.
+  const gate = useGate();
 
   const params: StripParams = useMemo(
     () => ({ orientation_deg: deg, head, ...(by === "count" ? { count } : by === "width" ? { width_m: width } : { days }) }),
@@ -119,9 +122,11 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
     if (!strip || !herdId) return;
     setBusy(true);
     try {
-      await api.sendBoundary(herdId, { geometry: strip.geometry });
-      done();
-      await store.refresh();
+      await gate.run(async (confirm) => {
+        await api.sendBoundary(herdId, { geometry: strip.geometry, confirm });
+        done();
+        await store.refresh();
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -160,6 +165,7 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
       </form>
       <div className="cfoot">
         {(error || strip) && <p className={"mono " + (error ? "err" : "cfacts")}>{error ?? facts(u, strip!, preview!.head)}</p>}
+        {gate.panel}
         {herdId && preview && (
           <ToolFooter tool="strip" geometry={strip?.geometry} strips={preview.strips.map((s) => s.geometry)} layoutId={layout?.id} herdId={herdId} opts={{}} />
         )}

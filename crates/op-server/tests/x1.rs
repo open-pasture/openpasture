@@ -44,15 +44,25 @@ async fn call(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], b
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
-fn app_for(ctx: &Ctx, dir: &std::path::Path) -> Router {
-    build_app(ctx.clone(), ServerInfo { data_dir: dir.into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None }, false)
+/// Requests without a token go as the owner (the app token), as the owner's client sends them.
+async fn app_for(ctx: &Ctx, dir: &std::path::Path) -> Router {
+    let token = ctx.settings().await.unwrap().server.app_token;
+    build_app(ctx.clone(), ServerInfo { data_dir: dir.into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None }, false).layer(
+        axum::middleware::map_request(move |mut req: Request<axum::body::Body>| {
+            let bearer = format!("Bearer {token}");
+            async move {
+                req.headers_mut().entry("authorization").or_insert(bearer.parse().unwrap());
+                req
+            }
+        }),
+    )
 }
 
 /// Herds of `sizes` collars each, linked through the API before any socket connects.
 async fn herds(sizes: &[usize]) -> (tempfile::TempDir, Ctx, Router, Vec<(String, Vec<Collar>)>) {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Ctx::open(dir.path()).await.unwrap();
-    let app = app_for(&ctx, dir.path());
+    let app = app_for(&ctx, dir.path()).await;
     let mut out = Vec::new();
     for (h, n) in sizes.iter().enumerate() {
         let herd = Herd {
@@ -213,7 +223,7 @@ async fn several_herds_live_stay_under_three_messages_a_second() {
 async fn a_rejected_acks_code_reaches_the_bus_and_the_ack_batch() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Ctx::open(dir.path()).await.unwrap();
-    let app = app_for(&ctx, dir.path());
+    let app = app_for(&ctx, dir.path()).await;
     let (s, _) = call(&app, "POST", "/api/farm", &[], Some(json!({"name": "Test farm", "timezone": "America/Chicago", "center": [-93.62, 42.03]}))).await;
     assert_eq!(s, StatusCode::CREATED);
     let p1 = json!({"type": "Polygon", "coordinates": [[[-93.625, 42.03], [-93.62, 42.03], [-93.62, 42.0336], [-93.625, 42.0336], [-93.625, 42.03]]]});
@@ -263,7 +273,13 @@ impl Served {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let handle = serve(ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
-        Self { _dir: dir, handle, http: reqwest::Client::new() }
+        // The owner's client: the app token unless a request names someone else.
+        let http = {
+            let mut auth = reqwest::header::HeaderMap::new();
+            auth.insert("authorization", format!("Bearer {}", handle.ctx().settings().await.unwrap().server.app_token).parse().unwrap());
+            reqwest::Client::builder().default_headers(auth).build().unwrap()
+        };
+        Self { _dir: dir, handle, http }
     }
 
     /// A person with a sign-in, and their token (`opu_…`).
@@ -289,7 +305,7 @@ impl Served {
         tokio_tungstenite::connect_async(req).await.unwrap().0
     }
 
-    /// A request from this machine: the owner.
+    /// A request from the owner's client (the app token).
     async fn local(&self, method: reqwest::Method, path: &str) -> reqwest::StatusCode {
         self.http.request(method, format!("{}{path}", self.handle.url())).send().await.unwrap().status()
     }

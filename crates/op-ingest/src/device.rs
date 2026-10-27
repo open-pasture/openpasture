@@ -135,6 +135,14 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     let config_version = rep.device.as_ref().and_then(|d| d.config_version);
     let config_reject = rep.device.as_ref().and_then(|d| d.config_reject.clone());
 
+    // Its place in the herd network, when it says (the simulator's LoRa herds; v2 later),
+    // for the fleet's network view. Outside the write below, which holds the database.
+    if let Some(role) = rep.device.as_ref().and_then(|d| d.device_class.as_deref()).map(|c| op_fleet::network::role_from(Some(c), true)) {
+        let up = op_fleet::network::Uplink { collar_id: collar.id.clone(), role: Some(role), at: received, ..Default::default() };
+        if let Err(e) = op_fleet::network::record_uplink(&ctx, &up).await {
+            tracing::warn!(collar = %collar.id, "herd network: {e:#}");
+        }
+    }
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     // The collar as it is now: another report for it may have just landed.
     let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&collar.id).fetch_optional(&mut *tx).await?;
@@ -145,15 +153,19 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     if let Some(d) = &rep.device {
         let caps_json = (!d.caps.is_empty()).then(|| serde_json::to_string(&d.caps)).transpose().map_err(anyhow::Error::from)?;
         let limits_json = d.limits.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?;
-        sqlx::query("UPDATE collars SET fw = ?, caps = ?, limits = ? WHERE id = ?")
+        // A collar that once said it is simulated stays so (op_core::sim).
+        let simulated = collar.simulated || op_core::sim::in_caps(&d.caps);
+        sqlx::query("UPDATE collars SET fw = ?, caps = ?, limits = ?, simulated = ? WHERE id = ?")
             .bind(&d.fw)
             .bind(caps_json)
             .bind(limits_json)
+            .bind(simulated)
             .bind(&collar.id)
             .execute(&mut *tx)
             .await?;
         collar.fw = d.fw.clone();
         collar.caps = d.caps.clone();
+        collar.simulated = simulated;
     }
     if let Some(list) = &rep.slots {
         slots::replace(&mut tx, &collar.id, list, received).await?;
@@ -194,7 +206,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     // grazing: only who it is, what it holds, its battery, health and last
     // contact are kept.
     if collar.parked_at.is_some() {
-        insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health).await?;
+        insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (rep.fixes.len(), rep.cues.len())).await?;
         collar.last_seen = Some(received);
         if rep.battery.is_some() {
             collar.battery = rep.battery;
@@ -269,22 +281,26 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             latest_event = Some((fix, fix_state));
         }
     }
-    insert_fixes(&mut tx, &collar, &herd_id, &fix_rows).await?;
+    // A resent report stores nothing new: fixes and cues already held are skipped.
+    let new_fixes = insert_fixes(&mut tx, &collar, &herd_id, &fix_rows).await?;
     // One fix event per report (the newest), so a burst of reports can't
     // flood the live feed.
     if let Some((fix, fix_state)) = latest_event {
         events.push(Event::Fix { collar_id: collar.id.clone(), animal_id: collar.animal_id.clone(), herd_id: herd_id.clone(), fix, state: fix_state });
     }
-    insert_cues(&mut tx, &collar, &herd_id, &rep.cues, rep.boundary_version).await?;
-    for cue in &rep.cues {
+    let new_cues = insert_cues(&mut tx, &collar, &herd_id, &rep.cues, rep.boundary_version).await?;
+    // Only cues stored now are announced, so a resent report can't count twice.
+    for (cue, _) in rep.cues.iter().zip(&new_cues).filter(|(_, new)| **new) {
         // Firmware 0.1 sends no kind: outside when past the line, else warn.
-        let kind = cue.kind.map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
+        // A kind this build doesn't know is stored and announced as sent.
+        let kind = cue.kind.as_ref().map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
         events.push(Event::Cue { collar_id: collar.id.clone(), at: cue.at, level: cue.level, margin_m: cue.margin_m, kind: Some(kind.into()), ring: cue.ring });
     }
     for e in &rep.episodes {
         insert_episode(&mut tx, &collar, &herd_id, e, rep.boundary_version).await?;
     }
-    insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health).await?;
+    let stored_cues = new_cues.iter().filter(|n| **n).count();
+    insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (new_fixes, stored_cues)).await?;
 
     collar.last_seen = Some(received);
     if rep.battery.is_some() {
@@ -330,7 +346,10 @@ struct FixRow {
 const ROWS_PER_INSERT: usize = 64;
 
 /// A report's fixes in as few statements as fit (one for any usual report).
-async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id: &str, rows: &[FixRow]) -> ApiResult<()> {
+/// A fix the collar already sent (same time) is skipped. Returns how many
+/// were stored.
+async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id: &str, rows: &[FixRow]) -> ApiResult<usize> {
+    let mut stored = 0;
     for chunk in rows.chunks(ROWS_PER_INSERT) {
         let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop) ",
@@ -353,19 +372,22 @@ async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id:
                 .push_bind(r.paddock_id.as_deref())
                 .push_bind(r.hdop);
         });
-        q.build().execute(&mut *tx).await?;
+        q.push(" ON CONFLICT DO NOTHING");
+        stored += q.build().execute(&mut *tx).await?.rows_affected() as usize;
     }
-    Ok(())
+    Ok(stored)
 }
 
-/// A report's cues, as [`insert_fixes`].
+/// A report's cues, as [`insert_fixes`]: a cue already held (same time and
+/// kind) is skipped. Returns, per cue, whether it was stored now.
 async fn insert_cues(
     tx: &mut sqlx::SqliteConnection,
     collar: &Collar,
     herd_id: &str,
     cues: &[op_protocol::WireCue],
     report_version: Option<u32>,
-) -> ApiResult<()> {
+) -> ApiResult<Vec<bool>> {
+    let mut stored = Vec::with_capacity(cues.len());
     for chunk in cues.chunks(ROWS_PER_INSERT) {
         let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "INSERT INTO cues (collar_id, herd_id, animal_id, at, t, level, margin_m, lon, lat, boundary_version, kind, ring, dur_ms) ",
@@ -381,13 +403,26 @@ async fn insert_cues(
                 .push_bind(cue.point.map(|p| p[0]))
                 .push_bind(cue.point.map(|p| p[1]))
                 .push_bind(cue.boundary_version.or(report_version).map(i64::from))
-                .push_bind(cue.kind.map(|k| k.as_str()))
+                .push_bind(cue.kind.as_ref().map(|k| k.as_str()))
                 .push_bind(cue.ring.map(i64::from))
                 .push_bind(cue.dur_ms.map(i64::from));
         });
-        q.build().execute(&mut *tx).await?;
+        // The kind as the unique key has it (derived for firmware 0.1's cues).
+        q.push(" ON CONFLICT DO NOTHING RETURNING t, COALESCE(kind, CASE WHEN margin_m < 0 THEN 'outside' ELSE 'warn' END)");
+        let mut new: Vec<(i64, String)> = q.build_query_as().fetch_all(&mut *tx).await?;
+        for cue in chunk {
+            let kind = cue.kind.as_ref().map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
+            let key = (unix_ms(&cue.at), kind.to_owned());
+            match new.iter().position(|k| *k == key) {
+                Some(i) => {
+                    new.swap_remove(i);
+                    stored.push(true);
+                }
+                None => stored.push(false),
+            }
+        }
     }
-    Ok(())
+    Ok(stored)
 }
 
 /// One episode, stored once however often the collar resends it.
@@ -422,7 +457,8 @@ async fn insert_episode(
 }
 
 /// One `health` row per report: battery and receiver, cell, motion and power
-/// health over time.
+/// health over time. `stored` is the fixes and cues the report added (none
+/// for a resent one), so summing them counts each fix and cue once.
 async fn insert_health(
     tx: &mut sqlx::SqliteConnection,
     collar_id: &str,
@@ -430,6 +466,7 @@ async fn insert_health(
     received: DateTime<Utc>,
     rep: &PositionReport,
     health: &op_protocol::Health,
+    stored: (usize, usize),
 ) -> ApiResult<()> {
     let cell = health.cell.clone().unwrap_or_default();
     sqlx::query(
@@ -445,8 +482,8 @@ async fn insert_health(
     .bind(health.sats.map(|s| s as i64))
     .bind(health.cn0)
     .bind(health.ttf_s)
-    .bind(rep.fixes.len() as i64)
-    .bind(rep.cues.len() as i64)
+    .bind(stored.0 as i64)
+    .bind(stored.1 as i64)
     .bind(rep.boundary_version.map(|v| v as i64))
     .bind(health.fix_attempts.map(i64::from))
     .bind(health.fix_ok.map(i64::from))
@@ -510,6 +547,12 @@ async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Wa
 async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -> ApiResult<StatusCode> {
     let mut collar = device.collar;
     check_collar_id(&collar, a.collar_id.as_deref())?;
+    // A status this build doesn't know (a newer collar's) is taken and set
+    // aside, so the collar doesn't resend it forever.
+    let Some(status) = a.status.known() else {
+        tracing::warn!(collar = %collar.id, version = a.version, status = a.status.as_str(), "ack with an unknown status, not stored");
+        return Ok(StatusCode::NO_CONTENT);
+    };
     if a.reason.as_ref().is_some_and(|r| r.len() > 1000) {
         return Err(ApiError::bad_request("reason is too long."));
     }
@@ -521,7 +564,7 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
         return Err(ApiError::bad_request(format!("Command {} is version {}, not {}.", b.id, b.version, a.version)));
     }
     // A code only goes with a rejection.
-    let code = a.code.filter(|_| a.status == AckStatus::Rejected);
+    let code = a.code.filter(|_| status == AckStatus::Rejected);
     // Collars may repeat an ack; keep one row per change of status (or code).
     let last: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT status, code FROM acks WHERE collar_id = ? AND version = ? AND herd_id = ? ORDER BY id DESC LIMIT 1")
@@ -564,8 +607,8 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
     .bind(to_db(&a.at))
     .execute(&mut *tx)
     .await?;
-    slots::record_ack(&mut tx, &collar.id, a.version, a.status, code, b.effective_at, received).await?;
-    if a.status == AckStatus::Applied && collar.boundary_version.is_none_or(|v| a.version > v) {
+    slots::record_ack(&mut tx, &collar.id, a.version, status, code, b.effective_at, received).await?;
+    if status == AckStatus::Applied && collar.boundary_version.is_none_or(|v| a.version > v) {
         collar.boundary_version = Some(a.version);
         sqlx::query("UPDATE collars SET boundary_version = ? WHERE id = ?").bind(a.version as i64).bind(&collar.id).execute(&mut *tx).await?;
     }
@@ -575,7 +618,7 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
         collar_id: collar.id.clone(),
         herd_id: collar.herd_id.clone(),
         version: a.version,
-        status: a.status,
+        status,
         reason: a.reason,
         code: code.map(|c| c.as_str().to_owned()),
     });

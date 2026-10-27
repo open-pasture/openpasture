@@ -153,10 +153,13 @@ impl ToolRegistry {
 
     /// Call a tool as `identity` under `scope`. A name that doesn't exist or
     /// isn't in the scope is 400 "Unknown tool"; a role too low is 403 (401
-    /// when anonymous).
+    /// when anonymous). A brain run calls the read tools its token was minted
+    /// with whatever their role (`run_sql` is a manager's for everyone else).
     pub async fn call(&self, ctx: &Ctx, name: &str, args: Value, client: Option<String>, identity: Identity, scope: &ToolScope) -> Result<Value, ApiError> {
         let spec = self.get(name).filter(|t| in_scope(t, scope)).ok_or_else(|| ApiError::bad_request(format!("Unknown tool {name}.")))?;
-        identity.require(spec.min_role)?;
+        if !brain_run(&identity, scope) {
+            identity.require(spec.min_role)?;
+        }
         (spec.run)(ToolCall { ctx: ctx.clone(), args, client, identity }).await
     }
 }
@@ -174,7 +177,13 @@ fn in_scope(t: &ToolSpec, scope: &ToolScope) -> bool {
 }
 
 fn allowed(t: &ToolSpec, identity: &Identity, scope: &ToolScope) -> bool {
-    in_scope(t, scope) && identity.can(t.min_role)
+    in_scope(t, scope) && (brain_run(identity, scope) || identity.can(t.min_role))
+}
+
+/// A brain run's identity under its token's allowlist: the server chose
+/// those read tools for it.
+fn brain_run(identity: &Identity, scope: &ToolScope) -> bool {
+    identity.via == crate::identity::Via::Brain && matches!(scope, ToolScope::Only(_))
 }
 
 /// A set of tools a model can use in a loop (a text question, `Brain::ask`).

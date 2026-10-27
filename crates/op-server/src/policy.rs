@@ -1,21 +1,21 @@
 //! Who may call what (field-ready §2.2), checked by the guard for every
 //! `/api` and `/mcp` request once it knows the [`Identity`]. Coarse on
-//! purpose, so feature handlers stay simple:
+//! purpose, so feature handlers stay simple. Every route is listed with the
+//! lowest role that may use it; a route on no list is the owner's alone
+//! (denied to everyone else), and a test fails until it is listed.
 //!
-//! - **viewer**: `GET`/`HEAD` on `/api/*` except the owner's and managers'
-//!   reads below; `/api/live`; `/mcp` (MCP lists and calls tools by role).
-//!   Every role may also use [`ANY_ROLE`]: its own profile and token, its
-//!   own push subscription.
+//! - **viewer**: [`VIEWER`] reads; `/mcp` (MCP lists and calls tools by
+//!   role). Every role may also use [`ANY_ROLE`]: its own profile and token,
+//!   its own push subscription, signing its own session out.
 //! - **hand**: a viewer plus [`HAND`].
-//! - **manager**: every other `/api/*` request except [`OWNER`].
-//! - **owner**: everything.
+//! - **manager**: [`MANAGER_READS`] and [`MANAGER`].
+//! - **owner**: everything, [`OWNER`] alone.
 //!
 //! [`OPEN`] needs no sign-in at all; the guard rate-limits it per peer.
 //!
 //! Patterns: `{x}` is one path segment, a trailing `*` any rest (`/api/users*`
 //! is `/api/users` and everything under it). Method `*` is any method. A
-//! stream adding a hand-level or owner-only endpoint adds a line under its
-//! anchor here.
+//! stream adding an endpoint adds a line to the list for its role.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -32,6 +32,8 @@ type Rule = (&'static str, &'static str);
 pub const OPEN: &[Rule] = &[
     // @J
     ("POST", "/api/invites/accept"),
+    // The owner's one-time sign-in code (op-server session).
+    ("POST", "/api/session"),
     // @A-engine
     // @A-notify
     // @D
@@ -56,6 +58,7 @@ pub const OPEN: &[Rule] = &[
 pub const ANY_ROLE: &[Rule] = &[
     // @J
     ("*", "/api/me"),
+    ("DELETE", "/api/session"),
     ("*", "/api/me/*"),
     ("POST", "/api/push/subscriptions*"),
     ("DELETE", "/api/push/subscriptions*"),
@@ -136,6 +139,18 @@ pub const MANAGER_READS: &[Rule] = &[
     // @H
     // @L
     // @M
+    // Units, factory tests, firmware and the herd network (op-fleet). `GET /api/fleet` stays fleet care.
+    ("GET", "/api/fleet/units*"),
+    ("GET", "/api/fleet/test-plans*"),
+    ("GET", "/api/fleet/firmware*"),
+    ("GET", "/api/fleet/signing-keys*"),
+    ("GET", "/api/fleet/network*"),
+    ("GET", "/api/fleet/anchors*"),
+    ("GET", "/api/fleet/collars/*"),
+    ("GET", "/api/fleet/provisioning"),
+    ("GET", "/api/fleet/yield"),
+    ("GET", "/api/fleet/throughput"),
+    ("GET", "/api/fleet/summary"),
     // @Z
 ];
 
@@ -143,6 +158,8 @@ pub const MANAGER_READS: &[Rule] = &[
 pub const OWNER: &[Rule] = &[
     // @J
     ("PUT", "/api/settings"),
+    // Revealing or replacing the app token.
+    ("POST", "/api/settings/app-token/*"),
     ("*", "/api/secrets*"),
     ("*", "/api/users*"),
     ("*", "/api/invites*"),
@@ -152,6 +169,10 @@ pub const OWNER: &[Rule] = &[
     ("*", "/api/texting*"),
     ("PUT", "/api/push/settings"),
     ("POST", "/api/collars/{id}/rekey"),
+    // The collar address goes into every collar.
+    ("*", "/api/server/collar-address*"),
+    // Retention deletes raw telemetry.
+    ("PUT", "/api/server/retention"),
     // @A-engine
     // Someone else's alert prefs (people ids are `usr_…`; `/api/alerts/prefs/me` stays a hand's).
     ("PUT", "/api/alerts/prefs/usr_*"),
@@ -171,7 +192,166 @@ pub const OWNER: &[Rule] = &[
     // @H
     // @L
     // @M
+    // op-fleet: station tokens, test plans, the maker, firmware releases and keys.
+    ("*", "/api/fleet/stations*"),
+    ("PUT", "/api/fleet/test-plans/{class}"),
+    ("PUT", "/api/fleet/provisioning"),
+    ("POST", "/api/fleet/firmware"),
+    ("PUT", "/api/fleet/firmware/{id}/image"),
+    ("POST", "/api/fleet/firmware/{id}/withdraw"),
+    ("POST", "/api/fleet/signing-keys*"),
     // @Z
+];
+
+/// Reads every signed-in role may make.
+pub const VIEWER: &[Rule] = &[
+    ("GET", "/api/alerts"),
+    ("GET", "/api/alerts/prefs/me"),
+    ("GET", "/api/alerts/rules"),
+    ("GET", "/api/alerts/{id}"),
+    ("GET", "/api/analytics/behaviour"),
+    ("GET", "/api/analytics/health"),
+    ("GET", "/api/analytics/heatmap"),
+    ("GET", "/api/analytics/pasture"),
+    ("GET", "/api/animals"),
+    ("GET", "/api/animals/{id}"),
+    ("GET", "/api/brains"),
+    ("GET", "/api/brief"),
+    ("GET", "/api/collars"),
+    ("GET", "/api/collars/config"),
+    ("GET", "/api/collars/{id}"),
+    ("GET", "/api/collars/{id}/slots"),
+    ("GET", "/api/collars/{id}/wire"),
+    ("GET", "/api/coverage"),
+    ("GET", "/api/decisions"),
+    ("GET", "/api/decisions/{id}"),
+    ("GET", "/api/export"),
+    ("GET", "/api/farm"),
+    ("GET", "/api/features"),
+    ("GET", "/api/features/{id}"),
+    ("GET", "/api/feed-log"),
+    ("GET", "/api/fleet"),
+    ("GET", "/api/fleet/settings"),
+    ("GET", "/api/fleet/{collar_id}/fit-checks"),
+    ("GET", "/api/gate/log"),
+    ("GET", "/api/gate/settings"),
+    ("GET", "/api/herds"),
+    ("GET", "/api/herds/{id}"),
+    ("GET", "/api/herds/{id}/boundary"),
+    ("GET", "/api/herds/{id}/slots"),
+    ("GET", "/api/import/positions"),
+    ("GET", "/api/import/positions/tracks"),
+    ("GET", "/api/import/positions/{id}"),
+    ("GET", "/api/knowledge"),
+    ("GET", "/api/land/{paddock_id}"),
+    ("GET", "/api/layers/paddocks"),
+    ("GET", "/api/layouts"),
+    ("GET", "/api/layouts/{id}"),
+    ("GET", "/api/leases"),
+    ("GET", "/api/leases/{paddock_id}"),
+    ("GET", "/api/live"),
+    ("GET", "/api/paddocks"),
+    ("GET", "/api/paddocks/{id}"),
+    ("GET", "/api/paddocks/{id}/heights"),
+    ("GET", "/api/positions"),
+    ("GET", "/api/push"),
+    ("GET", "/api/reports"),
+    ("GET", "/api/reports/settings"),
+    ("GET", "/api/reports/{id}"),
+    ("GET", "/api/rules"),
+    ("GET", "/api/schedules"),
+    ("GET", "/api/schedules/{id}"),
+    ("GET", "/api/schedules/{id}/moves"),
+    ("GET", "/api/server"),
+    ("GET", "/api/server/retention"),
+    ("GET", "/api/settings"),
+    ("GET", "/api/signals"),
+    ("GET", "/api/state"),
+    ("GET", "/api/tracks"),
+    ("GET", "/api/welfare/animals"),
+    ("GET", "/api/welfare/animals/{animal_id}/cues"),
+    ("GET", "/api/welfare/cues/points"),
+    ("GET", "/api/welfare/training/{herd_id}"),
+];
+
+/// Writes a manager may make.
+pub const MANAGER: &[Rule] = &[
+    ("PUT", "/api/alerts/prefs/{id}"),
+    ("PUT", "/api/alerts/rules"),
+    ("POST", "/api/animals"),
+    ("POST", "/api/animals/import/preview"),
+    ("POST", "/api/animals/import/{import_id}/commit"),
+    ("DELETE", "/api/animals/{id}"),
+    ("PATCH", "/api/animals/{id}"),
+    ("POST", "/api/animals/{id}/remove"),
+    ("POST", "/api/animals/{id}/swap"),
+    ("POST", "/api/brains/{id}/test"),
+    ("POST", "/api/cards"),
+    ("POST", "/api/collars"),
+    ("POST", "/api/collars/bulk"),
+    ("PUT", "/api/collars/config"),
+    ("DELETE", "/api/collars/{id}"),
+    ("PATCH", "/api/collars/{id}"),
+    ("POST", "/api/decisions/{id}/respond"),
+    ("PATCH", "/api/farm"),
+    ("POST", "/api/farm"),
+    ("POST", "/api/features"),
+    ("DELETE", "/api/features/{id}"),
+    ("PATCH", "/api/features/{id}"),
+    ("DELETE", "/api/feed-log/{id}"),
+    ("PATCH", "/api/feed-log/{id}"),
+    ("POST", "/api/fleet/anchors"),
+    ("DELETE", "/api/fleet/anchors/{id}"),
+    ("PATCH", "/api/fleet/anchors/{id}"),
+    ("POST", "/api/fleet/claim"),
+    ("PUT", "/api/fleet/firmware/policy"),
+    ("POST", "/api/fleet/firmware/rollouts"),
+    ("POST", "/api/fleet/firmware/rollouts/{id}/{action}"),
+    ("PUT", "/api/fleet/settings"),
+    ("POST", "/api/fleet/units"),
+    ("POST", "/api/fleet/units/{serial}/claim"),
+    ("POST", "/api/fleet/units/{serial}/provision"),
+    ("POST", "/api/fleet/units/{serial}/state"),
+    ("POST", "/api/fleet/units/{serial}/tests"),
+    ("PUT", "/api/gate/settings"),
+    ("POST", "/api/herds"),
+    ("DELETE", "/api/herds/{id}"),
+    ("PATCH", "/api/herds/{id}"),
+    ("POST", "/api/herds/{id}/boundary"),
+    ("POST", "/api/herds/{id}/decide"),
+    ("POST", "/api/import/paddocks/commit"),
+    ("POST", "/api/import/paddocks/preview"),
+    ("POST", "/api/import/positions/preview"),
+    ("DELETE", "/api/import/positions/{id}"),
+    ("POST", "/api/import/positions/{id}/commit"),
+    ("POST", "/api/import/positions/{id}/preview"),
+    ("POST", "/api/layouts"),
+    ("DELETE", "/api/layouts/{id}"),
+    ("PATCH", "/api/layouts/{id}"),
+    ("POST", "/api/layouts/{id}/apply"),
+    ("DELETE", "/api/leases/{paddock_id}"),
+    ("PUT", "/api/leases/{paddock_id}"),
+    ("POST", "/api/paddocks"),
+    ("DELETE", "/api/paddocks/{id}"),
+    ("PATCH", "/api/paddocks/{id}"),
+    ("POST", "/api/paddocks/{id}/copy"),
+    ("PUT", "/api/reports/settings"),
+    ("POST", "/api/rules"),
+    ("DELETE", "/api/rules/{id}"),
+    ("PATCH", "/api/rules/{id}"),
+    ("POST", "/api/rules/{id}/convert"),
+    ("POST", "/api/schedules"),
+    ("POST", "/api/schedules/preview"),
+    ("POST", "/api/schedules/{id}/end"),
+    ("POST", "/api/schedules/{id}/hold"),
+    ("POST", "/api/schedules/{id}/move-now"),
+    ("POST", "/api/schedules/{id}/pause"),
+    ("POST", "/api/schedules/{id}/resume"),
+    ("POST", "/api/schedules/{id}/skip"),
+    ("POST", "/api/schedules/{id}/time"),
+    ("POST", "/api/sql"),
+    ("POST", "/api/strips/preview"),
+    ("PUT", "/api/welfare/training/{herd_id}"),
 ];
 
 fn path_matches(pattern: &str, path: &str) -> bool {
@@ -203,30 +383,35 @@ pub fn is_open(method: &Method, path: &str) -> bool {
     listed(OPEN, method, path)
 }
 
-/// The lowest role that may make this request.
-pub fn required(method: &Method, path: &str) -> Role {
-    // HEAD reads what GET reads.
+/// The lowest role a list gives this request; `None` when no list has it.
+pub fn classified(method: &Method, path: &str) -> Option<Role> {
+    // HEAD reads what GET reads; a preflight reads nothing.
     let method = if *method == Method::HEAD { &Method::GET } else { method };
-    if path == "/mcp" || path.starts_with("/mcp/") || is_open(method, path) {
+    if path == "/mcp" || path.starts_with("/mcp/") || is_open(method, path) || *method == Method::OPTIONS {
         // MCP lists and calls tools by the caller's role.
-        return Role::Viewer;
+        return Some(Role::Viewer);
     }
     if listed(OWNER, method, path) {
-        return Role::Owner;
+        return Some(Role::Owner);
     }
     if listed(ANY_ROLE, method, path) {
-        return Role::Viewer;
+        return Some(Role::Viewer);
     }
     if listed(MANAGER_READS, method, path) {
-        return Role::Manager;
+        return Some(Role::Manager);
     }
-    if matches!(*method, Method::GET | Method::OPTIONS) {
-        return Role::Viewer;
+    if *method == Method::GET {
+        return listed(VIEWER, method, path).then_some(Role::Viewer);
     }
     if listed(HAND, method, path) {
-        return Role::Hand;
+        return Some(Role::Hand);
     }
-    Role::Manager
+    listed(MANAGER, method, path).then_some(Role::Manager)
+}
+
+/// The lowest role that may make this request: the owner's alone when no list has it.
+pub fn required(method: &Method, path: &str) -> Role {
+    classified(method, path).unwrap_or(Role::Owner)
 }
 
 /// 403 `{"error": "Your role can't do this."}` when the identity's role is
@@ -242,15 +427,25 @@ pub const OPEN_PER_MINUTE: usize = 5;
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// A sliding one-minute window per peer.
-#[derive(Default)]
 pub struct RateLimit {
+    limit: usize,
     seen: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
 }
 
+impl Default for RateLimit {
+    /// [`OPEN_PER_MINUTE`] a minute.
+    fn default() -> Self {
+        Self::new(OPEN_PER_MINUTE)
+    }
+}
+
 impl RateLimit {
-    /// Count one request from `peer`; false once it made
-    /// [`OPEN_PER_MINUTE`] in the last minute.
-    pub fn allow(&self, peer: IpAddr) -> bool {
+    /// `limit` a minute per peer.
+    pub fn new(limit: usize) -> Self {
+        Self { limit, seen: Mutex::default() }
+    }
+
+    fn window(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, VecDeque<Instant>>> {
         let now = Instant::now();
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.retain(|_, q| {
@@ -259,12 +454,23 @@ impl RateLimit {
             }
             !q.is_empty()
         });
+        seen
+    }
+
+    /// Count one request from `peer`; false once it made `limit` in the last minute.
+    pub fn allow(&self, peer: IpAddr) -> bool {
+        let mut seen = self.window();
         let q = seen.entry(peer).or_default();
-        if q.len() >= OPEN_PER_MINUTE {
+        if q.len() >= self.limit {
             return false;
         }
-        q.push_back(now);
+        q.push_back(Instant::now());
         true
+    }
+
+    /// `peer` made `limit` in the last minute (nothing counted).
+    pub fn full(&self, peer: IpAddr) -> bool {
+        self.window().get(&peer).is_some_and(|q| q.len() >= self.limit)
     }
 }
 
@@ -339,6 +545,15 @@ mod tests {
             ("POST", "/api/decisions/dec_1/respond", Manager),
             ("PUT", "/api/settings", Owner),
             ("GET", "/api/settings", Viewer),
+            ("POST", "/api/settings/app-token/reveal", Owner),
+            ("POST", "/api/settings/app-token/rotate", Owner),
+            ("POST", "/api/session", Viewer),
+            ("DELETE", "/api/session", Viewer),
+            ("GET", "/api/rules", Viewer),
+            ("POST", "/api/rules", Manager),
+            ("POST", "/api/rules/rul_1/convert", Manager),
+            ("GET", "/api/gate/log", Viewer),
+            ("PUT", "/api/gate/settings", Manager),
             ("GET", "/api/secrets", Owner),
             ("GET", "/api/users", Owner),
             ("POST", "/api/invites", Owner),
@@ -350,6 +565,10 @@ mod tests {
             ("GET", "/api/texting", Owner),
             ("PUT", "/api/push/settings", Owner),
             ("POST", "/api/collars/col_1/rekey", Owner),
+            ("PUT", "/api/server/collar-address", Owner),
+            ("POST", "/api/server/collar-address/check", Owner),
+            ("PUT", "/api/server/retention", Owner),
+            ("GET", "/api/server/retention", Viewer),
             ("POST", "/api/collars/col_1/park", Hand),
         ];
         for (method, path, need) in cases {
@@ -364,6 +583,65 @@ mod tests {
         assert_eq!(required(&m("PUT"), "/api/alerts/prefs/me"), Hand);
         assert_eq!(required(&m("GET"), "/api/alerts/prefs/me"), Viewer);
         assert_eq!(required(&m("GET"), "/api/alerts/prefs"), Manager);
+    }
+
+    /// Every `/api` route the crates register, from their sources: `.route("…", get(…).post(…))`.
+    fn api_routes() -> Vec<(String, String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() && p.file_name().is_some_and(|n| n != "tests" && n != "target") {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let mut files = Vec::new();
+        walk(&crates, &mut files);
+        let mut out = Vec::new();
+        for f in files {
+            let s = std::fs::read_to_string(&f).unwrap();
+            let mut rest = s.as_str();
+            while let Some(i) = rest.find(".route(") {
+                let body = &rest[i + 7..];
+                let mut depth = 1;
+                let end = body.char_indices().find_map(|(k, c)| {
+                    depth += match c {
+                        '(' => 1,
+                        ')' => -1,
+                        _ => 0,
+                    };
+                    (depth == 0).then_some(k)
+                });
+                let call = &body[..end.unwrap_or(body.len())];
+                rest = &body[end.unwrap_or(body.len())..];
+                let Some(path) = call.trim_start().strip_prefix('"').and_then(|p| p.split_once('"')).map(|(p, _)| p) else { continue };
+                if !path.starts_with("/api") {
+                    continue;
+                }
+                let bytes = call.as_bytes();
+                for m in ["get", "post", "put", "patch", "delete"] {
+                    let hit = call.match_indices(&format!("{m}(")).any(|(k, _)| k == 0 || !(bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_'));
+                    if hit {
+                        out.push((m.to_ascii_uppercase(), path.to_owned(), f.display().to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_api_route_is_on_a_list() {
+        let routes = api_routes();
+        assert!(routes.len() > 150, "found {} routes", routes.len());
+        let missing: Vec<String> = routes.iter().filter(|(m, p, _)| classified(&self::m(m), p).is_none()).map(|(m, p, f)| format!("{m} {p} ({f})")).collect();
+        assert!(missing.is_empty(), "not on any list in policy.rs (so the owner's alone):\n{}", missing.join("\n"));
+        // Unlisted: the owner's.
+        assert_eq!(required(&m("GET"), "/api/nothing-listed"), Role::Owner);
+        assert_eq!(required(&m("POST"), "/api/nothing-listed"), Role::Owner);
     }
 
     #[test]

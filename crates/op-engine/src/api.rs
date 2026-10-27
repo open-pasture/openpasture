@@ -49,12 +49,15 @@ struct RespondBody {
     action: Response,
     geometry: Option<Polygon>,
     note: Option<String>,
+    /// Hard findings the person confirms, by code (the safety gate).
+    #[serde(default)]
+    confirm: Vec<String>,
 }
 
 /// Managers and up answer; the caller is recorded as the responder.
 async fn respond(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>, ApiJson(b): ApiJson<RespondBody>) -> ApiResult<Json<Decision>> {
     identity.require(Role::Manager)?;
-    Ok(Json(cycle::respond(&ctx, &id, b.action, b.geometry, b.note, identity.actor()).await?))
+    Ok(Json(cycle::respond_confirmed(&ctx, &id, b.action, b.geometry, b.note, identity.actor(), b.confirm).await?))
 }
 
 #[derive(Deserialize)]

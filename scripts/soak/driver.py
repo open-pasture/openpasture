@@ -69,13 +69,14 @@ def du(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", required=True)
+    ap.add_argument("--token")
     ap.add_argument("--dir", required=True)
     ap.add_argument("--server-pid", type=int, required=True)
     ap.add_argument("--hours", type=float, default=6.0)
     ap.add_argument("--move-every", type=float, default=30.0)
     ap.add_argument("--advance-every", type=float, default=60.0)
     a = ap.parse_args()
-    api = farm.Api(a.api)
+    api = farm.Api(a.api, a.token)
     herds = {h["name"]: h["id"] for h in api.get("/api/herds")}
     cows, heifers = herds["Cows"], herds["Heifers"]
     log = open(os.path.join(a.dir, "driver.jsonl"), "a")

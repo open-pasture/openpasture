@@ -1,4 +1,5 @@
-//! API errors: HTTP status plus `{ "error": "message" }`.
+//! API errors: HTTP status plus `{ "error": "message" }`, and any details
+//! (an object) merged in beside it.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
@@ -9,13 +10,23 @@ use axum::response::{IntoResponse, Response};
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
+    /// Fields that go beside `error` in the body (e.g. the gate's `findings`).
+    pub details: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self { status, message: message.into(), details: None }
+    }
+    /// With fields beside `error` in the body. Not an object: no details.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = match details {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        };
+        self
     }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
@@ -45,15 +56,26 @@ impl std::fmt::Display for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, axum::Json(serde_json::json!({ "error": self.message }))).into_response()
+        let mut body = self.details.unwrap_or_default();
+        body.insert("error".into(), self.message.into());
+        (self.status, axum::Json(serde_json::Value::Object(body))).into_response()
     }
 }
 
+/// An internal error: the client gets an opaque message with a reference,
+/// the full error chain goes to the log under that reference.
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        tracing::error!("{e:#}");
-        Self::internal(format!("{e:#}"))
+        let id = log_ref();
+        tracing::error!(log_ref = %id, "{e:#}");
+        Self::internal(format!("Something went wrong on the server (ref {id}). The details are in the server log."))
     }
+}
+
+/// A short reference for one logged error, e.g. `7Q2M9X4KJD`.
+pub fn log_ref() -> String {
+    let id = ulid::Ulid::new().to_string();
+    id[id.len() - 10..].to_owned()
 }
 
 impl From<sqlx::Error> for ApiError {

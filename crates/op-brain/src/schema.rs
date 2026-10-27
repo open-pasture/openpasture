@@ -13,7 +13,7 @@ pub fn decision_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["action", "to_paddock_id", "geometry", "reasoning", "confidence", "need"],
+        "required": ["action", "to_paddock_id", "geometry", "reasoning", "confidence", "need", "rules"],
         "properties": {
             "action": {
                 "type": "string",
@@ -56,6 +56,10 @@ pub fn decision_schema() -> Value {
             "need": {
                 "type": ["string", "null"],
                 "description": "For NEEDS_INFO: the one thing the farmer should check or tell you. Otherwise null."
+            },
+            "rules": {
+                "type": ["string", "null"],
+                "description": "How this decision follows each of the farm's rules (farm_rules.rules in the context), one short clause per rule. Null only when the farm has no rules."
             }
         }
     })
@@ -83,7 +87,7 @@ mod tests {
     #[test]
     fn output_round_trips_through_the_parser() {
         // What a model writes under this schema parses back.
-        let v = json!({ "action": "MOVE", "to_paddock_id": "pad_b", "geometry": null, "reasoning": "r", "confidence": 0.9, "need": null });
+        let v = json!({ "action": "MOVE", "to_paddock_id": "pad_b", "geometry": null, "reasoning": "r", "confidence": 0.9, "need": null, "rules": null });
         let out = crate::parse::parse_output(&v).unwrap();
         assert_eq!(out.action, crate::Action::Move);
         // And DecisionOutput serialises with the same field names.

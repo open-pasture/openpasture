@@ -111,6 +111,7 @@ pub fn parse_output(v: &Value) -> anyhow::Result<DecisionOutput> {
     };
     let confidence = parse_confidence(obj.get("confidence"));
     let need = str_field(obj, &["need", "needs", "question", "uncertainty_request"]);
+    let rules = str_field(obj, &["rules", "farm_rules", "rule_compliance", "compliance"]);
     let model = str_field(obj, &["model"]);
 
     let (to_paddock_id, geometry) = if action == Action::Move {
@@ -121,7 +122,7 @@ pub fn parse_output(v: &Value) -> anyhow::Result<DecisionOutput> {
     } else {
         (None, None)
     };
-    Ok(DecisionOutput { action, to_paddock_id, geometry, reasoning, confidence, need, model })
+    Ok(DecisionOutput { action, to_paddock_id, geometry, reasoning, confidence, need, rules, model })
 }
 
 fn parse_action(v: &Value) -> anyhow::Result<Action> {

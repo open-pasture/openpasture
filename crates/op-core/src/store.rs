@@ -43,14 +43,14 @@ pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 /// checkpoint copies pages into the database file and syncs it; done inside
 /// a commit it made that commit (often a collar's report) wait for the disk.
 pub fn spawn_checkpointer(ctx: &crate::Ctx, every: Duration) {
-    let ctx = ctx.clone();
-    tokio::spawn(async move {
+    ctx.supervise("store.checkpoint", Some(every), move |ctx| async move {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = ctx.on_shutdown() => break,
                 _ = tick.tick() => {
+                    ctx.beat("store.checkpoint");
                     let started = std::time::Instant::now();
                     match sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)").fetch_one(ctx.db()).await {
                         Ok((busy, log, done)) => {
@@ -76,6 +76,61 @@ pub fn pool_size(env: Option<&str>) -> u32 {
     env.and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (1..=256).contains(n)).unwrap_or(DEFAULT_POOL)
 }
 
+/// Folder beside the database for the snapshots taken before migrations.
+pub const SNAPSHOT_DIR: &str = "backups";
+/// Snapshots kept; older ones are deleted after a new one is taken.
+pub const SNAPSHOTS_KEPT: usize = 3;
+const SNAPSHOT_PREFIX: &str = "pre-migrate-";
+
+/// Migration versions applied to a database, pending from this build, and
+/// applied but unknown to this build (a newer release opened it).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MigrationStatus {
+    pub applied: Vec<i64>,
+    pub pending: Vec<i64>,
+    pub unknown: Vec<i64>,
+}
+
+pub async fn migration_status(pool: &SqlitePool) -> anyhow::Result<MigrationStatus> {
+    let has_table: Option<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'").fetch_optional(pool).await?;
+    let applied: Vec<i64> =
+        if has_table.is_some() { sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version").fetch_all(pool).await? } else { Vec::new() };
+    let known: Vec<i64> = MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).map(|m| m.version).collect();
+    Ok(MigrationStatus {
+        pending: known.iter().copied().filter(|v| !applied.contains(v)).collect(),
+        unknown: applied.iter().copied().filter(|v| !known.contains(v)).collect(),
+        applied,
+    })
+}
+
+/// `<folder of the database>/backups`.
+pub fn snapshot_dir(db_path: &Path) -> std::path::PathBuf {
+    db_path.parent().unwrap_or(Path::new(".")).join(SNAPSHOT_DIR)
+}
+
+/// A consistent copy of the database (`VACUUM INTO`) named for the time and
+/// the newest migration it holds, then all but the newest
+/// [`SNAPSHOTS_KEPT`] snapshots are deleted.
+pub async fn snapshot(pool: &SqlitePool, dir: &Path, version: i64) -> anyhow::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let file = dir.join(format!("{SNAPSHOT_PREFIX}{stamp}-v{version:04}.db"));
+    sqlx::query("VACUUM INTO ?").bind(file.to_string_lossy().into_owned()).execute(pool).await.with_context(|| format!("writing {}", file.display()))?;
+    let mut old: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(SNAPSHOT_PREFIX) && n.ends_with(".db")))
+        .collect();
+    old.sort();
+    let extra = old.len().saturating_sub(SNAPSHOTS_KEPT);
+    for p in &old[..extra] {
+        if let Err(e) = std::fs::remove_file(p) {
+            tracing::warn!(file = %p.display(), "removing an old snapshot: {e}");
+        }
+    }
+    Ok(file)
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -94,16 +149,36 @@ impl Store {
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(10))
-            // @L: a WAL that grew while a long read held it back is cut to this once a checkpoint catches up.
+            // A WAL that grew while a long read held it back is cut to this once a checkpoint catches up.
             .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
-            // @L: checkpoints run from `spawn_checkpointer`; a commit only does one past 64 MB of WAL.
+            // Checkpoints run from `spawn_checkpointer`; a commit only does one past 64 MB of WAL.
             .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES.to_string());
         let pool = SqlitePoolOptions::new()
             .max_connections(pool_size(std::env::var(POOL_ENV).ok().as_deref()))
             .connect_with(opts)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
+        let status = migration_status(&pool).await?;
+        let snapshots = snapshot_dir(path);
+        if !status.unknown.is_empty() {
+            anyhow::bail!(
+                "{} was last opened by a newer openpasture: migrations {:?} are unknown to version {}. Install that version again, \
+                 or restore the snapshot taken before the upgrade from {}.",
+                path.display(),
+                status.unknown,
+                env!("CARGO_PKG_VERSION"),
+                snapshots.display()
+            );
+        }
+        if let Some(&from) = status.applied.iter().max()
+            && !status.pending.is_empty()
+        {
+            let file = snapshot(&pool, &snapshots, from).await.context("snapshotting the database before upgrading it")?;
+            tracing::info!(snapshot = %file.display(), pending = ?status.pending, "database snapshot taken before migrating");
+        }
         MIGRATOR.run(&pool).await.context("running migrations")?;
+        // Start with an empty WAL rather than one holding every migration's pages.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.context("checkpointing after migrations")?;
         Ok(Self { pool })
     }
 
@@ -513,6 +588,8 @@ pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
         outside_since: opt_from_db(r.try_get("outside_since")?)?,
         parked_at: opt_from_db(r.try_get("parked_at")?)?,
         parked_reason: r.try_get::<Option<String>, _>("parked_reason")?.map(|s| ParkReason::from_db(&s)).transpose()?,
+        // Absent from queries that pick their columns.
+        simulated: r.try_get::<Option<bool>, _>("simulated").ok().flatten().unwrap_or(false),
     })
 }
 

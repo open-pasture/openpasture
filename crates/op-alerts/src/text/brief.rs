@@ -63,6 +63,9 @@ pub async fn attention(ctx: &Ctx, herd_id: &str, _now: DateTime<Utc>) -> anyhow:
     let mut by_kind: Vec<(String, Vec<String>, usize)> = Vec::new();
     for r in &rows {
         let a = store::alert_from_row(r)?;
+        if crate::routing::simulated(&a) {
+            continue;
+        }
         let kind: String = r.try_get("kind")?;
         let items: Vec<String> = match a.data.get("members").and_then(Value::as_array) {
             Some(m) => m.iter().filter_map(item).collect(),

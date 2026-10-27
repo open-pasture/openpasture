@@ -2,7 +2,7 @@
 //! with where to draw it and what it is about.
 //!
 //! Pre-send codes (`docs/API.md`, pre-send check): `no_water`, `water_inside`,
-//! `forage_short`, `area_per_head_low`, `overlaps_exclusion`,
+//! `forage_short`, `area_per_head_low`, `overlaps_exclusion`, `enters_no_go`,
 //! `overlaps_hazard`, `crosses_farm_boundary`, `crosses_road`,
 //! `crosses_neighbour_line`, `weak_coverage`, `collars_offline`,
 //! `collars_no_holes`, `rested_short`, `animals_in_new_holes`,
@@ -11,13 +11,16 @@
 //! @F — what each means and how severe it is (op-ingest `prepare.rs` finds
 //! the map and collar ones, op-engine `presend.rs` the forage, rest and GPS
 //! ones; `geometry` is what the map draws):
-//! - critical: `crosses_road` (the road inside the shape).
+//! - critical, which op-ingest's safety gate refuses unless a person
+//!   confirms them by code (and `enters_no_go` for everyone): `crosses_road`
+//!   (the road inside the shape), `crosses_farm_boundary` (the part past
+//!   it), `enters_no_go` (the no-go zone it still takes in),
+//!   `overlaps_hazard` for a hazard marked `hard`, `overlaps_exclusion` when
+//!   the exclusion covers all of it, and `no_water` when the farm requires water.
 //! - warning: `no_water` (the farm has water mapped, none inside),
 //!   `forage_short` (grass for under half a day), `area_per_head_low` (under
-//!   25 m²/hd for cattle, 4 for sheep and goats), `overlaps_exclusion` when
-//!   the exclusion covers all of it and can't be kept out,
-//!   `overlaps_hazard` (the overlap), `crosses_neighbour_line` (the line
-//!   inside), `crosses_farm_boundary` (the part past it), `weak_coverage`
+//!   25 m²/hd for cattle, 4 for sheep and goats), `overlaps_hazard` (the
+//!   overlap), `crosses_neighbour_line` (the line inside), `weak_coverage`
 //!   (10 m cells inside with median accuracy ≥ 5 m or under 90 % of fixes
 //!   over the last week, clipped to the shape), `collars_offline` (no report
 //!   for 20 min; their last fixes), `collars_no_holes`, `rested_short`

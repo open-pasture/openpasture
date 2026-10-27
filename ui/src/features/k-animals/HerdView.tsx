@@ -279,7 +279,7 @@ function ImportFlow({ file, herd, onDone }: { file: File; herd: Herd; onDone: ()
 // Rows "tag,collar name" make the collars and put each on its animal. The keys come back
 // once: as a CSV, or as cards when the server has an https public URL.
 function LinkFlow({ file, herd, onDone }: { file: File; herd: Herd; onDone: () => void }) {
-  const publicUrl = useStore((s) => s.state?.settings.server.public_url);
+  const collarUrl = useStore((s) => s.state?.settings.server.collar_url);
   const [batch, setBatch] = useState<{ id: string; n: number }>();
   const [err, setErr] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -313,7 +313,7 @@ function LinkFlow({ file, herd, onDone }: { file: File; herd: Herd; onDone: () =
           <span className="mono">{batch.n} collars linked</span>
           <span className="sp" />
           <Button small onClick={download}>Keys CSV</Button>
-          {cardsPossible(publicUrl) && <Button small kind="primary" onClick={() => (location.hash = `/print/cards/${batch.id}`)}>Print cards</Button>}
+          {cardsPossible(collarUrl) && <Button small kind="primary" onClick={() => (location.hash = `/print/cards/${batch.id}`)}>Print cards</Button>}
           <Button small kind="plain" onClick={onDone}>Done</Button>
         </div>
       </section>

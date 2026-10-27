@@ -41,4 +41,8 @@ import "./h";
 // @L
 // @M
 import "./m";
+// Fleet: units, factory tests, firmware, the herd network, the collar console.
+import "./fleet";
+// Farm rules for the agent, the safety gate's hold in the send tools.
+import "./rules";
 // @Z

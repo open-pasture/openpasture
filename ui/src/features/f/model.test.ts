@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Finding, LonLat } from "../../api";
+import type { Finding, LonLat, Polygon } from "../../api";
 import type { CheckResult } from "../../api/f";
 import { fmt } from "../../units";
 import { causeOf, drawing, factsLine, MAX_SENTENCES, minutesText, sentences } from "./model";
@@ -42,7 +42,7 @@ test("sweep minutes", () => {
 });
 
 describe("drawing", () => {
-  const sq = (x: number): GeoJSON.Polygon => ({ type: "Polygon", coordinates: [[[x, 0], [x + 1, 0], [x + 1, 1], [x, 1], [x, 0]]] });
+  const sq = (x: number): Polygon => ({ type: "Polygon", coordinates: [[[x, 0], [x + 1, 0], [x + 1, 1], [x, 1], [x, 0]]] });
   const result: CheckResult = {
     sent: sq(0),
     facts: { area_ha: 1, head: 1, m2_per_head: 1, vertices: 4, holes: 0 },

@@ -350,6 +350,29 @@ fn told_of(r: &Row) -> Option<HashSet<String>> {
     (r.alert.status != AlertStatus::Open).then(|| r.alert.targets.iter().filter(|(k, _)| k == "collar").map(|(_, id)| id.clone()).collect())
 }
 
+/// Simulated collars and herds of simulated collars only (`op_core::sim`).
+#[derive(Default)]
+struct Sim {
+    collars: std::collections::BTreeSet<String>,
+    herds: std::collections::BTreeSet<String>,
+}
+
+impl Sim {
+    async fn load(ctx: &Ctx) -> anyhow::Result<Self> {
+        Ok(Self { collars: op_core::sim::collars(ctx.db()).await?, herds: op_core::sim::herds(ctx.db()).await? })
+    }
+
+    /// The alert is about the simulator only: every collar it names is
+    /// simulated, or it names none and its herd runs on simulated collars.
+    fn covers(&self, c: &Candidate) -> bool {
+        let mut collars = c.targets.iter().filter(|(k, _)| k == "collar").map(|(_, id)| id).peekable();
+        if collars.peek().is_some() {
+            return collars.all(|id| self.collars.contains(id));
+        }
+        c.herd_id.as_ref().is_some_and(|h| self.herds.contains(h))
+    }
+}
+
 /// Bring one kind's alerts in step with its candidates.
 async fn reconcile(
     ctx: &Ctx,
@@ -450,7 +473,17 @@ async fn reconcile(
         finals.push(rollup(kind, &h, &members, sev));
     }
 
-    for c in finals {
+    let sim = if finals.is_empty() { Sim::default() } else { Sim::load(ctx).await? };
+    for mut c in finals {
+        if sim.covers(&c) {
+            // The app and the farm webhook show it marked; no person is told (routing).
+            match &mut c.data {
+                Value::Object(m) => {
+                    m.insert("simulated".into(), Value::Bool(true));
+                }
+                d => *d = json!({ "simulated": true }),
+            }
+        }
         let severity = effective_severity(cfg, &c);
         if let Some(row) = existing.remove(&c.key) {
             let old = &row.alert;
@@ -564,7 +597,7 @@ fn wake_type(e: &Event) -> Option<String> {
 pub fn start(ctx: Ctx) {
     set_started(&ctx, now());
     text::brief::register(&ctx);
-    tokio::spawn(run(ctx));
+    ctx.clone().supervise("alerts.engine", Some(std::time::Duration::from_secs(1)), run);
 }
 
 async fn run(ctx: Ctx) {
@@ -581,7 +614,7 @@ async fn run(ctx: Ctx) {
     loop {
         tokio::select! {
             _ = ctx.on_shutdown() => break,
-            _ = tick.tick() => {}
+            _ = tick.tick() => { ctx.beat("alerts.engine"); }
             _ = wake.notified() => { all = true; }
             ev = rx.recv() => {
                 match ev {

@@ -3,13 +3,19 @@
 //! (herds, paddocks, tags) are made GSM-7 and cut to fit. Numbers go through
 //! `op_core::units`, times are farm time.
 //!
-//! Security (field-ready §8.1 #33): a Y, N or STOP MOVE without the
-//! decision's 4-digit code counts only within `approve_window_h` of our last
-//! alert or brief to that number ([`last_prompt_to`]); after that the code
-//! from the approval text is needed ("Y 4821"). Five wrong codes in an hour
-//! from one number and codes from it stop counting for the hour. Roles:
-//! answering, LATER and STOP MOVE need a manager; OK a hand; STATUS, WHERE
-//! and questions anyone on the farm.
+//! Security (field-ready §8.1 #33): approving a MOVE or HOLD by text always
+//! needs the decision's code from its approval text ("Y 4821"): a caller ID
+//! can be faked, the code can't be guessed in five tries. A bare Y (or Y and
+//! a list number) gets the decision's text back with its code. Every
+//! approval by text is texted to the farm's owners as well (not the one who
+//! approved). A decision the safety gate holds (a road, the farm boundary, a
+//! no-go zone) can't be approved by text at all: only in the app, on the
+//! map. N, LATER and STOP MOVE, the safe direction, still work bare within
+//! `approve_window_h` of our last alert or brief to that number
+//! ([`last_prompt_to`]); after that they need the code too. Five wrong codes
+//! in an hour from one number and codes from it stop counting for the hour.
+//! Roles: answering, LATER and STOP MOVE need a manager; OK a hand; STATUS,
+//! WHERE and questions anyone on the farm.
 //!
 //! A bare Y or N answers the decision the newest text that asked this number
 //! about one was about ([`ASKS`]: the decision's own text, a brief, a LATER
@@ -475,15 +481,93 @@ async fn answer(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User, a
         Ok(d) => d,
         Err(out) => return Ok(out),
     };
+    // Approving needs the code: what it would approve goes back, with its code.
+    if approve && acts_on_collars(&d) && !matches!(pick, Pick::Code(_)) {
+        let text = match code_of(ctx, &d.id).await? {
+            Some(code) => format!("To approve, reply Y {code}. {}", prompt(ctx, &d, now).await?),
+            None => {
+                let (herds, paddocks) = (ctx.store().list_herds().await?, ctx.store().list_paddocks().await?);
+                format!("{} has no code to approve by text. Approve it in the app, or reply N.", phrase(&d, &herds, &paddocks))
+            }
+        };
+        return Ok(Out { text: Some(fit(&text, reply_max(&msg.channel))), decision_id: Some(d.id), prompt: true, ..Default::default() });
+    }
     let how = if approve { Response::Approve } else { Response::Reject };
     match cycle::respond(ctx, &d.id, how, None, None, actor(user)).await {
         Ok(done) => {
             let herds = ctx.store().list_herds().await?;
             let paddocks = ctx.store().list_paddocks().await?;
+            if approve {
+                tell_owners(ctx, msg, user, &done, &herds, &paddocks).await;
+            }
             Ok(Out { text: Some(answered(&done, &herds, &paddocks)), decision_id: Some(done.id.clone()), ..Default::default() })
+        }
+        // The safety gate holds it: only a person looking at the map may send it.
+        Err(e) if e.details.as_ref().is_some_and(|d| d.contains_key("findings")) => {
+            let found: Vec<String> = e
+                .details
+                .as_ref()
+                .and_then(|d| d["findings"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|f| f["text"].as_str().map(str::to_owned))
+                .collect();
+            let text = format!("Not approved: {}. Approve it in the app, where it shows on the map.", found.join("; "));
+            Ok(Out { text: Some(fit(&gsm7(&text), 160)), decision_id: Some(d.id), ..Default::default() })
         }
         Err(e) if e.status.is_client_error() => Ok(Out { text: Some(fit(&gsm7(&e.message), 160)), decision_id: Some(d.id), ..Default::default() }),
         Err(e) => anyhow::bail!("answering {}: {}", d.id, e.message),
+    }
+}
+
+/// A MOVE or HOLD changes what the collars get; approving one needs its code.
+fn acts_on_collars(d: &Decision) -> bool {
+    matches!(action(d).as_str(), "MOVE" | "HOLD")
+}
+
+/// The code of a decision's newest `decision_waiting` alert.
+async fn code_of(ctx: &Ctx, decision_id: &str) -> anyhow::Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT json_extract(data, '$.code') FROM alerts WHERE key = ? ORDER BY opened_at DESC, id DESC LIMIT 1")
+        .bind(format!("decision_waiting:{decision_id}"))
+        .fetch_optional(ctx.db())
+        .await?
+        .flatten())
+}
+
+/// Text the farm's owners (with a verified phone, not opted out, not the
+/// one who approved) that a decision was approved by text, on the channel
+/// it came in on. Failures are logged; the approval stands.
+async fn tell_owners(ctx: &Ctx, msg: &MessageLog, by: &User, d: &Decision, herds: &[Herd], paddocks: &[Paddock]) {
+    let what = phrase(d, herds, paddocks);
+    let text = fit(&gsm7(&format!("{} approved by text from {}: {what}. Reply STOP MOVE to stop it.", by.name, msg.address)), text::MAX_ALERT);
+    let owners = match op_core::users::list_users(ctx).await {
+        Ok(u) => u,
+        Err(e) => return tracing::warn!("telling the owners about a texted approval: {e:#}"),
+    };
+    for o in owners.into_iter().filter(|o| o.role == Role::Owner && o.id != by.id && o.disabled_at.is_none() && o.phone_verified_at.is_some()) {
+        let Some(phone) = o.phone.clone() else { continue };
+        match crate::routing::prefs::get(ctx, &o.id).await {
+            Ok((_, true)) => continue,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("telling the owners about a texted approval: {e:#}");
+                continue;
+            }
+        }
+        let out = op_core::messages::Outbound {
+            idempotency_key: format!("approved:{}:{}", msg.id, o.id),
+            channel: super::reply_channel(&msg.channel).into(),
+            to: phone,
+            text: text.clone(),
+            subject: None,
+            kind: "reply".into(),
+            alert_id: None,
+            decision_id: Some(d.id.clone()),
+            user_id: Some(o.id.clone()),
+        };
+        if let Err(e) = op_core::messages::enqueue(ctx, out).await {
+            tracing::warn!(owner = %o.id, "telling the owner about a texted approval: {e:#}");
+        }
     }
 }
 

@@ -9,6 +9,8 @@ import { summarize, undrawn } from "../store/live";
 import { Button, Copy, Input, Menu, Segmented } from "../ui";
 import { useUnits } from "../units";
 import { age, clock, useNow } from "../util";
+import { collarCount, SIMULATED } from "../sim";
+import { Held, useGate } from "../features/rules";
 
 // Clicking Timer again steps through these.
 const TIMER_STEPS = [15, 30, 60, 120, 240, 480];
@@ -35,6 +37,8 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState("");
   const [err, setErr] = useState<string>();
+  // An approval the safety gate holds shows its findings, to send anyway by name.
+  const gate = useGate();
   // The herd menu entry open under the name, if any.
   const [openItem, setOpenItem] = useState<string>();
   const menu = herdMenu.use();
@@ -168,13 +172,15 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             <p className="call">{sentence(live)}</p>
             {live.reasoning && <Why key={live.id} text={live.reasoning} />}
             {live.apply_at && <p className="clock">{clock(Date.parse(live.apply_at) - now)}</p>}
+            <Held inputs={live.inputs} />
             {manage && <div className="acts">
               <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>{keeps ? "Hold" : "Reject"}</Button>
               {live.geometry && <Button small disabled={busy || changing} onClick={onChange}>Change</Button>}
-              <Button small kind="primary" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "approve" }))}>
+              <Button small kind="primary" disabled={busy} onClick={() => act(() => gate.run(async (confirm) => void (await api.respond(live.id, { action: "approve", confirm }))))}>
                 {live.apply_at ? "Send now" : keeps ? "Keep" : "Approve"}
               </Button>
             </div>}
+            {gate.panel}
           </>
         )}
         {!live && move?.status === "done" ? (
@@ -221,7 +227,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
         )}
         {summary && (
           <li className="sum mono">
-            <span>{summary.total} collars</span>
+            <span>{collarCount(collars)}</span>
             {summary.outside.length > 0 && <button type="button" title="Outside the boundary" onClick={() => onFocusCollars(summary.outside)}>{summary.outside.length} out</button>}
             {summary.warning.length > 0 && <button type="button" title="In the warning band" onClick={() => onFocusCollars(summary.warning)}>{summary.warning.length} near</button>}
             {summary.low.length > 0 && <button type="button" title="Battery under 20%" onClick={() => onFocusCollars(summary.low)}>{summary.low.length} low</button>}
@@ -232,7 +238,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             data-heard={heard(c.last_seen, calm)} style={{ "--b": c.battery ?? 0 } as CSSProperties}>
             <button type="button" onClick={() => onFocusCollar(c.id)} onMouseEnter={() => onHoverCollar(c.id)}
               onFocus={() => onHoverCollar(c.id)} onBlur={() => onHoverCollar(undefined)}>
-              <span className="cn">{c.label}</span>
+              <span className="cn">{c.label}{c.simulated && <i className="sim">{SIMULATED}</i>}</span>
               <span className={c.battery !== undefined && c.battery < 0.2 ? "low" : undefined}>{c.battery !== undefined ? `${Math.round(c.battery * 100)}%` : "–"}</span>
               <span>{age(c.last_seen, calm)}</span>
             </button>
@@ -329,7 +335,7 @@ function AddCollar({ herdId }: { herdId: string }) {
   if (made)
     return (
       <div className="addcollar">
-        <Copy label="endpoint" value={made.endpoint} />
+        {made.endpoint ? <Copy label="endpoint" value={made.endpoint} /> : <p className="dim nocollar">{made.no_endpoint} <a href="#/settings">Settings</a></p>}
         <Copy label="key" value={made.key} />
         <Copy label="public key" value={made.public_key} />
         <Button small kind="plain" onClick={() => setMade(undefined)}>Done</Button>

@@ -2,7 +2,9 @@
 //! `latest.json` next to the app; the app checks it a little after launch,
 //! every six hours after that, and from openpasture > Check for Updates…
 //! Installing swaps the .app in place, then the app restarts through the
-//! normal exit, so the server shuts down cleanly first.
+//! normal exit, so the server shuts down cleanly first. The restart waits
+//! while a move or escape runs (the fence would stop mid-way), and the
+//! background check doesn't offer an update then at all.
 //!
 //! The UI's sidebar has an update button too. It calls [`update_status`] and
 //! [`update_check`] over IPC; `capabilities/server-ui.json` lets the pages the
@@ -20,6 +22,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 pub const MENU_ID: &str = "check-for-updates";
 const FIRST_CHECK: Duration = Duration::from_secs(10);
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// While a move runs: how often to look again before offering or restarting.
+const WHILE_MOVING: Duration = Duration::from_secs(60);
 
 /// One check or install at a time. A version put off with Later isn't offered
 /// again by the background check; Check for Updates… still offers it.
@@ -51,12 +55,13 @@ pub fn update_check(app: AppHandle) {
     check_now(&app);
 }
 
-/// The default menu with Check for Updates… under About in the app menu.
+/// The default menu with Check for Updates… and Reveal Logs under About in the app menu.
 pub fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let menu = Menu::default(app)?;
     if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.first() {
         let check = MenuItem::with_id(app, MENU_ID, "Check for Updates…", true, None::<&str>)?;
-        app_menu.insert_items(&[&check, &PredefinedMenuItem::separator(app)?], 1)?;
+        let logs = MenuItem::with_id(app, crate::REVEAL_LOGS, "Reveal Logs", true, None::<&str>)?;
+        app_menu.insert_items(&[&check, &logs, &PredefinedMenuItem::separator(app)?], 1)?;
     }
     Ok(menu)
 }
@@ -95,7 +100,12 @@ async fn check(app: &AppHandle, asked: bool) {
         Ok(Some(update)) => {
             state.available.lock().unwrap().replace(update.version.clone());
             let put_off = state.later.lock().unwrap().as_deref() == Some(update.version.as_str());
-            if asked || !put_off {
+            // Not in the middle of a move unasked: the next check offers it.
+            let moving = !asked && crate::work(app).await.moving();
+            if moving {
+                tracing::info!(version = %update.version, "update available; not offered during a move");
+            }
+            if asked || !(put_off || moving) {
                 offer(app, update).await;
             }
         }
@@ -155,6 +165,14 @@ async fn offer(app: &AppHandle, update: Update) {
         .await;
     match result {
         Ok(()) => {
+            // Installed; the running copy carries on until it restarts.
+            if crate::work(app).await.moving() {
+                title("openpasture — restarts once the move is done");
+                tracing::info!(version = %update.version, "update installed; restarting after the move");
+                while crate::work(app).await.moving() {
+                    tokio::time::sleep(WHILE_MOVING).await;
+                }
+            }
             tracing::info!(version = %update.version, "update installed, restarting");
             app.request_restart();
         }

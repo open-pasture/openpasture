@@ -40,7 +40,12 @@ async fn points_the_collar_already_recorded_are_left_out_of_an_import() {
     let dir = tempfile::tempdir().unwrap();
     let handle = serve(ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
     let base = handle.url().to_owned();
-    let http = reqwest::Client::new();
+    // The owner's client: the app token on every request.
+    let http = {
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert("authorization", format!("Bearer {}", handle.ctx().settings().await.unwrap().server.app_token).parse().unwrap());
+        reqwest::Client::builder().default_headers(auth).build().unwrap()
+    };
     let post = |path: &str, body: Value| http.post(format!("{base}{path}")).json(&body).send();
     let ok = |r: reqwest::Response| async move {
         let s = r.status();

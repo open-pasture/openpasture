@@ -35,6 +35,7 @@ pub mod layouts;
 pub mod strips;
 // @F
 pub mod presend;
+pub mod rules;
 // @S
 pub mod schedules;
 // @A3
@@ -76,6 +77,7 @@ pub fn router() -> axum::Router<Ctx> {
         layouts::router(),
         // @F
         presend::router(),
+        rules::router(),
         // @S
         schedules::router(),
         // @A3
@@ -93,6 +95,7 @@ pub fn router() -> axum::Router<Ctx> {
 /// evaluation. Builds the knowledge index if it is missing or stale.
 pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     register_tools(&ctx);
+    rules::refresh(&ctx).await?;
     cycle::fail_interrupted(&ctx).await?;
     if let Err(e) = knowledge::ensure_index(&ctx).await {
         tracing::warn!("knowledge index: {e:#}");

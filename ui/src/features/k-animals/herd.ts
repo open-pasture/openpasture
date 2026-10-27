@@ -120,7 +120,7 @@ export function mappedRows(p: ImportPreview, m: Mapping, n = 5): Partial<Record<
 // Collar keys as a CSV, for setting collars up without cards. Shown once, like the keys.
 export function keysCsv(collars: LinkedCollar[]) {
   const q = (s: string) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
-  const lines = collars.map((c) => [c.tag ?? "", c.collar.name, c.collar.id, c.key, c.endpoint, c.public_key].map(q).join(","));
+  const lines = collars.map((c) => [c.tag ?? "", c.collar.name, c.collar.id, c.key, c.endpoint ?? "", c.public_key].map(q).join(","));
   return ["tag,collar,collar_id,key,endpoint,public_key", ...lines].join("\n") + "\n";
 }
 
@@ -131,8 +131,9 @@ export function sheets<T>(items: T[], per = 12): T[][] {
   return out;
 }
 
-// Cards print only from an https public URL: the endpoint goes into every collar.
-export const cardsPossible = (publicUrl?: string) => !!publicUrl && publicUrl.startsWith("https://");
+// Cards print only once there is a collar address (checked to reach this server when it was set):
+// the endpoint goes into every collar.
+export const cardsPossible = (collarUrl?: string) => !!collarUrl && collarUrl.startsWith("https://");
 
 // Run f over items, a few at a time. The first error stops every worker and is thrown.
 export async function each<T>(items: T[], f: (t: T) => Promise<unknown>, width = 6) {

@@ -21,6 +21,13 @@
 //! herd boundaries staged at that moment are copied for that collar alone
 //! (`collar_id` + `copy_of`), so the rest of the herd downloads nothing.
 //!
+//! Before the first pen the collar's own fixes have to make a believable
+//! escape ([`plausible`]): a stolen or faulty collar reporting a jump
+//! doesn't get a pen built around a place the animal never was. Every pen
+//! passes the safety gate as an escape pen ([`crate::gate`]): nothing it
+//! takes in beyond what the herd's boundary already does (a road, the farm
+//! boundary, a no-go zone, a hard hazard), else no pen goes.
+//!
 //! [`advance`] is pure. [`scan`] starts, steps and ends escapes; the driver
 //! runs it every 2 s.
 
@@ -58,6 +65,18 @@ pub const REACH_M: f64 = 100.0;
 const OWN_GROUND: Duration = Duration::hours(24);
 /// `BoundaryStatus.escapes` keeps showing an ended escape this long.
 pub const SHOW_ENDED: Duration = Duration::minutes(10);
+/// Fixes outside the herd's boundary a first pen needs.
+pub const PLAUSIBLE_FIXES: usize = 2;
+/// Fastest an animal is taken to move between two fixes (m/s), beyond what
+/// their accuracies allow: a bolting cow tops out near 11 m/s.
+pub const MAX_SPEED_M_S: f64 = 12.0;
+/// A fix less accurate than this (m) doesn't count toward a pen.
+pub const MAX_ACCURACY_M: f64 = 30.0;
+/// Fixes from this long before the animal went out are read too, for the jump out.
+const BEFORE_OUT: Duration = Duration::minutes(5);
+/// A pen the gate refused, or a track that wasn't believable, is looked at
+/// again after this (so the log isn't written every pass).
+const RETRY_AFTER: Duration = Duration::seconds(60);
 
 pub fn router() -> Router<Ctx> {
     Router::new().route("/api/collars/{id}/escape/stop", post(post_stop))
@@ -290,6 +309,31 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         tracing::debug!(collar = %collar_id, "escape: out of reach, no pen");
         return Ok(None);
     }
+    if waiting(collar_id, at) {
+        return Ok(None);
+    }
+    let track = collar_fixes(ctx, collar_id, since - BEFORE_OUT, at).await?;
+    if let Err(why) = plausible(&track, since, &active.geometry) {
+        hold_off(collar_id, at);
+        // Said once per trip out.
+        if IMPLAUSIBLE.lock().unwrap_or_else(|e| e.into_inner()).insert(collar_id.to_owned(), since) == Some(since) {
+            return Ok(None);
+        }
+        tracing::warn!(collar = %collar_id, "escape: no pen, the fixes aren't believable: {why}");
+        let event = ActivityEvent {
+            id: id::new_id(id::EVENT),
+            kind: "escape.implausible".into(),
+            source: "system".into(),
+            occurred_at: at,
+            recorded_at: at,
+            title: format!("{}: no pen, its fixes look wrong", collar.name),
+            body: Some(why),
+            payload: serde_json::json!({ "collar_id": collar.id, "outside_since": since }),
+            targets: vec![("herd".into(), collar.herd_id.clone()), ("collar".into(), collar.id.clone())],
+        };
+        let _ = ctx.store().record_event(&event).await.inspect_err(|err| tracing::warn!("activity log: {err:#}"));
+        return Ok(None);
+    }
     let limits = crate::shape::herd_limits(ctx, &collar.herd_id).await?;
     let state = EscapeState { target: &active.geometry, target_version: active.version, warn_m: active.warn_m, current: None, pen: &Pen::default(), limits };
     let (Next::Send { polygon, remaining_m }, pen) = advance(&state, point, at) else { return Ok(None) };
@@ -297,6 +341,10 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         tracing::info!(collar = %collar_id, "escape: an exclusion lies between the animal and the herd, no pen");
         return Ok(None);
     };
+    if !gate_pen(ctx, &collar, &active, &polygon, at).await? {
+        hold_off(collar_id, at);
+        return Ok(None);
+    }
 
     let mut e = Escape {
         id: id::new_id(id::ESCAPE),
@@ -374,6 +422,96 @@ async fn in_reach(ctx: &Ctx, herd_id: &str, herd: &Boundary, point: LonLat, at: 
     Ok(false)
 }
 
+/// Collars whose pen was refused or whose track wasn't believable, and when.
+static HELD_OFF: LazyLock<std::sync::Mutex<HashMap<String, DateTime<Utc>>>> = LazyLock::new(Default::default);
+
+/// The trip out (its `outside_since`) each collar's unbelievable track was last reported for.
+static IMPLAUSIBLE: LazyLock<std::sync::Mutex<HashMap<String, DateTime<Utc>>>> = LazyLock::new(Default::default);
+
+fn hold_off(collar_id: &str, at: DateTime<Utc>) {
+    let mut held = HELD_OFF.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|_, t| at - *t < RETRY_AFTER);
+    held.insert(collar_id.to_owned(), at);
+}
+
+/// Held off since less than [`RETRY_AFTER`] ago.
+fn waiting(collar_id: &str, at: DateTime<Utc>) -> bool {
+    HELD_OFF.lock().unwrap_or_else(|e| e.into_inner()).get(collar_id).is_some_and(|t| at - *t < RETRY_AFTER)
+}
+
+/// One collar's fixes in `[from, to]`, oldest first: time, point, accuracy (m).
+async fn collar_fixes(ctx: &Ctx, collar_id: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<(DateTime<Utc>, LonLat, f64)>> {
+    let rows: Vec<(i64, f64, f64, f64)> =
+        sqlx::query_as("SELECT t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ? AND t >= ? AND t <= ? ORDER BY t LIMIT 500")
+            .bind(collar_id)
+            .bind(from.timestamp_millis())
+            .bind(to.timestamp_millis())
+            .fetch_all(ctx.db())
+            .await?;
+    Ok(rows.into_iter().map(|(t, lon, lat, acc)| (op_core::time::from_unix_ms(t), [lon, lat], acc)).collect())
+}
+
+/// Whether a collar's fixes (oldest first) make a believable escape from
+/// `herd` since `since`: at least [`PLAUSIBLE_FIXES`] fixes since then, each
+/// accurate to [`MAX_ACCURACY_M`] and outside the herd's boundary, and no
+/// two fixes in a row (the last one before it went out too) further apart
+/// than [`MAX_SPEED_M_S`] allows once their accuracies are taken off. `Err`
+/// says why not.
+pub fn plausible(fixes: &[(DateTime<Utc>, LonLat, f64)], since: DateTime<Utc>, herd: &Polygon) -> Result<(), String> {
+    let out: Vec<&(DateTime<Utc>, LonLat, f64)> = fixes.iter().filter(|(t, _, _)| *t >= since).collect();
+    if out.len() < PLAUSIBLE_FIXES {
+        return Err(format!("{} fix{} since it went out", out.len(), if out.len() == 1 { "" } else { "es" }));
+    }
+    if let Some((_, _, acc)) = out.iter().find(|(_, _, acc)| !acc.is_finite() || *acc > MAX_ACCURACY_M) {
+        return Err(format!("a fix only good to {acc:.0} m"));
+    }
+    if out.iter().any(|(_, p, _)| herd.contains(*p)) {
+        return Err("it was back inside between fixes".into());
+    }
+    let first = fixes.iter().rposition(|(t, _, _)| *t < since).unwrap_or(0);
+    for w in fixes[first..].windows(2) {
+        let ((ta, a, acc_a), (tb, b, acc_b)) = (&w[0], &w[1]);
+        let dt = (*tb - *ta).num_milliseconds() as f64 / 1000.0;
+        if dt <= 0.0 {
+            continue;
+        }
+        let [x, y] = op_geo::Projection::new(*a).forward(*b);
+        let moved = (x.hypot(y) - acc_a.max(0.0) - acc_b.max(0.0)).max(0.0);
+        if moved / dt > MAX_SPEED_M_S {
+            return Err(format!("a jump of {:.0} m in {dt:.0} s", x.hypot(y)));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a pen may go: it passes the gate as an escape pen with the hard
+/// findings it has that the herd's boundary doesn't (judged as the collar
+/// enforces it). Logged either way; refused is `false`.
+async fn gate_pen(ctx: &Ctx, collar: &Collar, herd: &Boundary, pen: &Polygon, at: DateTime<Utc>) -> anyhow::Result<bool> {
+    let caps = crate::shape::herd_collars(ctx.db(), &collar.herd_id).await?.into_iter().find(|c| c.id == collar.id).map(|c| c.caps);
+    let holeless = caps.is_none_or(|c| !c.holds_holes());
+    let known = crate::prepare::map_only(ctx, &herd.geometry, at, holeless).await?;
+    let found = crate::prepare::map_only(ctx, pen, at, holeless).await?;
+    let new: Vec<op_core::check::Finding> = found.into_iter().filter(|f| !known.iter().any(|k| k.code == f.code && k.targets == f.targets)).collect();
+    let sender = crate::gate::Sender::of(crate::gate::SenderKind::Escape);
+    let check = crate::gate::Check {
+        herd_id: &collar.herd_id,
+        geometry: pen,
+        findings: &new,
+        sender: &sender,
+        decision_id: Some(&herd.decision_id),
+        collar_id: Some(&collar.id),
+    };
+    match crate::gate::pass(ctx, &check).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.status == axum::http::StatusCode::CONFLICT => {
+            tracing::warn!(collar = %collar.id, "escape: no pen, {}", e.message);
+            Ok(false)
+        }
+        Err(e) => Err(anyhow::anyhow!(e.message)),
+    }
+}
+
 /// A pen as it goes to the collar: the exclusions in effect that it takes
 /// in are kept out of it, as on any herd boundary. `None` when that leaves
 /// the animal out of it, or most of the herd's ground (an exclusion between
@@ -449,8 +587,15 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
         }
         (Next::Back, _) => end(ctx, row, Some(&collar), EscapeStatus::Back, at).await,
         (Next::Send { polygon, remaining_m }, pen) => {
-            // The pen it has stays while the next one can't keep the exclusions out.
+            // The pen it has stays while the next one can't keep the exclusions out, or the gate refuses it.
             let Some(polygon) = fenced(ctx, &active, &polygon, point, &limits, at).await? else { return Ok(()) };
+            if waiting(collar_id, at) {
+                return Ok(());
+            }
+            if !gate_pen(ctx, &collar, &active, &polygon, at).await? {
+                hold_off(collar_id, at);
+                return Ok(());
+            }
             let mut e = row.e.clone();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
             let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
@@ -606,12 +751,13 @@ fn round_m(v: f64) -> f64 {
 
 /// The driver: every 2 s.
 pub fn spawn_driver(ctx: Ctx) {
-    tokio::spawn(async move {
+    ctx.clone().supervise("ingest.escapes", Some(std::time::Duration::from_secs(2)), |ctx| async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             tokio::select! {
                 _ = ctx.on_shutdown() => break,
                 _ = tick.tick() => {
+                    ctx.beat("ingest.escapes");
                     if let Err(e) = scan(&ctx, now()).await {
                         tracing::warn!("escape driver: {e:#}");
                     }
@@ -634,6 +780,27 @@ mod tests {
     }
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
         Polygon::from_ring(vec![at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)])
+    }
+
+    #[test]
+    fn a_pen_needs_a_believable_walk_out() {
+        let herd = rect(0.0, 0.0, 300.0, 200.0);
+        let t0 = Utc::now();
+        let s = |sec: i64| t0 + Duration::seconds(sec);
+        let walk = vec![(s(0), at(150.0, 190.0), 3.0), (s(20), at(150.0, 215.0), 3.0), (s(50), at(150.0, 230.0), 3.0)];
+        assert_eq!(plausible(&walk, s(20), &herd), Ok(()));
+        // One fix out isn't enough yet.
+        assert!(plausible(&walk[..2], s(20), &herd).unwrap_err().contains("1 fix"));
+        // A fix good to 50 m doesn't count.
+        let mut vague = walk.clone();
+        vague[2].2 = 50.0;
+        assert!(plausible(&vague, s(20), &herd).unwrap_err().contains("50 m"));
+        // 120 m in 2 s from the last fix in: a jump, not a cow.
+        let jump = vec![(s(0), at(150.0, 100.0), 3.0), (s(2), at(150.0, 220.0), 3.0), (s(30), at(150.0, 221.0), 3.0)];
+        assert!(plausible(&jump, s(2), &herd).unwrap_err().contains("jump"));
+        // Back inside between fixes: not out.
+        let back = vec![(s(20), at(150.0, 215.0), 3.0), (s(30), at(150.0, 190.0), 3.0), (s(50), at(150.0, 215.0), 3.0)];
+        assert!(plausible(&back, s(20), &herd).is_err());
     }
     fn t0() -> DateTime<Utc> {
         from_db("2026-09-26T12:00:00.000Z").unwrap()

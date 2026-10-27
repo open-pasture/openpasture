@@ -32,7 +32,7 @@ const dist = (a: LonLat, b: LonLat) => {
 
 describe("kinds", () => {
   test("the Draw menu order follows Paddock and only exclusion has a key", () => {
-    expect(KINDS.map((k) => k.kind)).toEqual(["exclusion", "water", "gate", "shade", "hazard", "road", "neighbour_line", "farm_boundary"]);
+    expect(KINDS.map((k) => k.kind)).toEqual(["exclusion", "no_go", "water", "gate", "shade", "hazard", "road", "neighbour_line", "farm_boundary"]);
     const orders = KINDS.map((k) => k.order);
     expect(new Set(orders).size).toBe(orders.length);
     expect(Math.min(...orders)).toBeGreaterThan(10);
@@ -205,6 +205,7 @@ describe("pixel art", () => {
 
 test("a feature is drawn and reshaped in its shape's mode: exclusions red, other areas fg, points and lines", () => {
   expect(modeFor("exclusion", "Polygon")).toBe("exclusion");
+  expect(modeFor("no_go", "Polygon")).toBe("exclusion");
   expect(modeFor("water", "Polygon")).toBe("paddock");
   expect(modeFor("farm_boundary", "Polygon")).toBe("paddock");
   expect(modeFor("gate", "Point")).toBe("point");

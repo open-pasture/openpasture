@@ -2,7 +2,8 @@
 //! and without sign-in, sign-in links, what each role may do over REST, MCP
 //! and the live socket, redaction, revocation, and who answered a decision.
 //! Requests act as someone else the way a browser off this machine does:
-//! with a forwarding header (so they're never local) and a bearer token.
+//! with a forwarding header and a bearer token. The owner signs in with a
+//! one-time code, as the desktop app and `openpasture serve` hand out.
 
 use std::net::SocketAddr;
 
@@ -24,6 +25,8 @@ struct Farm {
     _dir: tempfile::TempDir,
     ctx: Ctx,
     app: Router,
+    /// The owner's session, from a one-time code.
+    owner: String,
     herd: String,
     paddock: String,
     p2: String,
@@ -38,7 +41,8 @@ async fn farm() -> Farm {
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let info = ServerInfo { data_dir: dir.path().into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None };
     let app = build_app(ctx.clone(), info, false);
-    let mut f = Farm { _dir: dir, ctx, app, herd: String::new(), paddock: String::new(), p2: String::new() };
+    let owner = owner_session(&ctx, &app).await;
+    let mut f = Farm { _dir: dir, ctx, app, owner, herd: String::new(), paddock: String::new(), p2: String::new() };
     f.local("POST", "/api/farm", Some(json!({"name": "Test farm", "timezone": "America/Chicago", "center": [-93.62, 42.03]}))).await;
     f.paddock = f.local("POST", "/api/paddocks", Some(json!({"name": "P1", "geometry": square(-93.625)}))).await.1["id"].as_str().unwrap().to_owned();
     f.p2 = f.local("POST", "/api/paddocks", Some(json!({"name": "P2", "geometry": square(-93.62)}))).await.1["id"].as_str().unwrap().to_owned();
@@ -67,10 +71,20 @@ async fn send(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)], b
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
+/// Sign the owner in on this machine: a one-time code traded for a session.
+async fn owner_session(ctx: &Ctx, app: &Router) -> String {
+    let url = op_server::session::sign_in_url(ctx, "http://127.0.0.1:7878", "test").await.unwrap();
+    let code = url.rsplit('/').next().unwrap();
+    let (s, v) = send(app, "POST", "/api/session", &[], Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    v["token"].as_str().unwrap().to_owned()
+}
+
 impl Farm {
-    /// This machine: the owner.
+    /// The owner, signed in on this machine.
     async fn local(&self, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-        send(&self.app, method, uri, &[], body).await
+        let bearer = format!("Bearer {}", self.owner);
+        send(&self.app, method, uri, &[("authorization", &bearer)], body).await
     }
 
     /// From elsewhere, with `token` (or none).
@@ -263,8 +277,10 @@ async fn a_viewer_reads_and_never_writes() {
     // MCP: read tools only; a write call fails.
     op_engine::register_tools(&f.ctx);
     let listed = names(&f.mcp(&viewer, 1, "tools/list", json!({})).await);
-    // The engine's read tools, then read tools added under the anchors (get_morning_brief, …).
-    assert_eq!(listed[..11], op_engine::mcp::READ_TOOLS, "no write tools");
+    // The engine's read tools but run_sql (a manager's, as REST's), then read tools added under the anchors (get_morning_brief, …).
+    let reads: Vec<&str> = op_engine::mcp::READ_TOOLS.iter().copied().filter(|t| *t != "run_sql").collect();
+    assert_eq!(listed[..10], reads[..], "no write tools, no SQL");
+    assert!(!listed.iter().any(|n| n == "run_sql"));
     assert!(listed.iter().all(|n| f.ctx.tools().get(n).is_some_and(|t| t.read)), "no write tools: {listed:?}");
     let v = f.mcp(&viewer, 2, "tools/call", json!({"name": "propose_boundary", "arguments": {"reasoning": "x", "to_paddock_id": f.p2}})).await;
     assert!(v["error"]["message"].as_str().unwrap().contains("Unknown tool"), "{v}");
@@ -366,23 +382,78 @@ async fn the_owner_does_everything() {
 }
 
 #[tokio::test]
-async fn only_owners_see_the_app_token() {
+async fn no_read_shows_the_app_token_and_only_owners_reveal_it() {
     let f = farm().await;
     let app_token = f.ctx.settings().await.unwrap().server.app_token;
+    let cody = f.signed_in("Cody", "owner").await;
     let cases = [
-        (f.signed_in("Vic", "viewer").await, ""),
-        (f.signed_in("Hal", "hand").await, ""),
-        (f.signed_in("Ana", "manager").await, ""),
-        (f.signed_in("Cody", "owner").await, app_token.as_str()),
-        (app_token.clone(), app_token.as_str()),
+        (f.signed_in("Vic", "viewer").await, StatusCode::FORBIDDEN),
+        (f.signed_in("Hal", "hand").await, StatusCode::FORBIDDEN),
+        (f.signed_in("Ana", "manager").await, StatusCode::FORBIDDEN),
+        (cody.clone(), StatusCode::OK),
+        (app_token.clone(), StatusCode::OK),
     ];
-    for (token, want) in &cases {
+    for (token, reveal) in &cases {
         let (_, s) = f.away(Some(token), "GET", "/api/settings", None).await;
         let (_, st) = f.away(Some(token), "GET", "/api/state", None).await;
-        assert_eq!(s["server"]["app_token"], *want);
-        assert_eq!(st["settings"]["server"]["app_token"], *want);
+        assert_eq!(s["server"]["app_token"], "");
+        assert_eq!(st["settings"]["server"]["app_token"], "");
+        let (r, v) = f.away(Some(token), "POST", "/api/settings/app-token/reveal", None).await;
+        assert_eq!(r, *reveal, "{v}");
+        if r == StatusCode::OK {
+            assert_eq!(v["app_token"], app_token.as_str());
+        }
     }
-    assert_eq!(f.local("GET", "/api/settings", None).await.1["server"]["app_token"], app_token.as_str());
+    assert_eq!(f.local("GET", "/api/settings", None).await.1["server"]["app_token"], "");
+    // Saving settings with the token in them changes nothing about it.
+    let (s, v) = f.local("PUT", "/api/settings", Some(json!({"server": {"app_token": "x".repeat(32)}}))).await;
+    assert_eq!((s, v["server"]["app_token"].as_str()), (StatusCode::OK, Some("")));
+    assert_eq!(f.ctx.settings().await.unwrap().server.app_token, app_token);
+    // Rotating: the old one stops working at once.
+    let (s, v) = f.away(Some(&cody), "POST", "/api/settings/app-token/rotate", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let new = v["app_token"].as_str().unwrap();
+    assert_ne!(new, app_token);
+    assert_eq!(f.away(Some(&app_token), "GET", "/api/state", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(f.away(Some(new), "GET", "/api/state", None).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn being_on_this_machine_grants_nothing() {
+    let f = farm().await;
+    // What nginx's default proxy_pass sends: loopback peer, Host 127.0.0.1:7878, no forwarding headers.
+    let (s, e) = send(&f.app, "GET", "/api/settings", &[], None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{e}");
+    assert_eq!(send(&f.app, "POST", "/api/paddocks", &[], Some(json!({"name": "P9", "geometry": square(-93.6)}))).await.0, StatusCode::UNAUTHORIZED);
+    // A one-time code works once.
+    let url = op_server::session::sign_in_url(&f.ctx, "http://127.0.0.1:7878", "test").await.unwrap();
+    assert!(url.starts_with("http://127.0.0.1:7878/#/signin/"), "{url}");
+    let code = url.rsplit('/').next().unwrap();
+    let (s, v) = send(&f.app, "POST", "/api/session", &[], Some(json!({"code": code}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let token = v["token"].as_str().unwrap();
+    assert!(token.starts_with("opo_"));
+    assert_eq!(send(&f.app, "POST", "/api/session", &[], Some(json!({"code": code}))).await.0, StatusCode::UNAUTHORIZED);
+    let bearer = format!("Bearer {token}");
+    let (s, me) = send(&f.app, "GET", "/api/me", &[("authorization", &bearer)], None).await;
+    assert_eq!((s, me["role"].as_str(), me["via"].as_str()), (StatusCode::OK, Some("owner"), Some("local")));
+    // A query-string token only counts on the live socket and MCP.
+    assert_eq!(send(&f.app, "GET", &format!("/api/state?token={token}"), &[], None).await.0, StatusCode::UNAUTHORIZED);
+    // Signed out: gone.
+    assert_eq!(send(&f.app, "DELETE", "/api/session", &[("authorization", &bearer)], None).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(send(&f.app, "GET", "/api/me", &[("authorization", &bearer)], None).await.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn wrong_tokens_are_limited_per_peer() {
+    let f = farm().await;
+    let from = |ip: &'static str, t: &'static str| vec![("x-forwarded-for", ip), ("authorization", t)];
+    for _ in 0..op_server::AUTH_FAILURES_PER_MINUTE {
+        assert_eq!(send(&f.app, "GET", "/api/state", &from("198.51.100.7", "Bearer nope"), None).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let (s, _) = send(&f.app, "GET", "/api/state", &from("198.51.100.7", "Bearer nope"), None).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(send(&f.app, "GET", "/api/state", &from("198.51.100.8", "Bearer nope"), None).await.0, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -446,7 +517,7 @@ async fn accepting_links_is_limited_per_peer() {
 }
 
 #[tokio::test]
-async fn a_person_token_wins_over_being_local() {
+async fn a_person_token_on_this_machine_is_that_person() {
     let f = farm().await;
     let viewer = f.signed_in("Vic", "viewer").await;
     let bearer = format!("Bearer {viewer}");

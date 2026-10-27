@@ -9,11 +9,12 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use op_core::store::decision_from_row;
 use op_core::time::{now, to_db};
-use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Boundary, BoundaryStatus, Ctx, Event, Move, ProposedBoundary, id};
+use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Boundary, BoundaryStatus, Ctx, Event, Identity, Move, ProposedBoundary, id};
 use op_geo::Polygon;
 use op_protocol::wire_time;
 use serde::Deserialize;
 
+use crate::gate::{self, Check, Sender};
 use crate::moves::{self, FarmerDecision};
 use crate::shape::{Prepared, prepare};
 use crate::{db, slots};
@@ -30,12 +31,19 @@ pub struct SendOpts {
     pub warn_m: Option<f64>,
     pub hysteresis_m: Option<f64>,
     pub effective_at: Option<DateTime<Utc>>,
+    /// Hard findings a person confirms by code ([`crate::gate`]).
+    #[serde(default)]
+    pub confirm: Vec<String>,
+    /// Who sends it, for the gate. Set by the caller, never read from a request.
+    #[serde(skip)]
+    pub sender: Sender,
 }
 
 /// Store the herd's next boundary (the next version of the one sequence all
 /// herds share) and make it available to its
 /// collars. Collars pick it up on their next boundary poll. Also points the
-/// decision at the boundary and publishes a `boundary` event.
+/// decision at the boundary and publishes a `boundary` event. It passes the
+/// safety gate as `opts.sender` first.
 pub async fn send_boundary(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: SendOpts, decision_id: &str) -> anyhow::Result<Boundary> {
     send(ctx, herd_id, geometry, opts, decision_id).await.map_err(|e| anyhow::anyhow!(e.message))
 }
@@ -44,7 +52,11 @@ async fn send(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: SendOpts, decis
     if ctx.store().get_herd(herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
-    let Prepared { geometry, warn_m, hysteresis_m, .. } = prepare(ctx, herd_id, &geometry, &opts).await?;
+    let prepared = prepare(ctx, herd_id, &geometry, &opts).await?;
+    let check =
+        Check { herd_id, geometry: &prepared.geometry, findings: &prepared.findings, sender: &opts.sender, decision_id: Some(decision_id), collar_id: None };
+    gate::pass(ctx, &check).await?;
+    let Prepared { geometry, warn_m, hysteresis_m, .. } = prepared;
     let created_at = now();
     // Wire times are whole seconds; a time already past means now.
     let effective_at = opts.effective_at.map(wire_time::trunc_secs).filter(|t| *t > created_at);
@@ -221,20 +233,37 @@ struct NewBoundaryBody {
     opts: SendOpts,
 }
 
-/// The farmer drew a target: record it as an applied farmer decision and
-/// start the move (decision, move and first boundary in one transaction),
-/// then supersede open proposals and move the herd on the record.
-async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJson(body): ApiJson<NewBoundaryBody>) -> ApiResult<(StatusCode, Json<Move>)> {
+/// The farmer drew a target: it passes the safety gate as the person
+/// sending it (a hard finding needs its code in `confirm`), is recorded as
+/// an applied farmer decision and starts the move (decision, move and first
+/// boundary in one transaction), then supersedes open proposals and moves
+/// the herd on the record.
+async fn post_boundary(
+    State(ctx): State<Ctx>,
+    identity: Identity,
+    Path(herd_id): Path<String>,
+    ApiJson(mut body): ApiJson<NewBoundaryBody>,
+) -> ApiResult<(StatusCode, Json<Move>)> {
     if ctx.store().get_herd(&herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
+    body.opts.sender = Sender::person(&identity, body.opts.confirm.clone());
     let prepared = prepare(&ctx, &herd_id, &body.geometry, &body.opts).await?;
+    let decision_id = id::new_id(id::DECISION);
+    let check = Check {
+        herd_id: &herd_id,
+        geometry: &prepared.geometry,
+        findings: &prepared.findings,
+        sender: &body.opts.sender,
+        decision_id: Some(&decision_id),
+        collar_id: None,
+    };
+    gate::pass(&ctx, &check).await?;
     let paddocks = ctx.store().list_paddocks().await?;
     let to_paddock = prepared.geometry.interior_point().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
     let target = prepared.geometry.clone();
-    let decision_id = id::new_id(id::DECISION);
     let farmer = FarmerDecision { to_paddock_id: to_paddock.as_deref(), reasoning: "Boundary drawn by the farmer." };
-    let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer)).await?;
+    let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer), &body.opts.confirm).await?;
 
     if let Some(r) = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(&decision_id).fetch_optional(ctx.db()).await? {
         let decision = decision_from_row(&r)?;
@@ -259,7 +288,7 @@ async fn post_boundary(State(ctx): State<Ctx>, Path(herd_id): Path<String>, ApiJ
 /// index); one that died before its time (a higher version took effect
 /// first) is not announced.
 pub fn spawn_activation_watcher(ctx: Ctx) {
-    tokio::spawn(async move {
+    ctx.clone().supervise("ingest.activations", Some(Duration::from_secs(2)), |ctx| async move {
         let mut last = now();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         loop {
@@ -267,6 +296,7 @@ pub fn spawn_activation_watcher(ctx: Ctx) {
                 _ = ctx.on_shutdown() => break,
                 _ = tick.tick() => {}
             }
+            ctx.beat("ingest.activations");
             let t = now();
             if let Err(e) = announce_activations(&ctx, last, t).await {
                 tracing::warn!("boundary watcher: {e:#}");

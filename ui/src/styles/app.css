@@ -171,6 +171,11 @@
 .story{position:absolute;inset:0;z-index:1;pointer-events:none;transition:opacity .6s}
 .story.off{opacity:0}
 .story canvas{position:absolute;inset:0;width:100%;height:100%}
+.story .sw{position:absolute;left:18px;bottom:16px;margin:0;font-size:11px;color:var(--fg2);letter-spacing:.02em}
+/* the simulator's collars and animals, in one plain word wherever they show */
+.sim{font-style:normal;font-size:10px;color:var(--fg3);margin-left:6px;letter-spacing:.02em}
+.bsim{color:var(--fg2)}
+.mapsim{position:absolute;left:12px;bottom:10px;margin:0;z-index:2;pointer-events:none;font-size:11px;color:var(--fg2);text-shadow:0 1px 2px rgba(0,0,0,.6)}
 .first[data-step=paddock] .veil,.first[data-step=herd] .veil{opacity:.5}
 .corner{position:absolute;top:16px;left:18px;display:flex;align-items:center;gap:14px;z-index:2}
 .dots{display:flex;gap:4px}
@@ -274,3 +279,13 @@ input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--grass)
 .addcollar.row .err{flex-basis:100%}
 .srow input[type=time]{width:140px}
 .q.herd .seg button{padding-top:6px;padding-bottom:6px;line-height:20px}
+/* Settings, Server: what it really listens on, and the collar address check. */
+.saddr{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11.5px}
+.caddr{display:grid;gap:8px}
+.caddr .cnote{font-size:12px;line-height:1.45;max-width:520px}
+.csteps{display:flex;gap:14px;font-size:11.5px;color:var(--fg3)}
+.csteps span[data-ok]{color:var(--fg2)}
+.csteps span[data-ok]::before{content:"✓ ";color:var(--grass)}
+.csteps span[data-failed]{color:var(--red)}
+.cconfirm{display:grid;gap:8px}
+.addcollar .nocollar{font-size:12px;line-height:1.45;max-width:320px}

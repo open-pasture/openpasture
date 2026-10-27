@@ -127,7 +127,7 @@ export function grazedAt(s: Schedule, moves: ScheduledMove[], at: number): numbe
   if (!s.back_fence.enabled) return range(0, k);
   const lag = s.back_fence.lag_strips;
   const closes = shaping(moves).filter((m) => m.index === k && m.step > 0);
-  const closed = closes.length === 0 || closes.every((m) => t(m) <= at);
+  const closed = closes.every((m) => t(m) <= at);
   if (closed) return range(0, Math.max(0, k - lag));
   const prev = shaping(moves).filter((m) => m.step === 0 && m.index < k).pop()?.index ?? k - 1;
   return range(0, Math.max(0, prev - lag));

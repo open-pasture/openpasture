@@ -1,8 +1,8 @@
 // Typed client for docs/API.md. Same origin: the Rust server serves this UI.
 // HTTP plumbing lives in ./api/http; each stream adds its own ./api/<id>.ts.
 
-import { del, get, getToken, patch, post, put, qs } from "./api/http";
-import { liveEvents } from "./api/x1";
+import { del, get, patch, post, put, qs } from "./api/http";
+export { live } from "./api/live";
 export { ApiError, authHeaders, downloadBlob, getToken, onUnauthorized, qs, setToken, type Query } from "./api/http";
 
 export type LonLat = [number, number];
@@ -42,7 +42,7 @@ export interface Animal {
 export interface Settings {
   brain: { id: BrainId; model?: string };
   decision_time: string;
-  server: { bind: string; port: number; public_url?: string; app_token: string };
+  server: { bind: string; port: number; public_url?: string; collar_url?: string; app_token: string };
   units: "metric" | "imperial";
 }
 export type SettingsPatch = {
@@ -62,6 +62,8 @@ export interface Collar {
   battery?: number; boundary_version?: number; state: CollarState; last_fix?: Fix;
   // What the collar reports about itself (fw, caps), and park state: a parked collar is on a shelf or charger.
   fw?: string; caps?: string[]; outside_since?: string; parked_at?: string; parked_reason?: ParkReason;
+  // Run by the simulator, not on an animal (it reports the `sim` cap). Never cleared.
+  simulated?: boolean;
 }
 export interface Position { collar_id: string; animal_id?: string; fix: Fix; state: CollarState }
 // The latest position of one collar, as the map keeps it (op_core::live::PositionItem).
@@ -104,7 +106,8 @@ export interface BoundaryStatus {
   slots?: SlotCount[];
 }
 export interface SlotCount { version: number; effective_at?: string; applied: number; stored: number; rejected: number; collars: number }
-export interface NewCollar { collar: Collar; key: string; endpoint: string; public_key: string }
+// endpoint is the collar address; absent until one is set, with no_endpoint saying why.
+export interface NewCollar { collar: Collar; key: string; endpoint?: string; no_endpoint?: string; public_key: string }
 
 export type DecisionStatus = "running" | "proposed" | "approved" | "applied" | "rejected" | "failed" | "superseded";
 export interface Decision {
@@ -148,7 +151,19 @@ export interface PastureRow {
   pressure: number | null; au_days: number | null; last_grazed: string | null; ndvi: number | null; herds: string[];
 }
 export interface SqlResult { columns: string[]; rows: unknown[][]; ms: number; truncated?: boolean }
-export interface ServerInfo { version: string; data_dir: string; bind: string; port: number; lan_url?: string; public_url?: string }
+// What the server is doing that stopping it would cut short (op_server::work).
+export interface ServerWork { moves: number; escapes: number; live_collars: number }
+export interface ServerInfo {
+  version: string; data_dir: string; bind: string; port: number; lan_url?: string; public_url?: string;
+  // Where collars reach this server, once checked (PUT /api/server/collar-address).
+  collar_url?: string;
+  // What this server can do ("sql", "analytics", "collar_address_check", …); older servers send none.
+  capabilities?: string[];
+  work?: ServerWork;
+}
+// POST /api/server/collar-address/check: the steps that passed, the one that failed and why.
+export type CollarAddressStep = "address" | "dns" | "https" | "server";
+export interface CollarAddressCheck { ok: boolean; url: string; endpoint: string; passed: CollarAddressStep[]; failed?: CollarAddressStep; problem?: string }
 
 // Live events on /api/live, keyed by `type`. Each stream adds its own events from its
 // ui/src/api/<id>.ts:
@@ -220,7 +235,7 @@ export interface MessageLog {
   text: string; subject?: string; status: MessageStatus; error?: string; alert_id?: string; decision_id?: string;
   provider_id?: string; attempts: number; created_at: string; updated_at: string;
 }
-export type FeatureKind = "exclusion" | "water" | "gate" | "shade" | "hazard" | "road" | "neighbour_line" | "farm_boundary";
+export type FeatureKind = "exclusion" | "no_go" | "water" | "gate" | "shade" | "hazard" | "road" | "neighbour_line" | "farm_boundary";
 export type FeatureGeometry =
   | { type: "Point"; coordinates: LonLat }
   | { type: "LineString"; coordinates: LonLat[] }
@@ -232,13 +247,6 @@ export interface MapFeature {
 
 export interface HostedKey { id: string; label?: string; created_at: string; last_used?: string }
 export interface NewHostedKey extends HostedKey { key: string }
-
-function socket(path: string) {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const token = getToken();
-  const q = token ? `?token=${encodeURIComponent(token)}` : "";
-  return new WebSocket(`${proto}//${location.host}${path}${q}`);
-}
 
 export type Range = { from?: string; to?: string };
 
@@ -273,7 +281,8 @@ export const api = {
   deleteCollar: (id: string) => del(`/api/collars/${id}`),
   boundary: (herd_id: string) => get<BoundaryStatus>(`/api/herds/${herd_id}/boundary`),
   // The geometry is the move's target; the server sweeps the active boundary toward it.
-  sendBoundary: (herd_id: string, b: { geometry: Polygon; warn_m?: number; hysteresis_m?: number; effective_at?: string }) =>
+  // confirm: hard findings the farmer sends it with anyway, by code (the safety gate).
+  sendBoundary: (herd_id: string, b: { geometry: Polygon; warn_m?: number; hysteresis_m?: number; effective_at?: string; confirm?: string[] }) =>
     post<Move>(`/api/herds/${herd_id}/boundary`, b),
   stopMove: (herd_id: string) => post<Move>(`/api/herds/${herd_id}/move/stop`),
   stopEscape: (collar_id: string) => post<Escape>(`/api/collars/${collar_id}/escape/stop`),
@@ -283,7 +292,7 @@ export const api = {
   decisions: (herd_id?: string, limit?: number) => get<Decision[]>("/api/decisions", { herd_id, limit }),
   decision: (id: string) => get<Decision>(`/api/decisions/${id}`),
   decide: (herd_id: string) => post<Decision>(`/api/herds/${herd_id}/decide`),
-  respond: (id: string, b: { action: "approve" | "reject" | "modify"; geometry?: Polygon; note?: string }) =>
+  respond: (id: string, b: { action: "approve" | "reject" | "modify"; geometry?: Polygon; note?: string; confirm?: string[] }) =>
     post<Decision>(`/api/decisions/${id}/respond`, b),
   brains: () => get<Brain[]>("/api/brains"),
   testBrain: (id: BrainId) => post<BrainTest>(`/api/brains/${id}/test`),
@@ -298,7 +307,8 @@ export const api = {
   // analytics
   tracks: (q: { collar_id?: string; herd_id?: string; max_points?: number } & Range) => get<Track[]>("/api/tracks", q),
   health: (q: { herd_id?: string; collar_id?: string; bucket?: string } & Range) => get<HealthSeries[]>("/api/analytics/health", q),
-  behaviour: (q: { herd_id: string } & Range) => get<Behaviour[]>("/api/analytics/behaviour", q),
+  // collar_id: that collar's row only, from its own fixes (the animal page).
+  behaviour: (q: { herd_id: string; collar_id?: string } & Range) => get<Behaviour[]>("/api/analytics/behaviour", q),
   heatmap: (q: { herd_id: string } & Range) => get<[number, number, number][]>("/api/analytics/heatmap", q),
   pasture: (herd_id?: string) => get<PastureRow[]>("/api/analytics/pasture", { herd_id }),
   sql: (query: string) => post<SqlResult>("/api/sql", { query }),
@@ -307,49 +317,8 @@ export const api = {
 
   // server
   server: () => get<ServerInfo>("/api/server"),
+  checkCollarAddress: (url: string) => post<CollarAddressCheck>("/api/server/collar-address/check", { url }),
+  // Checked again on the server; refused (422) with the reason unless it reaches this server. null clears it.
+  setCollarAddress: (url: string | null) => put<{ collar_url?: string; check?: CollarAddressCheck }>("/api/server/collar-address", { url }),
   me: () => get<Me>("/api/me"),
 };
-
-// Live feed with reconnect. Returns an unsubscribe function.
-export function live(onEvent: (e: LiveEvent) => void, onStatus?: (up: boolean) => void): () => void {
-  let ws: WebSocket | null = null;
-  let closed = false;
-  let delay = 500;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const connect = () => {
-    ws = socket("/api/live");
-    ws.onopen = () => {
-      delay = 500;
-      onStatus?.(true);
-    };
-    ws.onmessage = (m) => {
-      let msg: unknown;
-      try {
-        msg = JSON.parse(typeof m.data === "string" ? m.data : "");
-      } catch {
-        return; /* ignore malformed */
-      }
-      for (const e of liveEvents(msg)) {
-        try {
-          onEvent(e);
-        } catch {
-          /* one bad event doesn't drop the rest of its batch */
-        }
-      }
-    };
-    ws.onclose = () => {
-      onStatus?.(false);
-      if (closed) return;
-      timer = setTimeout(connect, delay);
-      delay = Math.min(delay * 2, 8000);
-    };
-    ws.onerror = () => ws?.close();
-  };
-  connect();
-  return () => {
-    closed = true;
-    clearTimeout(timer);
-    ws?.close();
-  };
-}

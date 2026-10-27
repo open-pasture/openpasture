@@ -95,6 +95,20 @@ pub struct Farm {
     /// Herds whose count follows their animal rows (K-animals).
     by_animals: BTreeSet<String>,
     versions: BTreeMap<String, Vec<PaddockVersion>>,
+    /// What the simulator ran here, kept out of every report.
+    pub sim: Sim,
+}
+
+/// Simulated collars on the farm (`op_core::sim`). Herds on simulated
+/// collars only are left out of `herds` (so of every stay); animals on a
+/// simulated collar are left out of per-animal tables. A herd with real and
+/// simulated collars stays in, and the report says so.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sim {
+    pub herds: BTreeSet<String>,
+    pub animals: BTreeSet<String>,
+    /// (herd, simulated collars) of herds that also have real ones.
+    pub mixed: Vec<(String, i64)>,
 }
 
 impl Farm {
@@ -135,7 +149,29 @@ impl Farm {
             versions.entry(r.get("paddock_id")).or_default().push(PaddockVersion { at: from_db(&at)?, area_ha, name: r.get("name") });
         }
 
-        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, by_animals, versions })
+        let sim = Sim {
+            herds: op_core::sim::herds(ctx.db()).await?,
+            animals: op_core::sim::animals(ctx.db()).await?,
+            mixed: op_core::sim::mixed_herds(ctx.db()).await?,
+        };
+        herds.retain(|h, _| !sim.herds.contains(h));
+
+        Ok(Self { name: farm.map(|f| f.name).unwrap_or_default(), tz, fmt, now: now(), inputs, paddocks, herds, current_herds, by_animals, versions, sim })
+    }
+
+    /// What a report says about simulated collars it left out or kept.
+    pub fn sim_notes(&self, p: &ReportParams) -> Vec<String> {
+        let asked = |h: &String| p.herd_id.as_ref().is_none_or(|x| x == h);
+        let mut out = Vec::new();
+        let left: Vec<String> = self.sim.herds.iter().filter(|h| asked(h)).map(|h| self.herd_name(h)).collect();
+        if !left.is_empty() {
+            out.push(format!("Left out: {} (simulated collars only).", left.join(", ")));
+        }
+        for (h, n) in self.sim.mixed.iter().filter(|(h, _)| asked(h)) {
+            let collars = if *n == 1 { "1 simulated collar".to_owned() } else { format!("{n} simulated collars") };
+            out.push(format!("{} has {collars}: head counts include their animals; per-animal rows leave them out.", self.herd_name(h)));
+        }
+        out
     }
 
     /// Farm-local midnight starting `day`, in UTC.

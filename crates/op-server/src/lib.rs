@@ -3,8 +3,14 @@
 //! desktop app both call [`serve`].
 
 mod auth;
+mod collar_address;
+mod limits;
+pub mod session;
 pub mod live;
+pub mod logging;
+pub mod ops;
 mod ui;
+pub mod work;
 // @HUB
 // @HUB-UI
 // @E-lib
@@ -46,9 +52,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
-pub use auth::is_loopback;
+pub use auth::{AUTH_FAILURES_PER_MINUTE, is_loopback};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -101,20 +106,34 @@ impl ServerHandle {
         &self.ctx
     }
 
-    /// Stop background tasks and the server. Waits up to 5 s for open
-    /// connections to finish.
+    /// A one-time sign-in URL for this machine's owner (see [`session`]):
+    /// the desktop app opens its window on it; `openpasture serve` prints it.
+    pub async fn sign_in_url(&self, label: &str) -> anyhow::Result<String> {
+        session::sign_in_url(&self.ctx, &self.url, label).await
+    }
+
+    /// Stop background tasks and the server: waits up to 5 s for open
+    /// connections and 10 s for supervised jobs to finish, then closes the
+    /// database (checkpointing the WAL) and removes `server.json`.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         self.ctx.shutdown();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.join).await {
-            Ok(res) => res.context("server task panicked")?,
+        let served = match tokio::time::timeout(Duration::from_secs(5), &mut self.join).await {
+            Ok(res) => res.context("server task panicked").and_then(|r| r),
             Err(_) => {
                 self.join.abort();
                 Ok(())
             }
+        };
+        if !self.ctx.tasks().join(Duration::from_secs(10)).await {
+            tracing::warn!("background jobs still running after 10 s; stopped");
         }
+        self.ctx.db().close().await;
+        op_core::instance::remove_server_file(self.ctx.data_dir());
+        tracing::info!("openpasture stopped");
+        served
     }
 
     /// Run until the server stops on its own (normally never).
@@ -149,9 +168,14 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     let info = ServerInfo { data_dir: data_dir.clone(), bind: bind.clone(), port: addr.port(), lan_url: lan_url.clone() };
     let app = build_app(ctx.clone(), info, opts.cors.unwrap_or(cfg!(debug_assertions)));
 
+    let running = op_core::instance::RunningServer { url: Some(url.clone()), port: Some(addr.port()), lan_url: lan_url.clone(), ..op_core::instance::this_process() };
+    op_core::instance::write_server_file(&data_dir, &running)?;
+
     // Tools list in registration order: the engine's farm tools first.
     op_engine::register_tools(&ctx);
     op_core::register_tools(&ctx);
+    // A crate that fails to start stops the jobs the ones before it started.
+    let stop_on_error = StopOnDrop(Some(ctx.clone()));
     op_ingest::start(ctx.clone()).await.context("starting op-ingest")?;
     op_analytics::start(ctx.clone()).await.context("starting op-analytics")?;
     op_brain::start(ctx.clone()).await.context("starting op-brain")?;
@@ -160,6 +184,7 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     op_alerts::start(ctx.clone()).await.context("starting op-alerts")?;
     op_import::start(ctx.clone()).await.context("starting op-import")?;
     op_reports::start(ctx.clone()).await.context("starting op-reports")?;
+    op_fleet::start(ctx.clone()).await.context("starting op-fleet")?;
     // @HUB-UI
     // @E-lib
     // @E-srv
@@ -182,10 +207,12 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     // @L
     // @M
     // @Z
+    stop_on_error.disarm();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let join = tokio::spawn(async move {
-        // The peer address feeds the "is this request local" check.
+        // The peer address feeds the per-peer limits; connections are capped and idle ones closed.
+        let listener = axum::serve::ListenerExt::tap_io(limits::capped(listener), |_| {});
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
@@ -197,9 +224,26 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     Ok(ServerHandle { url, addr, lan_url, ctx, shutdown_tx: Some(shutdown_tx), join })
 }
 
+/// Stops a half-started server's jobs when `serve` returns early.
+struct StopOnDrop(Option<Ctx>);
+
+impl StopOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.0.take() {
+            ctx.shutdown();
+        }
+    }
+}
+
 /// The full app: op-core and feature routers, `/api/server`, `/api/live`, UI.
-/// `/api` and `/mcp` need the app token unless the request is local (see
-/// `auth`). `dev` also lets the Vite dev server (localhost:5173) in.
+/// `/api` and `/mcp` need a token (see `auth`); public routes have limits
+/// (`limits`). `dev` also lets the Vite dev server (localhost:5173) in.
 pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
     let info = Arc::new(info);
     let mut routes = Router::new();
@@ -213,6 +257,7 @@ pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
         op_alerts::router(),
         op_import::router(),
         op_reports::router(),
+        op_fleet::router(),
         // @HUB-UI
         // @E-lib
         // @E-srv
@@ -239,11 +284,18 @@ pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
         routes = routes.merge(part);
     }
     let mut app = routes
+        .merge(collar_address::router())
+        .merge(session::router())
         .route("/api/server", get(move |state| server_info(state, info.clone())))
+        .route("/api/server/retention", get(ops::get_retention).put(ops::put_retention))
+        .route("/healthz", get(ops::healthz))
         .route("/api/live", get(live::handler))
         .fallback(ui::handler)
         .with_state(ctx.clone())
-        .layer(axum::middleware::from_fn_with_state(auth::AuthState::new(ctx, dev), auth::guard));
+        .layer(axum::middleware::from_fn_with_state(ctx.clone(), op_ingest::wire_log::record))
+        .layer(axum::middleware::from_fn_with_state(auth::AuthState::new(ctx), auth::guard))
+        .layer(axum::middleware::from_fn_with_state(Arc::new(limits::Public::default()), limits::limit_public))
+        .layer(axum::middleware::from_fn(limits::headers));
     if dev {
         use axum::http::{HeaderValue, Method, header};
         let origins: Vec<HeaderValue> = auth::DEV_ORIGINS.iter().filter_map(|o| HeaderValue::from_str(o).ok()).collect();
@@ -254,7 +306,7 @@ pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
         );
     }
-    app.layer(TraceLayer::new_for_http())
+    app.layer(axum::middleware::from_fn(ops::log_request))
 }
 
 #[derive(Serialize)]
@@ -267,7 +319,21 @@ struct ServerInfoBody {
     lan_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     public_url: Option<String>,
+    /// Where collars reach this server (Settings, Server), once checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collar_url: Option<String>,
+    /// What this server can do, for clients to ask instead of probing.
+    capabilities: &'static [&'static str],
+    work: work::Work,
+    /// Supervised background jobs: status, heartbeats, restarts, last error.
+    tasks: Vec<op_core::tasks::TaskInfo>,
+    /// What the data dir holds and the disk's free space.
+    disk: ops::Disk,
 }
+
+/// See [`ServerInfoBody::capabilities`]. A feature that may be missing from a
+/// build or a farm lists itself here.
+pub const CAPABILITIES: &[&str] = &["analytics", "sql", "export", "alerts", "texting", "push", "imports", "reports", "brains", "collar_address_check", "live_ping", "fleet"];
 
 async fn server_info(State(ctx): State<Ctx>, info: Arc<ServerInfo>) -> ApiResult<axum::Json<ServerInfoBody>> {
     let settings = ctx.settings().await?;
@@ -278,6 +344,11 @@ async fn server_info(State(ctx): State<Ctx>, info: Arc<ServerInfo>) -> ApiResult
         port: info.port,
         lan_url: info.lan_url.clone(),
         public_url: settings.server.public_url,
+        collar_url: settings.server.collar_url,
+        capabilities: CAPABILITIES,
+        work: work::current(&ctx).await?,
+        tasks: ops::tasks(&ctx),
+        disk: ops::disk(ctx.data_dir()).await,
     }))
 }
 

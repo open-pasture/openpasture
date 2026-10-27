@@ -21,6 +21,7 @@ import { asksPing, Desk } from "./Desk";
 import { FarmHead, FarmSidebar, HerdSwitch } from "./Farm";
 import { close, hashOf, prune, tabs, visit, type Tab } from "./tabs";
 import { UpdateButton } from "./UpdateButton";
+import { allSimulated, collarCount } from "../sim";
 import "../styles/bench.css";
 
 // Either side shown or put away, kept across reloads: [ the sidebar, ] the herd panel.
@@ -271,6 +272,8 @@ function focusOne(id: string) {
 
 function Status() {
   const up = useStore((s) => s.up);
+  // Something the farmer waits on has gone unanswered for a few seconds.
+  const slow = useStore((s) => !!s.slow);
   const farm = useStore((s) => s.state?.farm);
   const herdId = useStore((s) => s.herdId);
   const collars = useStore((s) => s.collars);
@@ -295,9 +298,10 @@ function Status() {
     : undefined;
   return (
     <footer className="bstatus mono">
-      <span className={"bconn" + (up ? " up" : "")}><i key={beat} className={beat ? "beat" : undefined} />{up ? "connected" : "offline"}</span>
+      <span className={"bconn" + (up ? " up" : "")}><i key={beat} className={beat ? "beat" : undefined} />{up ? (slow ? "slow" : "connected") : "offline"}</span>
+      {allSimulated(collars) && <span className="bsim" title="Every collar on this farm is run by the simulator">Simulated collars</span>}
       {items.map((t) => guarded(t.id, <t.Item />))}
-      {mine.length > 0 && <span>{mine.length} collars{newest && `, last report ${age(newest, now)} ago`}</span>}
+      {mine.length > 0 && <span>{collarCount(mine)}{newest && `, last report ${age(newest, now)} ago`}</span>}
       {sum.outside.length > 0 && <button type="button" className="bwarn" onClick={() => focus(sum.outside)}>{sum.outside.length} out</button>}
       {sum.warning.length > 0 && <button type="button" className="bwarn" onClick={() => focus(sum.warning)}>{sum.warning.length} near</button>}
       {sum.low.length > 0 && <button type="button" className="bwarn" onClick={() => focus(sum.low)}>{sum.low.length} low battery</button>}

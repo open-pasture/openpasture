@@ -160,6 +160,7 @@ pub fn decide(ctx: &Value) -> DecisionOutput {
         reasoning: reasoning.join(" "),
         confidence,
         need,
+        rules: None,
         model: None,
     }
 }
@@ -209,7 +210,7 @@ fn on_schedule(ctx: &Value) -> Option<DecisionOutput> {
         reasoning.push(format!("The schedule opens strip {strip} of {of} at {opens}."));
         Action::Stay
     };
-    Some(DecisionOutput { action, to_paddock_id: None, geometry: None, reasoning: reasoning.join(" "), confidence: MEDIUM, need: None, model: None })
+    Some(DecisionOutput { action, to_paddock_id: None, geometry: None, reasoning: reasoning.join(" "), confidence: MEDIUM, need: None, rules: None, model: None })
 }
 
 /// The candidate with the most rest (no rest record sorts as fully rested),

@@ -1,7 +1,8 @@
 # openpasture server
 
 `openpasture` runs collars, stores their data, analyses it, and decides where the herd goes.
-The web UI is built in. `collar-sim` runs simulated collars against it.
+The web UI is built in. `collar-sim` is the simulator: simulated collars on a throwaway farm
+of their own, for trying openpasture before you have a collar. Never point it at a real farm.
 
 ```
 ./openpasture serve                              # http://127.0.0.1:7878
@@ -26,13 +27,14 @@ xattr -d com.apple.quarantine openpasture collar-sim
 
 ## Simulated collars
 
-Create a farm, a paddock and a herd in the app, then:
-
 ```
-./collar-sim --server http://127.0.0.1:7878 --count 12
+./collar-sim farm
 ```
 
-Add `--token <app token>` when the server is on another machine.
+This starts its own server on port 7991 and a temporary data dir, makes "Simulated farm" with a
+herd of twelve simulated collars, and prints the address. Ctrl-c stops it and deletes the data
+dir (`--data-dir DIR` keeps one). It refuses port 7878 and any data dir with real collars. The
+app marks simulated collars "Simulated", and reports and texts leave them out.
 
 ## For a farm
 

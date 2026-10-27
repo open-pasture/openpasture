@@ -39,6 +39,8 @@ impl Report for WelfareRecord {
         // Every animal of the herd (or the farm) that was still on the farm when the dates began.
         let mut animals: Vec<op_core::Animal> =
             ctx.store().list_animals(p.herd_id.as_deref()).await?.into_iter().filter(|x| x.removed_at.is_none_or(|r| r >= w0)).collect();
+        // Animals on simulated collars aren't animals (`Farm::sim_notes` says so).
+        animals.retain(|x| !farm.sim.animals.contains(&x.id));
         animals.sort_by(|x, y| welfare::tag_order(&x.tag, &y.tag));
         let ids: Vec<String> = animals.iter().map(|x| x.id.clone()).collect();
         let cues = welfare::cues(ctx, Whose::Animals(&ids), a, z).await?;

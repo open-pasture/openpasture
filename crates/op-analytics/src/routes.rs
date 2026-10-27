@@ -819,7 +819,7 @@ pub struct AnimalBehaviour {
 
 pub async fn behaviour(State(ctx): State<Ctx>, Query(p): Query<Params>) -> ApiResult<Json<Vec<AnimalBehaviour>>> {
     let range = p.range(Duration::hours(24))?;
-    Ok(Json(animal_behaviour(&ctx, range, p.herd()).await?))
+    Ok(Json(collar_behaviour(&ctx, range, p.herd(), p.collar()).await?))
 }
 
 #[derive(Default)]
@@ -831,8 +831,14 @@ struct CollarBehaviour {
 }
 
 pub async fn animal_behaviour(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -> anyhow::Result<Vec<AnimalBehaviour>> {
+    collar_behaviour(ctx, range, herd, None).await
+}
+
+/// [`animal_behaviour`], for one collar only when `collar` is given (the
+/// animal page), so it reads that collar's fixes and not the herd's.
+pub async fn collar_behaviour(ctx: &Ctx, range: TimeRange, herd: Option<&str>, collar: Option<&str>) -> anyhow::Result<Vec<AnimalBehaviour>> {
     let paddocks = PaddockIndex::new(&ctx.store().list_paddocks().await?);
-    let scope = Scope { collar_ids: None, herd_id: herd.map(str::to_owned) };
+    let scope = Scope { collar_ids: collar.map(|c| vec![c.to_owned()]), herd_id: herd.map(str::to_owned) };
     let mut per: BTreeMap<String, CollarBehaviour> = BTreeMap::new();
     let mut dwell = Dwell::default();
     // @L: days with a Parquet file are read from it row by row; the fixes
@@ -879,8 +885,8 @@ pub async fn animal_behaviour(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -
     .await?;
     let mut dwell = dwell.finish(hot_from.min(end));
     if hot_from < to {
-        hot_behaviour(ctx, hot_from, to, herd, &mut per).await?;
-        for (k, agg) in hot_dwell(ctx, hot_from, end, herd, &paddocks).await? {
+        hot_behaviour(ctx, hot_from, to, herd, collar, &mut per).await?;
+        for (k, agg) in hot_dwell_for(ctx, hot_from, end, herd, collar, &paddocks).await? {
             let e = dwell.entry((k.0, String::new(), k.2, k.3)).or_default();
             e.fixes += agg.fixes;
             e.dwell_ms += agg.dwell_ms;
@@ -891,7 +897,7 @@ pub async fn animal_behaviour(ctx: &Ctx, range: TimeRange, herd: Option<&str>) -
     // Animals by id and by collar, for collars whose telemetry lacks animal_id.
     let animals = ctx.store().list_animals(herd).await?;
     let mut by_collar: HashMap<String, String> = animals.iter().filter_map(|a| Some((a.collar_id.clone()?, a.id.clone()))).collect();
-    for c in collars(ctx, herd, None).await? {
+    for c in collars(ctx, herd, collar).await? {
         if let Some(a) = c.animal_id {
             by_collar.entry(c.id).or_insert(a);
         }
@@ -1023,13 +1029,27 @@ pub fn walk_rows_sql(herd: bool) -> String {
 /// from every hot fix when the range holds at most [`WALK_ROWS`], else from
 /// one fix a bucket (a day of 250 collars is 4.3 M fixes; its walks come from
 /// 1,440 a collar). Dwell is [`hot_dwell`]'s; cues are the scan's.
-async fn hot_behaviour(ctx: &Ctx, from: i64, to: i64, herd: Option<&str>, per: &mut BTreeMap<String, CollarBehaviour>) -> anyhow::Result<()> {
-    let sql = hot_counts_sql(herd.is_some());
-    let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(from).bind(to);
-    if let Some(h) = herd {
-        q = q.bind(h);
-    }
-    let counts = q.fetch_all(ctx.db()).await?;
+async fn hot_behaviour(ctx: &Ctx, from: i64, to: i64, herd: Option<&str>, collar: Option<&str>, per: &mut BTreeMap<String, CollarBehaviour>) -> anyhow::Result<()> {
+    let counts = match collar {
+        Some(c) => {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 AND (?4 IS NULL OR herd_id = ?4)")
+                .bind(c)
+                .bind(from)
+                .bind(to)
+                .bind(herd)
+                .fetch_one(ctx.db())
+                .await?;
+            if n > 0 { vec![(c.to_owned(), n)] } else { Vec::new() }
+        }
+        None => {
+            let sql = hot_counts_sql(herd.is_some());
+            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(from).bind(to);
+            if let Some(h) = herd {
+                q = q.bind(h);
+            }
+            q.fetch_all(ctx.db()).await?
+        }
+    };
     let total: i64 = counts.iter().map(|c| c.1).sum();
     let herd_owned = herd.map(str::to_owned);
     let names: Vec<String> = counts.iter().map(|c| c.0.clone()).collect();
@@ -1048,6 +1068,21 @@ async fn hot_behaviour(ctx: &Ctx, from: i64, to: i64, herd: Option<&str>, per: &
         if animal.is_some() {
             per.entry(collar).or_default().animal_id = animal;
         }
+    }
+    if let (Some(c), true) = (collar, total <= WALK_ROWS) {
+        let rows: Vec<(i64, f64, f64, Option<f64>)> =
+            sqlx::query_as("SELECT t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t, id")
+                .bind(c)
+                .bind(from)
+                .bind(to)
+                .bind(herd)
+                .fetch_all(ctx.db())
+                .await?;
+        let w = per.entry(c.to_owned()).or_default();
+        for (t, lon, lat, acc) in rows {
+            w.walk.push(t, [lon, lat], acc);
+        }
+        return Ok(());
     }
     if total <= WALK_ROWS {
         let sql = walk_rows_sql(herd.is_some());
@@ -1318,7 +1353,13 @@ pub async fn paddock_pasture(ctx: &Ctx, range: TimeRange, herd: Option<&str>) ->
 /// times); fixes whose stored paddock is gone or unknown come back one by
 /// one with their point, for the caller to place.
 pub fn hot_dwell_sql(herd: bool) -> String {
+    hot_dwell_sql_for(herd, false)
+}
+
+/// [`hot_dwell_sql`], also limited to one collar (`?5`) when `collar`.
+pub fn hot_dwell_sql_for(herd: bool, collar: bool) -> String {
     let herd_filter = if herd { "AND herd_id = ?3" } else { "AND ?3 IS NULL" };
+    let herd_filter = if collar { format!("{herd_filter} AND collar_id = ?5") } else { herd_filter.to_owned() };
     format!(
         "WITH w AS (
              SELECT collar_id, herd_id, t, lon, lat, CASE WHEN paddock_id IN (SELECT id FROM paddocks) THEN paddock_id END AS pad,
@@ -1342,8 +1383,17 @@ pub fn hot_dwell_sql(herd: bool) -> String {
 /// paddock (none drawn yet, a lane, paddocks imported again with new ids)
 /// come one per fix, 4.3 M a day at 250 collars, and are never all held.
 pub async fn hot_dwell(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
-    let sql = hot_dwell_sql(herd.is_some());
-    let mut rows = sqlx::query(&sql).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS).fetch(ctx.db());
+    hot_dwell_for(ctx, from, end, herd, None, index).await
+}
+
+/// [`hot_dwell`] of one collar's fixes only, when `collar` is given.
+pub async fn hot_dwell_for(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, collar: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
+    let sql = hot_dwell_sql_for(herd.is_some(), collar.is_some());
+    let mut q = sqlx::query(&sql).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS);
+    if let Some(c) = collar {
+        q = q.bind(c);
+    }
+    let mut rows = q.fetch(ctx.db());
     let mut out: HashMap<DwellKey, DwellAgg> = HashMap::new();
     while let Some(r) = rows.try_next().await? {
         let pad: Option<String> = r.try_get("pad")?;

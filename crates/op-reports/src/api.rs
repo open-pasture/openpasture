@@ -64,7 +64,10 @@ async fn params(ctx: &Ctx, from: Option<&str>, to: Option<&str>, herd_id: Option
 /// Build report `id`, or 404.
 pub async fn build(ctx: &Ctx, id: &str, p: &ReportParams) -> ApiResult<ReportDoc> {
     let r = report(id).ok_or_else(|| ApiError::not_found("No such report."))?;
-    Ok(r.build(ctx, p).await?)
+    let mut doc = r.build(ctx, p).await?;
+    // Never mix the simulator into an official record without saying so.
+    doc.notes.extend(Farm::load(ctx).await?.sim_notes(p));
+    Ok(doc)
 }
 
 async fn list() -> Json<Vec<ReportInfo>> {

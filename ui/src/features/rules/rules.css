@@ -1,0 +1,13 @@
+/* Settings > Farm rules, and the safety gate's hold in the send tools */
+.rules{display:grid;gap:12px}
+.rules ol{display:grid;gap:10px;list-style:none;padding:0;margin:0}
+.rules li{display:grid;gap:4px}
+.rules li p{font-size:14px;color:var(--fg)}
+.rules .rline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.rules .rline .mono{font-size:11.5px}
+.rules .radd{display:flex;align-items:center;gap:8px}
+.rules .radd .input{flex:1}
+.gatehold{display:grid;gap:6px;padding-top:6px}
+.gatehold .gline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+.held{display:grid;gap:2px;list-style:none;padding:0;margin:0;font-size:12.5px;color:var(--warn)}

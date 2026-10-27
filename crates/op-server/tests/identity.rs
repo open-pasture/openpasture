@@ -49,7 +49,15 @@ async fn send(app: &Router, method: &str, uri: &str, peer: &str, headers: &[(&st
 #[tokio::test]
 async fn api_me_says_who_is_asking() {
     let (_dir, ctx, app) = app().await;
-    let (s, v) = send(&app, "GET", "/api/me", LO, &[("host", "127.0.0.1:7878")], None).await;
+    // On this machine with no token: nobody (being local is no credential).
+    let (s, _) = send(&app, "GET", "/api/me", LO, &[("host", "127.0.0.1:7878")], None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // Signed in with this machine's one-time code: the owner, `local`.
+    let url = op_server::session::sign_in_url(&ctx, "http://127.0.0.1:7878", "test").await.unwrap();
+    let (s, v) = send(&app, "POST", "/api/session", LO, &[("host", "127.0.0.1:7878")], Some(json!({"code": url.rsplit('/').next().unwrap()}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let owner = format!("Bearer {}", v["token"].as_str().unwrap());
+    let (s, v) = send(&app, "GET", "/api/me", LO, &[("host", "127.0.0.1:7878"), ("authorization", &owner)], None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v, json!({"role": "owner", "via": "local"}));
 
@@ -58,7 +66,7 @@ async fn api_me_says_who_is_asking() {
     let (s, v) = send(&app, "GET", "/api/me", LAN, &[("host", "192.168.1.2:7878"), ("authorization", &bearer)], None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v, json!({"role": "owner", "via": "app_token"}));
-    // Forwarding headers make even a loopback peer non-local.
+    // Through a proxy on this machine: the token says who.
     let (s, v) = send(&app, "GET", "/api/me", LO, &[("host", "127.0.0.1:7878"), ("x-forwarded-for", "203.0.113.9"), ("authorization", &bearer)], None).await;
     assert_eq!((s, v["via"].as_str()), (StatusCode::OK, Some("app_token")));
     let (s, _) = send(&app, "GET", "/api/me", LAN, &[("host", "192.168.1.2:7878")], None).await;

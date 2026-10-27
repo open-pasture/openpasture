@@ -19,7 +19,7 @@ const DAILY_GRACE_MINUTES: i64 = 60;
 const DAILY_KEY: &str = "engine.daily";
 
 pub fn spawn(c: Ctx) {
-    tokio::spawn(async move {
+    c.clone().supervise("engine.scheduler", Some(TICK), |c| async move {
         let mut tick = tokio::time::interval(TICK);
         let mut n: u32 = 0;
         loop {
@@ -28,6 +28,7 @@ pub fn spawn(c: Ctx) {
                 _ = tick.tick() => false,
                 _ = c.scheduler_woken() => true,
             };
+            c.beat("engine.scheduler");
             if let Err(e) = cycle::apply_due(&c).await {
                 tracing::warn!("timer decisions: {e:#}");
             }

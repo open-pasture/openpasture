@@ -45,8 +45,13 @@ pub(crate) fn api_error(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
+/// Send and read JSON. In hosted mode the URL must reach the public internet
+/// only (`op_core::net`): base URLs are typed by farmers.
 pub(crate) async fn send_json(rb: reqwest::RequestBuilder) -> anyhow::Result<Value> {
-    let resp = rb.send().await.map_err(|e| anyhow::anyhow!("{}", describe(&e)))?;
+    let (client, req) = rb.build_split();
+    let req = req?;
+    op_core::net::guard_url(req.url().as_str()).await.map_err(anyhow::Error::msg)?;
+    let resp = client.execute(req).await.map_err(|e| anyhow::anyhow!("{}", describe(&e)))?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {

@@ -1,9 +1,11 @@
 import { useEffect, useRef } from "react";
 import { C } from "../map/base";
+import { SIMULATED } from "../sim";
 
 // Behind the first question: a paddock on real rangeland, cut into strips. The fence steps
 // forward, the herd walks after it, and the ground they grazed regrows while it rests.
-// An illustration in screen space; nothing here is farm data.
+// A simulation in screen space, and it says so on screen for as long as it shows. Its
+// animals are pixels on a canvas: nothing here is farm data and nothing is written.
 
 type P = [number, number];
 const POLY: P[] = [[0.12, 0.2], [0.46, 0.12], [0.86, 0.2], [0.9, 0.72], [0.66, 0.88], [0.2, 0.82], [0.08, 0.52]];
@@ -236,8 +238,9 @@ export function Story({ active }: { active: boolean }) {
   }, [active]);
 
   return (
-    <div className={active ? "story" : "story off"} aria-hidden="true">
-      <canvas ref={el} />
+    <div className={active ? "story" : "story off"}>
+      <canvas ref={el} aria-hidden="true" />
+      <p className="sw mono">{SIMULATED}</p>
     </div>
   );
 }

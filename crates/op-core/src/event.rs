@@ -130,14 +130,30 @@ pub enum Event {
     // @L
     // @M
     // @Z
+    /// One message to or from a collar on `/collar/v1`, as the wire log keeps
+    /// it (op-ingest `wire_log`). Managers and up.
+    CollarWire {
+        collar_id: String,
+        entry: serde_json::Value,
+    },
+    /// A unit was registered, tested, provisioned, claimed or changed state
+    /// (op-fleet `Unit`, with its claim code). Managers and up.
+    FleetUnit {
+        unit: serde_json::Value,
+    },
+    /// A factory test run, judged (op-fleet `TestRun`). Managers and up.
+    FleetTest {
+        run: serde_json::Value,
+    },
 }
 
 impl Event {
     /// Who may see this event on `/api/live`: `message` events carry phone
-    /// numbers and go to managers and up; everything else to any role.
+    /// numbers, `collar_wire` raw device traffic and the fleet events claim
+    /// codes, so they go to managers and up; everything else to any role.
     pub fn min_role(&self) -> Role {
         match self {
-            Event::Message { .. } => Role::Manager,
+            Event::Message { .. } | Event::CollarWire { .. } | Event::FleetUnit { .. } | Event::FleetTest { .. } => Role::Manager,
             _ => Role::Viewer,
         }
     }

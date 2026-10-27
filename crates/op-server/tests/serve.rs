@@ -8,7 +8,14 @@ async fn serves_api_ui_and_live() {
     let handle = serve(ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
     let base = handle.url().to_owned();
     assert!(base.starts_with("http://127.0.0.1:"));
-    let http = reqwest::Client::new();
+    // The owner on this machine signs in with the one-time URL serve hands out.
+    let signin = handle.sign_in_url("test").await.unwrap();
+    assert!(signin.starts_with(&format!("{base}/#/signin/")), "{signin}");
+    let code = signin.rsplit('/').next().unwrap();
+    let session: Value = reqwest::Client::new().post(format!("{base}/api/session")).json(&json!({"code": code})).send().await.unwrap().json().await.unwrap();
+    let mut auth = reqwest::header::HeaderMap::new();
+    auth.insert("authorization", format!("Bearer {}", session["token"].as_str().unwrap()).parse().unwrap());
+    let http = reqwest::Client::builder().default_headers(auth).build().unwrap();
 
     let info: Value = http.get(format!("{base}/api/server")).send().await.unwrap().json().await.unwrap();
     assert_eq!(info["version"], op_server::VERSION);
@@ -36,8 +43,14 @@ async fn serves_api_ui_and_live() {
         assert!(!res.text().await.unwrap().contains("<html"), "{path}");
     }
 
+    // Every response: no framing, no sniffing, no referrer.
+    let res = http.get(format!("{base}/api/state")).send().await.unwrap();
+    assert_eq!(res.headers()["x-frame-options"], "DENY");
+    assert_eq!(res.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+
     // Live events.
-    let ws_url = format!("{}/api/live", base.replace("http://", "ws://"));
+    let ws_url = format!("{}/api/live?token={}", base.replace("http://", "ws://"), session["token"].as_str().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
     // Give the server a moment to subscribe.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -50,10 +63,11 @@ async fn serves_api_ui_and_live() {
     assert!(http.get(format!("{base}/api/state")).send().await.is_err());
 }
 
-/// `/api` and `/mcp` need the app token unless the request is genuinely
-/// local: loopback peer, loopback Host, no forwarding headers.
+/// `/api` and `/mcp` need a token, wherever the request comes from: a
+/// loopback peer with a loopback Host (what nginx's default proxy sends) is
+/// nobody without one.
 #[tokio::test]
-async fn token_required_unless_local() {
+async fn token_required_from_anywhere() {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
@@ -86,25 +100,17 @@ async fn token_required_unless_local() {
     let local_host = [("host", "127.0.0.1:7878")];
     let bearer = format!("Bearer {token}");
 
-    // Local: no token needed.
-    assert_eq!(status(req("GET", "/api/state", Some(lo), &local_host)).await, StatusCode::OK);
-    assert_eq!(status(req("GET", "/api/settings", Some(lo), &[("host", "localhost:7878")])).await, StatusCode::OK);
-    // A stale browser token doesn't lock the local UI out.
-    assert_eq!(status(req("GET", "/api/state", Some(lo), &[("host", "127.0.0.1:7878"), ("authorization", "Bearer old")])).await, StatusCode::OK);
-    // Not local: no peer info, LAN peer, rebinding Host, tunnel headers.
-    assert_eq!(status(req("GET", "/api/state", None, &local_host)).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(status(req("GET", "/api/state", Some(lan), &local_host)).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(status(req("GET", "/api/settings", Some(lo), &[("host", "evil.example:7878")])).await, StatusCode::UNAUTHORIZED);
-    for h in ["x-forwarded-for", "forwarded", "cf-connecting-ip", "tailscale-user-login"] {
-        let r = req("GET", "/api/settings", Some(lo), &[("host", "127.0.0.1:7878"), (h, "203.0.113.9")]);
-        assert_eq!(status(r).await, StatusCode::UNAUTHORIZED, "{h}");
-    }
+    // This machine, no token: nobody.
+    assert_eq!(status(req("GET", "/api/state", Some(lo), &local_host)).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(req("GET", "/api/settings", Some(lo), &[("host", "localhost:7878")])).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(req("GET", "/api/state", Some(lo), &[("host", "127.0.0.1:7878"), ("authorization", "Bearer old")])).await, StatusCode::UNAUTHORIZED);
     let tunnel = [("host", "farm.example.com"), ("cf-connecting-ip", "203.0.113.9"), ("x-forwarded-for", "203.0.113.9")];
     assert_eq!(status(req("GET", "/api/settings", Some(lo), &tunnel)).await, StatusCode::UNAUTHORIZED);
     assert_eq!(status(req("POST", "/mcp", Some(lo), &tunnel)).await, StatusCode::UNAUTHORIZED);
-    // With the token, from anywhere.
+    // With the token, from anywhere; in the query string only on the live socket and MCP.
     assert_eq!(status(req("GET", "/api/state", Some(lo), &[tunnel[0], tunnel[1], ("authorization", &bearer)])).await, StatusCode::OK);
-    assert_eq!(status(req("GET", &format!("/api/state?token={token}"), Some(lan), &local_host)).await, StatusCode::OK);
+    assert_eq!(status(req("GET", "/api/state", Some(lo), &[("host", "127.0.0.1:7878"), ("authorization", &bearer)])).await, StatusCode::OK);
+    assert_eq!(status(req("GET", &format!("/api/state?token={token}"), Some(lan), &local_host)).await, StatusCode::UNAUTHORIZED);
     assert_eq!(status(req("GET", "/api/state", Some(lan), &[("host", "x"), ("authorization", "Bearer wrong")])).await, StatusCode::UNAUTHORIZED);
     // The UI and collar endpoints aren't behind the app token.
     assert_eq!(status(req("GET", "/", None, &tunnel)).await, StatusCode::OK);
@@ -133,20 +139,10 @@ async fn token_required_unless_local() {
     drop(bt);
     assert_eq!(status(mcp("/mcp?scope=brain", &brain_bearer)).await, StatusCode::UNAUTHORIZED);
 
-    // Cross-site writes and WebSocket upgrades on local ambient authority are refused.
-    let evil = [("host", "127.0.0.1:7878"), ("origin", "http://evil.example"), ("content-type", "text/plain")];
-    assert_eq!(status(req("POST", "/api/herds/h/decide", Some(lo), &evil)).await, StatusCode::FORBIDDEN);
-    assert_eq!(status(req("PUT", "/api/settings", Some(lo), &evil)).await, StatusCode::FORBIDDEN);
-    let ws_evil = [("host", "127.0.0.1:7878"), ("origin", "http://evil.example"), ("upgrade", "websocket"), ("connection", "upgrade")];
-    assert_eq!(status(req("GET", "/api/live", Some(lo), &ws_evil)).await, StatusCode::FORBIDDEN);
-    // Same origin is fine.
-    let same = [("host", "127.0.0.1:7878"), ("origin", "http://127.0.0.1:7878")];
-    assert_eq!(status(req("POST", "/api/herds/nope/decide", Some(lo), &same)).await, StatusCode::NOT_FOUND);
-    // The Vite dev origin only in dev mode.
-    let vite = [("host", "127.0.0.1:7878"), ("origin", "http://localhost:5173")];
-    assert_eq!(status(req("POST", "/api/herds/nope/decide", Some(lo), &vite)).await, StatusCode::FORBIDDEN);
+    // Dev mode lets the Vite dev server call in (CORS); a token is still needed.
     let dev_app = build_app(ctx.clone(), ServerInfo { data_dir: dir.path().into(), bind: "127.0.0.1".into(), port: 7878, lan_url: None }, true);
-    assert_eq!(dev_app.clone().oneshot(req("POST", "/api/herds/nope/decide", Some(lo), &vite)).await.unwrap().status(), StatusCode::NOT_FOUND);
+    let vite = [("host", "127.0.0.1:7878"), ("origin", "http://localhost:5173")];
+    assert_eq!(dev_app.clone().oneshot(req("POST", "/api/herds/nope/decide", Some(lo), &vite)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     // Dev CORS answers the Vite origin only.
     let pre =
         |origin: &str| req("OPTIONS", "/api/state", Some(lo), &[("host", "127.0.0.1:7878"), ("origin", origin), ("access-control-request-method", "POST")]);

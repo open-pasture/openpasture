@@ -40,6 +40,8 @@ SECS=$(python3 -c "print(int($HOURS * 3600))")
 [ -d $ROOT/scripts/shotdiff/node_modules ] || (cd $ROOT/scripts/shotdiff && bun install > /dev/null)
 
 rm -rf $DIR && mkdir -p $DIR
+# Every client signs in with the app token (the server trusts no address).
+TOKEN=$($BIN/openpasture token --data-dir $DIR/data)
 PIDS=()
 stop() {
   for p in ${(Oa)PIDS}; do kill $p 2>/dev/null || true; done
@@ -54,15 +56,15 @@ python3 $S/proxy.py --listen $((PORT+2)) --upstream 127.0.0.1:$PORT --out $DIR/p
 python3 $S/hook.py --port $((PORT+3)) --out $DIR/hook.jsonl > $DIR/hook.log 2>&1 & PIDS+=($!)
 (cd $S && python3 -c "
 import farm
-api = farm.Api('$U'); farm.wait_up(api)
+api = farm.Api('$U', '$TOKEN'); farm.wait_up(api)
 farm.setup(api, [('Cows', 238, 'P1'), ('Heifers', 12, 'P3')], public_url='http://127.0.0.1:$((PORT+2))')
 api.put('/api/notify/channels', {'webhook': {'url': 'http://127.0.0.1:$((PORT+3))/hook'}, 'secrets': {'webhook_secret': 'soak-webhook-secret'}})
 ")
 echo "$(date -u +%FT%TZ) soak for $HOURS h on $U, data in $DIR"
-$BIN/collar-sim --server $U --herds Cows=238,Heifers=12 --state $DIR/sim.json --ramp 60 --duration $((SECS + 120)) > $DIR/sim.log 2>&1 & PIDS+=($!)
-node $S/ws.mjs ws://127.0.0.1:$PORT/api/live $DIR/ws.jsonl $SECS > $DIR/ws.log 2>&1 & PIDS+=($!)
+$BIN/collar-sim --server $U --token $TOKEN --herds Cows=238,Heifers=12 --state $DIR/sim.json --ramp 60 --duration $((SECS + 120)) > $DIR/sim.log 2>&1 & PIDS+=($!)
+node $S/ws.mjs "ws://127.0.0.1:$PORT/api/live?token=$TOKEN" $DIR/ws.jsonl $SECS > $DIR/ws.log 2>&1 & PIDS+=($!)
 bun $S/ui.ts $U $DIR/ui $SECS > $DIR/ui.log 2>&1 & PIDS+=($!)
-(cd $S && exec python3 driver.py --api $U --dir $DIR --server-pid $SERVER --hours $HOURS --move-every ${MOVE_EVERY:-30} --advance-every ${ADVANCE_EVERY:-60} > $DIR/driver.log 2>&1) & DRIVER=$!; PIDS+=($DRIVER)
+(cd $S && exec python3 driver.py --api $U --token $TOKEN --dir $DIR --server-pid $SERVER --hours $HOURS --move-every ${MOVE_EVERY:-30} --advance-every ${ADVANCE_EVERY:-60} > $DIR/driver.log 2>&1) & DRIVER=$!; PIDS+=($DRIVER)
 # In the background and waited for, so a signal to this script stops everything at once.
 wait $DRIVER || true
 trap - EXIT INT TERM

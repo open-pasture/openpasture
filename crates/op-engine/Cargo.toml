@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 op-core.workspace = true
 op-geo.workspace = true
+geo.workspace = true
 op-ingest.workspace = true
 op-brain.workspace = true
 op-analytics.workspace = true

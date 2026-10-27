@@ -3,6 +3,7 @@
 // Hovering a paddock here lights it on the map, and hovering it on the map lights it here.
 
 import { useEffect, useMemo, useState } from "react";
+import { scoped } from "../api/http";
 import { api, type Decision, type Paddock, type PastureRow, type Polygon } from "../api";
 import { toXY } from "../geo";
 import { FARM_SIDE, farmSide, interleave, sectionNodes, useSections } from "../registry";
@@ -110,11 +111,9 @@ function useVisits(herdId: string | undefined, live: readonly Decision[]): Visit
   const [list, setList] = useState<Decision[]>([]);
   useEffect(() => {
     if (!herdId) return;
-    let on = true;
-    api.decisions(herdId, 200).then((l) => on && setList(l), () => on && setList([]));
-    return () => {
-      on = false;
-    };
+    const ac = new AbortController();
+    scoped({ signal: ac.signal }, () => api.decisions(herdId, 200)).then((l) => !ac.signal.aborted && setList(l), () => !ac.signal.aborted && setList([]));
+    return () => ac.abort();
   }, [herdId]);
   return useMemo(() => visitsOf([...list, ...live.filter((d) => d.herd_id === herdId)], Date.now()), [list, live, herdId]);
 }
@@ -154,19 +153,22 @@ const restWords = (d: number) => (d >= 1.5 ? `${Math.round(d)} d` : `${Math.max(
 function usePasture(key: string): PastureRow[] {
   const [rows, setRows] = useState<PastureRow[]>([]);
   useEffect(() => {
-    let live = true;
-    let busy = false;
     // One at a time, and not while the app is still loading: on a busy server the analytics read
-    // is slow, and the browser's few connections should go to the farm and the view first.
+    // is slow, and the browser's few connections should go to the farm and the view first. A new
+    // key cancels the read in flight, so two never overlap.
+    const ac = new AbortController();
+    let busy = false;
     const load = () => {
       if (busy) return;
       busy = true;
-      api.pasture().then((r) => live && setRows(r), () => {}).finally(() => (busy = false));
+      scoped({ signal: ac.signal }, () => api.pasture())
+        .then((r) => !ac.signal.aborted && setRows(r), () => {})
+        .finally(() => (busy = false));
     };
     const first = setTimeout(load, PASTURE_DELAY_MS);
     const t = setInterval(load, PASTURE_EVERY_MS);
     return () => {
-      live = false;
+      ac.abort();
       clearTimeout(first);
       clearInterval(t);
     };

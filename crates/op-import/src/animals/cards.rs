@@ -6,7 +6,7 @@
 //! Keys travel only in request bodies and exist only in the link or rekey
 //! response, so a card can be printed only from that response; printing again
 //! means a new key. The endpoint is baked into the collar, so cards need the
-//! server's public https URL (a LAN or tunnel address would strand it).
+//! collar address (Settings, Server), checked to reach this server when set.
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::post;
@@ -46,13 +46,9 @@ pub fn qr_svg(payload: &str) -> anyhow::Result<String> {
     Ok(svg.find("<svg").map_or(svg.clone(), |i| svg[i..].to_owned()))
 }
 
-/// The endpoint that goes on cards: the public https URL, or why there is none.
+/// The endpoint that goes on cards: the collar address, or why there is none.
 pub async fn card_endpoint(ctx: &Ctx) -> ApiResult<String> {
-    match ctx.settings().await?.server.public_url {
-        Some(u) if u.starts_with("https://") => Ok(format!("{}/collar/v1", u.trim_end_matches('/'))),
-        Some(_) => Err(ApiError::conflict("Cards need an https public URL: collars only talk to https.")),
-        None => Err(ApiError::conflict("Cards need the server's public URL (Settings, Server): it goes into every collar.")),
-    }
+    op_ingest::collar_endpoint(ctx).await?.ok_or_else(|| ApiError::conflict(op_ingest::NO_COLLAR_ADDRESS))
 }
 
 #[derive(Deserialize)]

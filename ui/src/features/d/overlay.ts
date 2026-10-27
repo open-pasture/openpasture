@@ -40,9 +40,14 @@ export function mountFeatures(ctx: OverlayCtx): OverlayHandle {
   for (const id of Object.values(SRC)) map.addSource(id, { type: "geojson", data: empty() });
 
   const zones = ctx.beforeId("slot-zones");
-  const notExclusion = ["!=", ["get", "kind"], "exclusion"] as ["!=", ["get", string], string];
-  map.addLayer({ id: "d-excl-fill", type: "fill", source: SRC.zones, filter: kindIs("exclusion"), paint: { "fill-pattern": "d-hatch", "fill-opacity": 0.85 } }, zones);
-  map.addLayer({ id: "d-excl-line", type: "line", source: SRC.zones, filter: kindIs("exclusion"), paint: { "line-color": C.red, "line-width": 1, "line-opacity": 0.8 } }, zones);
+  // Exclusions and no-go zones share the red hatch; a no-go zone's edge is heavier.
+  const kept = ["in", ["get", "kind"], ["literal", ["exclusion", "no_go"]]] as unknown as ["==", ["get", string], string];
+  const notExclusion = ["!", kept] as unknown as ["!=", ["get", string], string];
+  map.addLayer({ id: "d-excl-fill", type: "fill", source: SRC.zones, filter: kept, paint: { "fill-pattern": "d-hatch", "fill-opacity": 0.85 } }, zones);
+  map.addLayer({
+    id: "d-excl-line", type: "line", source: SRC.zones, filter: kept,
+    paint: { "line-color": C.red, "line-width": ["match", ["get", "kind"], "no_go", 2, 1], "line-opacity": 0.8 },
+  }, zones);
   map.addLayer({
     id: "d-zone-fill", type: "fill", source: SRC.zones, filter: notExclusion,
     paint: { "fill-color": byKind({ hazard: C.warn }, C.fg), "fill-opacity": ["match", ["get", "kind"], "hazard", 0.08, 0.05] },

@@ -117,7 +117,7 @@ pub async fn paddock_forage(ctx: &Ctx, p: &Paddock) -> anyhow::Result<Option<For
 /// Exclusions in effect now that touch the paddock, as polygons.
 pub async fn exclusions(ctx: &Ctx, p: &Paddock) -> anyhow::Result<Vec<Polygon>> {
     let found = op_core::features::exclusions_for(ctx, &p.geometry, time::now()).await?;
-    Ok(found.into_iter().filter(|f| f.kind == FeatureKind::Exclusion).filter_map(|f| f.geometry.polygon()).collect())
+    Ok(found.into_iter().filter(|f| matches!(f.kind, FeatureKind::Exclusion | FeatureKind::NoGo)).filter_map(|f| f.geometry.polygon()).collect())
 }
 
 /// Days a strip feeds `animal_units`: [`calc::grazing_days`] of forage ×

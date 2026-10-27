@@ -1,10 +1,14 @@
-//! Map features: exclusions, water, gates, shade, hazards, roads, neighbour
-//! lines and the farm boundary. Types, the table and the read and insert API
-//! live here; CRUD routes and the map are op-core's `features_api` (stream D).
+//! Map features: exclusions, no-go zones, water, gates, shade, hazards,
+//! roads, neighbour lines and the farm boundary. Types, the table and the
+//! read and insert API live here; CRUD routes and the map are op-core's
+//! `features_api` (stream D).
 //!
 //! Exclusions become holes on sends whose activation time falls inside their
-//! active window. Everything else is checked before a send, never enforced by
-//! itself.
+//! active window. A no-go zone is a permanent exclusion: always in effect, kept
+//! out of every boundary, and a boundary that would still take it in is
+//! refused for every sender (op-ingest's gate). Everything else is checked
+//! before a send; the gate refuses the hard findings (roads, the farm
+//! boundary, hazards marked hard).
 
 use chrono::{DateTime, Utc};
 use geo::Intersects;
@@ -25,6 +29,8 @@ pub const FEATURE: &str = "fea";
 #[serde(rename_all = "snake_case")]
 pub enum FeatureKind {
     Exclusion,
+    /// A permanent exclusion nobody may send a herd into.
+    NoGo,
     Water,
     Gate,
     Shade,
@@ -75,7 +81,8 @@ pub struct MapFeature {
     pub paddock_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
-    /// water: `{source: tank|trough|pond|stream}`; hazard points: `{radius_m}`.
+    /// water: `{source: tank|trough|pond|stream}`; hazard points: `{radius_m}`;
+    /// hazards: `{hard: true}` when no boundary may take one in.
     #[serde(default)]
     pub props: Value,
     /// Temporary features (a wet spot, reseeding, a calving pen).
@@ -170,14 +177,14 @@ pub async fn get_feature(ctx: &Ctx, id: &str) -> anyhow::Result<Option<MapFeatur
     row.map(|r| feature_from_row(&r)).transpose()
 }
 
-/// Farm-wide exclusions plus those of every paddock `area` touches, active at `at`.
-/// Same order as [`list_features`].
+/// Farm-wide exclusions and no-go zones plus those of every paddock `area`
+/// touches, active at `at` (no-go zones always are). Same order as [`list_features`].
 pub async fn exclusions_for(ctx: &Ctx, area: &Polygon, at: DateTime<Utc>) -> anyhow::Result<Vec<MapFeature>> {
     let target = to_geo(area);
     let touched: Vec<String> = ctx.store().list_paddocks().await?.into_iter().filter(|p| to_geo(&p.geometry).intersects(&target)).map(|p| p.id).collect();
     let marks = vec!["?"; touched.len()].join(", ");
     let scope = if touched.is_empty() { "paddock_id IS NULL".to_owned() } else { format!("(paddock_id IS NULL OR paddock_id IN ({marks}))") };
-    let sql = format!("SELECT * FROM features WHERE kind = 'exclusion' AND {scope} AND {ACTIVE_AT}{ORDER}");
+    let sql = format!("SELECT * FROM features WHERE kind IN ('exclusion', 'no_go') AND {scope} AND {ACTIVE_AT}{ORDER}");
     let mut q = sqlx::query(&sql);
     for p in &touched {
         q = q.bind(p);
@@ -203,14 +210,14 @@ fn check_point(p: LonLat) -> ApiResult<LonLat> {
 }
 
 /// Check the geometry type for the kind and normalise it (coordinates rounded
-/// to 7 decimals, polygon rings closed and simple). Exclusion: one-ring
-/// Polygon. Water, shade, hazard: Point or Polygon (a hazard point needs
+/// to 7 decimals, polygon rings closed and simple). Exclusion, no-go zone:
+/// one-ring Polygon. Water, shade, hazard: Point or Polygon (a hazard point needs
 /// `props.radius_m` > 0). Gate: Point. Road, neighbour line: LineString.
 /// Farm boundary: Polygon.
 pub fn check_geometry(kind: FeatureKind, g: &FeatureGeometry, props: &Value) -> ApiResult<FeatureGeometry> {
     use FeatureKind::*;
     let allowed: &[&str] = match kind {
-        Exclusion | FarmBoundary => &["Polygon"],
+        Exclusion | NoGo | FarmBoundary => &["Polygon"],
         Water | Shade | Hazard => &["Point", "Polygon"],
         Gate => &["Point"],
         Road | NeighbourLine => &["LineString"],
@@ -233,8 +240,8 @@ pub fn check_geometry(kind: FeatureKind, g: &FeatureGeometry, props: &Value) -> 
             FeatureGeometry::LineString(pts.iter().map(|p| check_point(*p)).collect::<ApiResult<_>>()?)
         }
         FeatureGeometry::Polygon(rings) => {
-            if kind == Exclusion && rings.len() != 1 {
-                return Err(ApiError::bad_request("An exclusion is one ring, without holes."));
+            if matches!(kind, Exclusion | NoGo) && rings.len() != 1 {
+                return Err(ApiError::bad_request(format!("{} is one ring, without holes.", kind_label(kind))));
             }
             let p = Polygon { kind: Default::default(), coordinates: rings.clone() }.validated()?;
             FeatureGeometry::Polygon(p.coordinates)
@@ -242,9 +249,13 @@ pub fn check_geometry(kind: FeatureKind, g: &FeatureGeometry, props: &Value) -> 
     })
 }
 
+/// A no-go zone has no dates: a dated one is an exclusion.
+pub const NO_GO_LASTS: &str = "A no-go zone is permanent. Draw an exclusion for one with dates.";
+
 fn kind_label(kind: FeatureKind) -> &'static str {
     match kind {
         FeatureKind::Exclusion => "An exclusion",
+        FeatureKind::NoGo => "A no-go zone",
         FeatureKind::Water => "Water",
         FeatureKind::Gate => "A gate",
         FeatureKind::Shade => "Shade",
@@ -283,6 +294,9 @@ pub async fn insert_feature(ctx: &Ctx, f: NewFeature) -> ApiResult<MapFeature> {
         && until <= from
     {
         return Err(ApiError::bad_request("active_until must be after active_from."));
+    }
+    if f.kind == FeatureKind::NoGo && (f.active_from.is_some() || f.active_until.is_some()) {
+        return Err(ApiError::bad_request(NO_GO_LASTS));
     }
     const TAKEN: &str = "The farm already has a boundary. Edit that one instead.";
     if f.kind == FeatureKind::FarmBoundary && !list_features(ctx, Some(FeatureKind::FarmBoundary), None, None).await?.is_empty() {

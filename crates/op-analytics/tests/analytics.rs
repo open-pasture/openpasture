@@ -264,9 +264,14 @@ async fn sql_is_read_only_and_json_friendly() {
     let (status, res) = app.sql("SELECT key_hash FROM collars").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
     // Row limit.
-    let (_, res) = app.sql("SELECT * FROM generate_series(1, 20000)").await;
+    let (_, res) = app
+        .sql("WITH d AS (SELECT * FROM (VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)) t(x)) SELECT d1.x FROM d d1, d d2, d d3, d d4, d d5")
+        .await;
     assert_eq!(res["rows"].as_array().unwrap().len(), 10_000);
     assert_eq!(res["truncated"], json!(true));
+    // No table functions: a query can't make rows from nothing.
+    let (status, _) = app.sql("SELECT * FROM generate_series(1, 20000)").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// Collar 1 stands in A for 65 minutes, walks 100 m east into B, then stands
@@ -311,6 +316,29 @@ async fn behaviour_distance_and_time_per_paddock() {
     let per_day: i64 = r["cues_per_day"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).sum();
     assert_eq!(per_day, 3);
     assert_eq!(r["days"].as_array().unwrap().len(), r["cues_per_day"].as_array().unwrap().len());
+}
+
+#[tokio::test]
+async fn behaviour_for_one_collar_reads_only_that_collar() {
+    let app = App::new().await;
+    let base = time::now().timestamp_millis() - 5 * 60 * MIN;
+    walk_a_to_b(&app, base).await;
+    for i in 0..30 {
+        app.fix("col_2", base + i * MIN, at(20.0, 20.0), 5.0).await;
+    }
+    app.cue("col_1", base + 10 * MIN).await;
+    app.cue("col_2", base + 11 * MIN).await;
+    let (from, to) = (q(time::from_unix_ms(base)), q(time::from_unix_ms(base + 130 * MIN)));
+    let herd = app.get(&format!("/api/analytics/behaviour?herd_id=herd_1&from={from}&to={to}")).await;
+    assert_eq!(herd.as_array().unwrap().len(), 2, "{herd}");
+    let one = app.get(&format!("/api/analytics/behaviour?herd_id=herd_1&collar_id=col_1&from={from}&to={to}")).await;
+    let one = one.as_array().unwrap();
+    assert_eq!(one.len(), 1, "{one:?}");
+    let whole = herd.as_array().unwrap().iter().find(|r| r["collar_id"] == "col_1").unwrap();
+    // The same numbers as in the herd's answer.
+    for k in ["animal_id", "fixes", "distance_km", "paddock_hours", "outside_hours", "cues"] {
+        assert_eq!(one[0][k], whole[k], "{k}");
+    }
 }
 
 #[tokio::test]

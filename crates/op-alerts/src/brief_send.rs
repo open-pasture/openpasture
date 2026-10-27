@@ -88,7 +88,9 @@ async fn send(ctx: &Ctx, day: &str, at: DateTime<Utc>) -> anyhow::Result<Vec<Mes
     // Per herd: the text for those who answer decisions (with the decision it asks about), and for
     // everyone else (asking nothing: only managers and up answer).
     let mut briefs: Vec<(String, String, Option<String>, String)> = Vec::new();
-    for h in &herds {
+    // A herd on simulated collars only gets no brief: nobody is texted about the simulator.
+    let simulated = op_core::sim::herds(ctx.db()).await?;
+    for h in herds.iter().filter(|h| !simulated.contains(&h.id)) {
         let asking = op_engine::brief::brief_for(ctx, h, at, true).await?.text;
         let telling = op_engine::brief::brief_for(ctx, h, at, false).await?.text;
         briefs.push((h.id.clone(), asking, asks_about(ctx, h, at).await?, telling));

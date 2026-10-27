@@ -71,6 +71,9 @@ async fn migrations_have_unique_prefixes_and_run_on_a_fresh_db() {
     let mut prefixes = std::collections::BTreeMap::new();
     for e in std::fs::read_dir(&dir).unwrap() {
         let name = e.unwrap().file_name().into_string().unwrap();
+        if name == "SHIPPED" {
+            continue;
+        }
         assert!(name.ends_with(".sql"), "{name}");
         let (prefix, rest) = name.split_at(4);
         assert!(prefix.bytes().all(|b| b.is_ascii_digit()), "{name} needs a 4-digit prefix");

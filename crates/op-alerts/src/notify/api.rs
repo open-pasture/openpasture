@@ -88,6 +88,10 @@ async fn put_channels(State(ctx): State<Ctx>, ApiJson(body): ApiJson<Value>) -> 
     let mut next: ChannelsConfig = patch::apply(&current, &Value::Object(body), &[])?;
     next.relay = current.relay.clone();
     clean(&mut next)?;
+    // Hosted: typed URLs reach the public internet only.
+    for u in next.webhook.url.iter().chain(std::iter::once(&next.twilio_api_base)) {
+        op_core::net::guard_url(u).await.map_err(ApiError::bad_request)?;
+    }
 
     let mut values = Vec::with_capacity(secrets.len());
     let mut relay_secret_changed = false;

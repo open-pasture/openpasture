@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Map as MLMap } from "maplibre-gl";
-import { api, ApiError, downloadBlob, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
-import { get } from "../api/http";
+import { api, downloadBlob, type HealthSeries, type PastureRow, type SqlResult, type Track } from "../api";
+import { scoped } from "../api/http";
 import { DATA, dataSections, guarded, interleave } from "../registry";
 import { useStore } from "../store";
 import { useCan } from "../store/me";
+import { useRead } from "../store/reads";
+import { useCapability } from "../store/server";
 import { C, createMap, fc, fitPolys, onLoad, setData } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setBoundary, setPaddocks } from "../map/layers";
 import { Animals } from "../map/animals";
@@ -18,16 +20,10 @@ const SPAN: Record<RangeKey, number> = { "24h": 86400e3, "7d": 7 * 86400e3, "30d
 export function DataView() {
   const herdId = useStore((s) => s.herdId);
   const [range, setRange] = useState<RangeKey>("24h");
-  // SQL and export come from the analytics crate; show them once it answers.
-  const [sqlOk, setSqlOk] = useState(false);
+  // SQL and export come from the analytics crate: shown when the server says it has them.
+  const sqlOk = useCapability("sql");
   // The console is a POST, which managers and owners make.
   const sqlRole = useCan("manager");
-  useEffect(() => {
-    // Managers ask the console itself; everyone else may only read, so they ask a small read of
-    // the same crate (the fleet settings).
-    const probe = sqlRole ? api.sql("select count(*) from herds") : get("/api/fleet/settings");
-    probe.then(() => setSqlOk(true), (e) => setSqlOk(!(e instanceof ApiError && e.status === 404)));
-  }, [sqlRole]);
   const { from, to } = useMemo(() => {
     const t = Date.now();
     return { from: new Date(t - SPAN[range]).toISOString(), to: new Date(t).toISOString() };
@@ -77,10 +73,9 @@ const METRICS: Metric[] = [
 
 function Health({ herdId, from, to }: { herdId?: string; from: string; to: string }) {
   const u = useUnits();
-  const [series, setSeries] = useState<HealthSeries[] | null>([]);
-  useEffect(() => {
-    if (herdId) void api.health({ herd_id: herdId, from, to }).then(setSeries).catch(() => setSeries(null));
-  }, [herdId, from, to]);
+  // Cancelled when the range changes or the view is left.
+  const read = useRead(herdId ? () => api.health({ herd_id: herdId, from, to }) : null, [herdId, from, to]);
+  const series: HealthSeries[] | undefined = read.error ? undefined : read.data;
 
   // Herd mean per bucket: one line per chart. The x axis is the span the
   // server bucketed, so every chart shares the same start and end.
@@ -104,7 +99,8 @@ function Health({ herdId, from, to }: { herdId?: string; from: string; to: strin
     return { mean, span };
   }, [series]);
 
-  // One row per herd with collars, drawn from the first report on.
+  // One row per herd with collars, drawn from the first report on. A failed read says so.
+  if (read.error) return <p className="err">{read.error}</p>;
   if (!series?.length) return null;
   return (
     <div className="charts">
@@ -193,12 +189,18 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
 
   useEffect(() => {
     if (!herdId) return;
-    void api.tracks({ herd_id: herdId, from, to, max_points: 300 })
-      .then((t) => { setTracks(t); setHave((h) => ({ ...h, tracks: true })); })
-      .catch(() => { setTracks([]); setHave((h) => ({ ...h, tracks: false })); });
-    void api.heatmap({ herd_id: herdId, from, to })
-      .then((x) => { setHeat(x); setHave((h) => ({ ...h, heat: true })); })
-      .catch(() => { setHeat([]); setHave((h) => ({ ...h, heat: false })); });
+    // Both stop when the range changes or the view is left.
+    const ac = new AbortController();
+    const live = () => !ac.signal.aborted;
+    scoped({ signal: ac.signal }, () => {
+      void api.tracks({ herd_id: herdId, from, to, max_points: 300 })
+        .then((t) => { if (live()) { setTracks(t); setHave((h) => ({ ...h, tracks: true })); } })
+        .catch(() => { if (live()) { setTracks([]); setHave((h) => ({ ...h, tracks: false })); } });
+      void api.heatmap({ herd_id: herdId, from, to })
+        .then((x) => { if (live()) { setHeat(x); setHave((h) => ({ ...h, heat: true })); } })
+        .catch(() => { if (live()) { setHeat([]); setHave((h) => ({ ...h, heat: false })); } });
+    });
+    return () => ac.abort();
   }, [herdId, from, to]);
 
   useEffect(() => {
@@ -259,10 +261,9 @@ function Replay({ herdId, from, to }: { herdId?: string; from: string; to: strin
 function Pasture({ herdId }: { herdId?: string }) {
   const u = useUnits();
   const herdPad = useStore((s) => s.state?.herds.find((h) => h.id === s.herdId)?.paddock_id);
-  const [rows, setRows] = useState<PastureRow[] | null>([]);
-  useEffect(() => {
-    void api.pasture(herdId).then(setRows).catch(() => setRows(null));
-  }, [herdId, herdPad]);
+  const read = useRead(() => api.pasture(herdId), [herdId, herdPad]);
+  const rows: PastureRow[] | undefined = read.data;
+  if (read.error && !rows) return <p className="err">{read.error}</p>;
   if (!rows?.length) return null;
   const now = Date.now();
   const ndvi = rows.some((r) => r.ndvi !== null);

@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { esrv, type CollarsConfig } from "../../api/e-srv";
 import { Input } from "../../ui";
+import { errorText } from "../../store/action";
 import { seconds } from "./format";
 
 // Settings > Collars: "Report every [60] s, every [10] s while moving". Each number sets the
 // report and boundary-poll interval together; collars get it in their next signed config.
 export function Reporting() {
   const [cfg, setCfg] = useState<CollarsConfig>();
+  const [err, setErr] = useState<string>();
   // Saves run one after another against what the server last said, so a quick edit of both
   // numbers (Enter, then the other field) never loses one.
   const latest = useRef<CollarsConfig>(undefined);
@@ -28,7 +30,12 @@ export function Reporting() {
       const saved = await esrv.saveCollarsConfig({ report_s: base, poll_s: base, fast_report_s: fast, fast_poll_s: fast });
       latest.current = saved;
       setCfg(saved);
-    }).catch(() => {});
+      setErr(undefined);
+    }).catch((e) => {
+      // The fields go back to what the server holds, and say why.
+      setErr(errorText(e));
+      if (latest.current) setCfg({ ...latest.current });
+    });
   };
   return (
     <div className="line esrv-report">
@@ -37,6 +44,7 @@ export function Reporting() {
       <span>s, every</span>
       <Secs value={cfg.fast_report_s} label="Report every, while moving" onSave={(v) => save({ fast: v })} />
       <span>s while moving</span>
+      {err && <p className="err">{err}</p>}
     </div>
   );
 }

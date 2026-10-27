@@ -9,9 +9,9 @@ import { spec, type Shape } from "./kinds";
 
 export { KINDS, spec, upsert, withPaddocks, type KindSpec, type Shape } from "./kinds";
 
-// Which terra-draw mode draws (and reshapes) each shape: exclusions in red, other areas in fg.
+// Which terra-draw mode draws (and reshapes) each shape: exclusions and no-go zones in red, other areas in fg.
 export const modeFor = (kind: FeatureKind, shape: Shape): DrawKind =>
-  shape === "Point" ? "point" : shape === "LineString" ? "line" : kind === "exclusion" ? "exclusion" : "paddock";
+  shape === "Point" ? "point" : shape === "LineString" ? "line" : kind === "exclusion" || kind === "no_go" ? "exclusion" : "paddock";
 
 // A hazard point with no radius yet starts at this many metres.
 export const HAZARD_RADIUS_M = 10;
@@ -196,7 +196,7 @@ export function mapData(list: MapFeature[], now: number): MapData {
     }
     if (g.type === "Polygon") {
       zones.push(feat(f.id, f.kind, g));
-      if (f.kind !== "exclusion") points.push(feat(f.id, f.kind, { type: "Point", coordinates: centroid(g) }));
+      if (f.kind !== "exclusion" && f.kind !== "no_go") points.push(feat(f.id, f.kind, { type: "Point", coordinates: centroid(g) }));
       continue;
     }
     const r = radiusOf(f);

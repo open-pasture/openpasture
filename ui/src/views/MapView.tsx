@@ -23,6 +23,7 @@ import { touchUI, usePhone } from "../features/m/phone";
 import { pickAnimal } from "../features/m/select";
 import { picked } from "../store/m";
 import { HerdPanel } from "./HerdPanel";
+import { mapWord } from "../sim";
 import { mapAsk, mapState } from "../shell/bus";
 
 type Mode =
@@ -381,6 +382,7 @@ export function MapView() {
   useEffect(() => mapState.patch({ paddock: sheet?.k === "paddock" ? sheet.id : undefined }), [sheet]);
 
   const sheetPad = sheet?.k === "paddock" ? state.paddocks.find((p) => p.id === sheet.id) : undefined;
+  const simWord = mapWord(collars, herdId);
   const active = mode.k === "tool" ? shown.find((t) => t.id === mode.id) : undefined;
   // One context per tool run, so a tool's effects don't re-run on every render.
   const activeCtx = useMemo(() => (active && host.current ? overlayCtx(host.current, `tool:${active.id}`) : undefined), [active?.id, map]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -398,6 +400,7 @@ export function MapView() {
     <div className="mapview">
       <div className="mapwrap">
         <div ref={el} className="map" />
+        {simWord && <p className="mapsim mono" title="Collars run by the simulator, not on animals">{simWord}</p>}
         <div className="tools">
           {mode.k === "idle" && barItems.map((b) => b.node)}
           {active && activeCtx && draw.current && map && (

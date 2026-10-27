@@ -65,8 +65,14 @@ pub use op_core::schedule::{BackFence, Cadence, LATE_AFTER_MIN, MoveState, SCHED
 
 use crate::boundary::send_boundary;
 use crate::db::{self, HerdBoundaries};
+use crate::gate::{self, Sender, SenderKind};
 use crate::shape::{self, CollarCaps};
 use crate::{SendOpts, slots};
+
+/// A schedule's send passes the gate as the schedule.
+fn by_schedule(opts: SendOpts) -> SendOpts {
+    SendOpts { sender: Sender::of(SenderKind::Schedule), ..opts }
+}
 
 /// Occurrence `n` of a schedule's cadence in UTC; occurrence 0 is its
 /// `starts_at`. From the caller that knows the farm's time zone.
@@ -971,13 +977,25 @@ async fn planned(ctx: &Ctx, n: NewSchedule, occ: Occurrences<'_>) -> ApiResult<(
     }
     check_order(&rows).map_err(ApiError::bad_request)?;
     s.planned_end = Some(first((s.strips.len() - next) as u32));
-    // Every move must go to the collars as it stands (checked as it will be sent).
+    // Every move must go to the collars as it stands (checked as it will be
+    // sent), and pass the safety gate as the schedule will send it: nobody
+    // confirms a staged strip, so it has no hard findings.
     for r in &rows {
         let opts = SendOpts { effective_at: Some(r.at), ..Default::default() };
-        shape::prepare(ctx, &s.herd_id, &r.geometry, &opts).await.map_err(|e| {
-            let what = if r.step == 0 { format!("Strip {}", r.strip + 1) } else { format!("Strip {}'s back fence step {}", r.strip + 1, r.step) };
-            ApiError::bad_request(format!("{what} can't go to the collars: {}", e.message))
-        })?;
+        let what = || if r.step == 0 { format!("Strip {}", r.strip + 1) } else { format!("Strip {}'s back fence step {}", r.strip + 1, r.step) };
+        let prepared = shape::prepare(ctx, &s.herd_id, &r.geometry, &opts)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("{} can't go to the collars: {}", what(), e.message)))?;
+        let v = gate::judge(&prepared.findings, &Sender::of(SenderKind::Schedule));
+        if !v.allowed {
+            let said: Vec<&str> = v.hard.iter().map(|f| f.text.as_str()).collect();
+            let msg = format!(
+                "{} can't be scheduled: {}. A scheduled strip can't cross a road or the farm boundary, or take in a no-go zone or a hard hazard.",
+                what(),
+                said.join("; ")
+            );
+            return Err(ApiError::conflict(msg).with_details(serde_json::json!({ "findings": v.hard, "never": v.never })));
+        }
     }
     Ok((s, rows))
 }
@@ -1106,7 +1124,7 @@ async fn reissue_current(ctx: &Ctx, s: &Schedule, rows: &[Row]) -> ApiResult<Opt
     let split = db::herd_boundaries(ctx.db(), &s.herd_id, now()).await?;
     let Some(a) = split.active else { return Ok(None) };
     let geometry = rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
-    let opts = SendOpts { warn_m: Some(a.warn_m), hysteresis_m: Some(a.hysteresis_m), effective_at: None };
+    let opts = by_schedule(SendOpts { warn_m: Some(a.warn_m), hysteresis_m: Some(a.hysteresis_m), ..Default::default() });
     let b = send_boundary(ctx, &s.herd_id, geometry, opts, &s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
     tracing::info!(schedule = %s.id, herd = %s.herd_id, version = b.version, "current strip reissued");
     Ok(Some(b))
@@ -1243,7 +1261,8 @@ pub async fn move_now(ctx: &Ctx, schedule_id: &str) -> ApiResult<Schedule> {
     let bf = p.s.back_fence;
     let ground = db::herd_boundaries(ctx.db(), &p.s.herd_id, now()).await?.active.map(|a| ground_now(&p.s, &p.rows, &a));
     let o = opening(&p.s.strips, ground.as_ref(), k as usize, &bf).map_err(ApiError::bad_request)?;
-    let b = send_boundary(ctx, &p.s.herd_id, o.open.clone(), SendOpts::default(), &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let b =
+        send_boundary(ctx, &p.s.herd_id, o.open.clone(), by_schedule(SendOpts::default()), &p.s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
     let r = &mut p.rows[oi];
     r.at = at;
     r.geometry = o.open;
@@ -1589,7 +1608,7 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
 /// immediate version, so collars drop the strips staged above it.
 async fn give_up(ctx: &Ctx, mut s: Schedule, mut rows: Vec<Row>, gone: Vec<i64>, active: &Boundary) -> anyhow::Result<bool> {
     if rows.iter().any(|r| r.state == MoveState::Staged) {
-        let opts = SendOpts { warn_m: Some(active.warn_m), hysteresis_m: Some(active.hysteresis_m), effective_at: None };
+        let opts = by_schedule(SendOpts { warn_m: Some(active.warn_m), hysteresis_m: Some(active.hysteresis_m), ..Default::default() });
         send_boundary(ctx, &s.herd_id, active.geometry.clone(), opts, &s.id).await?;
     }
     for r in rows.iter_mut().filter(|r| r.pending()) {
@@ -1643,6 +1662,7 @@ async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec
             rows[i].state = MoveState::Done;
             lined_up = false;
             tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = v, "scheduled move took effect");
+            recheck_activated(ctx, s, rows, v, at).await?;
             continue;
         }
         let (strip, open) = (rows[i].strip, rows[i].step == 0);
@@ -1675,7 +1695,7 @@ async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec
             }
         }
         lined_up = false;
-        match send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), SendOpts::default(), &s.id).await {
+        match send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), by_schedule(SendOpts::default()), &s.id).await {
             Ok(b) => {
                 tracing::info!(schedule = %s.id, strip, step = rows[i].step, version = b.version, late_s = (at - rows[i].at).num_seconds(), "late move applied now");
                 let r = &mut rows[i];
@@ -1693,12 +1713,37 @@ async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec
     Ok(())
 }
 
-/// What the farm's exclusions are now, to see one drawn, changed or removed
-/// (they are deleted outright, hence the count).
+/// A staged move that took effect is checked against the map once more: a
+/// no-go zone or road drawn after it was staged, too late to stage it again
+/// (collars hold it and activate it on their own clocks). If the gate now
+/// refuses it, that is logged and the current strip goes again at once,
+/// prepared afresh (no-go zones cut out), so collars drop it.
+async fn recheck_activated(ctx: &Ctx, s: &Schedule, rows: &[Row], version: u32, at: DateTime<Utc>) -> anyhow::Result<()> {
+    let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active.filter(|a| a.version == version) else { return Ok(()) };
+    let holeless = shape::herd_collars(ctx.db(), &s.herd_id).await?.iter().any(|c| c.parked.is_none() && !c.caps.holds_holes());
+    let found = crate::prepare::map_only(ctx, &active.geometry, at, holeless).await?;
+    let sender = Sender::of(SenderKind::Schedule);
+    let check = gate::Check { herd_id: &s.herd_id, geometry: &active.geometry, findings: &found, sender: &sender, decision_id: Some(&s.id), collar_id: None };
+    if gate::judge(&found, &sender).allowed {
+        return Ok(());
+    }
+    let why = gate::pass(ctx, &check).await.err().map(|e| e.message).unwrap_or_default();
+    tracing::warn!(schedule = %s.id, version, "a staged move took effect that the safety gate now refuses ({why}): reissuing the current strip");
+    if let Err(e) = reissue_current(ctx, s, rows).await {
+        tracing::error!(schedule = %s.id, version, "the current strip can't go again past the safety gate: {}", e.message);
+    }
+    Ok(())
+}
+
+/// What the farm's exclusions, no-go zones and the other features the gate
+/// reads are now, to see one drawn, changed or removed (they are deleted
+/// outright, hence the count), and whether water is required.
 async fn exclusions_mark(ctx: &Ctx) -> anyhow::Result<String> {
     let (n, last): (i64, Option<String>) =
-        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM features WHERE kind = 'exclusion'").fetch_one(ctx.db()).await?;
-    Ok(format!("{n} {}", last.unwrap_or_default()))
+        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM features WHERE kind IN ('exclusion', 'no_go', 'road', 'farm_boundary', 'hazard', 'water')")
+            .fetch_one(ctx.db())
+            .await?;
+    Ok(format!("{n} {} {}", last.unwrap_or_default(), gate::settings(ctx).await?.require_water))
 }
 
 /// Per schedule, the exclusions its staged moves were last checked against.
@@ -1707,10 +1752,12 @@ static EXCLUSIONS_SEEN: LazyLock<std::sync::Mutex<HashMap<String, String>>> = La
 /// A staged move was prepared with the exclusions of the time it was staged.
 /// When they have changed since (or nothing is known: the server started),
 /// each staged move goes through `prepare` again as it was staged, and the
-/// first whose shape now comes out otherwise is unstaged, so [`stage`] sends
-/// the current strip again and stages everything afresh. So an exclusion
-/// drawn tonight is kept out of tomorrow's strip, and one removed no longer
-/// is. Nothing is sent when no staged move changes.
+/// first whose shape now comes out otherwise, or that the safety gate would
+/// now refuse (a no-go zone it can't keep out, a road drawn across it), is
+/// unstaged, so [`stage`] sends the current strip again and stages
+/// everything afresh (where the gate stops it). So an exclusion drawn tonight
+/// is kept out of tomorrow's strip, and one removed no longer is. Nothing is
+/// sent when no staged move changes.
 async fn restage_for_exclusions(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
     let mark = exclusions_mark(ctx).await?;
     if EXCLUSIONS_SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&s.id) == Some(&mark) {
@@ -1723,8 +1770,12 @@ async fn restage_for_exclusions(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: D
         let stored: HashMap<u32, &Boundary> = split.staged.iter().map(|b| (b.version, b)).collect();
         for i in order {
             let Some(b) = rows[i].version.and_then(|v| stored.get(&v)) else { continue };
-            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: Some(rows[i].at) };
-            let now_shape = shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts).await.ok().map(|p| p.geometry);
+            let opts = SendOpts { warn_m: Some(b.warn_m), hysteresis_m: Some(b.hysteresis_m), effective_at: Some(rows[i].at), ..Default::default() };
+            let now_shape = shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts)
+                .await
+                .ok()
+                .filter(|p| gate::judge(&p.findings, &Sender::of(SenderKind::Schedule)).allowed)
+                .map(|p| p.geometry);
             if now_shape.as_ref() != Some(&b.geometry) {
                 tracing::info!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, version = b.version, "exclusions changed: staged again from here");
                 rows[i].unstage();
@@ -1836,8 +1887,26 @@ async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc
         if count >= room.count {
             break;
         }
-        let opts = SendOpts { warn_m: Some(warn), hysteresis_m: Some(hyst), effective_at: Some(rows[i].at) };
+        let opts = by_schedule(SendOpts { warn_m: Some(warn), hysteresis_m: Some(hyst), effective_at: Some(rows[i].at), ..Default::default() });
         let prepared = match shape::prepare(ctx, &s.herd_id, &rows[i].geometry, &opts).await {
+            // The gate would refuse it now (a no-go zone, a road drawn since): logged once, not staged.
+            Ok(p) if !gate::judge(&p.findings, &opts.sender).allowed => {
+                let v = gate::judge(&p.findings, &opts.sender);
+                let why = v.reason.clone().unwrap_or_default();
+                if first_refusal(&s.id, rows[i].strip, rows[i].step, &why) {
+                    tracing::warn!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move can't be staged: {why}");
+                    let check = gate::Check {
+                        herd_id: &s.herd_id,
+                        geometry: &p.geometry,
+                        findings: &p.findings,
+                        sender: &opts.sender,
+                        decision_id: Some(&s.id),
+                        collar_id: None,
+                    };
+                    let _ = gate::pass(ctx, &check).await;
+                }
+                break;
+            }
             Ok(p) => p,
             Err(e) => {
                 // @L: the driver tries again every pass; one warning per move and reason is enough.
@@ -1881,10 +1950,28 @@ async fn active_ids(ctx: &Ctx) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar("SELECT id FROM schedules WHERE status = 'active' ORDER BY created_at").fetch_all(ctx.db()).await?)
 }
 
+/// After the driver missed events (the bus lagged): run every MOVE applied
+/// to a herd since its schedule began through [`on_decision`], so one that
+/// took the herd off the paddock still ends the schedule.
+async fn resync(ctx: &Ctx) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT d.* FROM schedules s JOIN decisions d ON d.herd_id = s.herd_id
+         WHERE s.status != 'done' AND d.status = 'applied' AND d.action = 'MOVE'
+           AND COALESCE(d.apply_at, d.responded_at, d.created_at) >= s.created_at
+         ORDER BY COALESCE(d.apply_at, d.responded_at, d.created_at)",
+    )
+    .fetch_all(ctx.db())
+    .await?;
+    for r in rows {
+        on_decision(ctx, &op_core::store::decision_from_row(&r)?).await?;
+    }
+    Ok(())
+}
+
 /// The driver: every 5 s a pass over each active schedule; a MOVE to another
 /// paddock ends the herd's schedule as soon as it applies.
 pub fn spawn_driver(ctx: Ctx) {
-    tokio::spawn(async move {
+    ctx.clone().supervise("ingest.schedules", Some(TICK), |ctx| async move {
         let mut rx = ctx.subscribe();
         let mut tick = tokio::time::interval(TICK);
         loop {
@@ -1896,10 +1983,17 @@ pub fn spawn_driver(ctx: Ctx) {
                             tracing::warn!("schedule: {e:#}");
                         }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "schedule driver fell behind the event bus; checking applied moves");
+                        if let Err(e) = resync(&ctx).await {
+                            tracing::warn!("schedule resync: {e:#}");
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
                 },
                 _ = tick.tick() => {
+                    ctx.beat("ingest.schedules");
                     match active_ids(&ctx).await {
                         Ok(ids) => for id in ids {
                             if let Err(e) = drive(&ctx, &id, now()).await {

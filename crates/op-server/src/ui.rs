@@ -6,6 +6,8 @@ use axum::response::{IntoResponse, Response};
 use op_core::ApiError;
 use rust_embed::RustEmbed;
 
+const CSP: &str = "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'";
+
 #[derive(RustEmbed)]
 #[folder = "$OP_UI_DIR"]
 struct Assets;
@@ -38,5 +40,11 @@ fn file(path: &str) -> Option<Response> {
     let h = res.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if mime.essence_str() == "text/html" {
+        // Nothing may frame the app or swap its base, and no plugins. Map
+        // tiles, place search and imports reach other hosts, so sources stay open.
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    }
     Some(res)
 }

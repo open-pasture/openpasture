@@ -5,18 +5,23 @@ GeoJSON, `[longitude, latitude]`, WGS 84. Times are RFC 3339 UTC. IDs are prefix
 ULIDs (`farm_…`, `pad_…`, `herd_…`, `ani_…`, `col_…`, `bnd_…`, `dec_…`; newer types name
 theirs, e.g. `usr_…`, `alr_…`, `sch_…`).
 
-Errors: HTTP status plus `{ "error": "message" }`.
+Errors: HTTP status plus `{ "error": "message" }`. A failure inside the server (500) says only
+`Something went wrong on the server (ref <10 characters>). The details are in the server log.`;
+the full error is logged at `error` with `log_ref=<the same reference>`.
 
-`/api/*` and `/mcp` need `Authorization: Bearer <app token>` (or `?token=`; the token is in
-settings, shown in the app and printed by `openpasture token`), or a person's own token
-(`opu_…`, see "People, roles and sign-in"), unless the request is local: from a loopback address, with a
-`Host` of `127.0.0.1`, `localhost` or `[::1]` (any port), and no proxy headers
-(`X-Forwarded-*`, `Forwarded`, `CF-Connecting-IP`, `X-Real-IP`, `Tailscale-*`). So traffic
-through a tunnel (cloudflared, Tailscale Funnel) or a LAN address always needs the token, and a
-DNS-rebinding page gets 401. Local requests that write (POST/PUT/PATCH/DELETE) or open the
-WebSocket are refused (403) when `Origin` is another site; requests carrying the token are not
-checked. Debug builds also allow CORS and `Origin` from the Vite dev server
-(`http://localhost:5173`, `http://127.0.0.1:5173`). `/collar/v1/*` uses collar keys, `/v1/*`
+Units, factory tests, provisioning, firmware rollout and the herd network: [`api/fleet.md`](api/fleet.md).
+
+`/api/*` and `/mcp` need `Authorization: Bearer <token>`, wherever the request comes from:
+the app token (`openpasture token`; no read shows it, the owner reveals it on purpose), an owner
+session (`opo_…`, see "Owner sign-in"), a person's own token (`opu_…`, see "People, roles and
+sign-in"), or a brain run's token on `/mcp?scope=brain`. Being on this machine grants nothing: a
+reverse proxy on it (nginx's default `proxy_pass`) makes every internet request look local. The
+owner on this machine signs in with a one-time code instead (the desktop app's launch, the URL
+`openpasture serve` prints). A token in the query string (`?token=`) counts only on `/api/live`
+(which also takes it as a `Sec-WebSocket-Protocol` value) and `/mcp`; elsewhere it would end up in
+access logs. A peer that sends 30 wrong tokens in a minute gets 429 (`Retry-After: 60`) until the
+minute is up. Debug builds also allow CORS from the Vite dev server (`http://localhost:5173`,
+`http://127.0.0.1:5173`); it still needs a token. `/collar/v1/*` uses collar keys, `/v1/*`
 hosted keys (`oph_…`) and `/hooks/twilio/*` Twilio's signature, never the app token.
 
 ## Farm (op-core)
@@ -94,13 +99,13 @@ MessageLog { id /* ntf_… */, direction: "out"|"in", channel: "sms"|"whatsapp"|
            address, user_id?, kind: "alert"|"brief"|"reply"|"test"|"verify"|"inbound", text, subject?,
            status: "queued"|"sending"|"sent"|"delivered"|"failed"|"received"|"ignored", error?,
            alert_id?, decision_id?, provider_id?, attempts, created_at, updated_at }
-MapFeature { id /* fea_… */, kind: "exclusion"|"water"|"gate"|"shade"|"hazard"|"road"|"neighbour_line"|"farm_boundary",
+MapFeature { id /* fea_… */, kind: "exclusion"|"no_go"|"water"|"gate"|"shade"|"hazard"|"road"|"neighbour_line"|"farm_boundary",
            name?, geometry: Point|LineString|Polygon, paddock_id? /* none = farm-wide */, notes?, props,
            active_from?, active_until?, created_at, updated_at }
 ```
 
-Every request carries an identity. The app token and local requests are the owner
-(`via: "app_token"` / `"local"`); a brain token on `/mcp?scope=brain` is the brain (a viewer that
+Every request carries an identity. The app token and an owner session are the owner
+(`via: "app_token"` / `"local"`, signed in on this machine); a brain token on `/mcp?scope=brain` is the brain (a viewer that
 lists and calls only its tools); `/collar/v1`, `/v1/*` and `/hooks/*` authenticate themselves.
 `/hooks/*` paths that don't exist are JSON 404s. A handler that needs a role answers 401 without
 credentials and 403 `{"error": "Your role can't do this."}` when the role is too low.
@@ -110,11 +115,14 @@ as E.164 (10 digits are a US number); changing a phone clears its verification. 
 `messages` and the other tables holding phone numbers are never readable through `/api/sql` or
 export.
 
-Map features: an exclusion is one polygon ring; water, shade and hazards are a point or a polygon
-(a hazard point needs `props.radius_m`); a gate is a point; roads and neighbour lines are lines;
-there is at most one farm boundary (409). A feature is active from `active_from` (inclusive) to
-`active_until` (exclusive); either may be absent. Exclusions become boundary holes on sends whose
-activation time falls in their window; the rest are checked before a send, never enforced.
+Map features: an exclusion or a no-go zone is one polygon ring; water, shade and hazards are a
+point or a polygon (a hazard point needs `props.radius_m`; `props.hard: true` makes one no
+boundary may take in); a gate is a point; roads and neighbour lines are lines; there is at most
+one farm boundary (409). A feature is active from `active_from` (inclusive) to `active_until`
+(exclusive); either may be absent; a no-go zone has neither (400): it is permanent. Exclusions
+become boundary holes on sends whose activation time falls in their window, and no-go zones on
+every send; the rest are checked before a send, and the safety gate refuses the hard findings
+(see "Safety gate").
 
 Numbers people read (reports, texts, the brief) go through the farm's `settings.units`: metric
 (ha, m, cm, kg, m²/hd, AU/ha) or imperial (ac, ft, in, lb, ft²/hd, AU/ac), rounded the same in
@@ -156,34 +164,57 @@ TokenInfo { id /* tok_… */, user_id, label, created_at, last_used?, revoked_at
 person with a phone. A sign-in link is `{base_url}/#/join/<code>` (a 128-bit code in hex, valid
 7 days, accepted once; the code rides in the URL fragment, which browsers don't send). Accepting
 it returns a person token (`opu_…`) that the browser keeps and sends as
-`Authorization: Bearer opu_…` (or `?token=` on the WebSocket), everywhere the app token works. A
+`Authorization: Bearer opu_…` (or `?token=` on the WebSocket and MCP), everywhere the app token
+works. A token unused for 30 days, or 180 days old, stops working (401): a new link signs in
+again. A
 person may have several tokens (one per browser); a new link for the same person signs in another
 browser. Codes and tokens are stored as sha256 only. Tokens resolve through a 30 s cache;
 revoking a token or a person's sign-in, or changing, disabling or removing a person, applies to
-the next request. `last_used` is written at most once a minute. A revoked or unknown person token
-is 401 even from this machine (it never falls back to the local owner). The app token and local
-requests are the owner; when the owner added themselves to People (as an owner), they act as the
-first enabled owner person (`/api/me` shows it, records name them).
+the next request. `last_used` is written at most once a minute. A revoked, expired or unknown
+person token is 401, from this machine too. The app token and an owner session are the owner;
+when the owner added themselves to People (as an owner), they act as the first enabled owner
+person (`/api/me` shows it, records name them).
 
-**Roles** (`viewer < hand < manager < owner`), checked for every `/api` request before the route:
+**Roles** (`viewer < hand < manager < owner`), checked for every `/api` request before the route.
+Every route is listed (`op-server/src/policy.rs`) with the lowest role that may use it; a route on
+no list is the owner's alone, and a test that reads every crate's routes fails until it is listed.
 
-- viewer: `GET`/`HEAD` everywhere except the reads below; `/api/live`; MCP read tools.
+- viewer: the reads (`GET`/`HEAD`) except the ones below; `/api/live`; MCP read tools but `run_sql`.
   Every role may also use `/api/me` and `/api/me/*` and `POST`/`DELETE /api/push/subscriptions*`.
 - hand: a viewer plus `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`,
   `PUT /api/alerts/prefs/me`, `POST /api/herds/:id/move/stop`, `POST /api/collars/:id/escape/stop`,
   `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/fleet/:id/fit-checks`,
   `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`, `POST /api/feed-log`,
   `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
-- manager: every other `/api` request except the owner's; `GET /api/messages` and
-  `GET /api/alerts/prefs` are managers' reads; all MCP tools.
-- owner: also `PUT /api/settings`, `/api/secrets*`, `/api/users*`, `/api/invites*` (except
-  `accept`, which needs no sign-in), `/api/tokens*`, `/api/brains/hosted/keys*`, `/api/notify/*`,
-  `/api/texting*`, `PUT /api/push/settings`, `POST /api/collars/:id/rekey`.
+- manager: the writes listed for managers (everything that isn't a hand's or the owner's);
+  `GET /api/messages` and `GET /api/alerts/prefs` are managers' reads; all MCP tools.
+- owner: also `PUT /api/settings`, `POST /api/settings/app-token/*`, `/api/secrets*`,
+  `/api/users*`, `/api/invites*` (except `accept`, which needs no sign-in), `/api/tokens*`,
+  `/api/brains/hosted/keys*`, `/api/notify/*`, `/api/texting*`, `PUT /api/push/settings`,
+  `POST /api/collars/:id/rekey`.
 
-A role too low is 403 `{"error": "Your role can't do this."}`. `GET /api/settings` and
-`GET /api/state` send `server.app_token: ""` to everyone but owners. `POST /api/sql` is a
-manager's (it is a POST). MCP lists and calls tools as the caller: a viewer or hand never sees
-`propose_boundary`, and calling it answers "Unknown tool".
+A role too low is 403 `{"error": "Your role can't do this."}`. No read sends the app token:
+`GET /api/settings`, `GET /api/state` and `PUT /api/settings` carry `server.app_token: ""` for
+everyone, the owner included, and a `PUT` can't change it. `POST /api/sql` is a manager's, and so is
+MCP `run_sql` (a brain run keeps it under its own token). MCP lists and calls tools as the caller:
+a viewer or hand never sees `propose_boundary` or `run_sql`, and calling one answers "Unknown tool".
+
+### Owner sign-in (op-server)
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/session` | `{ code }`, no token needed (5 tries a minute per peer) | 201 `{ token }` (`opo_` + 64 hex, shown once); 401 used, expired or unknown code |
+| DELETE | `/api/session` | | 204: signs this owner session out (400 for any other token) |
+| POST | `/api/settings/app-token/reveal` | | `{ app_token }` (owner) |
+| POST | `/api/settings/app-token/rotate` | | `{ app_token }`: a new one; the old one stops working at once (owner) |
+
+The owner on this machine signs in with a one-time code: 128 bits in hex, good once within 10
+minutes, stored as a hash. The desktop app opens its window on `{url}/#/signin/<code>`;
+`openpasture serve` prints such a URL when it starts, and `openpasture sign-in` prints another for
+the running server (it writes the code into the data dir's database, so only someone who can write
+there can sign in). The app trades the code at `POST /api/session` for an owner session, kept as a
+hash in `owner_sessions`, `via: "local"` on records; one unused for 30 days, or 180 days old, stops
+working.
 
 **Who answered.** `POST /api/decisions/:id/respond` records the caller:
 `inputs.farmer_response.by = Actor` (e.g. `{ via: "user_token", user_id, name: "Ana" }`, or
@@ -197,7 +228,7 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
-| POST | `/api/collars` | `{ name?, herd_id }` | `{ collar: Collar, key: string, endpoint: string, public_key: string }` (key shown once) |
+| POST | `/api/collars` | `{ name?, herd_id, simulated? }` | `{ collar: Collar, key: string, endpoint?: string, no_endpoint?: string, public_key: string }` (key shown once; `endpoint` is the collar address + `/collar/v1`, absent until one is set, with `no_endpoint` saying why) |
 | GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
@@ -206,7 +237,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 ```ts
 Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
            boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix,
-           fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair" }
+           fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair",
+           simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */ }
 Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
@@ -385,16 +417,55 @@ Per `../opencollar/protocol/README.md`. HTTP + JSON for V0. `Authorization: Bear
 | GET | `/collar/v1/boundary?have=N` | | 204 if N is current, else the boundary command plus `sig` |
 | POST | `/collar/v1/ack` | `{ command_id, version, status, reason?, at }` | 204 |
 
+Reports are idempotent: a report sent again (the reply was lost and the collar retried) stores
+nothing new and announces nothing. A fix is one per collar per instant (`(collar_id, at)` to the
+millisecond), a cue one per collar, instant and kind (`warn` and `outside` at the same instant are
+two cues), an episode one per collar and start. A record that carries the collar's own sequence
+number (`seq`, protocol v2) is also one per `(collar_id, seq)`; `seq` must never repeat for a
+collar. `health` keeps one row per report received, its `fixes` and `cues` counting only the ones
+that report added.
+
 `sig` is an Ed25519 signature (base64) over the command's canonical JSON without `sig`.
 The server's key pair lives in the data directory; the public key is given at link time.
 The command carries `herd_id` (signed with the rest); a collar rejects a command for a herd
 other than its own. Commands without `herd_id` (older servers) are accepted.
 
+**Wire log.** The server keeps each collar's last 64 messages on `/collar/v1` in memory (not on
+disk, gone on restart), so a real collar can be debugged without `sqlite3`: what it sent, what it
+got back, and the reason when a report or ack was refused.
+
+| Method | Path | Query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/collars/:id/wire` | `limit` (1–64, default 64) | `{ collar_id, entries: WireEntry[] }`, oldest first (managers and up; 404 for an unknown collar) |
+
+```ts
+WireEntry { at, dir: "in"|"out",                       // in: collar → server
+            route: "report"|"boundary"|"ack"|"config", // config: the one on a report reply
+            status?,                                   // HTTP status, on out entries
+            bytes, body, truncated?,                   // body (a download's query) cut to 512 bytes
+            note?,                                     // "60 fixes, 2 cues, 0 episodes, enforcing v4", "has v3",
+                                                       // "v4 bnd_…", "nothing newer", "latest v4", "config v2",
+                                                       // "v4 applied", or the error the collar was given
+            ms? }                                      // time the server took, on out entries
+```
+
+Only requests with a known collar key are kept (a wrong key can't fill the log). Fields named
+`key`, `k`, `token`, `app_token`, `secret` or `password` are replaced with `[redacted]`. Each
+entry also goes out live as `collar_wire { collar_id, entry }` to managers and up. At most 4,096
+collars are kept (the quietest goes first), about 40 KB each at most.
+`collar-bridge` (`tools/collar-bridge`) drives these routes for a collar on USB serial.
+
 ## Protocol v1 on the server (op-ingest)
 
 The collar protocol v1 (holes, slots, collar-scoped boundaries, cue kinds, episodes, signed
 configs) as the server speaks it. Firmware 0.1 collars (no `caps`) keep working: every new field
-is optional, and they get what they can hold.
+is optional, and they get what they can hold. The protocol itself, v2 (draft) and what any server
+must do are in `../opencollar/protocol/` (`README.md`, `v2/`, `v2/server.md`); this section is
+openpasture's side.
+
+Uplink values are lenient: a cue kind, episode outcome or slot status the server doesn't know is
+stored as sent (an unknown slot status reads as `received`), and an ack with an unknown status is
+answered 204 and not stored, so a newer collar's report is never refused for one new word.
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
@@ -454,8 +525,10 @@ herd's boundary in effect and of each staged one, as after an escape, and `lates
 them. The server-side fence starts from `unknown` when the herd's boundary took effect after the
 collar's last report, as the collar rearms on a new boundary.
 
-**Reports** may carry `device { fw, caps, limits, config_version, config_reject }` (stored
-on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`), `slots` (the complete
+**Reports** may carry `device { fw, caps, limits, config_version, config_reject, device_class }` (stored
+on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`; `sim` in `caps` marks the
+collar `simulated` for good; `device_class` (`node`, `anchor`, `direct`) is its role in the herd
+network view, sent by the simulator until protocol v2), `slots` (the complete
 list; replaces the collar's applied/received rows), `episodes` (stored once per collar and start),
 cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, and health
 `fix_attempts`, `fix_ok`, `cell { rsrp_dbm, rsrq_db, snr_db, mode, band, cell_id, tac }`,
@@ -467,8 +540,8 @@ version, as the collar does.
 
 **Configs**: each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,
 version per collar). It gets a new version when its herd changes (at once on the PATCH), when
-`server.public_url` changes (the `endpoint`, only when it is `https://`; seen on the collar's next
-report), when a move starts for its herd or an escape for it (a fast window: `fast_until` = the
+the collar address changes (`server.collar_url`, the `endpoint`; never this machine's own URL, and
+absent until a collar address is set; seen on the collar's next report), when a move starts for its herd or an escape for it (a fast window: `fast_until` = the
 estimated end, at 4 m/min of `remaining_m` kept between 5 and 30 min, plus 10 min; extended while
 the move runs once under 5 min is left; never cut short), and when `collars.config` changes. A
 report whose `device.config_version` is lower (or absent) gets it in the reply; a version the
@@ -497,8 +570,8 @@ version)`, `(effective_at)`, `(version)`.
 | PATCH | `/api/features/{id}` | JSON merge patch → `MapFeature`. `null` clears a field (`paddock_id: null` = farm-wide, `active_until: null` = lasting); `id`, `kind` and the timestamps don't change |
 | DELETE | `/api/features/{id}` | 204 |
 
-Geometry per kind (400 otherwise, e.g. `{"error": "A gate is drawn as a point."}`): exclusion a one-ring
-Polygon; water, shade and hazard a Point or a Polygon (a hazard point needs `props.radius_m` > 0);
+Geometry per kind (400 otherwise, e.g. `{"error": "A gate is drawn as a point."}`): exclusion and
+no-go zone a one-ring Polygon (a no-go zone with `active_from` or `active_until` is 400); water, shade and hazard a Point or a Polygon (a hazard point needs `props.radius_m` > 0);
 gate a Point; road and neighbour line a LineString (≥ 2 points); farm boundary a Polygon.
 Coordinates are stored to 7 decimals and polygon rings closed. A second farm boundary is 409
 (`"The farm already has a boundary. Edit that one instead."`); an unknown `paddock_id` is 400;
@@ -576,14 +649,15 @@ for it; parking again only changes the reason.
 when there is one). An empty tag makes a spare collar; an empty name takes the tag, else
 `Collar N`. All or nothing: any row to fix is 400 `{ error, errors: [{ row, error }] }` (no animal
 with that tag in the herd, the animal already wears a collar, a repeated tag or name, a name
-already used in the herd) and nothing is created. `endpoint` is the server's base URL +
-`/collar/v1`. A new key (`rekey`, owner only) stops the old one at once.
+already used in the herd) and nothing is created. `endpoint` is the collar address +
+`/collar/v1`; until one is set (Settings, Server) it is absent and `no_endpoint` says why. A new
+key (`rekey`, owner only) stops the old one at once.
 
 **Cards.** `qr_svg` is an inline SVG QR code (error correction M) of the provisioning payload,
-compact JSON in this order: `{"v":1,"c":"<collar id>","h":"<herd id>","k":"<collar key>","e":"<public url>/collar/v1","s":"<server public key, base64>"}`.
+compact JSON in this order: `{"v":1,"c":"<collar id>","h":"<herd id>","k":"<collar key>","e":"<collar address>/collar/v1","s":"<server public key, base64>"}`.
 Keys only ever travel in request bodies; each must be the collar's current key (400 otherwise:
-print again from a new key). Cards need `server.public_url` set to an https URL (409 otherwise),
-because the endpoint is written into the collar and a LAN or tunnel address would strand it.
+print again from a new key). Cards need the collar address (409 otherwise), because the endpoint
+is written into the collar.
 
 MCP: `list_animals` (read) `{ herd_id?, q?, removed? }` → `{ count, animals: [Animal & { herd, collar?: { id, name, state, battery?, last_seen?, position?, fix_at?, parked? } }] }`;
 animals on the farm unless `removed` is true.
@@ -715,14 +789,17 @@ stay with the original.
 
 ```ts
 CheckRequest { geometry: Polygon, warn_m?, effective_at?, sweep?: boolean }
-CheckResult  { sent: Polygon, legacy?: Polygon, facts: CheckFacts, findings: Finding[], sweep?: SweepPreview }
+CheckResult  { sent: Polygon, legacy?: Polygon, facts: CheckFacts, findings: Finding[], sweep?: SweepPreview,
+               gate: { confirm: string[], never: string[] } }
 CheckFacts   { area_ha, head, m2_per_head, grazing_days?, forage_kg_dm?, forage_source?: "ndvi" | "measured",
                rest_days?, sweep_minutes?, vertices, holes }
 SweepPreview { back_lines: LonLat[][], minutes }
 Finding      { code, severity: "info" | "warning" | "critical", text, geometry?, targets?: [kind, id][] }
 ```
 
-What a boundary would do, without sending it. Nothing is stored, and the check never blocks a send.
+What a boundary would do, without sending it. Nothing is stored. `gate` says what the safety gate
+will make of a person sending it: the critical codes they would have to confirm (`confirm`), and
+those nobody may send (`never`).
 
 **Every herd boundary is shaped by the exclusions in effect when it takes effect** (its
 `effective_at` when that is ahead, else now): farm-wide ones and those of the paddocks it touches.
@@ -731,10 +808,11 @@ one closer to the edge than the collars' gap is joined to it by a notch, close o
 hole, one covering the whole shape is left alone. This happens on every path (a farmer's draw, an
 applied decision, each sweep step, a staged boundary, a reissue), so an exclusion that starts later
 takes effect on the first send at or after it starts, and one that has ended no longer shapes
-sends. Drawing an exclusion doesn't by itself send the boundary in effect again; when it changes
+sends. A no-go zone is kept out the same way, always. Drawing an exclusion doesn't by itself send the boundary in effect again; when it changes
 a strip schedule's staged moves, those are staged again and the current strip goes again with them
 (see Schedules). An exclusion the shape already keeps out is left as it is, so a prepared boundary sent again
-doesn't change. Hazards, roads, neighbour lines, water and the farm boundary are only checked.
+doesn't change. Hazards, roads, neighbour lines, water and the farm boundary don't change the
+shape; the critical findings are what the safety gate refuses.
 
 `sent` is what sending the same shape now stores, byte for byte (holes and cuts from exclusions,
 fitted to the herd's collars); a sweep toward it ends on exactly this shape. `legacy` is the single
@@ -751,12 +829,13 @@ Findings, most severe first:
 
 | Code | Severity | When | `geometry` |
 | --- | --- | --- | --- |
+| `enters_no_go` | critical | it still takes in a no-go zone: the zone covers all of it, or it is a hole that collars without holes won't keep | the overlap |
 | `crosses_road` | critical | a road runs through it | the road inside |
 | `crosses_neighbour_line` | warning | a neighbour line runs through it | the line inside |
-| `crosses_farm_boundary` | warning | it goes past the farm boundary | the part outside |
-| `overlaps_hazard` | warning | it takes in a hazard (a point's `radius_m`, or an area) | the overlap |
-| `overlaps_exclusion` | info, warning | it overlapped an exclusion: kept out (info), or the exclusion covers all of it (warning) | the overlap |
-| `no_water` | warning | the farm has water mapped and none is inside | |
+| `crosses_farm_boundary` | critical | it goes past the farm boundary | the part outside |
+| `overlaps_hazard` | warning, critical | it takes in a hazard (a point's `radius_m`, or an area); critical for one with `props.hard` | the overlap |
+| `overlaps_exclusion` | info, critical | it overlapped an exclusion: kept out (info), or the exclusion covers all of it (critical) | the overlap |
+| `no_water` | warning, critical | the farm has water mapped and none is inside; critical when the farm requires water (`/api/gate/settings`) | |
 | `water_inside` | info | one per water point or area inside | the water |
 | `forage_short` | warning | grass for under half a day | |
 | `area_per_head_low` | warning | under 25 m²/hd for cattle, 4 for sheep and goats | |
@@ -785,6 +864,97 @@ preview when the herd is already inside, has no fresh positions, or the sweep ca
 
 MCP `check_boundary` (read) `{ herd_id?, geometry, warn_m?, effective_at?, sweep? }` returns the
 same `CheckResult`.
+
+## Safety gate (op-ingest)
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/gate/log` | `?herd_id&decision_id&refused=true&limit` (1–500, default 100) | `GateEntry[]` newest first |
+| GET PUT | `/api/gate/settings` | `{ require_water?: bool }` (PUT: manager) | `GateSettings` |
+
+```ts
+GateEntry    { id /* gat_… */, at, herd_id, collar_id? /* an escape pen's */, sender: Sender, by?: Actor,
+               decision_id?, allowed: boolean, codes: string[] /* hard findings */, confirmed: string[],
+               findings: Finding[] /* the hard ones, with geometry */, geometry?: Polygon, reason? }
+Sender       = "farmer"|"api"|"mcp"|"brain"|"timer"|"auto"|"schedule"|"sweep"|"escape"|"system"
+GateSettings { require_water: boolean }
+```
+
+Every herd boundary passes one gate before it can reach a collar, whoever sends it: the farmer
+drawing one (`POST /api/herds/:id/boundary`, `farmer`, or `api` with the app token), a person
+approving or changing a decision (`farmer`), the timer (`timer`) and autonomy auto (`auto`)
+applying one the brain (`brain`) or an MCP agent (`mcp`) proposed, a strip schedule's moves
+(`schedule`), each sweep step (`sweep`) and an escaped animal's pen (`escape`).
+
+**Hard findings** are the critical ones of the pre-send check: `enters_no_go`, `crosses_road`,
+`crosses_farm_boundary`, `overlaps_hazard` (hard hazards), `overlaps_exclusion` (all of it in one)
+and `no_water` (when required). A shape that can't be sent at all (self-crossing, too small, no
+room clear of the warning zone) is refused before the gate (400).
+
+- Nobody sends a boundary into a no-go zone (`never`): change the shape, or remove the zone.
+- A person may send one with any other hard finding by naming each code in `confirm` (on
+  `POST /api/herds/:id/boundary` and `POST /api/decisions/:id/respond`). Without it the answer is
+  409 `{ error, findings, confirm: [codes to name], never: [codes] }` and nothing is stored (a
+  decision still waits). An approval by text can't confirm: it gets the findings back and is
+  approved in the app.
+- Every other sender is refused on any hard finding (409, the same body with `confirm: []`).
+  A move's sweep steps carry what the person confirmed for its target; a step the gate refuses
+  stops the move (`move.refused` activity) with the active boundary left as it is.
+- Sweep steps and escape pens are passing shapes: water isn't asked of them. A pen is judged on
+  what it takes in beyond the herd's own boundary; refused, no pen goes and it is looked at again
+  a minute later.
+- A strip schedule whose strips have a hard finding is refused when it is made (409). Drawing a
+  no-go zone (or a road, the farm boundary, a hazard, water) checks its staged strips again, so a
+  strip the gate would now refuse is unstaged and the current strip goes again without it; a
+  staged strip that takes effect and fails the gate is reissued at once, prepared afresh.
+
+Every gate decision is logged, allowed or refused, with who sent it and what was confirmed.
+
+**Escape plausibility.** Before a first pen the collar's own fixes have to make a believable
+escape: at least 2 fixes since it went out, each good to 30 m, none back inside, and no two in a
+row (the last one before it went out included) further apart than 12 m/s allows once their
+accuracies are taken off. Otherwise no pen, and an `escape.implausible` activity once per trip out.
+
+## Farm rules (op-engine)
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/rules` | | `FarmRule[]` in force, oldest first |
+| POST | `/api/rules` | `{ text }` (≤ 500 characters, at most 100 rules) | 201 `FarmRule` |
+| PATCH | `/api/rules/:id` | `{ text }` | `FarmRule` |
+| DELETE | `/api/rules/:id` | | 204 (kept on record with who removed it and when) |
+| POST | `/api/rules/:id/convert` | | 201 `{ rule, feature: MapFeature }`: the no-go zone or exclusion it suggests; 409 when it suggests none |
+
+```ts
+FarmRule   { id /* rul_… */, text, feature_id?, created_by: Actor, created_at, updated_by?: Actor, updated_at,
+             suggestion?: Suggestion }
+Suggestion { kind: "no_go"|"exclusion", name, geometry: Polygon, paddock_id?, active_from?, active_until?,
+             text /* "Make Creek a no-go zone" */ }
+```
+
+Plain-language rules the owner and managers give the farm agent ("never put the heifers in the
+creek paddock before July", "always leave 30 m from the neighbour's bull pasture"). Writes are a
+manager's. Every decision prompt carries them (`farm_rules` in the decision context, with the
+no-go zones), MCP agents read them (`list_farm_rules`, and in every write tool's description),
+and the brain says how its decision follows them (`rules` in its answer).
+
+A rule read as ground and dates: it names a paddock or a map feature, says never / no / keep out /
+stay out of / avoid / leave N m from, maybe with dates ("before July", "until 15 June", "after
+March 1", "between November 1 and March 1", each year), and maybe a herd by name. When it names
+no herd and no animals that aren't a herd, it offers to become a map feature (`suggestion`): a
+no-go zone, or an exclusion for its next window when it has dates; N m becomes a band that far
+around the ground.
+
+**Review.** A MOVE or HOLD from the brain or an MCP agent is reviewed when it is recorded, and a
+timer decision again when its time comes: the safety gate as the proposer, then every rule in
+force. A rule that became a feature is kept by the gate; a rule read as ground and dates is
+checked on the map (in force today, the herd it names, the ground it touches); any other rule goes
+to a second pass of the farm's brain as reviewer (`COMPLIES`, `VIOLATES` or `UNSURE`; a brain that
+can't answer is unsure) when the decision would go on its own. A hard finding, a broken rule, any
+doubt, or no statement from an LLM brain about the rules: the decision stays proposed with no
+timer, `inputs.review = { clean: false, reasons: string[], gate: Finding[], rules: RuleCheck[], at }`
+says why (`decision.held` activity), and a person approves or rejects it. Rule text never lets
+anything past the gate.
 
 ## Strip schedules (op-ingest, op-engine)
 
@@ -924,7 +1094,7 @@ reads the same way.
 | GET | `/api/decisions` | `?herd_id&limit` | `Decision[]` newest first |
 | GET | `/api/decisions/:id` | | `Decision` |
 | POST | `/api/herds/:id/decide` | | `Decision` with `status: "running"` (progress on `/api/live`) |
-| POST | `/api/decisions/:id/respond` | `{ action: "approve"\|"reject"\|"modify", geometry?, note? }` | `Decision` (409 unless `proposed`) |
+| POST | `/api/decisions/:id/respond` | `{ action: "approve"\|"reject"\|"modify", geometry?, note?, confirm?: string[] }` | `Decision` (409 unless `proposed`; 409 with `findings` when the safety gate holds it) |
 | GET | `/api/brains` | `?refresh=1` re-detects now | `Brain[]` |
 | POST | `/api/brains/:id/test` | | `{ ok, detail, ms }`: one real decision on this farm's record, no MCP; `detail` is `ACTION (model)` or a one-line error |
 | GET POST | `/api/brains/hosted/keys` | `{ label? }` | `HostedKey[]` / 201 `HostedKey & { key }` (key shown once, `oph_…`) |
@@ -943,7 +1113,8 @@ Decision { id, herd_id, source: "brain"|"farmer"|"heuristic", brain?: BrainId, m
 Brain    { id: BrainId, name, available: boolean, signed_in: boolean, needs: string[] /* secret names */,
            models: string[], detail?: string }
 HostedKey { id, label, created_at, last_used? }
-DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need, model }
+DecisionOutput { action: "STAY"|"MOVE"|"NEEDS_INFO"|"HOLD", to_paddock_id, geometry, reasoning, confidence, need,
+                 rules /* how it follows the farm's rules; null when there are none */, model }
 Signals  { as_of, herd_id, current_paddock_id, position_source, herd_animal_units, feed_budget_days_current,
            behavior, risk_flags, assumptions,
            paddocks: { paddock_id, name, status, area_ha, current, rest_days, grazing_pressure, forage, recovery, risk_flags }[] }
@@ -963,7 +1134,8 @@ The app answers a NEEDS_INFO decision by posting the farmer's reply as `approve`
 then starting a new decision.
 
 **Autonomy.** `propose` waits. `timer` sets `apply_at = now + timer_minutes` on a proposed
-MOVE and the server sends it then unless it was answered. `auto` sends a MOVE at once.
+MOVE and the server sends it then unless it was answered. `auto` sends a MOVE at once. Timer and
+auto only when the review is clean (see "Farm rules"); otherwise it waits like `propose`.
 STAY and NEEDS_INFO always wait. The daily decision runs for every herd with collars once
 the farm's local time reaches `settings.decision_time` (within the following hour, once a day).
 
@@ -1000,7 +1172,8 @@ What the engine hands a brain (`DecisionRequest.context`, also the `context` of
   history: { id, created_at, source, status, action, from_paddock_id, to_paddock_id,
              reasoning, confidence, need, farmer_response?, outcome? }[] /* last 10, newest first */,
   units,
-  schedule /* the herd's strip schedule while it runs, see "Strip schedules" */ }
+  schedule /* the herd's strip schedule while it runs, see "Strip schedules" */,
+  farm_rules: { rules: { id, text }[], no_go_zones: { id, name?, geometry }[] } }
 ```
 
 "Where the herd is": the paddock holding at least half of the herd's collar fixes from the
@@ -1384,10 +1557,10 @@ MySubscription = { id /* psh_… */, endpoint, created_at, last_ok? /* the push 
 | --- | --- | --- | --- |
 | GET | `/api/tracks` | `collar_id?&herd_id?&from&to&max_points` | `Track[]` |
 | GET | `/api/analytics/health` | `herd_id\|collar_id&from&to&bucket` | `CollarHealth[]` |
-| GET | `/api/analytics/behaviour` | `herd_id&from&to` | `Behaviour[]` |
+| GET | `/api/analytics/behaviour` | `herd_id&collar_id?&from&to` | `Behaviour[]`; with `collar_id`, that collar's row only, read from its own fixes (the animal page) |
 | GET | `/api/analytics/heatmap` | `herd_id&from&to&cell_m?&normalize?` | `[lon, lat, weight][]` |
 | GET | `/api/analytics/pasture` | `herd_id?&from&to` (default 90 days) | `PaddockPasture[]` |
-| POST | `/api/sql` | `{ query, limit? }` | `{ columns: string[], rows: any[][], ms, truncated? }` |
+| POST | `/api/sql` | `{ query, limit? }` (manager) | `{ columns: string[], rows: any[][], ms, truncated? }`; no table functions (`range`, `generate_series`), 256 MB for a query's joins, sorts and aggregates ("resources exhausted" past it), two queries at a time (503 after waiting 5 s), 20 s each (408) |
 | GET | `/api/export` | `table&format=csv\|geojson\|parquet&from&to&collar_id?&herd_id?` | file download |
 
 `from`/`to`: RFC 3339, `YYYY-MM-DD`, `now`, or relative (`-24h`, `-7d`, `-30m`, `-2w`); default
@@ -1642,6 +1815,14 @@ one paddock with head: a stretch at 0 head isn't grazing, so a herd made empty a
 animals a moment later goes in when they came, one emptied into another herd and left in place leaves
 when its last animal did, and one that never had any is no event (the paddock rests through it).
 Head is the count on the day in and head-days follow every count change inside it.
+
+**Simulated collars stay out of reports.** A herd whose collars are all simulated (`Collar.simulated`)
+is left out of every report, and animals on a simulated collar are left out of per-animal rows; the
+notes end with `Left out: <herd> (simulated collars only).`, or for a herd with some simulated
+collars `<herd> has N simulated collars: head counts include their animals; per-animal rows leave
+them out.` Alerts about simulated collars only (or a herd of them) carry `data.simulated: true`:
+the app shows them and the farm webhook gets them, but no person is texted, pushed or emailed
+about them, and the morning brief leaves them out (a herd of simulated collars gets no brief).
 Stocking density is AU on the day in over the paddock's area then. Rest before in is the time since
 any herd last left the paddock. Collar dwell (`paddock_days`) adds a "Collar days" column where it
 exists: UTC days on which the paddock held at least 1/24 of the herd's tracked dwell (the pasture
@@ -1678,9 +1859,71 @@ MCP: `get_report` (read) `{ id, from?, to?, herd_id? }` returns the `ReportDoc`.
 
 | Method | Path | Returns |
 | --- | --- | --- |
-| GET | `/api/server` | `{ version, data_dir, bind, port, lan_url?, public_url? }` |
-| GET | `/api/live` | WebSocket, server → client `Event` messages |
-| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`), tools listed and called as the caller's identity; `?scope=brain` lists only the brain tools. A brain run off a loopback URL gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only and lists and calls only the tools it was minted with) |
+| GET | `/api/server` | `{ version, data_dir, bind, port, lan_url?, public_url?, collar_url?, capabilities, work, tasks: TaskInfo[], disk: Disk }` |
+| GET | `/api/server/retention` | `Retention`: days of raw telemetry kept |
+| PUT | `/api/server/retention` | owner; body `Retention` (the whole setting; each value at least 7, or `null`), returns it; applied at the next hourly rollup. 400 when a value is under 7 |
+| GET | `/healthz` | no sign-in, nothing private: `{ status: "ok"|"degraded"|"down", version, db: "ok"|"error", jobs: { name, status, restarts }[] }`. 200 for `ok` and `degraded`, 503 for `down` (the database doesn't answer or the server is stopping) |
+| POST | `/api/server/collar-address/check` | owner; `{ url }` → `CollarAddressCheck`. Nothing is saved |
+| PUT | `/api/server/collar-address` | owner; `{ url: string \| null }`: checks `url` again and saves it as `server.collar_url`, then every collar that takes configs gets it in its next one. 422 with the reason when the check fails; `null` clears it. Returns `{ collar_url?, check? }` |
+| GET | `/collar/v1/reach/:nonce` | no sign-in: 204 when `nonce` is one this process is checking an address with, else 404 |
+| GET | `/api/live` | WebSocket, server → client `Event` messages (token as a subprotocol, below) |
+| POST | `/mcp` | MCP (streamable HTTP, stateless, protocol up to `2025-11-25`), tools listed and called as the caller's identity; `?scope=brain` narrows any caller to the brain tools under their own role. A brain run gets its own token (`opb_…`, in memory, valid for that run only, opens `?scope=brain` only and lists and calls only the tools it was minted with), on loopback too |
+
+**Limits.** The public routes (`/collar/v1/*`, `/hooks/*`, `/v1/*`) answer before their own
+checks are paid for: a peer refused (401, 403, 404) 30 times in a minute gets 429 with
+`Retry-After: 60` for the rest of it (collars behind one carrier address or one LoRa anchor share a
+peer, so only refusals count); one collar key may post 30 reports a minute (429 with
+`Retry-After: 10` past that); at most 64 public requests run at once (503 with `Retry-After: 5`);
+each has 30 s (503) and a `Content-Length` of at most 2 MB (413; a body without one meets axum's
+2 MB limit). At most 1,024 connections are open at once, and one with nothing sent either way for
+120 s is closed (the live feed pings every 15 s). Every response says `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`; the UI's pages add their
+`Content-Security-Policy` (`frame-ancestors 'none'`).
+
+**Hosted mode** (`OPENPASTURE_HOSTED=1`, the paid hosted service): URLs a person typed (the
+webhook, `twilio_api_base`, the `*_url` secrets such as `compatible_base_url` and `hosted_url`)
+may only reach the public internet: an IP literal or a name that resolves to this host, a private
+network, link-local (cloud metadata) or carrier-grade NAT is 400 when saved and refused again
+before each request.
+
+```ts
+TaskInfo {
+  name,                 // "alerts.engine", "ingest.moves", "ingest.escapes", "ingest.schedules", "ingest.activations",
+                        // "engine.scheduler", "notify.workers", "notify.wakes", "notify.status",
+                        // "analytics.rollup", "store.checkpoint", …
+  status: "running"     // and beating on time
+        | "stale"       // no heartbeat for 3 of its intervals (at least 60 s): stuck or very slow
+        | "restarting"  // panicked or stopped on its own; starts again after a backoff (1 s doubling to 60 s)
+        | "stopped",    // the server is shutting down
+  started_at, every_s?, last_beat_at?, restarts, last_error?, last_error_at?
+}
+Disk { db_bytes, wal_bytes, telemetry_bytes, snapshots_bytes, logs_bytes, total_bytes, free_bytes? }
+Work { moves, escapes, live_collars }   // sweeping moves, returning escapes, unparked collars heard from in the last 15 min
+CollarAddressCheck {
+  ok, url /* as it would be saved */, endpoint /* url + /collar/v1 */,
+  passed: Step[], failed?: Step, problem?: string   // the step that failed and why, in a sentence
+}
+Step = "address"   // https, a host a collar can reach (not this machine), not a quick-tunnel name, short enough
+     | "dns"       // the name resolves, and not only to this machine
+     | "https"     // it answers over https with a certificate a collar would accept (no redirects)
+     | "server"    // what answers is this server: GET <url>/collar/v1/reach/<nonce> comes back 204
+Retention { fixes_days: number | null, cues_days: number | null, health_days: number | null }  // null (default): keep for good
+```
+
+`capabilities` lists what this server can do (`analytics`, `sql`, `export`, `collar_address_check`,
+`live_ping`, …) so a client asks instead of probing. `work` is what stopping the server would cut
+short: the desktop app asks before quitting during a move or escape, keeps the Mac awake while
+there is any, and installs an update only once no move runs.
+
+**Collar address.** Collars talk only to https, can't reach this machine's loopback, and keep an
+address for up to a day after it stops answering, so the address that goes into collars
+(`server.collar_url`) is set on its own, after a check: the form, DNS, https with a valid
+certificate, and that it reaches this server (the server asks `<url>/collar/v1/reach/<nonce>`
+through the address itself, and only this process knows the nonce). A public URL alone is never
+handed to collars. `PUT /api/settings` with `server.collar_url` checks only the form.
+
+`healthz` is `degraded` while any job is `stale` or `restarting`. Retention deletes whole Parquet
+days (and SQLite rows) older than that many days; day summaries and episodes are kept.
 
 ```ts
 Event =
@@ -1699,19 +1942,21 @@ Event =
   | { type: "animals_changed", herd_id? }
   | { type: "schedule", schedule: Schedule }   // made, changed (staged, opened, skipped, held, retimed), paused, resumed or ended
   | { type: "resync" }                   // this socket fell behind and missed events: refetch state
+  | { type: "collar_wire", collar_id, entry: WireEntry }   // one /collar/v1 message (see Wire log); managers and up only
   // on /api/live only, never on the bus; they replace fix, ack and cue on the socket:
   | { type: "positions", herd_id, items: PositionItem[] }
   | { type: "ack_batch", herd_id, items: AckItem[] }
   | { type: "cue_batch", herd_id, items: CueItem[] }
   | { type: "batch", events: Event[] }   // one farm window's positions, ack_batch and cue_batch, in herd id order
+  | { type: "ping" }                     // every 15 s, so a quiet socket can be told from a dead one
 
 PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
 AckItem      { collar_id, version, status: "received"|"applied"|"rejected", code?, reason? }  // latest per collar
 CueItem      { collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }              // every cue, in order
 ```
 
-Each socket gets only the events its identity may see: `message` events go to managers and up
-(they carry phone numbers), everything else to every role. A report publishes one `fix` event per
+Each socket gets only the events its identity may see: `message` events (phone numbers) and
+`collar_wire` events (raw device traffic) go to managers and up, everything else to every role. A report publishes one `fix` event per
 collar (its newest new fix), not one per fix.
 
 **At herd scale.** `/api/live` sends the bus's `fix`, `ack` and `cue` events coalesced per herd
@@ -1735,6 +1980,13 @@ the coalescer) that falls behind gets `resync`. A socket opened with a person's 
 within 5 s once that token is revoked, the person disabled or their role changed; the browser
 reconnects as whoever it is now. A client's close gets a close back.
 
+**Liveness and the token.** Every 15 s the server sends `{ "type": "ping" }` and a WebSocket ping;
+a socket that sends nothing back (not even the pong) for 45 s is closed. A client that hears
+nothing for 45 s should close and reconnect (the app does, and at once on `online` or when the
+page is shown again, with jittered backoff otherwise). A browser can't set headers on a WebSocket,
+so the token goes in the subprotocol list, `["openpasture", "openpasture.token.<token>"]`; the
+server answers with `openpasture`.
+
 ## MCP tools
 
 `/mcp` lists and calls tools as the caller. Every tool call is logged at info
@@ -1753,11 +2005,12 @@ calling one answers "Unknown tool". The brain (`?scope=brain`) gets only the too
 | `search_knowledge` | viewer | yes | `query, limit?` |
 | `list_decisions` | viewer | yes | `herd_id?, limit?` |
 | `get_decision` | viewer | yes | `decision_id` |
-| `run_sql` | viewer | yes | `query, max_rows?` |
+| `run_sql` | manager | yes | `query, max_rows?` |
 | `get_morning_brief` | viewer | | `herd_id?` → `Brief` |
 | `check_boundary` | viewer | | `geometry, herd_id?, warn_m?, effective_at?, sweep?` → `CheckResult` |
 | `get_schedule` | viewer | | `herd_id?` → `{ herd_id, schedule \| null, moves, next? }` |
 | `list_features` | viewer | | `kind?, paddock_id?, active?: bool` → `MapFeature[]` |
+| `list_farm_rules` | viewer | | → `{ rules: { id, text, feature_id?, by?, at }[] }` |
 | `list_animals` | viewer | | `herd_id?, q?, removed?` (see Animals) |
 | `get_coverage` | viewer | | `metric?, from?, to?, cell_m?, herd_id?` → `Coverage` (at most the 500 weakest cells) |
 | `get_fleet` | viewer | | `herd_id?` → `{ fit_check_days, collars: FleetRow[] }` |
@@ -1766,11 +2019,13 @@ calling one answers "Unknown tool". The brain (`?scope=brain`) gets only the too
 | `list_alerts` | viewer | | `status?, herd_id?, limit?` → `Alert[]` |
 | `ack_alert` | hand | | `id` |
 | `resolve_alert` | hand | | `id` |
-| `propose_boundary` | manager | | `reasoning, herd_id?, to_paddock_id?, geometry?, confidence?`: records a decision; the herd's autonomy still applies |
+| `propose_boundary` | manager | | `reasoning, herd_id?, to_paddock_id?, geometry?, rules?, confidence?`: records a decision (reviewed, see "Farm rules"); the herd's autonomy applies only when the review is clean |
 | `schedule_strips` | manager | | `herd_id?, layout_id? \| orientation_deg + count \| width_m \| days, every_days?, at?, starts_at?, back_fence?: boolean, next_index?` |
 
 `herd_id` may be left out when the farm has one herd. `run_sql` is one read-only query, as
-`/api/sql`; questions by text never get it.
+`/api/sql` (a manager's; a brain run has it under its own token); questions by text never get it.
+Every write tool's description ends with the farm's rules, numbered, and what the safety gate
+refuses.
 
 ## Analytics at 250 collars (op-analytics)
 
@@ -1858,7 +2113,10 @@ with the load): health 34 s → 6-9 s, heatmap 50 s → 2-3 s, behaviour 35 s �
 day or a week), pasture 9-15 s → 9-15 s (its one pass sorts the day; a per-collar day summary
 kept at ingest is what would make it and behaviour's dwell fast).
 
-**Dev tools.** `collar-sim --herds Cows=238,Heifers=12` runs several herds in one process (each
+**Dev tools.** The simulator lives in `simulation/` (`simulation/README.md`): `collar-sim farm`
+runs a throwaway simulated farm on its own server, data dir and port (7991), and refuses port 7878
+and data dirs with real collars; a plain run refuses port 7878 and servers with real collars.
+`--anchors <n>` gives each herd n anchors and the rest nodes (`device.device_class`). `collar-sim --herds Cows=238,Heifers=12` runs several herds in one process (each
 with its own paddock and herd view), `--ramp <s>` spreads the collars' first fixes over that many
 seconds, `--duration <s>` stops the run. `scripts/soak.sh` runs a server, collar-sim with 250
 collars, a counting proxy for the collars' traffic, a farm webhook, a live-socket counter and one
