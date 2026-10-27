@@ -1,0 +1,35 @@
+[package]
+name = "collar-bridge"
+description = "Bench and factory tool: a real OpenCollar's serial console to an openpasture server, with capture and replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "collar-bridge"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+op-protocol.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+# raw_value: configs and boundaries go to the collar byte for byte as signed.
+serde_json = { workspace = true, features = ["raw_value"] }
+chrono.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+libc.workspace = true
+
+[dev-dependencies]
+op-server.workspace = true
+op-core.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

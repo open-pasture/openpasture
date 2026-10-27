@@ -1,0 +1,20 @@
+*** Booting nRF Connect SDK v3.4.1-a7f9c4bd5e1d ***
+*** Using Zephyr OS v4.2.99-1b9d2a4ebd3b ***
+[00:00:00.251,000] <inf> opencollar: OpenCollar 0.2.0 starting
+[00:00:00.262,000] <inf> opencollar: Collar col_bench, herd hrd_bench, config none
+[00:00:00.263,000] <inf> opencollar: Boundary v3 enforced from flash: 1 rings, 4 vertices
+[00:00:00.263,000] <inf> opencollar: 1 staged boundaries wait for the first GNSS fix
+[00:00:00.420,000] <inf> opencollar: GNSS started
+[00:00:10.420,000] <inf> opencollar: searching: 5 tracked, 0 in fix
+collar col_bench herd hrd_bench fw 0.2.0 config - active 3 slots 3 4
+[00:01:59.001,000] <inf> opencollar: fix 38.120000,-92.410000 acc=4.1m sats=7 v3 state=inside margin=12.4m ring=0 cue=off vol=0 at=2026-10-26T15:04:00Z
+[00:02:00.001,000] <inf> opencollar: fix 38.120010,-92.410000 acc=3.6m sats=8 v3 state=inside margin=8.1m ring=0 cue=off vol=0 at=2026-10-26T15:04:01Z
+[00:02:01.001,000] <inf> opencollar: fix 38.120020,-92.410000 acc=3.2m sats=8 v3 state=inside margin=5.6m ring=0 cue=off vol=0 at=2026-10-26T15:04:02Z
+[00:02:02.001,000] <inf> opencollar: fix 38.120030,-92.410000 acc=3.0m sats=9 v3 state=warning margin=3.1m ring=0 cue=warn vol=2 at=2026-10-26T15:04:03Z
+[00:02:02.002,000] <inf> opencollar: event: state -> warning
+[00:02:03.001,000] <inf> opencollar: fix 38.120040,-92.410000 acc=3.0m sats=9 v3 state=warning margin=0.4m ring=0 cue=warn vol=4 at=2026-10-26T15:04:04Z
+[00:02:04.001,000] <inf> opencollar: fix 38.120050,-92.410000 acc=3.1m sats=9 v3 state=outside margin=-0.6m ring=0 cue=outside vol=4 at=2026-10-26T15:04:05Z
+[00:02:04.002,000] <inf> opencollar: event: state -> outside
+[00:02:04.003,000] <inf> opencollar: episode: crossed ring=0 cues=2 max=4 min_margin=-0.6m 2000 ms
+[00:02:05.001,000] <inf> opencollar: event: staged boundary v4 now in force
+[00:02:05.002,000] <inf> opencollar: ack v4 applied at 2026-10-26T15:04:06Z (1 pending)
