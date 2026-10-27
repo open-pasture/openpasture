@@ -1,0 +1,36 @@
+/* Fleet (op-fleet): the Fleet view, the collar console, first contact in the herd panel, labels.
+   Patterns from base.css: .kv, .tbl, .line, .seg. */
+.fleet{height:100%;overflow:auto;padding:16px 24px 48px}
+.fleet .fbar{margin-bottom:16px}
+.fleet .fbody{display:flex;flex-direction:column;gap:12px;max-width:1100px}
+.fleet h3{font-size:13px;font-weight:550;margin-top:12px}
+.fleet .tbl td.wrap{white-space:normal}
+.fleet .tbl tr.click{cursor:pointer}
+.fline{flex-wrap:wrap;gap:8px}
+.fline .grow{flex:1;min-width:180px}
+.fclaim,.fdone{display:flex;flex-direction:column;gap:6px}
+.fdone p{font-size:13px}
+.funit{display:flex;flex-direction:column;gap:10px}
+.funit .kv{max-width:520px}
+.frun>button.line{gap:12px;font-size:13px;padding:4px 0;width:100%;text-align:left}
+.fplan .lim{width:9ch}
+.fplan h3 .mono{font-size:11.5px;margin-left:6px}
+.fwset{display:flex;flex-direction:column;gap:6px}
+.fwset p{font-size:12.5px}
+
+.fwait{display:flex;flex-direction:column;gap:4px;padding:6px 0;font-size:12.5px}
+.fwait li{display:flex;gap:8px;align-items:baseline}
+.fwait a{color:var(--fg)}
+
+.fcon{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.fcon h3{font-size:12.5px;font-weight:550;color:var(--fg2)}
+.fcon .tbl td{padding:5px 10px}
+.fwaiting{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.ffence{font-family:var(--mono);font-size:12.5px;color:var(--fg2)}
+.flog summary{cursor:pointer;font-size:12.5px;color:var(--fg2);padding:4px 0}
+.flog summary .dim{margin-left:6px;font-family:var(--mono);font-size:11.5px}
+.fwire{font-size:11.5px;line-height:17px;color:var(--fg2);max-height:320px;overflow:auto;margin:4px 0 0;white-space:pre}
+
+.flabels{display:flex;flex-wrap:wrap;gap:4mm;padding:4mm}
+.flabel{margin:0;width:50mm;height:25mm;break-inside:avoid}
+.flabel svg{width:50mm;height:25mm}
