@@ -1,5 +1,8 @@
-//! Protocol v1 test vectors (field-ready contract §3.10), shared with the
-//! firmware: EF copies `tests/vectors/*.json` byte-identical into
+//! Test vectors for v1 commands and for the fence itself (shapes, geofence,
+//! slots, cues), shared with the firmware. The published copy is
+//! `opencollar/protocol/vectors/` (the source of truth, see its README);
+//! `vectors/` here must stay byte-identical to it (`vectors_v2.rs` checks),
+//! and the firmware copies the files it runs into
 //! `opencollar/firmware/tests/host/vectors/`.
 //!
 //! Every expected result below is written by hand (codes, validity, acks),
@@ -46,7 +49,7 @@ fn t0() -> DateTime<Utc> {
 }
 
 fn dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors")
 }
 
 /// A file: header fields pretty, one compact case per line.
@@ -719,6 +722,18 @@ fn boot() -> SlotStep {
     SlotStep { op: "boot".into(), ..Default::default() }
 }
 
+/// A signed config naming `herd` took effect.
+fn set_herd(herd: &str) -> SlotStep {
+    SlotStep { op: "set_herd".into(), herd_id: Some(herd.into()), ..Default::default() }
+}
+
+/// `step` for a command of `herd`.
+fn of_herd(herd: &str, step: SlotStep) -> SlotStep {
+    SlotStep { herd_id: Some(herd.into()), ..step }
+}
+
+const OTHER_HERD: &str = "herd_01J7OTHER";
+
 fn ack(version: u32, status: &str, at_s: Option<i64>) -> ExpAck {
     ExpAck { version, status: status.into(), code: None, at: at_s.map(at) }
 }
@@ -875,6 +890,37 @@ fn slot_cases() -> Vec<SlotCase> {
         v0,
         vec![(insert(1, Some(-60), Some(0)), state(vec![ack(1, "applied", Some(0))], Some(1), 1, 15, fb(1)))],
     ));
+    // A herd change drops the other herd's staged slots with no ack; the
+    // active boundary stays until one of the new herd applies. A version
+    // refused `wrong_herd` before the change is taken after it.
+    out.push(case(
+        "herd_change_drops_staged",
+        v0,
+        vec![
+            (insert(10, None, Some(0)), state(vec![ack(10, "applied", Some(0))], Some(10), 10, 15, fb(1))),
+            (insert(13, Some(3600), Some(0)), state(vec![ack(13, "received", Some(0))], Some(10), 13, 14, fb(2))),
+            (of_herd(OTHER_HERD, insert(14, None, Some(10))), state(vec![rejected(14, RejectCode::WrongHerd, Some(10))], Some(10), 13, 14, fb(2))),
+            (set_herd(OTHER_HERD), state(vec![], Some(10), 10, 15, fb(1))),
+            (tick(3600), state(vec![], Some(10), 10, 15, fb(1))),
+            (boot(), state(vec![], Some(10), 10, 15, fb(1))),
+            (tick(3601), state(vec![], Some(10), 10, 15, fb(1))),
+            (of_herd(OTHER_HERD, insert(12, None, Some(3605))), state(vec![ack(12, "applied", Some(3605))], Some(12), 12, 15, fb(1))),
+            (of_herd(OTHER_HERD, insert(14, None, Some(3610))), state(vec![ack(14, "applied", Some(3610))], Some(14), 14, 15, fb(1))),
+        ],
+    ));
+    out.push(case(
+        "herd_change_keeps_own_herds_staged",
+        v0,
+        vec![
+            (insert(1, None, Some(0)), state(vec![ack(1, "applied", Some(0))], Some(1), 1, 15, fb(1))),
+            (insert(2, Some(600), Some(0)), state(vec![ack(2, "received", Some(0))], Some(1), 2, 14, fb(2))),
+            (set_herd(SLOT_HERD), state(vec![], Some(1), 2, 14, fb(2))),
+            (set_herd(OTHER_HERD), state(vec![], Some(1), 1, 15, fb(1))),
+            (of_herd(OTHER_HERD, insert(3, Some(1200), Some(5))), state(vec![ack(3, "received", Some(5))], Some(1), 3, 14, fb(2))),
+            (set_herd(SLOT_HERD), state(vec![], Some(1), 1, 15, fb(1))),
+            (tick(1800), state(vec![], Some(1), 1, 15, fb(1))),
+        ],
+    ));
     out
 }
 
@@ -908,6 +954,190 @@ fn slot_command(case: &SlotCase, step: &SlotStep) -> BoundaryCommand {
     cmd
 }
 
+// ---------------------------------------------------------------- cue
+
+/// One step of a cue case: a fence result (`fix`), a new boundary
+/// (`rearm`), or a cue mode change (`mode`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CueStep {
+    op: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    t_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    margin_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ring: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CueOut {
+    kind: String,
+    level: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct EpisodeOut {
+    start_ms: i64,
+    end_ms: i64,
+    ring: usize,
+    cues: u32,
+    max_level: u8,
+    min_margin_m: f64,
+    outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CueExpect {
+    cue: Option<CueOut>,
+    armed: bool,
+    episodes: Vec<EpisodeOut>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CueCase {
+    name: String,
+    warn_m: f64,
+    steps: Vec<CueStep>,
+    expect: Vec<CueExpect>,
+}
+
+fn fix(t_ms: i64, state: &str, margin_m: f64) -> CueStep {
+    CueStep { op: "fix".into(), t_ms: Some(t_ms), state: Some(state.into()), margin_m: Some(margin_m), ring: Some(0), mode: None }
+}
+
+fn fix_ring(t_ms: i64, state: &str, margin_m: f64, ring: usize) -> CueStep {
+    CueStep { ring: Some(ring), ..fix(t_ms, state, margin_m) }
+}
+
+fn rearm(t_ms: i64) -> CueStep {
+    CueStep { op: "rearm".into(), t_ms: Some(t_ms), ..Default::default() }
+}
+
+fn mode(m: &str) -> CueStep {
+    CueStep { op: "mode".into(), mode: Some(m.into()), ..Default::default() }
+}
+
+fn geo_state(s: &str) -> op_geo::GeofenceState {
+    match s {
+        "inside" => op_geo::GeofenceState::Inside,
+        "warning" => op_geo::GeofenceState::Warning,
+        "outside" => op_geo::GeofenceState::Outside,
+        _ => op_geo::GeofenceState::Unknown,
+    }
+}
+
+/// Run a case through op-geo's cue policy (the port of the firmware's `cue.c`).
+fn run_cue(warn_m: f64, steps: &[CueStep]) -> Vec<CueExpect> {
+    let mut cue = op_geo::Cue::new(op_geo::CueConfig::default());
+    steps
+        .iter()
+        .map(|s| {
+            let mut out = None;
+            match s.op.as_str() {
+                "fix" => {
+                    let r = op_geo::GeofenceResult {
+                        state: geo_state(s.state.as_deref().unwrap()),
+                        margin_m: s.margin_m.unwrap(),
+                        nearest_ring: s.ring.unwrap_or(0),
+                        ..Default::default()
+                    };
+                    let c = cue.update(&r, warn_m, s.t_ms.unwrap());
+                    out = c.active.then(|| CueOut { kind: c.kind.unwrap().as_str().into(), level: c.volume });
+                }
+                "rearm" => cue.rearm_at(s.t_ms.unwrap()),
+                "mode" => cue.set_mode(if s.mode.as_deref() == Some("track") { CueMode::Track } else { CueMode::Audio }),
+                op => panic!("unknown op {op}"),
+            }
+            let episodes = cue
+                .take_episodes()
+                .into_iter()
+                .map(|e| EpisodeOut {
+                    start_ms: e.start,
+                    end_ms: e.end,
+                    ring: e.ring,
+                    cues: e.cues,
+                    max_level: e.max_level,
+                    min_margin_m: e.min_margin_m,
+                    outcome: e.outcome.as_str().into(),
+                })
+                .collect();
+            CueExpect { cue: out, armed: cue.armed(), episodes }
+        })
+        .collect()
+}
+
+fn cue_cases() -> Vec<CueCase> {
+    let case = |name: &str, steps: Vec<CueStep>| CueCase { name: name.into(), warn_m: 5.0, expect: run_cue(5.0, &steps), steps };
+    let mut rest = vec![fix(0, "warning", 2.0)];
+    rest.extend((1..=19).map(|i| fix(i * 1000, "warning", 2.0)));
+    rest.extend([fix(20_000, "warning", 2.0), fix(49_000, "warning", 2.0), fix(50_000, "warning", 2.0)]);
+    let cases = vec![
+        case("warning_louder_toward_the_edge", vec![fix(0, "warning", 4.9), fix(1000, "warning", 0.1), fix(2000, "warning", 0.0), fix(3000, "inside", 20.0)]),
+        case("warning_zone_arms_after_boot", vec![fix(0, "warning", 1.0), fix(1000, "warning", 1.5)]),
+        case("rest_after_20_s_of_cueing", rest),
+        case(
+            "outside_tone_stops_after_10_s",
+            vec![fix(0, "inside", 20.0), fix(1000, "outside", -3.0), fix(10_000, "outside", -3.0), fix(11_000, "outside", -3.0), fix(60_000, "outside", -3.0)],
+        ),
+        case(
+            "boundary_leaves_the_animal_outside",
+            vec![
+                fix(0, "outside", -20.0),
+                fix(5000, "outside", -10.0),
+                fix(10_000, "warning", 2.0),
+                fix(15_000, "inside", 10.0),
+                fix(20_000, "warning", 3.0),
+                fix(25_000, "outside", -1.0),
+            ],
+        ),
+        case(
+            "walking_back_in_is_not_cued",
+            vec![
+                fix(0, "inside", 20.0),
+                fix(1000, "outside", -2.0),
+                fix(12_000, "warning", 1.0),
+                fix(13_000, "warning", 4.0),
+                fix(14_000, "inside", 6.0),
+                fix(15_000, "warning", 4.0),
+            ],
+        ),
+        case(
+            "new_boundary_ends_the_episode",
+            vec![fix(0, "inside", 20.0), fix(1000, "warning", 2.0), rearm(1500), fix(2000, "warning", 2.0), fix(3000, "inside", 8.0)],
+        ),
+        case(
+            "track_mode_is_silent",
+            vec![
+                mode("track"),
+                fix(0, "inside", 20.0),
+                fix(1000, "warning", 2.0),
+                fix(2000, "outside", -1.0),
+                mode("audio"),
+                fix(3000, "inside", 20.0),
+                fix(4000, "warning", 2.0),
+            ],
+        ),
+        case("mode_change_ends_the_episode", vec![fix(0, "inside", 20.0), fix(1000, "warning", 2.0), mode("track"), fix(2000, "warning", 1.0)]),
+        case("crossing_into_a_hole", vec![fix_ring(0, "inside", 30.0, 0), fix_ring(1000, "warning", 2.0, 1), fix_ring(2000, "outside", -0.5, 1)]),
+        case("unknown_state_changes_nothing", vec![fix(0, "unknown", 0.0), fix(1000, "warning", 2.0), fix(2000, "unknown", 0.0), fix(3000, "warning", 1.0)]),
+    ];
+    // What the rules say, checked by hand on the reference's output.
+    let by = |n: &str| cases.iter().find(|c| c.name == n).unwrap();
+    let levels: Vec<Option<u8>> = by("warning_louder_toward_the_edge").expect.iter().map(|e| e.cue.as_ref().map(|c| c.level)).collect();
+    assert_eq!(levels, [Some(1), Some(3), Some(4), None]);
+    assert!(by("boundary_leaves_the_animal_outside").expect[..4].iter().all(|e| e.cue.is_none()), "outside and walking in: silent");
+    assert_eq!(by("boundary_leaves_the_animal_outside").expect[5].cue.as_ref().unwrap().kind, "outside", "a crossing is cued");
+    assert_eq!(by("rest_after_20_s_of_cueing").expect[20].episodes[0].outcome, "rest");
+    assert_eq!(by("new_boundary_ends_the_episode").expect[2].episodes[0].outcome, "boundary_changed");
+    assert!(by("track_mode_is_silent").expect[1..4].iter().all(|e| e.cue.is_none() && e.episodes.is_empty()));
+    assert_eq!(by("crossing_into_a_hole").expect[2].episodes[0].ring, 1);
+    cases
+}
+
 // ---------------------------------------------------------------- files
 
 fn render() -> Vec<(&'static str, String)> {
@@ -923,6 +1153,7 @@ fn render() -> Vec<(&'static str, String)> {
         ("shapes.json", file(&[("slack_m", json(&0.0))], &shape_cases())),
         ("geofence.json", file(&[("tolerance_m", json(&0.001))], &geofence_cases())),
         ("slots.json", file(&[("start", json(&T0))], &slot_cases())),
+        ("cue.json", file(&[("config", json(&op_geo::CueConfig::default()))], &cue_cases())),
     ]
 }
 
@@ -1049,10 +1280,30 @@ fn slots_agree() {
                     store.boot();
                     vec![]
                 }
+                "set_herd" => {
+                    store.set_herd(step.herd_id.clone());
+                    vec![]
+                }
                 op => panic!("unknown op {op}"),
             };
             let got = Expect { acks, active: store.active().map(|a| a.cmd.version), have: store.have(), free: store.free(), free_bytes: store.free_bytes() };
             assert_eq!(&got, expect, "{} step {i} ({})", case.name, step.op);
+        }
+    }
+}
+
+#[test]
+fn cue_agrees() {
+    #[derive(Deserialize)]
+    struct F {
+        config: op_geo::CueConfig,
+        cases: Vec<CueCase>,
+    }
+    let f: F = read("cue.json");
+    assert_eq!(f.config, op_geo::CueConfig::default());
+    for c in &f.cases {
+        for (i, (got, want)) in run_cue(c.warn_m, &c.steps).iter().zip(&c.expect).enumerate() {
+            assert_eq!(got, want, "{} step {i}", c.name);
         }
     }
 }

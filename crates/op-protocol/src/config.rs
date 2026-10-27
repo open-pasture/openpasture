@@ -1,4 +1,4 @@
-//! Collar configuration (protocol v1, §3.4): the signed command that sets a
+//! Collar configuration (protocol README, Config command): the signed command that sets a
 //! collar's herd, endpoint and report cadence. It rides inline in
 //! [`crate::ReportResponse::config`].
 

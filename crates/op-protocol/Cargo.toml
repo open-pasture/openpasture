@@ -1,6 +1,6 @@
 [package]
 name = "op-protocol"
-description = "OpenCollar device protocol: boundary commands, acks, position reports, validation and signing"
+description = "OpenCollar device protocol: v1 (JSON) and the v2 draft (CBOR, COSE, LoRa frames): commands, records, validation and signing"
 version.workspace = true
 edition.workspace = true
 license = "Apache-2.0"
@@ -15,6 +15,9 @@ chrono.workspace = true
 ed25519-dalek.workspace = true
 base64.workspace = true
 rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+aes.workspace = true
 
 [lints]
 workspace = true

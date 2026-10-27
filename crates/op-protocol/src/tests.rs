@@ -155,7 +155,9 @@ fn readme_report_and_ack_parse() {
     )
     .unwrap();
     assert_eq!(ack.reason.as_deref(), Some("Ring crosses itself."));
-    assert!(serde_json::from_value::<Ack>(json!({ "command_id": "bc", "version": 1, "status": "maybe", "at": "2026-09-25T12:30:04Z" })).is_err());
+    // A status this build doesn't know is kept, not refused.
+    let ack: Ack = serde_json::from_value(json!({ "command_id": "bc", "version": 1, "status": "maybe", "at": "2026-09-25T12:30:04Z" })).unwrap();
+    assert_eq!((ack.status.known(), ack.status.as_str()), (None, "maybe"));
 }
 
 #[test]
@@ -242,7 +244,7 @@ fn new_fields_are_omitted_when_empty_and_signed_when_present() {
     let explicit: BoundaryCommand = serde_json::from_str(r#"{"command_id":"b","version":1,"boundary":[],"cue_mode":"audio"}"#).unwrap();
     assert_eq!(explicit.cue_mode, CueMode::Audio);
     // Other wire types: nothing new appears until set.
-    let ack = Ack { command_id: "bnd_x".into(), version: 3, status: AckStatus::Applied, at: t("2026-09-27T12:00:00Z"), ..Default::default() };
+    let ack = Ack { command_id: "bnd_x".into(), version: 3, status: AckStatus::Applied.into(), at: t("2026-09-27T12:00:00Z"), ..Default::default() };
     assert_eq!(serde_json::to_string(&ack).unwrap(), r#"{"command_id":"bnd_x","version":3,"status":"applied","at":"2026-09-27T12:00:00Z"}"#);
     let rep = PositionReport {
         boundary_version: Some(3),
@@ -354,7 +356,7 @@ fn readme_v1_report_parses() {
     let slots = report.slots.as_ref().unwrap();
     assert_eq!((slots[1].version, slots[1].status), (58, AckStatus::Received));
     assert_eq!(report.fixes[0].hdop, Some(0.9));
-    assert_eq!((report.cues[0].kind, report.cues[0].ring, report.cues[0].dur_ms), (Some(CueKind::Warn), Some(2), Some(300)));
+    assert_eq!((report.cues[0].kind.clone(), report.cues[0].ring, report.cues[0].dur_ms), (Some(CueKind::Warn.into()), Some(2), Some(300)));
     assert_eq!(report.episodes[0].outcome, EpisodeOutcome::TurnedBack);
     let h = report.health.as_ref().unwrap();
     assert_eq!((h.fix_ok, h.cell.as_ref().unwrap().rsrp_dbm, h.charging, h.reset.as_deref()), (Some(118), Some(-104.0), Some(true), Some("power_on")));
@@ -422,7 +424,7 @@ fn episodes_convert_from_the_cue_policy() {
     };
     let w = WireEpisode::from_episode(&e, Some(57)).unwrap();
     assert_eq!((w.end - w.start).num_seconds(), 12);
-    assert_eq!((w.ring, w.boundary_version, w.outcome), (2, Some(57), EpisodeOutcome::Crossed));
+    assert_eq!((w.ring, w.boundary_version, w.outcome.clone()), (2, Some(57), EpisodeOutcome::Crossed.into()));
     assert_eq!(serde_json::to_value(&w).unwrap()["outcome"], "crossed");
 }
 

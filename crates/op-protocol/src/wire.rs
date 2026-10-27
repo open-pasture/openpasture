@@ -1,5 +1,5 @@
 //! Commands as a collar receives them: raw bytes, scanned the way the
-//! firmware scans them (protocol v1, §3.2).
+//! firmware scans them (protocol README, Signing).
 //!
 //! The collar doesn't parse JSON into a tree. It records up to 16 top-level
 //! key/value spans, sorts them by key bytes, copies each value token verbatim

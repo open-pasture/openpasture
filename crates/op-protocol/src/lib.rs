@@ -1,11 +1,17 @@
-//! The OpenCollar device protocol, v1 (field-ready contract §3; the V0 shape
-//! of `opencollar/protocol/README.md` is a subset and serializes byte for byte
-//! as before).
+//! The OpenCollar device protocol, v1, as specified in
+//! `opencollar/protocol/README.md` (the firmware 0.1 shape is a subset and
+//! serializes byte for byte as before). [`v2`] is the draft of protocol v2,
+//! `opencollar/protocol/v2/`.
 //!
 //! Boundaries go down ([`BoundaryCommand`]), so does collar configuration
 //! ([`ConfigCommand`], inside [`ReportResponse`]); acknowledgements ([`Ack`])
-//! and position reports ([`PositionReport`]) come up. HTTP + JSON; the same
-//! logical messages may map one to one onto CBOR later.
+//! and position reports ([`PositionReport`]) come up, over HTTP + JSON. v2
+//! carries the same fence in compact CBOR over LoRa and LTE.
+//!
+//! Uplink values from the protocol's registries (cue kinds, episode
+//! outcomes, ack and slot statuses, reject codes) are lenient: a value this
+//! build doesn't know is kept as sent ([`Named`]) or read as unknown, never
+//! refusing the whole report.
 //!
 //! Commands are signed with Ed25519 over their canonical JSON without `sig`
 //! (see [`canonical_json`] and [`sign_command`]) so a collar only accepts its
@@ -19,8 +25,10 @@
 
 mod canonical;
 pub mod config;
+mod named;
 mod sign;
 pub mod slots;
+pub mod v2;
 pub mod wire;
 pub mod wire_time;
 
@@ -32,6 +40,7 @@ use serde::{Deserialize, Serialize};
 pub use canonical::canonical_json;
 pub use config::{ConfigCommand, sign_config, verify_config};
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
+pub use named::{Named, RegistryName};
 pub use op_geo::{CollarLimits, CueKind, CueMode, EpisodeOutcome};
 pub use sign::{
     decode_public_key, decode_signing_key, encode_public_key, encode_signing_key, generate_signing_key, sign_command, signing_payload, verify_command,
@@ -69,6 +78,9 @@ pub mod caps {
     pub const CONFIG: &str = "config";
     /// Everything firmware 0.2 does.
     pub const ALL: [&str; 6] = [HOLES, SLOTS, COLLAR_ID, CUE_MODE, EPISODES, CONFIG];
+    /// A simulated collar, not on an animal. Every simulated collar lists it,
+    /// and servers show its data as simulated.
+    pub const SIM: &str = "sim";
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -93,7 +105,7 @@ pub enum ProtocolError {
     Rejected(RejectCode),
 }
 
-/// Why a collar rejected a command (the ack's `code`, protocol v1 §3.5).
+/// Why a collar rejected a command (the ack's `code`; protocol README, Validation).
 /// Every code except `slots_full` is permanent: the server doesn't offer
 /// that version to that collar again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -260,7 +272,7 @@ fn id_ok(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID_BYTES
 }
 
-/// A boundary sent to a collar (§3.2). `boundary` is the outer ring and
+/// A boundary sent to a collar (protocol README, Boundary command). `boundary` is the outer ring and
 /// `holes` the holes, each unclosed, `[lon, lat]` with at most 7 decimals.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoundaryCommand {
@@ -471,7 +483,8 @@ pub struct Ack {
     pub collar_id: Option<String>,
     pub command_id: String,
     pub version: u32,
-    pub status: AckStatus,
+    /// A status this build doesn't know is kept as sent.
+    pub status: Named<AckStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Why it was rejected. A code this build doesn't know reads as `None`.
@@ -513,9 +526,10 @@ pub struct WireFix {
 pub struct WireCue {
     #[serde(with = "wire_time")]
     pub at: DateTime<Utc>,
-    /// Absent from firmware 0.1: readers take `outside` when `margin_m` < 0, else `warn`.
+    /// Absent from firmware 0.1: readers take `outside` when `margin_m` < 0,
+    /// else `warn`. A kind this build doesn't know is kept as sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<CueKind>,
+    pub kind: Option<Named<CueKind>>,
     pub level: u8,
     /// Tone length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,7 +545,7 @@ pub struct WireCue {
     pub point: Option<LonLat>,
 }
 
-/// A run of armed warning cues (§3.6).
+/// A run of armed warning cues (protocol README, Geofence and cues).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireEpisode {
     #[serde(with = "wire_time")]
@@ -544,7 +558,8 @@ pub struct WireEpisode {
     pub cues: u32,
     pub max_level: u8,
     pub min_margin_m: f64,
-    pub outcome: EpisodeOutcome,
+    /// An outcome this build doesn't know is kept as sent.
+    pub outcome: Named<EpisodeOutcome>,
 }
 
 impl WireEpisode {
@@ -558,7 +573,7 @@ impl WireEpisode {
             cues: e.cues,
             max_level: e.max_level,
             min_margin_m: e.min_margin_m,
-            outcome: e.outcome,
+            outcome: e.outcome.into(),
         })
     }
 }
@@ -628,7 +643,7 @@ pub struct ConfigReject {
     pub code: Option<RejectCode>,
 }
 
-/// What the collar is (§3.8 `device`).
+/// What the collar is (the report's `device`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,6 +657,11 @@ pub struct DeviceInfo {
     pub config_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_reject: Option<ConfigReject>,
+    /// The device class by name (registry: `node`, `anchor`, `station`,
+    /// `direct`), for a collar that knows its place in a herd network.
+    /// Optional in v1: firmware 0.2 doesn't send it; the simulator does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_class: Option<String>,
 }
 
 impl DeviceInfo {
@@ -659,11 +679,14 @@ impl DeviceInfo {
     }
 }
 
-/// One boundary a collar holds (§3.8 `slots`): `applied` (the one in effect)
+/// One boundary a collar holds (the report's `slots`): `applied` (the one in effect)
 /// or `received` (staged).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlotReport {
     pub version: u32,
+    /// A status this build doesn't know reads as `received`: the collar
+    /// holds that version, not in effect.
+    #[serde(deserialize_with = "named::held_status")]
     pub status: AckStatus,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "wire_time::option")]
     pub effective_at: Option<DateTime<Utc>>,

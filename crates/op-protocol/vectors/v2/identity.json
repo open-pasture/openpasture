@@ -1,0 +1,24 @@
+{
+  "keys": {"anchor":{"kid":"519cae93e93ad011","public":"cd14b37f956e953194ff7fb73b3d81dcc561d61a7538094b7c3e1a643ee5f3aa","seed":"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"},"device":{"kid":"68894d58f18f2c34","public":"174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5","seed":"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"},"maker":{"kid":"a18112b0b7b4225f","public":"4fd099ccd47d7893dfe9ec24414ecb0d9b5420232aad30d91c465be33cbe65c4","seed":"a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"},"new_owner":{"kid":"9b4369d4b0fcc017","public":"13d9908a70925992ed546007d27f50da68ba7217ef62ac3cca784529ff10471c","seed":"e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"},"next_server":{"kid":"24f6ed6acbfe1009","public":"29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7","seed":"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"},"owner":{"kid":"03396219237f75a6","public":"2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d","seed":"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"},"release":{"kid":"b9bef12177642648","public":"dde3bccec7f3a66a1115f45d720f4dc135c3ae7c4e22dca38fdb1efd6a495ff8","seed":"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"},"server":{"kid":"56475aa75463474c","public":"03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8","seed":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}},
+  "device_id": "68894d58f18f2c34",
+  "claim": {"claim_check":"82b5cea0a254b8af8b8a7cbfc0bda231","claim_key":"6d2a64f7028cad511605edee49dc16d9a34f08593d873f861cc0a7704b5581f2","code":"7Q4K9M2XH8D3TV5W","device_id":"68894d58f18f2c34","herd":"4845524430303031","nonce":"4e4f4e4345303031","proof":"9971e814586263d694669eb068c29b18","server_key":"29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7"},
+  "card": {"claim_code":"7Q4K9M2XH8D3TV5W","device_key":"174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5","serial":"OCN-2611-00123","text":"OC2:OCN-2611-00123:F0VTtFbd38aQjsqxwQH-arIeK6oGF3lbfUOmNIKZP9U:7Q4K9M2XH8D3TV5W"},
+  "manifest": {"hex":"d2844da201270448b9bef12177642648a05849a80018411065322e312e301158205a5b58595e5f5c5d52535051565754554a4b48494e4f4c4d4243404146474445121a00033e00138201021482644e312e306441312e301502161832584028c6e5aaaf9e7783acd255fde09cd030876ce62d9c8c0a16283f693c6fed590d36b0a9ccbb0b421cd29bfa94c735e2d6058bf11edecb1617953167380544010f","json":{"classes":["node","anchor"],"digest":"5a5b58595e5f5c5d52535051565754554a4b48494e4f4c4d4243404146474445","hw_revs":["N1.0","A1.0"],"min_battery":50,"security_counter":2,"size":212480,"type":"manifest","version":"2.1.0"},"min_battery_floor":40},
+  "claim_codes": [
+    {"input":"7Q4K-9M2X-H8D3-TV5W","normalized":"7Q4K9M2XH8D3TV5W"},
+    {"input":"7q4k 9m2x h8d3 tv5w","normalized":"7Q4K9M2XH8D3TV5W"},
+    {"input":"IL0O-0000-0000-0000","normalized":"1100000000000000"},
+    {"input":"7Q4K9M2XH8D3TV5","normalized":null},
+    {"input":"7Q4K9M2XH8D3TV5U","normalized":null}
+  ],
+  "install": [
+    {"battery":80,"class":"node","escaping":false,"expect":"ok","hw_rev":"N1.0","moving":false,"name":"installs","security_counter":2},
+    {"battery":80,"class":"node","escaping":false,"expect":"incompatible","hw_rev":"N0.9","moving":false,"name":"other_board","security_counter":2},
+    {"battery":80,"class":"station","escaping":false,"expect":"incompatible","hw_rev":"N1.0","moving":false,"name":"station_class","security_counter":2},
+    {"battery":80,"class":"node","escaping":false,"expect":"downgrade","hw_rev":"N1.0","moving":false,"name":"older_than_running","security_counter":3},
+    {"battery":49,"class":"node","escaping":false,"expect":"not_now","hw_rev":"N1.0","moving":false,"name":"battery_under_the_manifest_minimum","security_counter":2},
+    {"battery":null,"class":"node","escaping":false,"expect":"not_now","hw_rev":"N1.0","moving":false,"name":"battery_unknown","security_counter":2},
+    {"battery":80,"class":"node","escaping":false,"expect":"not_now","hw_rev":"N1.0","moving":true,"name":"during_a_move","security_counter":2},
+    {"battery":80,"class":"node","escaping":true,"expect":"not_now","hw_rev":"N1.0","moving":false,"name":"during_an_escape","security_counter":2}
+  ]
+}

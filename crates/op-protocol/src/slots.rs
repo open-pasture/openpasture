@@ -1,4 +1,4 @@
-//! Slots: the boundaries a collar holds (protocol v1, §3.7). This is the
+//! Slots: the boundaries a collar holds (protocol README, Slots). This is the
 //! reference logic the firmware's `slots.c` and collar-sim follow, and
 //! [`split_by_activation`] is the same rule for the server's view.
 //!
@@ -18,6 +18,9 @@
 //!   staged slots get no ack), and it is acked `applied` at the fix's time.
 //! - **Boot** keeps every slot (they are in flash) and enforces the active
 //!   one at once, but forgets the clock: staged slots wait for the first fix.
+//! - **Herd change** (a signed config naming another herd) drops the staged
+//!   slots of every other herd; the active boundary stays until one of the
+//!   new herd applies.
 //!
 //! The order of checks on insert: ids (`bad_json`), `wrong_herd`,
 //! `wrong_collar`, re-ack or `stale`, the shape rules, `slots_full`.
@@ -68,7 +71,7 @@ impl SlotAck {
         Ack {
             command_id: self.command_id.clone(),
             version: self.version,
-            status: self.status,
+            status: self.status.into(),
             code: self.code,
             reason: self.code.map(|c| c.message().to_string()),
             at: self.at.unwrap_or(fallback),
@@ -103,9 +106,20 @@ impl SlotStore {
         &self.limits
     }
 
-    /// A signed config moved the collar to another herd.
+    /// A signed config moved the collar to another herd: staged slots of
+    /// any other herd go, with no ack (the next report's `slots` and a lower
+    /// `have` show it). The active boundary stays in force until one of the
+    /// new herd applies, so the collar is never left without a fence. Slots
+    /// whose command had no herd stay, as insert takes them in any herd.
     pub fn set_herd(&mut self, herd_id: Option<String>) {
         self.herd_id = herd_id;
+        self.drop_other_herds_staged();
+    }
+
+    fn drop_other_herds_staged(&mut self) {
+        if let Some(herd) = &self.herd_id {
+            self.staged.retain(|s| s.cmd.herd_id.as_ref().is_none_or(|h| h == herd));
+        }
     }
 
     /// Offer a command whose signature verified. `now` is the collar's GNSS
@@ -179,9 +193,12 @@ impl SlotStore {
         Some(ack)
     }
 
-    /// Reboot: slots stay, the clock is gone until the next fix.
+    /// Reboot: slots stay, the clock is gone until the next fix. Staged
+    /// slots of another herd go, as on a herd change (a power cut after the
+    /// config was stored).
     pub fn boot(&mut self) {
         self.clock = None;
+        self.drop_other_herds_staged();
     }
 
     /// Provisioning wipes every slot.
@@ -332,7 +349,7 @@ mod tests {
         s.insert(cmd(5, None), Some(t0()));
         let a = s.insert(cmd(4, None), None);
         let wire = a.to_ack(t0());
-        assert_eq!((wire.status, wire.code, wire.at), (AckStatus::Rejected, Some(RejectCode::Stale), t0()));
+        assert_eq!((wire.status, wire.code, wire.at), (AckStatus::Rejected.into(), Some(RejectCode::Stale), t0()));
         assert!(wire.reason.is_some());
     }
 
