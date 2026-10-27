@@ -20,10 +20,15 @@ pub struct Logged {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Line {
     /// `OpenCollar 0.2.0 starting`
-    Boot { fw: String },
+    Boot {
+        fw: String,
+    },
     Fix(FixLine),
     /// `searching: 7 tracked, 0 in fix`
-    Searching { tracked: u32, in_fix: u32 },
+    Searching {
+        tracked: u32,
+        in_fix: u32,
+    },
     Episode(EpisodeLine),
     /// `ack v59 applied at 2026-10-26T15:04:05Z (1 pending)`
     Ack(AckLine),
@@ -91,12 +96,20 @@ pub enum Reply {
     /// `error <code>` (provisioning, config, or a command it couldn't read)
     Error(String),
     /// `boundary`: `applied N` or `received N`
-    Boundary { version: u32, status: AckStatus },
+    Boundary {
+        version: u32,
+        status: AckStatus,
+    },
     /// `boundary`: `rejected N <code>`
-    Rejected { version: u32, code: String },
+    Rejected {
+        version: u32,
+        code: String,
+    },
     Status(Status),
     /// `status` before provisioning: `unprovisioned fw 0.2.0`
-    Unprovisioned { fw: String },
+    Unprovisioned {
+        fw: String,
+    },
 }
 
 /// `collar <id> herd <id> fw 0.2.0 config 3 active 59 slots 59 60`
@@ -149,18 +162,29 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// `[hh:mm:ss.mmm,uuu] <lvl> module: msg` → (uptime ms, msg).
+/// Longest uptime a log prefix may claim: a year (Zephyr's hours roll on;
+/// anything bigger is line noise).
+const MAX_UPTIME_H: u64 = 24 * 366;
+
+/// `[hh:mm:ss.mmm,uuu] <lvl> module: msg` → (uptime ms, msg). A prefix
+/// whose numbers are out of range (garbage on the line) isn't one: the
+/// line is kept as plain text, never a crash or a wrapped clock.
 fn log_prefix(s: &str) -> Option<(u64, &str)> {
     let rest = s.strip_prefix('[')?;
     let (stamp, rest) = rest.split_once(']')?;
     let (hms, frac) = stamp.split_once('.')?;
     let mut parts = hms.split(':').map(|p| p.parse::<u64>().ok());
     let (h, m, sec) = (parts.next()??, parts.next()??, parts.next()??);
-    let ms: u64 = frac.split(',').next()?.parse().ok()?;
+    let ms_text = frac.split(',').next()?;
+    let ms: u64 = ms_text.parse().ok()?;
+    if h > MAX_UPTIME_H || m >= 60 || sec >= 60 || ms_text.len() != 3 || parts.next().is_some() {
+        return None;
+    }
     let rest = rest.trim_start().strip_prefix('<')?;
     let (_level, rest) = rest.split_once('>')?;
     let (_module, msg) = rest.trim_start().split_once(": ")?;
-    Some(((h * 3600 + m * 60 + sec) * 1000 + ms, msg.trim()))
+    let uptime = h.checked_mul(3600)?.checked_add(m * 60 + sec)?.checked_mul(1000)?.checked_add(ms)?;
+    Some((uptime, msg.trim()))
 }
 
 fn parse_log(msg: &str) -> Line {
@@ -185,8 +209,13 @@ fn parse_log(msg: &str) -> Line {
     Line::Log(msg.to_owned())
 }
 
+/// A finite number: `NaN` and `inf` parse as f64 but aren't readings.
+fn finite(v: &str) -> Option<f64> {
+    v.parse::<f64>().ok().filter(|x| x.is_finite())
+}
+
 fn metres(v: &str) -> Option<f64> {
-    v.strip_suffix('m').unwrap_or(v).parse().ok()
+    finite(v.strip_suffix('m').unwrap_or(v))
 }
 
 fn time(v: &str) -> Option<DateTime<Utc>> {
@@ -196,7 +225,11 @@ fn time(v: &str) -> Option<DateTime<Utc>> {
 fn parse_fix(rest: &str) -> Option<FixLine> {
     let mut words = rest.split_whitespace();
     let (lat, lon) = words.next()?.split_once(',')?;
-    let mut fix = FixLine { lat: lat.parse().ok()?, lon: lon.parse().ok()?, ..FixLine::default() };
+    let (lat, lon) = (finite(lat)?, finite(lon)?);
+    if lat.abs() > 90.0 || lon.abs() > 180.0 {
+        return None;
+    }
+    let mut fix = FixLine { lat, lon, ..FixLine::default() };
     let mut fence = FenceLine::default();
     let mut fenced = false;
     let mut cue = None;
@@ -322,7 +355,9 @@ mod tests {
         let fence = f.fence.unwrap();
         assert_eq!((fence.version, fence.state.as_str(), fence.margin_m, fence.ring, fence.cue), (59, "warning", 2.5, Some(1), Some((CueKind::Warn, 3))));
 
-        let l = parse("[00:00:05.000,000] <inf> opencollar: fix 38.1,-92.4 acc=4.0m sats=6 v2 state=inside margin=20.0m ring=0 (unarmed) cue=off vol=0 at=2026-10-26T15:04:06Z");
+        let l = parse(
+            "[00:00:05.000,000] <inf> opencollar: fix 38.1,-92.4 acc=4.0m sats=6 v2 state=inside margin=20.0m ring=0 (unarmed) cue=off vol=0 at=2026-10-26T15:04:06Z",
+        );
         let Line::Fix(f) = l.line else { panic!() };
         let fence = f.fence.unwrap();
         assert!(fence.unarmed && fence.cue.is_none());
@@ -342,7 +377,9 @@ mod tests {
     fn other_log_lines() {
         assert_eq!(parse("[00:00:00.001,000] <inf> opencollar: OpenCollar 0.2.0 starting").line, Line::Boot { fw: "0.2.0".into() });
         assert_eq!(parse("[00:00:10.000,000] <inf> opencollar: searching: 7 tracked, 0 in fix").line, Line::Searching { tracked: 7, in_fix: 0 });
-        let Line::Episode(e) = parse("[00:01:00.000,000] <inf> opencollar: episode: crossed ring=0 cues=5 max=4 min_margin=-1.2m 15000 ms").line else { panic!() };
+        let Line::Episode(e) = parse("[00:01:00.000,000] <inf> opencollar: episode: crossed ring=0 cues=5 max=4 min_margin=-1.2m 15000 ms").line else {
+            panic!()
+        };
         assert_eq!((e.outcome, e.ring, e.cues, e.max_level, e.min_margin_m, e.dur_ms), (EpisodeOutcome::Crossed, 0, 5, 4, -1.2, 15_000));
         let Line::Ack(a) = parse("[00:01:00.000,000] <inf> opencollar: ack v59 applied at 2026-10-26T15:04:05Z (1 pending)").line else { panic!() };
         assert_eq!((a.version, a.status, a.code, a.at), (59, AckStatus::Applied, None, Some(t("2026-10-26T15:04:05Z"))));
@@ -350,6 +387,28 @@ mod tests {
         assert_eq!((a.status, a.code, a.at), (AckStatus::Rejected, Some(RejectCode::BadSig), None));
         assert_eq!(parse("[00:01:00.000,000] <inf> opencollar: event: state -> outside").line, Line::Log("event: state -> outside".into()));
         assert_eq!(parse("*** Booting nRF Connect SDK v3.4.1 ***").line, Line::Other("*** Booting nRF Connect SDK v3.4.1 ***".into()));
+    }
+
+    /// Review P2-11: an hour count that overflows u64 arithmetic panicked
+    /// the debug build. Out-of-range prefixes are plain text now.
+    #[test]
+    fn garbage_prefixes_and_readings_dont_crash_or_pass() {
+        for raw in [
+            "[18446744073709551615:00:00.000,000] <inf> opencollar: noise",
+            "[99999999:00:00.000,000] <inf> opencollar: noise",
+            "[00:61:00.000,000] <inf> opencollar: noise",
+            "[00:00:00.99999999999999999999,000] <inf> opencollar: noise",
+            "[00:00:00.1,000] <inf> opencollar: noise",
+        ] {
+            let l = parse(raw);
+            assert_eq!((l.uptime_ms, &l.line), (None, &Line::Other(raw.to_owned())), "{raw}");
+        }
+        assert_eq!(parse("[8784:00:00.000,000] <inf> opencollar: x").uptime_ms, Some(8784 * 3_600_000));
+        // Review P1-08: non-finite or impossible fixes aren't fixes.
+        for bad in ["fix NaN,NaN acc=NaNm sats=0 (no boundary)", "fix 38.1,-92.4 acc=infm sats=6 (no boundary)", "fix 95.0,-92.4 acc=3.0m sats=6 (no boundary)"]
+        {
+            assert!(matches!(parse(&format!("[00:00:05.000,000] <inf> opencollar: {bad}")).line, Line::Log(_)), "{bad}");
+        }
     }
 
     #[test]

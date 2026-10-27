@@ -3,28 +3,57 @@ import { fleet, type Claimed, type Provisioning, type TestRun, type Unit, type U
 import { store, useStore } from "../../store";
 import { useCan } from "../../store/me";
 import { Button, Copy, Input } from "../../ui";
-import { grouped, readClaim, STATE_WORDS, stepLine } from "./model";
+import { addPage, grouped, nextStep, readClaim, runNote, shownLine, STATE_WORDS, stepLine } from "./model";
 
 const STATES = ["", "built", "tested", "provisioned", "claimed", "in_service", "rma", "retired"] as const;
 
-// Units: every unit by serial, newest first; one unit's tests and history; claiming one.
+// Units: every unit by serial, newest first, a page at a time with the total; one unit's
+// tests and history; claiming one.
 export function Units({ serial }: { serial?: string }) {
   if (serial) return <UnitPage serial={serial} />;
   return <UnitList />;
 }
 
+const PAGE = 200;
+
 function UnitList() {
   const [units, setUnits] = useState<Unit[]>();
+  const [total, setTotal] = useState(0);
+  const [next, setNext] = useState<string>();
   const [state, setState] = useState("");
   const [q, setQ] = useState("");
   const [err, setErr] = useState<string>();
-  const load = () => fleet.units({ state: state || undefined, q: q || undefined }).then((u) => { setUnits(u); setErr(undefined); }, (e) => setErr((e as Error).message));
+  const [busy, setBusy] = useState(false);
+  const filters = { state: state || undefined, q: q || undefined };
+  // From the top, as many as are shown (at most 1,000 at once), so new units appear in place.
+  const load = (shown = PAGE) =>
+    fleet.units({ ...filters, limit: Math.min(Math.max(shown, PAGE), 1000) }).then((p) => {
+      setUnits(p.units);
+      setTotal(p.total);
+      setNext(p.next);
+      setErr(undefined);
+    }, (e) => setErr((e as Error).message));
+  const more = async () => {
+    if (!next || !units) return;
+    setBusy(true);
+    try {
+      const p = await fleet.units({ ...filters, limit: PAGE, cursor: next });
+      setUnits(addPage(units, p.units));
+      setTotal(p.total);
+      setNext(p.next);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   useEffect(() => {
     void load();
-    // A station working while this is open: its units show up as they come.
-    const off = store.on("fleet_unit", () => void load());
-    return off;
   }, [state, q]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // A station working while this is open: its units show up as they come.
+    return store.on("fleet_unit", () => void load(units?.length));
+  }, [state, q, units?.length]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <>
       <Claim onClaimed={() => void load()} />
@@ -35,7 +64,9 @@ function UnitList() {
         </select>
       </div>
       {err && <p className="err">{err}</p>}
-      {units && (units.length === 0 ? <p className="dim">No units yet. A station registers them as it tests them.</p> : (
+      {units && (units.length === 0 ? <p className="dim">{q || state ? "No units match." : "No units yet. A station registers them as it tests them."}</p> : (
+        <>
+        <p className="dim">{shownLine(units.length, total)}</p>
         <table className="tbl">
           <thead><tr><th>serial</th><th>class</th><th>board</th><th>firmware</th><th>state</th><th>last test</th><th>station</th><th>collar</th></tr></thead>
           <tbody>
@@ -48,6 +79,8 @@ function UnitList() {
             ))}
           </tbody>
         </table>
+        {next && <Button small kind="plain" disabled={busy} onClick={() => void more()}>Show {Math.min(PAGE, total - units.length).toLocaleString("en-US")} more</Button>}
+        </>
       ))}
     </>
   );
@@ -94,7 +127,8 @@ function Claim({ onClaimed }: { onClaimed: () => void }) {
       {err && <p className="err">{err}</p>}
       {done && (
         <div className="fdone">
-          <p>{done.unit.serial} is {done.collar.name} in {herds.find((h) => h.id === done.collar.herd_id)?.name ?? "the herd"}.</p>
+          <p>{done.unit.serial} is {done.reclaimed ? "back as " : ""}{done.collar.name} in {herds.find((h) => h.id === done.collar.herd_id)?.name ?? "the herd"}.{done.reclaimed ? " Its old collar key no longer works." : ""}</p>
+          {!done.code_checked && <p className="dim">This card came without a factory record, so its code couldn't be checked here. The collar checks it when it first reports.</p>}
           <p className="dim">For firmware that speaks protocol v1, set it up with this once:</p>
           {done.v1.line ? <Copy label="console" value={done.v1.line} secret /> : <p className="dim">{done.v1.why}</p>}
         </div>
@@ -134,6 +168,7 @@ function UnitPage({ serial }: { serial: string }) {
   return (
     <div className="funit">
       <p><a href="#/fleet/units" className="dim">Units</a> / {u.serial}</p>
+      <p><b>{nextStep(u)}</b></p>
       <ul className="kv">
         <li><span>class, board</span><b>{u.device_class} {u.hw_rev}</b></li>
         <li><span>firmware as built</span><b>{u.fw_version}</b></li>
@@ -161,7 +196,7 @@ function UnitPage({ serial }: { serial: string }) {
         </div>
       )}
       <h3>Tests</h3>
-      {d.runs.length === 0 ? <p className="dim">Not tested yet.</p> : d.runs.map((r) => <Run key={r.id} run={r} />)}
+      {d.runs.length === 0 ? <p className="dim">Not tested yet.</p> : d.runs.map((r) => <Run key={r.id} run={r} note={runNote(r, u.generation)} />)}
       <h3>History</h3>
       <table className="tbl">
         <tbody>
@@ -184,14 +219,14 @@ function detailText(d: Record<string, unknown>) {
   return Object.entries(d).filter(([, v]) => v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0)).map(([k, v]) => `${k} ${Array.isArray(v) ? v.join(" ") : String(v)}`).join("  ");
 }
 
-function Run({ run }: { run: TestRun }) {
-  const [open, setOpen] = useState(run.result === "fail");
+function Run({ run, note }: { run: TestRun; note?: string }) {
+  const [open, setOpen] = useState(run.result === "fail" && !note);
   return (
     <div className="frun">
       <button type="button" className="line" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <span className={run.result === "fail" ? "err" : "ok"}>{run.result}</span>
+        <span className={note ? "dim" : run.result === "fail" ? "err" : "ok"}>{run.result}</span>
         <span className="mono">{run.finished_at.slice(0, 19).replace("T", " ")}</span>
-        <span className="dim">{run.plan_id} v{run.plan_version}{run.station ? ` · ${run.station}` : ""}{run.failed.length ? ` · ${run.failed.join(", ")}` : ""}</span>
+        <span className="dim">{run.plan_id} v{run.plan_version}{run.station ? ` · ${run.station}` : ""}{run.failed.length ? ` · ${run.failed.join(", ")}` : ""}{note ? ` · ${note}` : ""}</span>
       </button>
       {open && (
         <table className="tbl">

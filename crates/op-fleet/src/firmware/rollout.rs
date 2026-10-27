@@ -8,23 +8,32 @@
 //! capability), ready, offered, confirmed, failed or rolled back. A rollback,
 //! a failure, or a collar silent since installing pauses the rollout.
 //!
-//! The collar ingest asks [`offer_for`] what to put in a report response and
-//! tells [`record_result`] what the collar said. A rollback the collar does
-//! by itself also shows in its reported version going back down.
+//! The collar ingest asks [`offer_for`] what to put in a report response,
+//! asks [`still_good`] right before the bytes go out, and tells
+//! [`record_result`] what the collar said. A rollback the collar does by
+//! itself also shows in its reported version going back down.
+//!
+//! An offer is reserved in one write that also reads every gate (the
+//! rollout still active, the policy, a move, an escape, the battery), so a
+//! pause or a move that commits first wins. [`still_good`] reads them again
+//! at send time and takes the offer back if anything changed. An offer the
+//! collar never answered goes out again after [`OFFER_TIMEOUT`], with a
+//! growing wait, up to [`OFFER_TRIES`] times; then the collar has failed
+//! (which pauses the rollout).
 
 use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use op_core::time::{now, to_db};
 use op_core::{ApiError, ApiJson, ApiResult, Collar, Ctx, Identity, id};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 use tokio::sync::Notify;
 
 use super::{Firmware, FirmwarePolicy, Mode, UnitsQuery, firmware_from_row, older, policy};
@@ -39,6 +48,16 @@ pub const TICK: StdDuration = StdDuration::from_secs(60);
 pub const SILENT_AFTER: Duration = Duration::hours(2);
 
 pub const UNSUPPORTED: &str = "This collar can't take updates over the air yet";
+
+/// An offer with no answer (not even "written") this long was lost.
+pub const OFFER_TIMEOUT: Duration = Duration::minutes(30);
+/// Offers a collar gets before it counts as failed.
+pub const OFFER_TRIES: i64 = 5;
+
+/// The wait before offer `attempts + 1`: 15 min, doubling, at most 6 h.
+pub fn retry_wait(attempts: i64) -> Duration {
+    Duration::minutes((15i64 << attempts.clamp(1, 6).saturating_sub(1)).min(360))
+}
 
 static WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
 
@@ -170,7 +189,11 @@ pub fn wave_of(collar_id: &str, herd_id: &str, waves: &[Wave]) -> i64 {
 
 async fn counts(ctx: &Ctx, rollout_id: &str) -> anyhow::Result<Counts> {
     let mut c = Counts::default();
-    for (state, n) in sqlx::query_as::<_, (String, i64)>("SELECT state, COUNT(*) FROM fleet_rollout_units WHERE rollout_id = ? GROUP BY state").bind(rollout_id).fetch_all(ctx.db()).await? {
+    for (state, n) in sqlx::query_as::<_, (String, i64)>("SELECT state, COUNT(*) FROM fleet_rollout_units WHERE rollout_id = ? GROUP BY state")
+        .bind(rollout_id)
+        .fetch_all(ctx.db())
+        .await?
+    {
         c.targeted += n;
         match state.as_str() {
             "waiting" => c.waiting = n,
@@ -226,9 +249,11 @@ pub(crate) async fn list(State(ctx): State<Ctx>) -> ApiResult<Json<Vec<Rollout>>
 
 async fn start_rollout(ctx: &Ctx, fw: &Firmware, by: Option<&str>) -> anyhow::Result<String> {
     // A newer release for a class replaces any older rollout still going for it.
-    let live = sqlx::query("SELECT r.id, f.version, f.classes FROM fleet_rollouts r JOIN fleet_firmware f ON f.id = r.firmware_id WHERE r.state IN ('active', 'paused')")
-        .fetch_all(ctx.db())
-        .await?;
+    let live = sqlx::query(
+        "SELECT r.id, f.version, f.classes FROM fleet_rollouts r JOIN fleet_firmware f ON f.id = r.firmware_id WHERE r.state IN ('active', 'paused')",
+    )
+    .fetch_all(ctx.db())
+    .await?;
     for row in &live {
         let classes: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("classes")?)?;
         let version: String = row.try_get("version")?;
@@ -255,7 +280,13 @@ async fn start_rollout(ctx: &Ctx, fw: &Firmware, by: Option<&str>) -> anyhow::Re
 }
 
 async fn set_state(ctx: &Ctx, id: &str, state: &str, reason: Option<&str>) -> anyhow::Result<()> {
-    sqlx::query("UPDATE fleet_rollouts SET state = ?, paused_reason = ?, updated_at = ? WHERE id = ?").bind(state).bind(reason).bind(to_db(&now())).bind(id).execute(ctx.db()).await?;
+    sqlx::query("UPDATE fleet_rollouts SET state = ?, paused_reason = ?, updated_at = ? WHERE id = ?")
+        .bind(state)
+        .bind(reason)
+        .bind(to_db(&now()))
+        .bind(id)
+        .execute(ctx.db())
+        .await?;
     Ok(())
 }
 
@@ -288,7 +319,11 @@ pub(crate) async fn act(State(ctx): State<Ctx>, identity: Identity, Path((id, ac
     match action.as_str() {
         "pause" if live => set_state(&ctx, &id, "paused", Some(&format!("Paused by {by}"))).await?,
         "resume" if live => {
-            sqlx::query("UPDATE fleet_rollouts SET state = 'active', paused_reason = NULL, updated_at = ? WHERE id = ?").bind(to_db(&now())).bind(&id).execute(ctx.db()).await?;
+            sqlx::query("UPDATE fleet_rollouts SET state = 'active', paused_reason = NULL, updated_at = ? WHERE id = ?")
+                .bind(to_db(&now()))
+                .bind(&id)
+                .execute(ctx.db())
+                .await?;
         }
         "cancel" if live => set_state(&ctx, &id, "cancelled", Some(&format!("Cancelled by {by}"))).await?,
         "pause" | "resume" | "cancel" => return Err(ApiError::conflict(format!("This rollout is {}.", r.state))),
@@ -387,9 +422,10 @@ struct Target {
 /// Claimed units of the release's classes, on a board it names, whose
 /// bootloader trusts its signer (when the factory record said which keys).
 async fn targets(ctx: &Ctx, fw: &Firmware) -> anyhow::Result<Vec<Target>> {
-    let rows = sqlx::query("SELECT u.serial, c.* FROM fleet_units u JOIN collars c ON c.id = u.collar_id WHERE u.state IN ('claimed', 'in_service') ORDER BY c.id")
-        .fetch_all(ctx.db())
-        .await?;
+    let rows =
+        sqlx::query("SELECT u.serial, c.* FROM fleet_units u JOIN collars c ON c.id = u.collar_id WHERE u.state IN ('claimed', 'in_service') ORDER BY c.id")
+            .fetch_all(ctx.db())
+            .await?;
     let mut out = Vec::new();
     for r in &rows {
         let serial: String = r.try_get("serial")?;
@@ -410,8 +446,15 @@ fn current_of(collar: &Collar, unit: Option<&Unit>) -> Option<String> {
     collar.fw.clone().or_else(|| unit.map(|u| u.fw_version.clone()).filter(|v| !v.is_empty()))
 }
 
-/// Why a collar can't take the image right now, if it can't.
-async fn held_because(ctx: &Ctx, collar: &Collar, fw: &Firmware, p: &FirmwarePolicy, rollout_paused: bool) -> anyhow::Result<Option<String>> {
+/// The firmware policy as stored, read on `conn` (inside a transaction too).
+async fn policy_on(conn: &mut SqliteConnection) -> anyhow::Result<FirmwarePolicy> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(super::POLICY_KEY).fetch_optional(&mut *conn).await?;
+    Ok(v.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default())
+}
+
+/// Why a collar can't take the image right now, if it can't. Reads on
+/// `conn`, so inside a write every gate is read in the same transaction.
+async fn held_because(conn: &mut SqliteConnection, collar: &Collar, fw: &Firmware, p: &FirmwarePolicy, rollout_paused: bool) -> anyhow::Result<Option<String>> {
     if p.mode == Mode::Paused || rollout_paused {
         return Ok(Some("Updates are paused".into()));
     }
@@ -421,11 +464,13 @@ async fn held_because(ctx: &Ctx, collar: &Collar, fw: &Firmware, p: &FirmwarePol
     if !fw.has_image {
         return Ok(Some("The image isn't on this server yet".into()));
     }
-    let moving: Option<String> = sqlx::query_scalar("SELECT id FROM moves WHERE herd_id = ? AND status = 'sweeping'").bind(&collar.herd_id).fetch_optional(ctx.db()).await?;
+    let moving: Option<String> =
+        sqlx::query_scalar("SELECT id FROM moves WHERE herd_id = ? AND status = 'sweeping'").bind(&collar.herd_id).fetch_optional(&mut *conn).await?;
     if moving.is_some() {
         return Ok(Some("The herd is being moved".into()));
     }
-    let escaped: Option<String> = sqlx::query_scalar("SELECT id FROM escapes WHERE collar_id = ? AND status = 'returning'").bind(&collar.id).fetch_optional(ctx.db()).await?;
+    let escaped: Option<String> =
+        sqlx::query_scalar("SELECT id FROM escapes WHERE collar_id = ? AND status = 'returning'").bind(&collar.id).fetch_optional(&mut *conn).await?;
     if escaped.is_some() {
         return Ok(Some("Out on an escape".into()));
     }
@@ -443,17 +488,25 @@ struct Prev {
     state: UnitState,
     reason: Option<String>,
     current: Option<String>,
+    offered_at: Option<DateTime<Utc>>,
     applied_at: Option<DateTime<Utc>>,
+    attempts: i64,
 }
 
 async fn unit_row(ctx: &Ctx, rollout_id: &str, collar_id: &str) -> anyhow::Result<Option<Prev>> {
-    let r = sqlx::query("SELECT state, reason, current, applied_at FROM fleet_rollout_units WHERE rollout_id = ? AND collar_id = ?").bind(rollout_id).bind(collar_id).fetch_optional(ctx.db()).await?;
+    let r = sqlx::query("SELECT state, reason, current, offered_at, applied_at, attempts FROM fleet_rollout_units WHERE rollout_id = ? AND collar_id = ?")
+        .bind(rollout_id)
+        .bind(collar_id)
+        .fetch_optional(ctx.db())
+        .await?;
     r.map(|r| -> anyhow::Result<Prev> {
         Ok(Prev {
             state: op_core::DbEnum::from_db(&r.try_get::<String, _>("state")?)?,
             reason: r.try_get("reason")?,
             current: r.try_get("current")?,
+            offered_at: op_core::time::opt_from_db(r.try_get("offered_at")?)?,
             applied_at: op_core::time::opt_from_db(r.try_get("applied_at")?)?,
+            attempts: r.try_get("attempts")?,
         })
     })
     .transpose()
@@ -463,7 +516,8 @@ async fn unit_row(ctx: &Ctx, rollout_id: &str, collar_id: &str) -> anyhow::Resul
 pub async fn tick(ctx: &Ctx) -> anyhow::Result<()> {
     let p = policy(ctx).await?;
     auto_start(ctx, &p).await?;
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM fleet_rollouts WHERE state IN ('active', 'paused') ORDER BY created_at").fetch_all(ctx.db()).await?;
+    let ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM fleet_rollouts WHERE state IN ('active', 'paused') ORDER BY created_at").fetch_all(ctx.db()).await?;
     for id in ids {
         step(ctx, &id, &p).await?;
     }
@@ -492,7 +546,12 @@ async fn step(ctx: &Ctx, rollout_id: &str, p: &FirmwarePolicy) -> anyhow::Result
             if let Some(w) = waves.get_mut(1) {
                 w.herd_id = Some(t.collar.herd_id.clone());
             }
-            sqlx::query("UPDATE fleet_rollouts SET waves = ?, updated_at = ? WHERE id = ?").bind(serde_json::to_string(&waves)?).bind(to_db(&at)).bind(rollout_id).execute(ctx.db()).await?;
+            sqlx::query("UPDATE fleet_rollouts SET waves = ?, updated_at = ? WHERE id = ?")
+                .bind(serde_json::to_string(&waves)?)
+                .bind(to_db(&at))
+                .bind(rollout_id)
+                .execute(ctx.db())
+                .await?;
         }
     }
     let mut problem: Option<String> = None;
@@ -507,7 +566,12 @@ async fn step(ctx: &Ctx, rollout_id: &str, p: &FirmwarePolicy) -> anyhow::Result
         let chosen = waves.first().is_some_and(|w| w.collar_id.is_some());
         let prev = unit_row(ctx, rollout_id, &collar.id).await?;
         let at_target = current.as_deref() == Some(fw.version.as_str());
-        let silent = prev.as_ref().and_then(|x| x.applied_at).is_some_and(|applied| at - applied > SILENT_AFTER && collar.last_seen.is_none_or(|seen| seen < applied));
+        let silent =
+            prev.as_ref().and_then(|x| x.applied_at).is_some_and(|applied| at - applied > SILENT_AFTER && collar.last_seen.is_none_or(|seen| seen < applied));
+        // Offered, never even written, and the time is up: the offer was lost.
+        let lost =
+            prev.as_ref().is_some_and(|x| x.state == UnitState::Offered && x.applied_at.is_none() && x.offered_at.is_none_or(|o| at - o > OFFER_TIMEOUT));
+        let attempts = prev.as_ref().map_or(0, |x| x.attempts);
         let (state, reason) = match prev.as_ref().map(|x| x.state) {
             // Ran the release, now runs something older: the collar went back.
             Some(UnitState::Confirmed) if !at_target && current.as_deref().is_some_and(|c| older(c, &fw.version)) => {
@@ -515,12 +579,15 @@ async fn step(ctx: &Ctx, rollout_id: &str, p: &FirmwarePolicy) -> anyhow::Result
             }
             Some(s @ (UnitState::Failed | UnitState::RolledBack)) => (s, prev.as_ref().and_then(|x| x.reason.clone())),
             _ if at_target => (UnitState::Confirmed, None),
-            _ if current.as_deref().is_some_and(|c| !older(c, &fw.version)) => (UnitState::Confirmed, Some(format!("Runs {}", current.clone().unwrap_or_default()))),
+            _ if current.as_deref().is_some_and(|c| !older(c, &fw.version)) => {
+                (UnitState::Confirmed, Some(format!("Runs {}", current.clone().unwrap_or_default())))
+            }
             Some(UnitState::Offered) if silent => (UnitState::Failed, Some("Not heard from since it installed".into())),
+            Some(UnitState::Offered) if lost && attempts >= OFFER_TRIES => (UnitState::Failed, Some(format!("No answer to {attempts} offers"))),
             _ if !collar.caps.iter().any(|c| c == FOTA_CAP) => (UnitState::Unsupported, Some(UNSUPPORTED.into())),
             _ if !chosen || wave > r.wave => (UnitState::Waiting, Some(stage_words(wave))),
-            Some(UnitState::Offered) => (UnitState::Offered, prev.as_ref().and_then(|x| x.reason.clone())),
-            _ => match held_because(ctx, collar, &fw, p, paused).await? {
+            Some(UnitState::Offered) if !lost => (UnitState::Offered, prev.as_ref().and_then(|x| x.reason.clone())),
+            _ => match held_because(&mut *ctx.db().acquire().await?, collar, &fw, p, paused).await? {
                 Some(why) => (UnitState::Held, Some(why)),
                 None => (UnitState::Ready, None),
             },
@@ -536,6 +603,17 @@ async fn step(ctx: &Ctx, rollout_id: &str, p: &FirmwarePolicy) -> anyhow::Result
         }
         if matches!(state, UnitState::Failed | UnitState::RolledBack) && problem.is_none() {
             problem = Some(format!("{} {}", collar.name, if state == UnitState::Failed { "failed to update" } else { "rolled back" }));
+        }
+        if lost {
+            // Offered again after a wait; the old offer id is dead.
+            let wait = retry_wait(attempts);
+            sqlx::query("UPDATE fleet_rollout_units SET offer_id = NULL, next_try_at = ? WHERE rollout_id = ? AND collar_id = ? AND state = 'offered'")
+                .bind(to_db(&(at + wait)))
+                .bind(rollout_id)
+                .bind(&collar.id)
+                .execute(ctx.db())
+                .await?;
+            tracing::info!(rollout = %rollout_id, collar = %collar.id, attempts, "firmware offer lost; offered again after {} min", wait.num_minutes());
         }
         let changed = prev.as_ref().is_none_or(|x| x.state != state || x.current != current);
         sqlx::query(
@@ -555,7 +633,14 @@ async fn step(ctx: &Ctx, rollout_id: &str, p: &FirmwarePolicy) -> anyhow::Result
         .await?;
         if changed && matches!(state, UnitState::Confirmed | UnitState::RolledBack | UnitState::Failed) && prev.is_some() {
             let mut conn = ctx.db().acquire().await?;
-            units::log(&mut conn, &t.unit.serial, "firmware", json!({ "rollout_id": rollout_id, "version": fw.version, "state": state, "current": current }), None).await?;
+            units::log(
+                &mut conn,
+                &t.unit.serial,
+                "firmware",
+                json!({ "rollout_id": rollout_id, "version": fw.version, "state": state, "current": current }),
+                None,
+            )
+            .await?;
         }
     }
     if let Some(why) = problem
@@ -681,6 +766,8 @@ pub(crate) async fn units(State(ctx): State<Ctx>, Query(q): Query<UnitsQuery>) -
 /// What goes in the collar's firmware command (protocol v2 type 9).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FirmwareOffer {
+    /// This offer: what [`still_good`] checks before sending.
+    pub offer_id: String,
     pub rollout_id: String,
     pub firmware_id: String,
     pub version: String,
@@ -690,44 +777,103 @@ pub struct FirmwareOffer {
     pub manifest: Vec<u8>,
 }
 
-/// An image for this collar if it is `ready` in a live rollout and nothing
-/// holds it now (checked again here). Marks it `offered`.
+/// The collar, read on `conn`.
+async fn collar_on(conn: &mut SqliteConnection, collar_id: &str) -> anyhow::Result<Option<Collar>> {
+    let c = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(collar_id).fetch_optional(&mut *conn).await?;
+    c.map(|c| op_core::store::collar_from_row(&c)).transpose()
+}
+
+/// An image for this collar if it is `ready` in an active rollout, its retry
+/// wait is over, and nothing holds it now. Reserves it (`offered`, with an
+/// offer id) in the same write that read every gate.
 pub async fn offer_for(ctx: &Ctx, collar_id: &str) -> anyhow::Result<Option<FirmwareOffer>> {
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let at = now();
     let row = sqlx::query(
         "SELECT ru.rollout_id, r.state AS rollout_state, f.* FROM fleet_rollout_units ru JOIN fleet_rollouts r ON r.id = ru.rollout_id JOIN fleet_firmware f ON f.id = r.firmware_id
-         WHERE ru.collar_id = ? AND ru.state = 'ready' AND r.state = 'active' AND f.withdrawn_at IS NULL ORDER BY r.created_at DESC LIMIT 1",
+         WHERE ru.collar_id = ? AND ru.state = 'ready' AND r.state = 'active' AND f.withdrawn_at IS NULL AND (ru.next_try_at IS NULL OR ru.next_try_at <= ?)
+         ORDER BY r.created_at DESC LIMIT 1",
     )
     .bind(collar_id)
-    .fetch_optional(ctx.db())
+    .bind(to_db(&at))
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else { return Ok(None) };
     let rollout_id: String = row.try_get("rollout_id")?;
     let fw = firmware_from_row(&row)?;
-    let Some(c) = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(collar_id).fetch_optional(ctx.db()).await? else { return Ok(None) };
-    let collar = op_core::store::collar_from_row(&c)?;
+    let Some(collar) = collar_on(&mut tx, collar_id).await? else { return Ok(None) };
     if !collar.caps.iter().any(|c| c == FOTA_CAP) {
         return Ok(None);
     }
-    let p = policy(ctx).await?;
-    if let Some(why) = held_because(ctx, &collar, &fw, &p, false).await? {
+    let p = policy_on(&mut tx).await?;
+    if let Some(why) = held_because(&mut tx, &collar, &fw, &p, false).await? {
         sqlx::query("UPDATE fleet_rollout_units SET state = 'held', reason = ?, updated_at = ? WHERE rollout_id = ? AND collar_id = ?")
             .bind(why)
-            .bind(to_db(&now()))
+            .bind(to_db(&at))
             .bind(&rollout_id)
             .bind(collar_id)
-            .execute(ctx.db())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         return Ok(None);
     }
-    sqlx::query("UPDATE fleet_rollout_units SET state = 'offered', reason = NULL, offered_at = ?, updated_at = ? WHERE rollout_id = ? AND collar_id = ?")
-        .bind(to_db(&now()))
+    let offer_id = id::new_id("fwo");
+    sqlx::query(
+        "UPDATE fleet_rollout_units SET state = 'offered', reason = NULL, offer_id = ?, attempts = attempts + 1, next_try_at = NULL, offered_at = ?, updated_at = ?
+         WHERE rollout_id = ? AND collar_id = ? AND state = 'ready'",
+    )
+    .bind(&offer_id)
+    .bind(to_db(&at))
+    .bind(to_db(&at))
+    .bind(&rollout_id)
+    .bind(collar_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let manifest = crate::keys::unhex(&fw.manifest).unwrap_or_default();
+    Ok(Some(FirmwareOffer { offer_id, rollout_id, firmware_id: fw.id, version: fw.version, sha256: fw.sha256, size: fw.size, manifest }))
+}
+
+/// Right before an offer's bytes go out: is it still the collar's live
+/// offer, its rollout still active, its image not withdrawn, and nothing
+/// holding the collar now (pause, a held herd, a move, an escape, the
+/// battery)? If not, the offer is taken back (held, with the reason; this
+/// try doesn't count) and nothing should be sent.
+pub async fn still_good(ctx: &Ctx, collar_id: &str, offer_id: &str) -> anyhow::Result<bool> {
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let row = sqlx::query(
+        "SELECT ru.rollout_id, r.state AS rollout_state, f.* FROM fleet_rollout_units ru JOIN fleet_rollouts r ON r.id = ru.rollout_id JOIN fleet_firmware f ON f.id = r.firmware_id
+         WHERE ru.collar_id = ? AND ru.offer_id = ? AND ru.state = 'offered' AND ru.applied_at IS NULL",
+    )
+    .bind(collar_id)
+    .bind(offer_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else { return Ok(false) };
+    let rollout_id: String = row.try_get("rollout_id")?;
+    let rollout_state: String = row.try_get("rollout_state")?;
+    let fw = firmware_from_row(&row)?;
+    let why = match collar_on(&mut tx, collar_id).await? {
+        _ if rollout_state != "active" => Some("Updates are paused".to_owned()),
+        _ if fw.withdrawn_at.is_some() => Some("The image was withdrawn".to_owned()),
+        None => return Ok(false),
+        Some(collar) => {
+            let p = policy_on(&mut tx).await?;
+            held_because(&mut tx, &collar, &fw, &p, false).await?
+        }
+    };
+    let Some(why) = why else { return Ok(true) };
+    sqlx::query("UPDATE fleet_rollout_units SET state = 'held', reason = ?, offer_id = NULL, attempts = MAX(attempts - 1, 0), updated_at = ? WHERE rollout_id = ? AND collar_id = ? AND offer_id = ?")
+        .bind(&why)
         .bind(to_db(&now()))
         .bind(&rollout_id)
         .bind(collar_id)
-        .execute(ctx.db())
+        .bind(offer_id)
+        .execute(&mut *tx)
         .await?;
-    let manifest = crate::keys::unhex(&fw.manifest).unwrap_or_default();
-    Ok(Some(FirmwareOffer { rollout_id, firmware_id: fw.id, version: fw.version, sha256: fw.sha256, size: fw.size, manifest }))
+    tx.commit().await?;
+    tracing::info!(rollout = %rollout_id, collar = %collar_id, "firmware offer taken back before sending: {why}");
+    Ok(false)
 }
 
 /// What a collar said about an image.

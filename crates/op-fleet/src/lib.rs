@@ -44,9 +44,11 @@ pub fn router() -> axum::Router<Ctx> {
     app
 }
 
-/// Shipped test plans, then the background jobs: units turning `in_service`
+/// The maker key, shipped test plans, then the background jobs: units turning `in_service`
 /// on their collar's first report, and the firmware rollout tick.
 pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
+    // The maker key exists before the first request can ask for it.
+    keys::maker_key(ctx.data_dir())?;
     plans::ensure_shipped(&ctx).await?;
     units::spawn_in_service_watch(&ctx);
     firmware::rollout::spawn(&ctx);

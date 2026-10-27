@@ -61,15 +61,7 @@ pub struct TestPlan {
 pub const MAX_STEPS: usize = 64;
 
 fn step(name: &str, kind: StepKind, lo: Option<f64>, hi: Option<f64>, unit: Option<&str>, required: bool, note: &str) -> PlanStep {
-    PlanStep {
-        name: name.into(),
-        kind,
-        limit_lo: lo,
-        limit_hi: hi,
-        unit: unit.map(Into::into),
-        required,
-        note: (!note.is_empty()).then(|| note.into()),
-    }
+    PlanStep { name: name.into(), kind, limit_lo: lo, limit_hi: hi, unit: unit.map(Into::into), required, note: (!note.is_empty()).then(|| note.into()) }
 }
 
 /// The node's end-of-line test: flash, rails, sleep current, charger, data

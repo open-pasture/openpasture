@@ -31,7 +31,7 @@ use sqlx::Row;
 use crate::keys::{self, hex, unhex};
 use crate::who;
 
-pub use rollout::{FirmwareOffer, FwResult, UnitFirmware, offer_for, record_result, status_for_collar};
+pub use rollout::{FirmwareOffer, FwResult, UnitFirmware, offer_for, record_result, status_for_collar, still_good};
 
 /// OpenCollar's firmware release keys: (name, base64 Ed25519 public key).
 /// Empty until the first signed release is published with its key; until
@@ -110,7 +110,8 @@ fn vendor_keys() -> Vec<SigningKey> {
 /// Every key: built in, enrolled, and revoked ones (with `revoked_at`).
 pub async fn signing_keys(ctx: &Ctx) -> anyhow::Result<Vec<SigningKey>> {
     let revoked: Vec<(String, String)> = sqlx::query_as("SELECT kid, at FROM fleet_revoked_kids").fetch_all(ctx.db()).await?;
-    let revoked_at = |kid: &str| -> anyhow::Result<Option<DateTime<Utc>>> { revoked.iter().find(|(k, _)| k == kid).map(|(_, at)| op_core::time::from_db(at)).transpose() };
+    let revoked_at =
+        |kid: &str| -> anyhow::Result<Option<DateTime<Utc>>> { revoked.iter().find(|(k, _)| k == kid).map(|(_, at)| op_core::time::from_db(at)).transpose() };
     let mut out = Vec::new();
     for mut k in vendor_keys() {
         k.revoked_at = revoked_at(&k.kid)?;
@@ -187,7 +188,12 @@ async fn revoke_key(State(ctx): State<Ctx>, Path(kid): Path<String>) -> ApiResul
     if vendor_keys().iter().any(|k| k.kid == kid) {
         return Err(ApiError::bad_request("OpenCollar's release keys are revoked by a signed release, not here."));
     }
-    let n = sqlx::query("UPDATE fleet_signing_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE kid = ?").bind(to_db(&now())).bind(&kid).execute(ctx.db()).await?.rows_affected();
+    let n = sqlx::query("UPDATE fleet_signing_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE kid = ?")
+        .bind(to_db(&now()))
+        .bind(&kid)
+        .execute(ctx.db())
+        .await?
+        .rows_affected();
     if n == 0 {
         return Err(ApiError::not_found("No such signing key."));
     }
@@ -356,7 +362,8 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
     let key = keys::parse_public_key(&signer.public_key, "signer key").map_err(ApiError::internal)?;
     env.verify(&key).map_err(|_| ApiError::bad_request(format!("The manifest's signature doesn't verify against key {kid}.")))?;
     let sha = hex(&m.digest);
-    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM fleet_firmware WHERE sha256 = ? AND version = ?").bind(&sha).bind(&m.version).fetch_optional(ctx.db()).await?;
+    let taken: Option<String> =
+        sqlx::query_scalar("SELECT id FROM fleet_firmware WHERE sha256 = ? AND version = ?").bind(&sha).bind(&m.version).fetch_optional(ctx.db()).await?;
     if taken.is_some() {
         return Err(ApiError::conflict(format!("Release {} is already here.", m.version)));
     }
@@ -389,7 +396,12 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
     .execute(&mut *tx)
     .await?;
     for r in &revoke {
-        sqlx::query("INSERT OR IGNORE INTO fleet_revoked_kids (kid, at, firmware_id) VALUES (?, ?, ?)").bind(r).bind(&at).bind(&fw_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO fleet_revoked_kids (kid, at, firmware_id) VALUES (?, ?, ?)")
+            .bind(r)
+            .bind(&at)
+            .bind(&fw_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     for r in &revoke {
@@ -408,7 +420,10 @@ pub fn image_path(ctx: &Ctx, sha256: &str) -> std::path::PathBuf {
 /// The image with this digest, for the collar endpoint that serves it to
 /// anchors (`<endpoint>/fw/<digest hex>` in protocol v2).
 pub async fn image_bytes(ctx: &Ctx, sha256: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    let known: Option<i64> = sqlx::query_scalar("SELECT has_image FROM fleet_firmware WHERE sha256 = ? AND withdrawn_at IS NULL LIMIT 1").bind(sha256).fetch_optional(ctx.db()).await?;
+    let known: Option<i64> = sqlx::query_scalar("SELECT has_image FROM fleet_firmware WHERE sha256 = ? AND withdrawn_at IS NULL LIMIT 1")
+        .bind(sha256)
+        .fetch_optional(ctx.db())
+        .await?;
     if known != Some(1) {
         return Ok(None);
     }
@@ -482,7 +497,13 @@ pub struct FirmwarePolicy {
 
 impl Default for FirmwarePolicy {
     fn default() -> Self {
-        Self { mode: Mode::Auto, channel: "stable".into(), battery_floor: f64::from(op_protocol::v2::firmware::MIN_BATTERY_FLOOR) / 100.0, wave_hours: 24.0, held_herds: Vec::new() }
+        Self {
+            mode: Mode::Auto,
+            channel: "stable".into(),
+            battery_floor: f64::from(op_protocol::v2::firmware::MIN_BATTERY_FLOOR) / 100.0,
+            wave_hours: 24.0,
+            held_herds: Vec::new(),
+        }
     }
 }
 

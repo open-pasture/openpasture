@@ -107,7 +107,10 @@ async fn a_bench_collar_reports_takes_a_boundary_and_is_logged() {
     // The report: five fixes with the collar's own times.
     let rep = s.take_report();
     assert_eq!(rep.fixes.len(), 5);
-    let Sent::Ok(reply) = uplink.report(&rep).await else { panic!("report refused") };
+    let reply = match uplink.report(&rep).await {
+        Sent::Ok(reply) => reply,
+        other => panic!("report refused: {other:?}"),
+    };
     // A collar with the config cap and no config gets one on the first reply.
     let (config_wire, config) = reply.config.expect("a config for a collar with the config cap");
     op_protocol::verify_config_wire(config_wire.as_bytes(), &server_key).unwrap();
@@ -139,7 +142,8 @@ async fn a_bench_collar_reports_takes_a_boundary_and_is_logged() {
     assert!(acked, "{status}");
 
     // A report the server refuses: its reason shows in the wire log.
-    let bad = PositionReport { fixes: vec![WireFix { at: Utc::now(), point: [0.0, 95.0], accuracy_m: 3.0, ..WireFix::default() }], ..PositionReport::default() };
+    let bad =
+        PositionReport { fixes: vec![WireFix { at: Utc::now(), point: [0.0, 95.0], accuracy_m: 3.0, ..WireFix::default() }], ..PositionReport::default() };
     let Sent::Refused { status: 400, message } = uplink.report(&bad).await else { panic!("a fix at 95° N was taken") };
 
     let wire = api.get(&format!("/api/collars/{collar_id}/wire?limit=64")).await;
@@ -161,17 +165,50 @@ async fn a_bench_collar_reports_takes_a_boundary_and_is_logged() {
     let http = recs.iter().filter(|r| matches!(r, Record::Http { .. })).count();
     assert_eq!(http, 5);
     assert!(!std::fs::read_to_string(&cap_path).unwrap().contains(key));
-    let sum = replay::run(replay::Options {
+    let token = server.ctx().settings().await.unwrap().server.app_token;
+    let replay_to = |api_key: Option<String>, into_farm: Option<&str>| replay::Options {
         capture: cap_path.clone(),
         target: Some((server.url().to_owned(), key.to_owned())),
+        api_key,
+        into_farm: into_farm.map(str::to_owned),
         pace: false,
         out: Arc::new(Capture::none()),
-    })
-    .await
-    .unwrap();
+    };
+    // Review P1-10: this collar isn't simulated. Without a check, a replay
+    // wrote old reports to it. Now nothing is sent unless the farm is named.
+    let wire_before = api.get(&format!("/api/collars/{collar_id}/wire?limit=64")).await["entries"].as_array().unwrap().len();
+    let e = replay::run(replay_to(None, None)).await.unwrap_err().to_string();
+    assert!(e.contains("--api-key"), "{e}");
+    let e = replay::run(replay_to(Some(token.clone()), None)).await.unwrap_err().to_string();
+    assert!(e.contains("aren't simulated") && e.contains("Bench collar") && e.contains(r#"--into-farm "Bench""#), "{e}");
+    let e = replay::run(replay_to(Some(token.clone()), Some("Other farm"))).await.unwrap_err().to_string();
+    assert!(e.contains("not \"Other farm\""), "{e}");
+    assert_eq!(
+        api.get(&format!("/api/collars/{collar_id}/wire?limit=64")).await["entries"].as_array().unwrap().len(),
+        wire_before,
+        "nothing reached the server"
+    );
+    let sum = replay::run(replay_to(Some(token.clone()), Some("Bench"))).await.unwrap();
     // The first download found nothing then; now the boundary is there for a collar that says it has none.
     assert_eq!(sum, replay::Summary { requests: 5, same: 4, different: 1 });
 
+    tokio::time::timeout(Duration::from_secs(10), server.shutdown()).await.unwrap().unwrap();
+}
+
+/// A server whose every collar is simulated takes a replay without naming
+/// the farm (review P1-10's other half).
+#[tokio::test]
+async fn a_simulated_farm_takes_a_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(ServeOptions { data_dir: Some(dir.path().join("data")), free_port: true, ..Default::default() }).await.unwrap();
+    let token = server.ctx().settings().await.unwrap().server.app_token;
+    let mut auth = reqwest::header::HeaderMap::new();
+    auth.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let api = Api { http: reqwest::Client::builder().default_headers(auth).build().unwrap(), base: server.url().to_owned() };
+    api.post("/api/farm", json!({"name": "Sandbox", "center": CENTRE, "timezone": "America/Chicago"})).await;
+    let herd = api.post("/api/herds", json!({"name": "Sim", "species": "cattle", "count": 1, "simulated": true})).await;
+    api.post("/api/collars", json!({"herd_id": herd["id"], "name": "Sim 1", "simulated": true})).await;
+    assert_eq!(replay::check_target(server.url(), Some(&token), None).await.unwrap(), replay::Target::Simulated { collars: 1 });
     tokio::time::timeout(Duration::from_secs(10), server.shutdown()).await.unwrap().unwrap();
 }
 
@@ -197,7 +234,11 @@ async fn a_station_run_is_judged_by_the_fleet_api() {
     // Firmware 0.2 prints no device key; this test registers the unit with
     // one of its own to reach the run route.
     let device_key = op_protocol::encode_public_key(&op_protocol::generate_signing_key().verifying_key());
-    api.post("/api/fleet/units", json!({"serial": "OC1-N-TEST01", "device_class": "node", "hw_rev": "N1.0", "fw_version": "0.2.0", "device_pubkey": device_key})).await;
+    api.post(
+        "/api/fleet/units",
+        json!({"serial": "OC1-N-TEST01", "device_class": "node", "hw_rev": "N1.0", "fw_version": "0.2.0", "device_pubkey": device_key}),
+    )
+    .await;
 
     let seen = Observed {
         fw: Some("0.2.0".into()),
@@ -206,7 +247,7 @@ async fn a_station_run_is_judged_by_the_fleet_api() {
         waited: Duration::from_secs(31),
         ..Observed::default()
     };
-    let steps = evaluate(&plan, &seen, None);
+    let steps = evaluate(&plan, &seen, Some("0.2.0"), None);
     let now = Utc::now();
     let run = run_body(&plan, Some("bench-1"), Some("fx-01"), now - chrono::Duration::seconds(40), now, &steps);
     let judged = station.post_run("OC1-N-TEST01", &run).await.unwrap();

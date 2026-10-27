@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { SIMULATED } from "../../sim";
 import type { Animal, Collar, Polygon } from "../../api";
 import { esrv, type CollarSlots } from "../../api/e-srv";
 import { fleet, wireLog, type CollarConsole, type WireEntry } from "../../api/fleet";
@@ -44,7 +45,7 @@ export function Console({ collar }: { animal?: Animal; collar?: Collar }) {
   if (!c) return null;
   return (
     <section className="fcon">
-      <h3>Console</h3>
+      <h3>Console{collar.simulated && <i className="sim">{SIMULATED}</i>}</h3>
       <Contact c={c} collar={collar} />
       <Fence collar={collar} />
       <Health c={c} />

@@ -27,10 +27,21 @@ async fn farm() -> Site {
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let now = time::now();
     let s = ctx.store();
-    s.insert_farm(&Farm { id: "farm_1".into(), name: "Test".into(), timezone: "America/Chicago".into(), center: [-93.62, 42.03], created_at: now }).await.unwrap();
-    s.insert_herd(&Herd { id: "herd_1".into(), name: "Cows".into(), species: Species::Cattle, count: 10, paddock_id: None, autonomy: Autonomy::Propose, timer_minutes: 60, created_at: now })
+    s.insert_farm(&Farm { id: "farm_1".into(), name: "Test".into(), timezone: "America/Chicago".into(), center: [-93.62, 42.03], created_at: now })
         .await
         .unwrap();
+    s.insert_herd(&Herd {
+        id: "herd_1".into(),
+        name: "Cows".into(),
+        species: Species::Cattle,
+        count: 10,
+        paddock_id: None,
+        autonomy: Autonomy::Propose,
+        timer_minutes: 60,
+        created_at: now,
+    })
+    .await
+    .unwrap();
     s.insert_animal(&Animal { id: "ani_1".into(), tag: "101".into(), herd_id: "herd_1".into(), ..Default::default() }).await.unwrap();
     Site { _dir: dir, ctx, herd: "herd_1".into() }
 }
@@ -180,13 +191,15 @@ async fn a_unit_from_registration_to_service() {
     // The label.
     let (s, svg) = f.call("GET", &format!("/api/fleet/units/{serial}/label.svg"), None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(svg.as_str().unwrap().contains(&op_fleet::provision::grouped(&code)));
+    let grouped = op_fleet::provision::grouped(&code);
+    assert!(svg.as_str().unwrap().contains(&format!(">{}<", &grouped[..9])) && svg.as_str().unwrap().contains(&format!(">{}<", &grouped[10..])));
 
     // Claimed into the herd, on an animal: a collar, and the v1 key for today's firmware.
     let wrong = json!({ "claim_code": "0000000000000000", "herd_id": f.herd });
     assert_eq!(f.call("POST", &format!("/api/fleet/units/{serial}/claim"), Some(wrong)).await.0, StatusCode::NOT_FOUND);
     let typed = op_fleet::provision::grouped(&code).to_lowercase();
-    let (s, c) = f.call("POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": typed, "herd_id": f.herd, "animal_id": "ani_1" }))).await;
+    let (s, c) =
+        f.call("POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": typed, "herd_id": f.herd, "animal_id": "ani_1" }))).await;
     assert_eq!(s, StatusCode::CREATED, "{c}");
     let collar_id = c["collar"]["id"].as_str().unwrap().to_owned();
     assert_eq!(c["collar"]["name"], serial);
@@ -215,7 +228,10 @@ async fn a_unit_from_registration_to_service() {
     // Back for repair: RMA, retested, re-provisioned returns it to its collar.
     let (_, u) = f.call("POST", &format!("/api/fleet/units/{serial}/state"), Some(json!({ "state": "rma", "note": "buzzer" }))).await;
     assert_eq!(u["state"], "rma");
-    f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 20))).await;
+    let (s, e) = f.call("POST", &format!("/api/fleet/units/{serial}/provision"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "back from RMA, it needs a fresh pass: {e}");
+    let (_, r) = f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 60))).await;
+    assert_eq!((r["counted"].as_bool(), r["generation"].as_i64()), (Some(true), Some(1)), "{r}");
     let (_, p) = f.call("POST", &format!("/api/fleet/units/{serial}/provision"), None).await;
     let code2 = p["claim_code"].as_str().unwrap();
     assert!(code2.len() == 16 && code2 != code, "the old code was forgotten once in service");
@@ -276,8 +292,10 @@ async fn another_server_claims_from_the_card() {
     // A server that never saw the unit takes the card at its word; the collar
     // itself checks the code when the bind reaches it.
     let wrong = card.rsplit_once(':').map(|(head, _)| format!("{head}:0000000000000000")).unwrap();
-    let (s, _) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": wrong, "herd_id": "herd_1" }))).await;
+    let (s, c) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": wrong, "herd_id": "herd_1" }))).await;
     assert_eq!(s, StatusCode::CREATED);
+    assert_eq!((c["code_checked"].as_bool(), c["unit"]["claim_checked"].as_bool()), (Some(false), Some(false)), "said plainly: {c}");
+    assert_eq!(c["unit"]["state"], "claimed", "claimed, not in service, until the collar reports");
     let (s, e) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_1" }))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "the same serial now has another code here: {e}");
 
@@ -290,10 +308,17 @@ async fn another_server_claims_from_the_card() {
 
     // Enrol the maker's key and the next unit from them verifies.
     let maker_pk = op_fleet::keys::maker_key(maker.ctx.data_dir()).unwrap().verifying_key();
-    let (s, k) = farm3.call("POST", "/api/fleet/signing-keys", Some(json!({ "name": "Test farm", "public_key": op_protocol::encode_public_key(&maker_pk), "purpose": "maker" }))).await;
+    let (s, k) = farm3
+        .call(
+            "POST",
+            "/api/fleet/signing-keys",
+            Some(json!({ "name": "Test farm", "public_key": op_protocol::encode_public_key(&maker_pk), "purpose": "maker" })),
+        )
+        .await;
     assert_eq!(s, StatusCode::CREATED, "{k}");
     let p2 = provisioned(&maker, "OCN-2611-00004", 7).await;
-    let (s, c) = farm3.call("POST", "/api/fleet/claim", Some(json!({ "card": p2["card"], "factory_record": p2["factory_record"]["cose"], "herd_id": "herd_1" }))).await;
+    let (s, c) =
+        farm3.call("POST", "/api/fleet/claim", Some(json!({ "card": p2["card"], "factory_record": p2["factory_record"]["cose"], "herd_id": "herd_1" }))).await;
     assert_eq!(s, StatusCode::CREATED, "{c}");
     assert_eq!(c["unit"]["maker_verified"], true);
 }
@@ -328,14 +353,21 @@ async fn firmware_goes_out_only_when_the_collar_can_take_it() {
     let code = p["unit"]["claim_code"].as_str().unwrap().to_owned();
     let (_, c) = f.call("POST", "/api/fleet/claim", Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
     let collar = c["collar"]["id"].as_str().unwrap().to_owned();
-    sqlx::query("UPDATE collars SET fw = '1.0.0', battery = 0.9, last_seen = ? WHERE id = ?").bind(time::to_db(&time::now())).bind(&collar).execute(f.ctx.db()).await.unwrap();
+    sqlx::query("UPDATE collars SET fw = '1.0.0', battery = 0.9, last_seen = ? WHERE id = ?")
+        .bind(time::to_db(&time::now()))
+        .bind(&collar)
+        .execute(f.ctx.db())
+        .await
+        .unwrap();
 
     // A release signed by a key this server doesn't trust is refused.
     let image = b"opencollar node firmware 1.1.0".to_vec();
     let key = SigningKey::from_bytes(&[42; 32]);
     let (s, e) = f.call("POST", "/api/fleet/firmware", Some(json!({ "manifest": manifest(&image, &key, "1.1.0") }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
-    let (s, k) = f.call("POST", "/api/fleet/signing-keys", Some(json!({ "name": "Bench builds", "public_key": op_protocol::encode_public_key(&key.verifying_key()) }))).await;
+    let (s, k) = f
+        .call("POST", "/api/fleet/signing-keys", Some(json!({ "name": "Bench builds", "public_key": op_protocol::encode_public_key(&key.verifying_key()) })))
+        .await;
     assert_eq!(s, StatusCode::CREATED, "{k}");
     assert_eq!(k["purpose"], "image");
     let (s, fw) = f.call("POST", "/api/fleet/firmware", Some(json!({ "manifest": manifest(&image, &key, "1.1.0"), "notes": "faster fixes" }))).await;
@@ -397,9 +429,12 @@ async fn firmware_goes_out_only_when_the_collar_can_take_it() {
     assert_eq!((s, r["state"].as_str()), (StatusCode::OK, Some("paused")), "a rollback pauses it again at once");
 
     // The farmer pauses everything.
-    let (s, p) = f.call_as(manager(), "PUT", "/api/fleet/firmware/policy", Some(json!({ "mode": "paused", "channel": "stable", "battery_floor": 0.5, "wave_hours": 24 }))).await;
+    let (s, p) = f
+        .call_as(manager(), "PUT", "/api/fleet/firmware/policy", Some(json!({ "mode": "paused", "channel": "stable", "battery_floor": 0.5, "wave_hours": 24 })))
+        .await;
     assert_eq!((s, p["mode"].as_str()), (StatusCode::OK, Some("paused")));
-    let (s, _) = f.call("PUT", "/api/fleet/firmware/policy", Some(json!({ "mode": "auto", "channel": "stable", "battery_floor": 0.2, "wave_hours": 24 }))).await;
+    let (s, _) =
+        f.call("PUT", "/api/fleet/firmware/policy", Some(json!({ "mode": "auto", "channel": "stable", "battery_floor": 0.2, "wave_hours": 24 }))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "never below the collar's own floor");
 }
 
@@ -425,10 +460,18 @@ async fn the_herd_network_and_the_console() {
     assert_eq!(s, StatusCode::CREATED, "{a}");
     let anchor = a["id"].as_str().unwrap().to_owned();
     let now = time::now();
-    op_fleet::network::record_beacon(&f.ctx, &op_fleet::network::Beacon { anchor_id: anchor.clone(), herd_id: f.herd.clone(), lte_rsrp_dbm: Some(-98.0), at: now }).await.unwrap();
-    op_fleet::network::record_uplink(&f.ctx, &op_fleet::network::Uplink { collar_id: collar.clone(), role: None, via: Some(anchor.clone()), rssi_dbm: Some(-95.0), snr_db: Some(6.5), at: now })
-        .await
-        .unwrap();
+    op_fleet::network::record_beacon(
+        &f.ctx,
+        &op_fleet::network::Beacon { anchor_id: anchor.clone(), herd_id: f.herd.clone(), lte_rsrp_dbm: Some(-98.0), at: now },
+    )
+    .await
+    .unwrap();
+    op_fleet::network::record_uplink(
+        &f.ctx,
+        &op_fleet::network::Uplink { collar_id: collar.clone(), role: None, via: Some(anchor.clone()), rssi_dbm: Some(-95.0), snr_db: Some(6.5), at: now },
+    )
+    .await
+    .unwrap();
     let (s, n) = f.call("GET", &format!("/api/fleet/network/{}", f.herd), None).await;
     assert_eq!(s, StatusCode::OK, "{n}");
     assert_eq!(n["active_anchor"], anchor.as_str());
@@ -441,7 +484,11 @@ async fn the_herd_network_and_the_console() {
     // Not heard for an hour: a gap, at its last fix.
     let old = time::to_db(&(now - Duration::hours(1)));
     sqlx::query("UPDATE fleet_links SET heard_at = ? WHERE collar_id = ?").bind(&old).bind(&collar).execute(f.ctx.db()).await.unwrap();
-    sqlx::query(r#"UPDATE collars SET last_fix = '{"at":"2026-10-26T12:00:00Z","point":[-93.621,42.031],"accuracy_m":2.0,"sats":9}' WHERE id = ?"#).bind(&collar).execute(f.ctx.db()).await.unwrap();
+    sqlx::query(r#"UPDATE collars SET last_fix = '{"at":"2026-10-26T12:00:00Z","point":[-93.621,42.031],"accuracy_m":2.0,"sats":9}' WHERE id = ?"#)
+        .bind(&collar)
+        .execute(f.ctx.db())
+        .await
+        .unwrap();
     let n = f.call("GET", &format!("/api/fleet/network/{}", f.herd), None).await.1;
     assert_eq!(n["members"][0]["quality"], "lost");
     assert_eq!(n["gaps"][0]["point"], json!([-93.621, 42.031]));
@@ -458,13 +505,15 @@ async fn the_herd_network_and_the_console() {
         .await
         .unwrap();
     let fix_at = t - Duration::seconds(12);
-    sqlx::query("INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, sats, cn0, hdop) VALUES (?, 'herd_1', ?, ?, -93.62, 42.03, 1.8, 9, 41.0, 0.9)")
-        .bind(&collar)
-        .bind(time::to_db(&fix_at))
-        .bind(time::unix_ms(&fix_at))
-        .execute(f.ctx.db())
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m, sats, cn0, hdop) VALUES (?, 'herd_1', ?, ?, -93.62, 42.03, 1.8, 9, 41.0, 0.9)",
+    )
+    .bind(&collar)
+    .bind(time::to_db(&fix_at))
+    .bind(time::unix_ms(&fix_at))
+    .execute(f.ctx.db())
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO cues (collar_id, herd_id, at, t, level, margin_m, kind, ring) VALUES (?, 'herd_1', ?, ?, 2, -1.4, 'outside', 0)")
         .bind(&collar)
         .bind(&at)
@@ -527,7 +576,16 @@ async fn a_release_goes_to_one_collar_then_its_herd_then_every_herd() {
     let now = time::now();
     f.ctx
         .store()
-        .insert_herd(&Herd { id: "herd_2".into(), name: "Heifers".into(), species: Species::Cattle, count: 5, paddock_id: None, autonomy: Autonomy::Propose, timer_minutes: 60, created_at: now })
+        .insert_herd(&Herd {
+            id: "herd_2".into(),
+            name: "Heifers".into(),
+            species: Species::Cattle,
+            count: 5,
+            paddock_id: None,
+            autonomy: Autonomy::Propose,
+            timer_minutes: 60,
+            created_at: now,
+        })
         .await
         .unwrap();
     let mut collars = Vec::new();
@@ -570,7 +628,12 @@ async fn a_release_goes_to_one_collar_then_its_herd_then_every_herd() {
         let ctx = f.ctx.clone();
         async move {
             let at = serde_json::to_value(time::now() - Duration::hours(hours)).unwrap();
-            sqlx::query("UPDATE fleet_rollouts SET waves = json_set(waves, '$[0].started_at', ?) WHERE id = ?").bind(at.as_str().unwrap()).bind(&id).execute(ctx.db()).await.unwrap();
+            sqlx::query("UPDATE fleet_rollouts SET waves = json_set(waves, '$[0].started_at', ?) WHERE id = ?")
+                .bind(at.as_str().unwrap())
+                .bind(&id)
+                .execute(ctx.db())
+                .await
+                .unwrap();
         }
     };
     backdate(25).await;
@@ -578,4 +641,306 @@ async fn a_release_goes_to_one_collar_then_its_herd_then_every_herd() {
     assert_eq!((s[1].0.as_str(), s[2].0.as_str()), ("ready", "waiting"));
     backdate(73).await;
     assert_eq!(states().await[2].0, "ready", "every herd after 72 h");
+}
+
+// ---- review 2026-10-26 (Astra) regressions ---------------------------------------------------------
+
+/// A run of the shipped node plan finishing at `end`.
+fn run_at(rail: f64, end: chrono::DateTime<chrono::Utc>) -> Value {
+    let mut r = run(rail, 0);
+    r["started_at"] = json!(time::to_db(&(end - Duration::seconds(55))));
+    r["finished_at"] = json!(time::to_db(&end));
+    r
+}
+
+async fn state_of(f: &Site, serial: &str) -> String {
+    f.call("GET", &format!("/api/fleet/units/{serial}"), None).await.1["unit"]["state"].as_str().unwrap().to_owned()
+}
+
+/// P1-05: "latest" is the server's order, a delayed retry of an old pass
+/// can't overrule a newer failure, a retry with the same run key is the
+/// same run, and a unit back from RMA needs a fresh pass.
+#[tokio::test]
+async fn an_old_pass_never_overrules_a_newer_failure_and_rma_needs_a_retest() {
+    let f = farm().await;
+    let serial = "OCN-2611-00201";
+    let tests = format!("/api/fleet/units/{serial}/tests");
+    let prov = format!("/api/fleet/units/{serial}/provision");
+    f.call("POST", "/api/fleet/units", Some(new_unit(serial, 21))).await;
+    let t0 = time::now() - Duration::minutes(30);
+    let first_pass = run_at(3.3, t0);
+    let (s, r) = f.call("POST", &tests, Some(first_pass.clone())).await;
+    assert_eq!((s, r["result"].as_str(), r["counted"].as_bool()), (StatusCode::CREATED, Some("pass"), Some(true)));
+    assert_eq!(f.call("POST", &prov, None).await.0, StatusCode::OK);
+
+    // Sent back: no earlier pass counts, and its old pass resent doesn't either.
+    let (_, u) = f.call("POST", &format!("/api/fleet/units/{serial}/state"), Some(json!({ "state": "rma" }))).await;
+    assert_eq!((u["state"].as_str(), u["generation"].as_i64()), (Some("rma"), Some(1)));
+    assert!(u.get("last_test").is_none(), "{u}");
+    let (s, e) = f.call("POST", &prov, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "provisioned after RMA without a retest: {e}");
+    let (s, r) = f.call("POST", &tests, Some(first_pass.clone())).await;
+    assert_eq!((s, r["counted"].as_bool()), (StatusCode::CREATED, Some(false)), "the pre-RMA pass, resent: {r}");
+    assert_eq!(f.call("POST", &prov, None).await.0, StatusCode::CONFLICT);
+    assert_eq!(state_of(&f, serial).await, "rma");
+
+    // A fresh pass, then a newer failure on another station.
+    let (_, r) = f.call("POST", &tests, Some(run_at(3.3, time::now()))).await;
+    assert_eq!((r["counted"].as_bool(), r["generation"].as_i64()), (Some(true), Some(1)));
+    assert_eq!(state_of(&f, serial).await, "tested");
+    let mut fail = run_at(2.1, time::now());
+    fail["station"] = json!("bench-2");
+    let (_, r) = f.call("POST", &tests, Some(fail)).await;
+    assert_eq!(r["result"], "fail");
+    assert_eq!(state_of(&f, serial).await, "built");
+    // A disconnected station delivers its earlier pass late.
+    let (s, r) = f.call("POST", &tests, Some(run_at(3.3, time::now() - Duration::seconds(10)))).await;
+    assert_eq!((s, r["result"].as_str(), r["counted"].as_bool()), (StatusCode::CREATED, Some("pass"), Some(false)), "{r}");
+    assert_eq!(f.call("POST", &prov, None).await.0, StatusCode::CONFLICT, "the newer failure stands");
+    let (_, d) = f.call("GET", &format!("/api/fleet/units/{serial}"), None).await;
+    assert_eq!(d["unit"]["last_test"]["result"], "fail");
+    let seqs: Vec<i64> = d["runs"].as_array().unwrap().iter().map(|r| r["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] > w[1]), "newest first by the server's order: {seqs:?}");
+
+    // A retry with the station's run key is the same run, not a new one.
+    let mut keyed = run_at(3.3, time::now());
+    keyed["run_key"] = json!("bench-1/0042");
+    let (s, a) = f.call("POST", &tests, Some(keyed.clone())).await;
+    assert_eq!((s, a["counted"].as_bool()), (StatusCode::CREATED, Some(true)), "{a}");
+    let (s, b) = f.call("POST", &tests, Some(keyed.clone())).await;
+    assert_eq!((s, b["id"].as_str()), (StatusCode::OK, a["id"].as_str()));
+    let mut reused = keyed.clone();
+    reused["finished_at"] = json!(time::to_db(&(time::now() - Duration::seconds(5))));
+    assert_eq!(f.call("POST", &tests, Some(reused)).await.0, StatusCode::CONFLICT, "one key, one run");
+    assert_eq!(f.call("GET", &format!("/api/fleet/units/{serial}"), None).await.1["runs"].as_array().unwrap().len(), 6);
+
+    // A run started before the unit was sent back again is refused.
+    let mut bound = run_at(3.3, time::now());
+    bound["generation"] = json!(1);
+    f.call("POST", &format!("/api/fleet/units/{serial}/state"), Some(json!({ "state": "rma" }))).await;
+    assert_eq!(f.call("POST", &tests, Some(bound)).await.0, StatusCode::CONFLICT);
+}
+
+/// P1-06: provisioning reads eligibility inside its write. The reviewer's
+/// interleaving: hold the writer lock, start provisioning, retire the unit
+/// and commit, let provisioning go on. The retire wins.
+#[tokio::test]
+async fn provisioning_cant_resurrect_a_unit_retired_meanwhile() {
+    let f = farm().await;
+    let serial = "OCN-2611-00202";
+    f.call("POST", "/api/fleet/units", Some(new_unit(serial, 22))).await;
+    f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 1))).await;
+    assert_eq!(state_of(&f, serial).await, "tested");
+
+    let mut lock = f.ctx.db().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *lock).await.unwrap();
+    let app = f.app(owner());
+    let uri = format!("/api/fleet/units/{serial}/provision");
+    let pending = tokio::spawn(async move { app.oneshot(Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()).await.unwrap().status() });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sqlx::query("UPDATE fleet_units SET state = 'retired', generation = generation + 1 WHERE serial = ?").bind(serial).execute(&mut *lock).await.unwrap();
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    assert_eq!(pending.await.unwrap(), StatusCode::CONFLICT);
+    assert_eq!(state_of(&f, serial).await, "retired");
+    // A retired unit's tests are refused too, until it is sent back.
+    assert_eq!(f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 59))).await.0, StatusCode::CONFLICT);
+}
+
+/// A claimed collar with fota, battery and a firmware release ready for it.
+async fn ready_for_firmware(f: &Site, serial: &str, seed: u8) -> String {
+    provisioned(f, serial, seed).await;
+    let code = f.call("GET", &format!("/api/fleet/units/{serial}"), None).await.1["unit"]["claim_code"].as_str().unwrap().to_owned();
+    let (_, c) = f.call("POST", "/api/fleet/claim", Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
+    let collar = c["collar"]["id"].as_str().unwrap().to_owned();
+    sqlx::query(r#"UPDATE collars SET fw = '1.0.0', battery = 0.9, caps = '["holes","firmware"]', last_seen = ? WHERE id = ?"#)
+        .bind(time::to_db(&time::now()))
+        .bind(&collar)
+        .execute(f.ctx.db())
+        .await
+        .unwrap();
+    let image = b"opencollar node firmware 1.1.0".to_vec();
+    let key = SigningKey::from_bytes(&[43; 32]);
+    f.call("POST", "/api/fleet/signing-keys", Some(json!({ "name": "Bench", "public_key": op_protocol::encode_public_key(&key.verifying_key()) }))).await;
+    let (_, fw) = f.call("POST", "/api/fleet/firmware", Some(json!({ "manifest": manifest(&image, &key, "1.1.0") }))).await;
+    assert_eq!(f.raw("PUT", &format!("/api/fleet/firmware/{}/image", fw["id"].as_str().unwrap()), image).await.0, StatusCode::OK);
+    assert_eq!(rollout_state(f, &collar).await.0, "ready");
+    collar
+}
+
+/// P1-09: a pause that commits while an offer waits for the writer lock
+/// wins; a move that starts after the offer stops it at send time; a lost
+/// offer goes out again after a wait, and after five it has failed.
+#[tokio::test]
+async fn firmware_offers_respect_a_pause_and_lost_offers_retry() {
+    let f = farm().await;
+    let collar = ready_for_firmware(&f, "OCN-2611-00203", 23).await;
+    let rollout = f.call("GET", "/api/fleet/firmware/rollouts", None).await.1[0]["id"].as_str().unwrap().to_owned();
+
+    // The reviewer's interleaving: the offer is blocked, the pause commits first.
+    let mut lock = f.ctx.db().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *lock).await.unwrap();
+    let ctx = f.ctx.clone();
+    let c2 = collar.clone();
+    let pending = tokio::spawn(async move { op_fleet::firmware::offer_for(&ctx, &c2).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    sqlx::query("UPDATE fleet_rollouts SET state = 'paused' WHERE id = ?").bind(&rollout).execute(&mut *lock).await.unwrap();
+    sqlx::query("COMMIT").execute(&mut *lock).await.unwrap();
+    drop(lock);
+    assert_eq!(pending.await.unwrap(), None, "offered after the pause was acknowledged");
+
+    // Resumed: offered; a move starting before the send takes it back.
+    sqlx::query("UPDATE fleet_rollouts SET state = 'active' WHERE id = ?").bind(&rollout).execute(f.ctx.db()).await.unwrap();
+    assert_eq!(rollout_state(&f, &collar).await.0, "ready");
+    let offer = op_fleet::firmware::offer_for(&f.ctx, &collar).await.unwrap().unwrap();
+    assert!(op_fleet::firmware::rollout::still_good(&f.ctx, &collar, &offer.offer_id).await.unwrap());
+    let at = time::to_db(&time::now());
+    sqlx::query("INSERT INTO moves (id, herd_id, decision_id, target, status, warn_m, hysteresis_m, started_at, updated_at) VALUES ('mov_9', 'herd_1', 'dec_9', '{}', 'sweeping', 3, 1, ?, ?)")
+        .bind(&at)
+        .bind(&at)
+        .execute(f.ctx.db())
+        .await
+        .unwrap();
+    assert!(!op_fleet::firmware::rollout::still_good(&f.ctx, &collar, &offer.offer_id).await.unwrap(), "a move started after the offer");
+    assert_eq!(rollout_state(&f, &collar).await, ("held".into(), Some("The herd is being moved".into())));
+    sqlx::query("UPDATE moves SET status = 'done'").execute(f.ctx.db()).await.unwrap();
+    assert_eq!(rollout_state(&f, &collar).await.0, "ready");
+
+    // Lost: never answered. Offered again after the wait, each time with a new id.
+    let mut last_id = String::new();
+    for attempt in 1..=op_fleet::firmware::rollout::OFFER_TRIES {
+        let offer = op_fleet::firmware::offer_for(&f.ctx, &collar).await.unwrap().unwrap_or_else(|| panic!("offer {attempt}"));
+        assert_ne!(offer.offer_id, last_id);
+        last_id = offer.offer_id.clone();
+        let long_ago = time::to_db(&(time::now() - op_fleet::firmware::rollout::OFFER_TIMEOUT - Duration::minutes(1)));
+        sqlx::query("UPDATE fleet_rollout_units SET offered_at = ? WHERE collar_id = ?").bind(&long_ago).bind(&collar).execute(f.ctx.db()).await.unwrap();
+        let (state, reason) = rollout_state(&f, &collar).await;
+        if attempt == op_fleet::firmware::rollout::OFFER_TRIES {
+            assert_eq!((state.as_str(), reason.as_deref()), ("failed", Some("No answer to 5 offers")));
+            break;
+        }
+        assert_eq!(state, "ready", "attempt {attempt}");
+        assert_eq!(op_fleet::firmware::offer_for(&f.ctx, &collar).await.unwrap(), None, "not before the wait is over");
+        assert!(!op_fleet::firmware::rollout::still_good(&f.ctx, &collar, &offer.offer_id).await.unwrap(), "the lost offer's id is dead");
+        sqlx::query("UPDATE fleet_rollout_units SET next_try_at = ? WHERE collar_id = ?")
+            .bind(time::to_db(&(time::now() - Duration::seconds(1))))
+            .bind(&collar)
+            .execute(f.ctx.db())
+            .await
+            .unwrap();
+    }
+    assert_eq!(f.call("GET", "/api/fleet/firmware/rollouts", None).await.1[0]["state"], "paused", "a collar that never answers pauses the rollout");
+    assert_eq!(op_fleet::firmware::rollout::retry_wait(1), Duration::minutes(15));
+    assert_eq!(op_fleet::firmware::rollout::retry_wait(9), Duration::minutes(360));
+}
+
+/// Protocol review F15: a card's code is checked against the factory
+/// record's claim check before anything is stored, and an in-service unit
+/// that was reset is claimed again from its card: same collar, new key.
+#[tokio::test]
+async fn card_claims_check_the_code_and_a_reset_unit_is_reclaimed() {
+    let maker = farm().await;
+    let p = provisioned(&maker, "OCN-2611-00204", 24).await;
+    let card = p["card"].as_str().unwrap().to_owned();
+    let record = p["factory_record"]["cose"].as_str().unwrap().to_owned();
+    let typo = card.rsplit_once(':').map(|(head, _)| format!("{head}:7Q4K9M2XH8D3TV5W")).unwrap();
+
+    let farm2 = farm().await;
+    let (s, e) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": typo, "factory_record": record, "herd_id": "herd_1" }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a typo against the record's claim check: {e}");
+    assert_eq!(farm2.call("GET", "/api/fleet/units/OCN-2611-00204", None).await.0, StatusCode::NOT_FOUND, "nothing stored");
+    let (s, c) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "factory_record": record, "herd_id": "herd_1" }))).await;
+    assert_eq!((s, c["code_checked"].as_bool()), (StatusCode::CREATED, Some(true)), "{c}");
+
+    // On the maker's own server: claimed, in service, code forgotten, then reset.
+    let (s, c) = maker.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_1", "animal_id": "ani_1" }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+    let collar_id = c["collar"]["id"].as_str().unwrap().to_owned();
+    let old_key = c["v1"]["key"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE collars SET last_seen = ? WHERE id = ?").bind(time::to_db(&time::now())).bind(&collar_id).execute(maker.ctx.db()).await.unwrap();
+    assert!(op_fleet::units::mark_in_service(&maker.ctx, &collar_id).await.unwrap());
+    assert_eq!(
+        maker.call("POST", "/api/fleet/claim", Some(json!({ "card": typo, "herd_id": "herd_1" }))).await.0,
+        StatusCode::NOT_FOUND,
+        "a wrong code can't reclaim it"
+    );
+    let (s, e) = maker.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_2" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "it comes back in its own herd: {e}");
+    let (s, r) = maker.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_1" }))).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!((r["reclaimed"].as_bool(), r["code_checked"].as_bool()), (Some(true), Some(true)));
+    assert_eq!((r["collar"]["id"].as_str(), r["unit"]["state"].as_str()), (Some(collar_id.as_str()), Some("claimed")));
+    let new_key = r["v1"]["key"].as_str().unwrap();
+    assert_ne!(new_key, old_key);
+    let hash: String = sqlx::query_scalar("SELECT key_hash FROM collars WHERE id = ?").bind(&collar_id).fetch_one(maker.ctx.db()).await.unwrap();
+    assert_eq!(hash, op_core::keys::hash_key(new_key), "the old key stops working");
+    assert_eq!(maker.ctx.store().get_animal("ani_1").await.unwrap().unwrap().collar_id.as_deref(), Some(collar_id.as_str()));
+    // In service again only after a report under the new key.
+    op_fleet::units::sweep_in_service(&maker.ctx).await.unwrap();
+    assert_eq!(state_of(&maker, "OCN-2611-00204").await, "claimed");
+    let later = time::to_db(&(time::now() + Duration::seconds(1)));
+    sqlx::query("UPDATE collars SET last_seen = ? WHERE id = ?").bind(&later).bind(&collar_id).execute(maker.ctx.db()).await.unwrap();
+    op_fleet::units::sweep_in_service(&maker.ctx).await.unwrap();
+    assert_eq!(state_of(&maker, "OCN-2611-00204").await, "in_service");
+    let kinds: Vec<String> = maker.call("GET", "/api/fleet/units/OCN-2611-00204", None).await.1["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(kinds.ends_with(&["reclaimed".to_owned(), "in_service".to_owned()]), "{kinds:?}");
+}
+
+/// P2-04: a 1,000-unit batch is all there, a page at a time, with its total.
+#[tokio::test]
+async fn every_unit_of_a_thousand_is_listed() {
+    let f = farm().await;
+    let at = time::now();
+    let mut tx = f.ctx.db().begin().await.unwrap();
+    for i in 0..1000 {
+        let key = SigningKey::from_bytes(&{
+            let mut b = [7u8; 32];
+            b[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            b
+        })
+        .verifying_key();
+        // Batches register within the same millisecond too: the serial breaks ties.
+        let created = time::to_db(&(at + Duration::milliseconds(i / 3)));
+        sqlx::query("INSERT INTO fleet_units (serial, device_class, hw_rev, fw_version, device_pubkey, device_kid, state, origin, created_at, updated_at) VALUES (?, 'node', 'N1.0', '1.0.0', ?, ?, 'built', 'station', ?, ?)")
+            .bind(format!("OCN-2611-{i:05}"))
+            .bind(op_protocol::encode_public_key(&key))
+            .bind(op_fleet::keys::kid(&key))
+            .bind(&created)
+            .bind(&created)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let uri = match &cursor {
+            Some(c) => format!("/api/fleet/units?cursor={}", c.replace(':', "%3A").replace('|', "%7C")),
+            None => "/api/fleet/units".to_owned(),
+        };
+        let (s, page) = f.call("GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{page}");
+        assert_eq!(page["total"], 1000);
+        pages += 1;
+        for u in page["units"].as_array().unwrap() {
+            assert!(seen.insert(u["serial"].as_str().unwrap().to_owned()), "listed twice: {}", u["serial"]);
+        }
+        match page["next"].as_str() {
+            Some(n) => cursor = Some(n.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!((seen.len(), pages), (1000, 5));
+    let (_, one) = f.call("GET", "/api/fleet/units?limit=1000", None).await;
+    assert_eq!(one["units"].as_array().unwrap().len(), 1000);
+    assert!(one.get("next").is_none());
+    let (_, q) = f.call("GET", "/api/fleet/units?q=OCN-2611-0099", None).await;
+    assert_eq!(q["total"], 10);
 }

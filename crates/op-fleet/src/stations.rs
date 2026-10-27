@@ -142,7 +142,8 @@ async fn create(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJson<
     if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
         return Err(ApiError::bad_request("A station needs a name of 1–64 characters."));
     }
-    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM fleet_stations WHERE name = ? AND revoked_at IS NULL").bind(name).fetch_optional(ctx.db()).await?;
+    let taken: Option<String> =
+        sqlx::query_scalar("SELECT id FROM fleet_stations WHERE name = ? AND revoked_at IS NULL").bind(name).fetch_optional(ctx.db()).await?;
     if taken.is_some() {
         return Err(ApiError::conflict(format!("There is already a station called {name}.")));
     }
@@ -162,7 +163,12 @@ async fn create(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJson<
 }
 
 async fn revoke(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<Station>> {
-    let n = sqlx::query("UPDATE fleet_stations SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?").bind(to_db(&now())).bind(&id).execute(ctx.db()).await?.rows_affected();
+    let n = sqlx::query("UPDATE fleet_stations SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?")
+        .bind(to_db(&now()))
+        .bind(&id)
+        .execute(ctx.db())
+        .await?
+        .rows_affected();
     if n == 0 {
         return Err(ApiError::not_found("No such station."));
     }

@@ -78,11 +78,13 @@ Unit {
   radios: { lora_eui?, imei?, iccid?, ble_addr? },
   image_keys?: string[], caps?: string[],
   state: "built"|"tested"|"provisioned"|"claimed"|"in_service"|"retired"|"rma",
+  generation, generation_at?,                 // up by one on RMA, retire or a new key (server time it began)
   origin: "station"|"card",                   // registered here, or claimed from another builder's card
   station?,                                   // last station that registered or tested it
   claim_code?,                                // 16 characters, until the unit is in service
+  claim_checked: boolean,                     // drawn or written here, or matched a factory record's claim check
   collar_id?, herd_id?,                       // once claimed
-  last_test?: { id, result: "pass"|"fail", plan_id, plan_version, finished_at },
+  last_test?: { id, result: "pass"|"fail", plan_id, plan_version, finished_at, seq },   // the run that decides (below)
   maker?, maker_kid?, maker_verified: boolean, made_at?,   // from its factory record
   provisioned_at?, claimed_at?, created_at, updated_at,
 }
@@ -90,8 +92,16 @@ Unit {
 
 Lifecycle: `built` → `tested` (a passing test run) → `provisioned` → `claimed` → `in_service`
 (the collar's first report) → `retired` or `rma`. A failing run sends `tested` or `provisioned`
-back to `built`. An `rma` unit goes back to `tested` on a passing run, and provisioning it again
-returns it to its collar.
+back to `built`. An `rma` unit goes back to `tested` on a fresh passing run, and provisioning it
+again returns it to its collar. A `retired` unit comes back only through `rma`.
+
+**Which run decides.** `last_test` is the latest run by the server's own order (`seq`, given in
+the write that stores the run, never a station's clock) among the **counted** runs of the unit's
+current **generation**. RMA, retiring and a new device key start a new generation, so no earlier
+pass counts: a repaired unit needs a fresh pass. Every transition (test, provision, claim, state)
+reads the unit in the same write that changes it and changes it only if its state and generation
+are still the ones it read, so a retire or a failure that lands meanwhile wins (409 "changed
+meanwhile" for the loser).
 
 ### Test plans
 
@@ -122,6 +132,7 @@ TestPlan {
   "plan_id": "node-fct", "plan_version": 1,
   "station": "bench-1", "fixture_id": "fx-01",
   "started_at": "2026-10-26T14:02:11Z", "finished_at": "2026-10-26T14:03:05Z",
+  "run_key": "bench-1/OCN-2611-00123/1793023331000", "generation": 0,
   "steps": [
     { "name": "rail_3v3", "status": "pass", "value": 3.31, "unit": "V" },
     { "name": "sleep_current", "status": "pass", "value": 4.2, "unit": "uA" },
@@ -130,12 +141,18 @@ TestPlan {
 }
 ```
 
+`run_key` (optional, ≤ 64): the station's own id for the run; sending it again returns the stored
+run (200) instead of a new one, and a different run with the same key is refused (409).
+`generation` (optional): the unit's generation when the station registered it; if the unit was
+sent back or retired since, the run is refused (409, test again).
+
 Returns a `TestRun` (201) with the **server's** verdict against the plan's limits:
 
 ```ts
 TestRun {
   id, serial, plan_id, plan_version, station?, fixture_id?, started_at, finished_at, received_at,
   result: "pass"|"fail",
+  seq, generation, counted: boolean, run_key?,
   failed: string[],                           // required steps that didn't pass, in plan order
   steps: [{
     name, status?, value?, unit?, detail?,               // as sent
@@ -154,14 +171,18 @@ TestRun {
   not in the future (a station with a wrong clock is told so).
 - The unit must be registered (404) and not `claimed`, `in_service` or `retired` (409: mark it
   `rma` first). The plan version must exist for the unit's class (400).
+- `counted: false`: a **pass** that finished before a run of this unit already stored (a
+  disconnected station delivering late), or before the unit's generation began. It is kept and
+  shown, but can't make the unit eligible. A failure always counts.
 
 ### Provision
 
 `POST /api/fleet/units/:serial/provision`, body optional:
 `{ "claim_code": "<the fixture's>", "rotate_claim": false }`.
 
-Refused (409) unless the unit's latest test run passed (or it came from another builder's card
-and is claimed here), and, for units that talk LTE, until the server has a collar address.
+Refused (409) unless the run that decides (above) passed (or the unit came from another builder's
+card and is claimed here), never for `built`, `rma` or `retired` units, and, for units that talk
+LTE, until the server has a collar address.
 
 ```ts
 Provisioning {
@@ -195,7 +216,20 @@ link it to the unit.
 `POST /api/fleet/claim` `{ claim_code? | card?, factory_record?, herd_id, name?, animal_id? }`: by
 claim code alone, or by the scanned card. A server that never saw the unit registers it from the
 card (`origin: "card"`; class, board and firmware from `factory_record` when given, else
-`unknown`). The collar itself checks the code when the bind reaches it.
+`unknown`).
+
+- **The typo check** (`identity.md` §3, key 8): whenever there is a factory record (sent with the
+  card, or stored here), the card's code must match its `claim_check` before anything is stored;
+  a mismatch is a wrong code (404). A card with no record is taken at its word: `code_checked` is
+  false and the collar checks the code when the bind reaches it. Either way the unit stays
+  `claimed` (not `in_service`) until the collar reports.
+- **Reclaim after a reset**: a unit in service here has forgotten its code. Its card, whose code
+  matches the stored factory record's claim check, claims it again: the same collar (history,
+  herd, animal), a new collar key (the old one stops working), fence state starting over, the
+  unit `claimed` until it reports under the new key. Returns **200** with `reclaimed: true`. The
+  body's `herd_id` must be the collar's herd and `animal_id`, if given, its animal (409
+  otherwise: move it from the collar's page afterwards). This needs the stored record, so units
+  this server didn't record a claim check for can't be reclaimed this way.
 
 Returns 201:
 
@@ -204,6 +238,8 @@ Claimed {
   unit: Unit,
   collar: Collar,                             // named after the serial unless `name` is given
   v1: { key, public_key, endpoint?, line?, why? },   // firmware that speaks protocol v1: shown once
+  code_checked: boolean,                      // see the typo check
+  reclaimed?: true,                           // a reset unit claimed again (200)
 }
 ```
 
@@ -224,14 +260,14 @@ provisioning, claim and state change, and `{"type":"fleet_test","run":TestRun}` 
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/fleet/units` | `?state=&device_class=&station=&q=&limit=` (`q` matches serial, device id, a radio id or a collar id) | `Unit[]`, newest first, at most `limit` (default 500, max 5000) |
+| GET | `/api/fleet/units` | `?state=&device_class=&station=&q=&limit=&cursor=` (`q` matches serial, device id, a radio id or a collar id) | `{ units: Unit[], total, next? }`: newest first, `limit` per page (default 200, max 1000), `total` matching the filters; pass `next` as `cursor` for the next page (keyset: units registered meanwhile don't shift pages) |
 | GET | `/api/fleet/units/:serial` | | `UnitDetail { unit, factory_record?, runs: TestRun[], events: UnitEvent[], keys: [{ device_pubkey, device_kid, from, to? }] }` |
 | POST | `/api/fleet/units/:serial/state` | `{ state: "retired"\|"rma", note? }` | `Unit` |
 | GET | `/api/fleet/units/:serial/label.svg` | | the label (SVG, 50 × 25 mm), 409 before it has a claim code |
 | GET | `/api/fleet/summary` | | `{ total, by_state: {state: n}, by_class: {class: n} }` |
 
 `UnitEvent { at, kind, detail, by? }`; kinds: `registered`, `key_replaced`, `tested`,
-`provisioned`, `claimed`, `in_service`, `state`, `firmware`.
+`provisioned`, `claimed`, `reclaimed`, `in_service`, `state`, `firmware`.
 
 ## Batch views
 
@@ -242,12 +278,13 @@ provisioning, claim and state change, and `{"type":"fleet_test","run":TestRun}` 
 
 ```ts
 Yield {
-  plan_id, plan_version?, runs, units,
+  plan_id, plan_version, runs, units,         // one version only: the one asked for, else the latest
   first_pass: { units, passed, rate },        // each unit's first run
   final: { units, passed, rate },             // each unit's latest run
   steps: [{ name, required, runs, pass, fail, skip, missing, rate,
             values?: { n, min, p50, max, mean, unit? } }],   // in plan order
   failures: [{ name, fail }],                 // required steps by failures, most first
+  other_versions: [{ plan_version, runs }],   // runs in the window judged by other versions: never in the numbers
 }
 Throughput {
   from, to, bucket,
@@ -301,9 +338,16 @@ can enrol it (`POST /api/fleet/signing-keys` with `purpose: "maker"`).
 ## Labels
 
 `GET /api/fleet/units/:serial/label.svg` draws the unit's label: serial, class and board, the
-claim code in groups of four, and a QR code (error correction M) holding the card text
+claim code on two lines of two groups, and a QR code (error correction M) holding the card text
 `OC2:<serial>:<device key, base64url>:<claim code>`. The app prints labels for one unit or a
 selection at `#/print/fleet-labels/<serial>,<serial>…`.
+
+Every text line fits the 24 mm column right of the QR at the longest values (32-character
+serial, which wraps to two lines at a `-`; 32-character class plus 16-character board): sizes
+are worked out from a monospace advance of 0.602 em and each line carries that `textLength`, so
+a printer's own monospace font can't push it past the edge. The claim code prints at 3.2 mm, the
+serial at 3.4 mm (no smaller than 2.1 mm when it wraps). Print and scan one at real size before a
+batch: no physical printer or scanner was tested.
 
 ## Firmware
 
@@ -372,6 +416,15 @@ UnitFirmware {
   yet.*
 - Delivery is the protocol's firmware command (type 9), which the collar ingest builds from
   `op_fleet::firmware::offer_for`; images are served from `op_fleet::firmware::image_bytes`.
+- **An offer is a reservation.** `offer_for` reads every gate (rollout active, policy, held herd,
+  a move, an escape, the battery) in the same write that marks the collar `offered` with a new
+  `offer_id`, so a pause or a move that commits first wins. `still_good(ctx, collar_id,
+  offer_id)` reads them again right before the bytes go out and takes the offer back (`held`,
+  with the reason) if anything changed. A pause acknowledged after `still_good` returned can't
+  stop bytes already handed to the radio.
+- **Lost offers.** No answer at all (not even "written") within 30 min: the offer is dead and the
+  collar is offered again after 15 min, doubling up to 6 h; after 5 offers it has `failed`
+  ("No answer to 5 offers"), which pauses the rollout.
 
 ## Herd network
 
@@ -432,8 +485,10 @@ on every report, and op-fleet depends on op-core alone so there is no cycle:
 
 - `op_fleet::network::record_uplink(ctx, &Uplink { collar_id, role, via, rssi_dbm, snr_db, at })`
 - `op_fleet::network::record_beacon(ctx, &Beacon { anchor_id, herd_id, lte_rsrp_dbm, at })`
-- `op_fleet::firmware::offer_for(ctx, collar_id)` → the signed manifest and digest for the
-  firmware command, if this collar is ready now (gates checked again)
+- `op_fleet::firmware::offer_for(ctx, collar_id)` → the signed manifest, digest and `offer_id`
+  for the firmware command, if this collar is ready now (gates read in the reserving write)
+- `op_fleet::firmware::still_good(ctx, collar_id, offer_id)` → call right before sending; `false`
+  means don't send
 - `op_fleet::firmware::record_result(ctx, collar_id, version, &FwResult::{Applied, Confirmed,
   RolledBack, Failed { code }})`
 - `op_fleet::firmware::image_bytes(ctx, sha256)` for `<endpoint>/fw/<digest hex>`

@@ -17,7 +17,10 @@ pub enum Sent<T> {
     /// 401: the server doesn't know this key.
     Unlinked(String),
     /// Another 4xx: the server will never take it, so it isn't resent.
-    Refused { status: u16, message: String },
+    Refused {
+        status: u16,
+        message: String,
+    },
     /// 5xx or no answer: worth trying again.
     Down(String),
 }

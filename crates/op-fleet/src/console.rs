@@ -149,7 +149,8 @@ pub struct CollarConsole {
 pub const LOG_ROWS: i64 = 50;
 
 async fn console(State(ctx): State<Ctx>, Path(id): Path<String>) -> ApiResult<Json<CollarConsole>> {
-    let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&id).fetch_optional(ctx.db()).await?.ok_or_else(|| ApiError::not_found("No such collar."))?;
+    let row =
+        sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&id).fetch_optional(ctx.db()).await?.ok_or_else(|| ApiError::not_found("No such collar."))?;
     let collar = op_core::store::collar_from_row(&row)?;
     let created_at = from_db(&row.try_get::<String, _>("created_at")?)?;
     let db = ctx.db();

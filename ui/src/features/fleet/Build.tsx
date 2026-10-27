@@ -11,6 +11,7 @@ const SPAN: Record<Range, number> = { "1d": 86400e3, "7d": 7 * 86400e3, "30d": 3
 export function Build() {
   const [plans, setPlans] = useState<TestPlan[]>();
   const [plan, setPlan] = useState<string>();
+  const [version, setVersion] = useState<number>();
   const [range, setRange] = useState<Range>("7d");
   const [y, setY] = useState<Yield>();
   const [t, setT] = useState<Throughput>();
@@ -27,22 +28,33 @@ export function Build() {
     const now = Date.now();
     return { from: new Date(now - SPAN[range]).toISOString(), to: new Date(now + 60e3).toISOString() };
   }, [range, tick]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Every version of the chosen plan, newest first: yield is per version, never mixed.
+  const versions = useMemo(() => (plans ?? []).filter((p) => p.id === plan).map((p) => p.version).sort((a, b) => b - a), [plans, plan]);
+  const ids = useMemo(() => [...new Set((plans ?? []).map((p) => p.id))], [plans]);
   useEffect(() => {
     if (!plan) return;
-    fleet.yield({ plan_id: plan, from, to }).then(setY, (e) => setErr((e as Error).message));
+    fleet.yield({ plan_id: plan, plan_version: version, from, to }).then(setY, (e) => setErr((e as Error).message));
     fleet.throughput({ from, to, bucket: range === "1d" ? "hour" : "day" }).then(setT, (e) => setErr((e as Error).message));
-  }, [plan, from, to, range]);
+  }, [plan, version, from, to, range]);
   if (err) return <p className="err">{err}</p>;
   if (!plans) return null;
   return (
     <>
       <div className="line fline">
-        <select className="input sm" value={plan ?? ""} onChange={(e) => setPlan(e.target.value)} aria-label="Test plan">
-          {plans.map((p) => <option key={p.id} value={p.id}>{p.id}</option>)}
+        <select className="input sm" value={plan ?? ""} onChange={(e) => { setPlan(e.target.value); setVersion(undefined); }} aria-label="Test plan">
+          {ids.map((id) => <option key={id} value={id}>{id}</option>)}
         </select>
+        {versions.length > 1 && (
+          <select className="input sm" value={version ?? versions[0]} onChange={(e) => setVersion(Number(e.target.value))} aria-label="Plan version">
+            {versions.map((v) => <option key={v} value={v}>v{v}</option>)}
+          </select>
+        )}
         <Segmented label="Range" value={range} onChange={setRange} options={[{ value: "1d", label: "24 h" }, { value: "7d", label: "7 d" }, { value: "30d", label: "30 d" }]} />
       </div>
-      {y && (y.runs === 0 ? <p className="dim">No runs of {y.plan_id} in this range.</p> : (
+      {y && y.other_versions.length > 0 && (
+        <p className="dim">{y.other_versions.map((o) => `${o.runs} run${o.runs === 1 ? "" : "s"} judged by v${o.plan_version}`).join(", ")} in this range {y.other_versions.length === 1 ? "isn't" : "aren't"} in these numbers.</p>
+      )}
+      {y && (y.runs === 0 ? <p className="dim">No runs of {y.plan_id} v{y.plan_version} in this range.</p> : (
         <>
           <ul className="kv">
             <li><span>units, runs</span><b>{y.units}, {y.runs}</b></li>

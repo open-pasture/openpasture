@@ -68,11 +68,19 @@ pub struct Failure {
     pub fail: i64,
 }
 
+/// Runs judged by another version of the plan: counted apart, never mixed in.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct OtherVersion {
+    pub plan_version: i64,
+    pub runs: i64,
+}
+
+/// Yield for one version of a plan: its steps, limits and units, and only
+/// the runs judged by it. Runs of other versions are listed apart.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Yield {
     pub plan_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan_version: Option<i64>,
+    pub plan_version: i64,
     pub runs: i64,
     pub units: i64,
     pub first_pass: Rate,
@@ -80,11 +88,16 @@ pub struct Yield {
     pub last: Rate,
     pub steps: Vec<StepYield>,
     pub failures: Vec<Failure>,
+    /// Runs in the same window and filters judged by other versions.
+    pub other_versions: Vec<OtherVersion>,
 }
 
 /// One run as the batch views read it.
 #[derive(Debug, Clone)]
 pub struct RunRow {
+    /// The server's order.
+    pub seq: i64,
+    pub plan_version: i64,
     pub serial: String,
     pub station: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -103,15 +116,22 @@ fn median(sorted: &[f64]) -> f64 {
     if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 }
 }
 
-/// Yield from runs (any order), by the plan's steps in order.
-pub fn compute_yield(plan_id: &str, plan_version: Option<i64>, plan_steps: &[crate::plans::PlanStep], runs: &[RunRow]) -> Yield {
+/// Yield from runs (any order) of one plan version, by its steps in order.
+/// Runs of other versions are left out of every number and counted in
+/// `other_versions`: a step's limits and unit belong to its version.
+pub fn compute_yield(plan_id: &str, plan_version: i64, plan_steps: &[crate::plans::PlanStep], all: &[RunRow]) -> Yield {
+    let mut others: BTreeMap<i64, i64> = BTreeMap::new();
+    for r in all.iter().filter(|r| r.plan_version != plan_version) {
+        *others.entry(r.plan_version).or_default() += 1;
+    }
+    let runs: Vec<&RunRow> = all.iter().filter(|r| r.plan_version == plan_version).collect();
     let mut by_unit: HashMap<&str, Vec<&RunRow>> = HashMap::new();
-    for r in runs {
+    for r in &runs {
         by_unit.entry(r.serial.as_str()).or_default().push(r);
     }
     let (mut first_ok, mut last_ok) = (0, 0);
     for list in by_unit.values_mut() {
-        list.sort_by_key(|r| r.received_at);
+        list.sort_by_key(|r| r.seq);
         first_ok += list.first().is_some_and(|r| r.pass) as i64;
         last_ok += list.last().is_some_and(|r| r.pass) as i64;
     }
@@ -121,7 +141,7 @@ pub fn compute_yield(plan_id: &str, plan_version: Option<i64>, plan_steps: &[cra
         .map(|p| {
             let (mut pass, mut fail, mut skip, mut missing) = (0, 0, 0, 0);
             let mut vals: Vec<f64> = Vec::new();
-            for r in runs {
+            for r in &runs {
                 match r.steps.iter().find(|s| s.name == p.name).map(|s| (s.verdict, s.value.as_ref().and_then(Value::as_f64))) {
                     Some((v, value)) => {
                         match v {
@@ -149,11 +169,21 @@ pub fn compute_yield(plan_id: &str, plan_version: Option<i64>, plan_steps: &[cra
                 unit: p.unit.clone(),
             });
             let n = runs.len() as i64;
-            StepYield { name: p.name.clone(), required: p.required, runs: n, pass, fail, skip, missing, rate: if n > 0 { pass as f64 / n as f64 } else { 0.0 }, values }
+            StepYield {
+                name: p.name.clone(),
+                required: p.required,
+                runs: n,
+                pass,
+                fail,
+                skip,
+                missing,
+                rate: if n > 0 { pass as f64 / n as f64 } else { 0.0 },
+                values,
+            }
         })
         .collect();
     let mut fails: BTreeMap<&str, i64> = BTreeMap::new();
-    for r in runs {
+    for r in &runs {
         for f in &r.failed {
             *fails.entry(f.as_str()).or_default() += 1;
         }
@@ -169,12 +199,15 @@ pub fn compute_yield(plan_id: &str, plan_version: Option<i64>, plan_steps: &[cra
         last: Rate::of(units, last_ok),
         steps,
         failures,
+        other_versions: others.into_iter().map(|(plan_version, runs)| OtherVersion { plan_version, runs }).collect(),
     }
 }
 
 fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<RunRow> {
     let ts = |c: &str| -> anyhow::Result<DateTime<Utc>> { op_core::time::from_db(&r.try_get::<String, _>(c)?) };
     Ok(RunRow {
+        seq: r.try_get("seq")?,
+        plan_version: r.try_get("plan_version")?,
         serial: r.try_get("serial")?,
         station: r.try_get("station")?,
         started_at: ts("started_at")?,
@@ -206,10 +239,8 @@ async fn yield_view(State(ctx): State<Ctx>, Query(q): Query<YieldQuery>) -> ApiR
             .ok_or_else(|| ApiError::not_found(format!("No test plan {plan_id}.")))?,
     };
     let plan = crate::plans::by_id(&ctx, plan_id, version).await?.ok_or_else(|| ApiError::not_found(format!("No test plan {plan_id} version {version}.")))?;
+    // Every version's runs are read so the others can be counted apart.
     let mut sql = String::from("SELECT * FROM fleet_test_runs WHERE plan_id = ?");
-    if q.plan_version.is_some() {
-        sql.push_str(" AND plan_version = ?");
-    }
     if q.from.is_some() {
         sql.push_str(" AND finished_at >= ?");
     }
@@ -219,11 +250,8 @@ async fn yield_view(State(ctx): State<Ctx>, Query(q): Query<YieldQuery>) -> ApiR
     if q.station.as_deref().is_some_and(|s| !s.is_empty()) {
         sql.push_str(" AND station = ?");
     }
-    sql.push_str(&format!(" ORDER BY received_at LIMIT {MAX_RUNS}"));
+    sql.push_str(&format!(" ORDER BY seq LIMIT {MAX_RUNS}"));
     let mut query = sqlx::query(&sql).bind(plan_id);
-    if let Some(v) = q.plan_version {
-        query = query.bind(v);
-    }
     if let Some(f) = q.from {
         query = query.bind(to_db(&f));
     }
@@ -234,7 +262,7 @@ async fn yield_view(State(ctx): State<Ctx>, Query(q): Query<YieldQuery>) -> ApiR
         query = query.bind(s);
     }
     let runs: Vec<RunRow> = query.fetch_all(ctx.db()).await?.iter().map(run_from_row).collect::<anyhow::Result<_>>()?;
-    Ok(Json(compute_yield(&plan.id, q.plan_version, &plan.steps, &runs)))
+    Ok(Json(compute_yield(&plan.id, plan.version, &plan.steps, &runs)))
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -340,7 +368,15 @@ mod tests {
 
     fn plan() -> Vec<PlanStep> {
         vec![
-            PlanStep { name: "rail".into(), kind: StepKind::Measure, limit_lo: Some(3.2), limit_hi: Some(3.4), unit: Some("V".into()), required: true, note: None },
+            PlanStep {
+                name: "rail".into(),
+                kind: StepKind::Measure,
+                limit_lo: Some(3.2),
+                limit_hi: Some(3.4),
+                unit: Some("V".into()),
+                required: true,
+                note: None,
+            },
             PlanStep { name: "imu".into(), kind: StepKind::Check, limit_lo: None, limit_hi: None, unit: None, required: true, note: None },
         ]
     }
@@ -373,6 +409,8 @@ mod tests {
             failed.push("imu".to_string());
         }
         RunRow {
+            seq: minute,
+            plan_version: 1,
             serial: serial.into(),
             station: Some(station.into()),
             started_at: t - Duration::seconds(50),
@@ -392,7 +430,7 @@ mod tests {
             run("B", 5, 3.31, Verdict::Pass, "s1"),
             run("C", 2, 3.3, Verdict::Fail, "s2"),
         ];
-        let y = compute_yield("node-fct", None, &plan(), &runs);
+        let y = compute_yield("node-fct", 1, &plan(), &runs);
         assert_eq!((y.runs, y.units), (4, 3));
         assert_eq!(y.first_pass, Rate::of(3, 1));
         assert_eq!(y.last, Rate::of(3, 2), "B passed on its second try");
@@ -402,6 +440,28 @@ mod tests {
         assert_eq!((v.n, v.min, v.max), (4, 2.9, 3.31));
         assert_eq!(v.p50, 3.3);
         assert_eq!(y.failures.iter().map(|f| (f.name.as_str(), f.fail)).collect::<Vec<_>>(), vec![("imu", 1), ("rail", 1)]);
+    }
+
+    /// Review P2-03: v1 measured `rail` in volts; v2 judges it in millivolts.
+    /// The v2 yield never shows a v1 reading as if it were in mV.
+    #[test]
+    fn yield_is_per_plan_version() {
+        let mut old = run("A", 0, 3.3, Verdict::Pass, "s1");
+        old.plan_version = 1;
+        let mut v2 = plan();
+        v2[0].limit_lo = Some(3100.0);
+        v2[0].limit_hi = Some(3500.0);
+        v2[0].unit = Some("mV".into());
+        let y = compute_yield("node-fct", 2, &v2, std::slice::from_ref(&old));
+        assert_eq!((y.plan_version, y.runs, y.units), (2, 0, 0));
+        assert_eq!(y.steps[0].values, None, "no v1 volts shown as mV");
+        assert_eq!(y.other_versions, vec![OtherVersion { plan_version: 1, runs: 1 }]);
+        let mut new = run("B", 3, 3.3, Verdict::Pass, "s1");
+        new.plan_version = 2;
+        new.steps[0].value = Some(Value::from(3301.0));
+        let y = compute_yield("node-fct", 2, &v2, &[old, new]);
+        let v = y.steps[0].values.as_ref().unwrap();
+        assert_eq!((y.runs, v.n, v.min, v.unit.as_deref()), (1, 1, 3301.0, Some("mV")));
     }
 
     #[test]

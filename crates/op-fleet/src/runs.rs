@@ -2,6 +2,14 @@
 //! server judges the run against that plan version. For a `measure` step the
 //! server's verdict wins over the station's; a required step that is missing
 //! or skipped fails the run.
+//!
+//! Which run counts: the latest by the server's own order (`seq`, given in
+//! the write that stores it) among the runs of the unit's current
+//! generation. A retry with the station's `run_key` is the same run. A pass
+//! that finished before a run already stored, or before the unit's
+//! generation began (it was sent back or retired since), is kept but not
+//! counted: a delayed retry can't overrule a newer failure, and a repaired
+//! unit needs a fresh pass. A failure always counts.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -102,6 +110,14 @@ pub struct TestRun {
     pub result: RunResult,
     pub failed: Vec<String>,
     pub steps: Vec<JudgedStep>,
+    /// The server's order: higher is later, whatever the stations' clocks say.
+    pub seq: i64,
+    /// The unit's generation the run belongs to.
+    pub generation: i64,
+    /// Whether the run can decide the unit's eligibility (see the module docs).
+    pub counted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
 }
 
 fn fmt_num(v: f64) -> String {
@@ -153,8 +169,12 @@ pub fn judge_step(plan: &PlanStep, got: Option<&StepResult>) -> JudgedStep {
                 Some(_) if unit.is_some() && got.unit.as_deref().is_some_and(|u| Some(u) != unit) => {
                     fail(format!("Measured in {}, the plan wants {}", got.unit.as_deref().unwrap_or_default(), unit.unwrap_or_default()))
                 }
-                Some(v) if plan.limit_lo.is_some_and(|lo| v < lo) => fail(format!("{} below {}", with_unit(v, unit), with_unit(plan.limit_lo.unwrap_or_default(), unit))),
-                Some(v) if plan.limit_hi.is_some_and(|hi| v > hi) => fail(format!("{} above {}", with_unit(v, unit), with_unit(plan.limit_hi.unwrap_or_default(), unit))),
+                Some(v) if plan.limit_lo.is_some_and(|lo| v < lo) => {
+                    fail(format!("{} below {}", with_unit(v, unit), with_unit(plan.limit_lo.unwrap_or_default(), unit)))
+                }
+                Some(v) if plan.limit_hi.is_some_and(|hi| v > hi) => {
+                    fail(format!("{} above {}", with_unit(v, unit), with_unit(plan.limit_hi.unwrap_or_default(), unit)))
+                }
                 // In limits, but the fixture saw something else wrong (its detail says what).
                 Some(_) if got.status == StepStatus::Fail => fail("In limits, but the fixture failed it".into()),
                 Some(_) => (Verdict::Pass, None),
@@ -208,13 +228,23 @@ fn from_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TestRun> {
         result: if r.try_get::<String, _>("result")? == "pass" { RunResult::Pass } else { RunResult::Fail },
         failed: serde_json::from_str(&r.try_get::<String, _>("failed")?)?,
         steps: serde_json::from_str(&r.try_get::<String, _>("steps")?)?,
+        seq: r.try_get("seq")?,
+        generation: r.try_get("generation")?,
+        counted: r.try_get::<i64, _>("counted")? != 0,
+        run_key: r.try_get("run_key")?,
     })
 }
 
-/// A unit's runs, newest first.
+/// A unit's runs, newest first (by the server's order).
 pub async fn for_unit(ctx: &Ctx, serial: &str) -> anyhow::Result<Vec<TestRun>> {
-    let rows = sqlx::query("SELECT * FROM fleet_test_runs WHERE serial = ? ORDER BY received_at DESC, id DESC LIMIT 200").bind(serial).fetch_all(ctx.db()).await?;
+    let rows = sqlx::query("SELECT * FROM fleet_test_runs WHERE serial = ? ORDER BY seq DESC LIMIT 200").bind(serial).fetch_all(ctx.db()).await?;
     rows.iter().map(from_row).collect()
+}
+
+/// One run by id, on any connection (inside a transaction too).
+pub async fn load(conn: &mut sqlx::SqliteConnection, id: &str) -> anyhow::Result<Option<TestRun>> {
+    let row = sqlx::query("SELECT * FROM fleet_test_runs WHERE id = ?").bind(id).fetch_optional(&mut *conn).await?;
+    row.map(|r| from_row(&r)).transpose()
 }
 
 #[derive(Deserialize)]
@@ -227,6 +257,11 @@ struct NewRun {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     steps: Vec<StepResult>,
+    /// The station's own id for this run: a retry with it is the same run.
+    run_key: Option<String>,
+    /// The unit's generation when the station started (from registering it).
+    /// A unit sent back or retired since refuses the run.
+    generation: Option<i64>,
 }
 
 const MAX_RUN_STEPS: usize = 256;
@@ -257,7 +292,7 @@ fn check_run(b: &NewRun, at: DateTime<Utc>) -> ApiResult<()> {
             return Err(ApiError::bad_request(format!("Step {}: a value is a number, true/false or a short text.", s.name)));
         }
     }
-    for (what, v) in [("station", &b.station), ("fixture_id", &b.fixture_id)] {
+    for (what, v) in [("station", &b.station), ("fixture_id", &b.fixture_id), ("run_key", &b.run_key)] {
         if v.as_deref().is_some_and(|s| s.trim().is_empty() || s.len() > 64) {
             return Err(ApiError::bad_request(format!("{what} is 1–64 characters.")));
         }
@@ -265,32 +300,60 @@ fn check_run(b: &NewRun, at: DateTime<Utc>) -> ApiResult<()> {
     Ok(())
 }
 
-/// `POST /api/fleet/units/:serial/tests`.
+/// `POST /api/fleet/units/:serial/tests`. 201 with the judged run; 200 with
+/// the stored run when the station sent this `run_key` before.
 async fn create(State(ctx): State<Ctx>, identity: Identity, Path(serial): Path<String>, ApiJson(b): ApiJson<NewRun>) -> ApiResult<(StatusCode, Json<TestRun>)> {
-    let at = now();
-    check_run(&b, at)?;
-    let unit = units::find(&ctx, &serial).await?;
-    if unit.state.on_farm() || unit.state == UnitState::Retired {
-        return Err(ApiError::conflict(format!("{serial} is {}. Mark it RMA before testing it again.", state_words(unit.state))));
-    }
+    check_run(&b, now())?;
     let plan = crate::plans::by_id(&ctx, &b.plan_id, b.plan_version)
         .await?
         .ok_or_else(|| ApiError::bad_request(format!("No test plan {} version {}.", b.plan_id, b.plan_version)))?;
+    let (result, failed, steps) = judge(&plan, &b.steps);
+    let station = b.station.clone().or_else(|| stations::station_name(&identity));
+    let run_key = b.run_key.as_deref().map(str::trim).map(str::to_owned);
+
+    // Everything the decision reads is read in the write that stores it.
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let at = now();
+    let unit = units::load(&mut tx, &serial).await?.ok_or_else(|| ApiError::not_found(format!("No unit with serial {serial}.")))?;
+    if let Some(key) = &run_key {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM fleet_test_runs WHERE serial = ? AND run_key = ?").bind(&serial).bind(key).fetch_optional(&mut *tx).await?;
+        if let Some(id) = id {
+            let run = load(&mut tx, &id).await?.ok_or_else(|| ApiError::internal("run vanished"))?;
+            if run.plan_id != plan.id || run.plan_version != plan.version || to_db(&run.finished_at) != to_db(&b.finished_at) {
+                return Err(ApiError::conflict(format!("run_key {key} is already another run of {serial}. Each run needs its own.")));
+            }
+            return Ok((StatusCode::OK, Json(run)));
+        }
+    }
+    if unit.state.on_farm() || unit.state == UnitState::Retired {
+        return Err(ApiError::conflict(format!("{serial} is {}. Mark it RMA before testing it again.", state_words(unit.state))));
+    }
+    if b.generation.is_some_and(|g| g != unit.generation) {
+        return Err(ApiError::conflict(format!("{serial} was sent back or retired after this run started. Test it again.")));
+    }
     if plan.device_class != unit.device_class {
         return Err(ApiError::bad_request(format!("{} is a plan for {} units; {serial} is a {}.", plan.id, plan.device_class, unit.device_class)));
     }
-    let (result, failed, steps) = judge(&plan, &b.steps);
-    let station = b.station.clone().or_else(|| stations::station_name(&identity));
-    let run_id = id::new_id("tst");
-    let next = match (result, unit.state) {
-        (RunResult::Pass, UnitState::Built | UnitState::Rma) => Some(UnitState::Tested),
-        (RunResult::Fail, UnitState::Tested | UnitState::Provisioned) => Some(UnitState::Built),
+    // A pass can't overrule a run the station finished later, nor count for a
+    // generation that began after it finished.
+    let later: Option<String> = sqlx::query_scalar("SELECT id FROM fleet_test_runs WHERE serial = ? AND generation = ? AND finished_at > ? LIMIT 1")
+        .bind(&serial)
+        .bind(unit.generation)
+        .bind(to_db(&b.finished_at))
+        .fetch_optional(&mut *tx)
+        .await?;
+    let stale = unit.generation_at.is_some_and(|g| b.finished_at < g);
+    let counted = result == RunResult::Fail || (later.is_none() && !stale);
+    let next = match (counted, result, unit.state) {
+        (true, RunResult::Pass, UnitState::Built | UnitState::Rma) => Some(UnitState::Tested),
+        (true, RunResult::Fail, UnitState::Tested | UnitState::Provisioned) => Some(UnitState::Built),
         _ => None,
     };
-    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let run_id = id::new_id("tst");
     sqlx::query(
-        "INSERT INTO fleet_test_runs (id, serial, plan_id, plan_version, station, fixture_id, started_at, finished_at, received_at, result, failed, steps)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO fleet_test_runs (id, serial, plan_id, plan_version, station, fixture_id, started_at, finished_at, received_at, result, failed, steps, seq, run_key, generation, counted)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM fleet_test_runs), ?, ?, ?)",
     )
     .bind(&run_id)
     .bind(&serial)
@@ -304,23 +367,33 @@ async fn create(State(ctx): State<Ctx>, identity: Identity, Path(serial): Path<S
     .bind(if result == RunResult::Pass { "pass" } else { "fail" })
     .bind(serde_json::to_string(&failed).map_err(anyhow::Error::from)?)
     .bind(serde_json::to_string(&steps).map_err(anyhow::Error::from)?)
+    .bind(&run_key)
+    .bind(unit.generation)
+    .bind(counted)
     .execute(&mut *tx)
     .await?;
-    if let Some(next) = next {
-        sqlx::query("UPDATE fleet_units SET state = ?, station = COALESCE(?, station), updated_at = ? WHERE serial = ?")
-            .bind(op_core::DbEnum::as_db(&next))
-            .bind(&station)
-            .bind(to_db(&at))
-            .bind(&serial)
-            .execute(&mut *tx)
-            .await?;
-    } else if station.is_some() {
-        sqlx::query("UPDATE fleet_units SET station = ?, updated_at = ? WHERE serial = ?").bind(&station).bind(to_db(&at)).bind(&serial).execute(&mut *tx).await?;
-    }
-    units::log(&mut tx, &serial, "tested", json!({ "run_id": run_id, "result": result, "failed": failed, "plan": format!("{} v{}", plan.id, plan.version), "station": station }), who(&identity).as_deref()).await?;
-    let run = from_row(&sqlx::query("SELECT * FROM fleet_test_runs WHERE id = ?").bind(&run_id).fetch_one(&mut *tx).await?)?;
+    let state = next.unwrap_or(unit.state);
+    sqlx::query("UPDATE fleet_units SET state = ?, station = COALESCE(?, station), updated_at = ? WHERE serial = ? AND state = ? AND generation = ?")
+        .bind(op_core::DbEnum::as_db(&state))
+        .bind(&station)
+        .bind(to_db(&at))
+        .bind(&serial)
+        .bind(op_core::DbEnum::as_db(&unit.state))
+        .bind(unit.generation)
+        .execute(&mut *tx)
+        .await?;
+    let why_not = (!counted).then_some(if stale { "finished before the unit came back" } else { "a later run is already in" });
+    units::log(
+        &mut tx,
+        &serial,
+        "tested",
+        json!({ "run_id": run_id, "result": result, "failed": failed, "plan": format!("{} v{}", plan.id, plan.version), "station": station, "not_counted": why_not }),
+        who(&identity).as_deref(),
+    )
+    .await?;
+    let run = load(&mut tx, &run_id).await?.ok_or_else(|| ApiError::internal("run vanished"))?;
     tx.commit().await?;
-    tracing::info!(serial = %serial, run = %run_id, result = ?result, failed = ?run.failed, "unit tested");
+    tracing::info!(serial = %serial, run = %run_id, result = ?result, counted, failed = ?run.failed, "unit tested");
     ctx.publish(Event::FleetTest { run: serde_json::to_value(&run).unwrap_or(Value::Null) });
     units::publish(&ctx, &serial).await;
     Ok((StatusCode::CREATED, Json(run)))

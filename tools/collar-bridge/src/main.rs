@@ -73,6 +73,12 @@ enum Cmd {
         server: Option<String>,
         #[arg(long, env = "COLLAR_KEY", hide_env_values = true)]
         key: Option<String>,
+        /// A token for the server, to check every collar on it is simulated before anything is sent.
+        #[arg(long, env = "OPENPASTURE_TOKEN", hide_env_values = true)]
+        api_key: Option<String>,
+        /// Replay into this farm (its exact name) even though it has collars that aren't simulated.
+        #[arg(long)]
+        into_farm: Option<String>,
         /// Keep the captured gaps between requests.
         #[arg(long)]
         pace: bool,
@@ -105,6 +111,9 @@ enum Cmd {
         /// Seconds to wait for a GNSS fix.
         #[arg(long, default_value_t = 120)]
         gnss_timeout: u64,
+        /// The firmware version the fixture flashes, e.g. 0.2.0. Without it fw_flash is skipped (and the run fails).
+        #[arg(long = "fw")]
+        expect_fw: Option<String>,
         /// Ask for readings and checks the console can't give (a meter, an ear).
         #[arg(long)]
         operator: bool,
@@ -128,7 +137,7 @@ fn capture_for(path: Option<PathBuf>, none: bool) -> anyhow::Result<Arc<Capture>
     Ok(Arc::new(Capture::open(&path)?))
 }
 
-fn load_link(path: &PathBuf, collar: Option<&str>, endpoint: Option<String>) -> anyhow::Result<Link> {
+fn load_link(path: &std::path::Path, collar: Option<&str>, endpoint: Option<String>) -> anyhow::Result<Link> {
     let mut link = Link::load(path, collar)?;
     if let Some(e) = endpoint {
         link.endpoint = e;
@@ -161,14 +170,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Replay { capture, server, key, pace, out } => {
+        Cmd::Replay { capture, server, key, api_key, into_farm, pace, out } => {
             let out = match out {
                 Some(p) => Arc::new(Capture::open(&p)?),
                 None => Arc::new(Capture::none()),
             };
             let target = server.zip(key);
             let dry = target.is_none();
-            let sum = replay::run(replay::Options { capture, target, pace, out }).await?;
+            let sum = replay::run(replay::Options { capture, target, api_key, into_farm, pace, out }).await?;
             if dry {
                 println!("{} requests (pass --server and --key to send them)", sum.requests);
             } else {
@@ -186,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             fixture,
             serial,
             gnss_timeout,
+            expect_fw,
             operator,
             results,
             capture,
@@ -195,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(p) => Arc::new(Capture::open(&p)?),
                 None => Arc::new(Capture::none()),
             };
-            factory::run(factory::Options {
+            let code = factory::run(factory::Options {
                 server,
                 station_token,
                 port,
@@ -205,12 +215,18 @@ async fn main() -> anyhow::Result<()> {
                 fixture_id: fixture,
                 serial,
                 gnss_timeout: Duration::from_secs(gnss_timeout),
+                expect_fw,
                 operator,
                 results,
                 capture,
                 verbose,
             })
-            .await
+            .await?;
+            // Nonzero unless every unit went all the way (none can yet; see `factory`).
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Cmd::Ports => {
             let ports = serial::list();

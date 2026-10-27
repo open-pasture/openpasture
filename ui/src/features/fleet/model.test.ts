@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { JudgedStep, Rollout, WireEntry } from "../../api/fleet";
-import { addWire, duration, fenceLine, grouped, pct, qualityLine, readClaim, stageLine, stepLine, wireLine } from "./model";
+import type { JudgedStep, Rollout, TestRun, Unit, WireEntry } from "../../api/fleet";
+import { STATE_WORDS, addPage, addWire, duration, fenceLine, grouped, nextStep, pct, qualityLine, readClaim, runNote, shownLine, stageLine, stepLine, wireLine } from "./model";
 
 describe("fleet model", () => {
   test("claim codes print in fours and claims read as a card or a code", () => {
@@ -44,5 +44,29 @@ describe("fleet model", () => {
     expect(list.length).toBe(64);
     expect(list[0].bytes).toBe(6);
     expect(list[63].bytes).toBe(69);
+  });
+
+  // Review P2-04: half of a 1,000-unit batch showed with no sign of the rest.
+  test("a long list says how much of it shows and pages without repeats", () => {
+    const u = (serial: string) => ({ serial }) as Unit;
+    expect(shownLine(200, 1000)).toBe("200 of 1,000 units");
+    expect(shownLine(1000, 1000)).toBe("1,000 units");
+    expect(shownLine(1, 1)).toBe("1 unit");
+    expect(shownLine(0, 0)).toBe("no units");
+    expect(addPage([u("A"), u("B")], [u("B"), u("C")]).map((x) => x.serial)).toEqual(["A", "B", "C"]);
+  });
+
+  test("every unit state says what happens next", () => {
+    const base = { generation: 0, claim_checked: true } as Unit;
+    const states = ["built", "tested", "provisioned", "claimed", "in_service", "rma", "retired"] as const;
+    const lines = states.map((state) => nextStep({ ...base, state }));
+    expect(new Set(lines).size).toBe(states.length);
+    expect(nextStep({ ...base, state: "rma" })).toContain("fresh passing test");
+    expect(nextStep({ ...base, state: "claimed", claim_checked: false })).toContain("checks the code");
+    expect(STATE_WORDS.claimed).toBe("claim pending");
+    const run = { result: "pass", counted: false, generation: 1 } as TestRun;
+    expect(runNote(run, 1)).toContain("not counted");
+    expect(runNote({ ...run, counted: true }, 2)).toBe("before the unit came back");
+    expect(runNote({ ...run, counted: true }, 1)).toBeUndefined();
   });
 });

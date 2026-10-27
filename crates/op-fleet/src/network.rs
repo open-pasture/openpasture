@@ -318,7 +318,12 @@ pub struct Beacon {
 pub async fn record_beacon(ctx: &Ctx, b: &Beacon) -> anyhow::Result<()> {
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let at = to_db(&now());
-    sqlx::query("UPDATE fleet_links SET active = 0, updated_at = ? WHERE herd_id = ? AND collar_id != ? AND active = 1").bind(&at).bind(&b.herd_id).bind(&b.anchor_id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE fleet_links SET active = 0, updated_at = ? WHERE herd_id = ? AND collar_id != ? AND active = 1")
+        .bind(&at)
+        .bind(&b.herd_id)
+        .bind(&b.anchor_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO fleet_links (collar_id, herd_id, role, beacon_at, active, lte_rsrp_dbm, heard_at, updated_at) VALUES (?1, ?2, 'anchor', ?3, 1, ?4, ?3, ?5)
          ON CONFLICT(collar_id) DO UPDATE SET herd_id = excluded.herd_id, role = 'anchor', beacon_at = excluded.beacon_at, active = 1,

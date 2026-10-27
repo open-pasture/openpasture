@@ -204,7 +204,13 @@ impl Session {
 
     /// An ack the server didn't take for a reason worth retrying.
     pub fn retry_ack(&mut self, owed: OwedAck, now: Instant) {
-        self.pending.push(PendingAck { version: owed.ack.version, status: owed.ack.status.known().unwrap_or_default(), code: owed.ack.code, at: Some(owed.ack.at), since: now });
+        self.pending.push(PendingAck {
+            version: owed.ack.version,
+            status: owed.ack.status.known().unwrap_or_default(),
+            code: owed.ack.code,
+            at: Some(owed.ack.at),
+            since: now,
+        });
     }
 
     /// The collar took a config: its cadence is the bridge's from now on.

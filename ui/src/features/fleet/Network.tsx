@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fleet, type FixedAnchor, type HerdNetwork } from "../../api/fleet";
+import { isSimulated, SIMULATED } from "../../sim";
 import { useStore } from "../../store";
 import { Button, Input } from "../../ui";
 import { age, useNow } from "../../util";
@@ -10,6 +11,7 @@ import { qualityLine } from "./model";
 export function NetworkTab() {
   const herdId = useStore((s) => s.herdId);
   const herds = useStore((s) => s.state?.herds ?? []);
+  const collars = useStore((s) => s.collars);
   const now = useNow(10_000);
   const [n, setN] = useState<HerdNetwork>();
   const [fixed, setFixed] = useState<FixedAnchor[]>();
@@ -21,6 +23,9 @@ export function NetworkTab() {
   useEffect(load, [herdId]); // eslint-disable-line react-hooks/exhaustive-deps
   if (err) return <p className="err">{err}</p>;
   if (!herdId) return <p className="dim">Pick a herd.</p>;
+  // The simulator's collars, marked in every row they show in.
+  const simIds = new Set(collars.filter(isSimulated).map((c) => c.id));
+  const sim = (id?: string) => (id && simIds.has(id) ? <i className="sim">{SIMULATED}</i> : null);
   const name = (id?: string) => (id ? n?.anchors.find((a) => a.id === id)?.name ?? n?.members.find((m) => m.collar_id === id)?.name ?? id : "");
   return (
     <>
@@ -32,7 +37,7 @@ export function NetworkTab() {
               <thead><tr><th>anchor</th><th>on</th><th>beacon</th><th>battery</th><th>LTE</th></tr></thead>
               <tbody>
                 {n.anchors.map((a) => (
-                  <tr key={a.id}><td>{a.name}{a.active ? " (link)" : ""}</td><td>{a.source === "fixed" ? "post" : "collar"}</td>
+                  <tr key={a.id}><td>{a.name}{a.active ? " (link)" : ""}{sim(a.id)}</td><td>{a.source === "fixed" ? "post" : "collar"}</td>
                     <td>{a.last_beacon_at ? `${age(a.last_beacon_at, now)} ago` : ""}</td><td>{a.battery !== undefined ? `${Math.round(a.battery * 100)} %` : ""}</td>
                     <td>{a.lte_rsrp_dbm !== undefined ? `${a.lte_rsrp_dbm} dBm` : ""}</td></tr>
                 ))}
@@ -43,7 +48,7 @@ export function NetworkTab() {
             <thead><tr><th>collar</th><th>part</th><th>link</th><th>via</th><th>heard</th></tr></thead>
             <tbody>
               {n.members.map((m) => (
-                <tr key={m.collar_id}><td>{m.name}</td><td>{m.role}</td><td className={m.quality === "lost" || m.quality === "poor" ? "err" : ""}>{qualityLine(m.quality, m.rssi_dbm, m.snr_db)}</td>
+                <tr key={m.collar_id}><td>{m.name}{sim(m.collar_id)}</td><td>{m.role}</td><td className={m.quality === "lost" || m.quality === "poor" ? "err" : ""}>{qualityLine(m.quality, m.rssi_dbm, m.snr_db)}</td>
                   <td>{name(m.via)}</td><td>{m.last_heard_at ? `${age(m.last_heard_at, now)} ago` : "never"}</td></tr>
               ))}
             </tbody>
@@ -52,7 +57,7 @@ export function NetworkTab() {
             <>
               <h3>Not heard lately</h3>
               <ul className="kv">
-                {n.gaps.map((g) => <li key={g.collar_id}><span>{g.name}</span><b>{age(g.since, now)} ago{g.point ? `  at ${g.point[1].toFixed(5)}, ${g.point[0].toFixed(5)}` : ""}</b></li>)}
+                {n.gaps.map((g) => <li key={g.collar_id}><span>{g.name}{sim(g.collar_id)}</span><b>{age(g.since, now)} ago{g.point ? `  at ${g.point[1].toFixed(5)}, ${g.point[0].toFixed(5)}` : ""}</b></li>)}
               </ul>
             </>
           )}

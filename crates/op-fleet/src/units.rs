@@ -77,6 +77,8 @@ pub struct LastTest {
     pub plan_id: String,
     pub plan_version: i64,
     pub finished_at: DateTime<Utc>,
+    /// The server's order of runs: the latest is the highest.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,11 +98,21 @@ pub struct Unit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caps: Vec<String>,
     pub state: UnitState,
+    /// Goes up when the unit is sent back (RMA), retired or gets a new key.
+    /// Only test runs of this generation count.
+    pub generation: i64,
+    /// When this generation began (server time); absent for the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_at: Option<DateTime<Utc>>,
     pub origin: Origin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub station: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_code: Option<String>,
+    /// The claim code was checked: this server drew it, a station wrote it,
+    /// or it matched the factory record's claim check. A card claimed with
+    /// no record is taken at its word until the collar reports.
+    pub claim_checked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collar_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,11 +135,12 @@ pub struct Unit {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Units with their herd (through the collar) and latest test run (the one
-/// the server received last).
+/// Units with their herd (through the collar) and the run that decides
+/// whether they can be provisioned: the latest by the server's order among
+/// the counted runs of the unit's current generation.
 const SELECT: &str = "SELECT u.*, c.herd_id AS c_herd_id,
-    (SELECT json_object('id', r.id, 'result', r.result, 'plan_id', r.plan_id, 'plan_version', r.plan_version, 'finished_at', r.finished_at)
-       FROM fleet_test_runs r WHERE r.serial = u.serial ORDER BY r.received_at DESC, r.id DESC LIMIT 1) AS last_test_json
+    (SELECT json_object('id', r.id, 'result', r.result, 'plan_id', r.plan_id, 'plan_version', r.plan_version, 'finished_at', r.finished_at, 'seq', r.seq)
+       FROM fleet_test_runs r WHERE r.id = (SELECT r.id FROM fleet_test_runs r WHERE r.serial = u.serial AND r.generation = u.generation AND r.counted = 1 ORDER BY r.seq DESC LIMIT 1)) AS last_test_json
     FROM fleet_units u LEFT JOIN collars c ON c.id = u.collar_id";
 
 fn from_row(r: &SqliteRow) -> anyhow::Result<Unit> {
@@ -148,9 +161,12 @@ fn from_row(r: &SqliteRow) -> anyhow::Result<Unit> {
         image_keys: serde_json::from_str(&r.try_get::<String, _>("image_keys")?).unwrap_or_default(),
         caps: serde_json::from_str(&r.try_get::<String, _>("caps")?).unwrap_or_default(),
         state: UnitState::from_db(&r.try_get::<String, _>("state")?)?,
+        generation: r.try_get("generation")?,
+        generation_at: opt_from_db(r.try_get("generation_at")?)?,
         origin: Origin::from_db(&r.try_get::<String, _>("origin")?)?,
         station: r.try_get("station")?,
         claim_code: r.try_get("claim_code")?,
+        claim_checked: r.try_get::<i64, _>("claim_checked")? != 0,
         collar_id: r.try_get("collar_id")?,
         herd_id: r.try_get("c_herd_id")?,
         last_test,
@@ -317,7 +333,13 @@ async fn check_record(ctx: &Ctx, b: &NewUnit, serial: &str, key: &op_protocol::V
         }
     }
     let made_at = chrono::DateTime::from_timestamp(r.made_at as i64, 0).unwrap_or_else(now);
-    Ok(Some(FromRecord { cose: read.view.cose, maker: r.maker.clone(), maker_kid: read.view.maker_kid, verified: read.view.verified, made_at: to_db(&made_at) }))
+    Ok(Some(FromRecord {
+        cose: read.view.cose,
+        maker: r.maker.clone(),
+        maker_kid: read.view.maker_kid,
+        verified: read.view.verified,
+        made_at: to_db(&made_at),
+    }))
 }
 
 /// `POST /api/fleet/units`: idempotent on serial. Another key for a known
@@ -350,12 +372,14 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
     let caps = serde_json::to_string(&b.caps).map_err(anyhow::Error::from)?;
 
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let other: Option<String> = sqlx::query_scalar("SELECT serial FROM fleet_units WHERE device_kid = ? AND serial != ?").bind(&kid).bind(&serial).fetch_optional(&mut *tx).await?;
+    let other: Option<String> =
+        sqlx::query_scalar("SELECT serial FROM fleet_units WHERE device_kid = ? AND serial != ?").bind(&kid).bind(&serial).fetch_optional(&mut *tx).await?;
     if let Some(other) = other {
         return Err(ApiError::conflict(format!("This device key is already registered to {other}. Two units can't share a key.")));
     }
     if let Some(c) = &code {
-        let taken: Option<String> = sqlx::query_scalar("SELECT serial FROM fleet_units WHERE claim_code = ? AND serial != ?").bind(c).bind(&serial).fetch_optional(&mut *tx).await?;
+        let taken: Option<String> =
+            sqlx::query_scalar("SELECT serial FROM fleet_units WHERE claim_code = ? AND serial != ?").bind(c).bind(&serial).fetch_optional(&mut *tx).await?;
         if taken.is_some() {
             return Err(ApiError::conflict("Another unit already has this claim code. Draw a new one."));
         }
@@ -364,8 +388,8 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
     let status = match existing {
         None => {
             sqlx::query(
-                "INSERT INTO fleet_units (serial, device_class, hw_rev, fw_version, device_pubkey, device_kid, radios, image_keys, caps, state, origin, station, claim_code, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'built', 'station', ?, ?, ?, ?)",
+                "INSERT INTO fleet_units (serial, device_class, hw_rev, fw_version, device_pubkey, device_kid, radios, image_keys, caps, state, origin, station, claim_code, claim_checked, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'built', 'station', ?, ?, 1, ?, ?)",
             )
             .bind(&serial)
             .bind(&b.device_class)
@@ -382,8 +406,21 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
             .bind(&at)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("INSERT INTO fleet_unit_keys (serial, device_pubkey, device_kid, from_at) VALUES (?, ?, ?, ?)").bind(&serial).bind(&pubkey).bind(&kid).bind(&at).execute(&mut *tx).await?;
-            log(&mut tx, &serial, "registered", json!({ "device_class": b.device_class, "hw_rev": b.hw_rev, "fw_version": b.fw_version, "device_id": kid, "station": station }), by.as_deref()).await?;
+            sqlx::query("INSERT INTO fleet_unit_keys (serial, device_pubkey, device_kid, from_at) VALUES (?, ?, ?, ?)")
+                .bind(&serial)
+                .bind(&pubkey)
+                .bind(&kid)
+                .bind(&at)
+                .execute(&mut *tx)
+                .await?;
+            log(
+                &mut tx,
+                &serial,
+                "registered",
+                json!({ "device_class": b.device_class, "hw_rev": b.hw_rev, "fw_version": b.fw_version, "device_id": kid, "station": station }),
+                by.as_deref(),
+            )
+            .await?;
             StatusCode::CREATED
         }
         Some(u) => {
@@ -411,16 +448,24 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
                     .bind(&at)
                     .execute(&mut *tx)
                     .await?;
-                // A new key needs a new factory record: back to the fixture.
-                sqlx::query(
-                    "UPDATE fleet_units SET device_pubkey = ?, device_kid = ?, factory_record = NULL, maker = NULL, maker_kid = NULL, maker_verified = 0, state = 'built', updated_at = ? WHERE serial = ?",
+                // A new key needs a new factory record and a fresh test: back to
+                // the fixture, in a new generation so no earlier pass counts.
+                let n = sqlx::query(
+                    "UPDATE fleet_units SET device_pubkey = ?, device_kid = ?, factory_record = NULL, maker = NULL, maker_kid = NULL, maker_verified = 0, state = 'built',
+                       generation = generation + 1, generation_at = ?, updated_at = ? WHERE serial = ? AND generation = ?",
                 )
                 .bind(&pubkey)
                 .bind(&kid)
                 .bind(&at)
+                .bind(&at)
                 .bind(&serial)
+                .bind(u.generation)
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
+                if n != 1 {
+                    return Err(ApiError::conflict(format!("{serial} changed meanwhile. Try again.")));
+                }
                 log(&mut tx, &serial, "key_replaced", json!({ "from": u.device_kid, "to": kid }), by.as_deref()).await?;
             }
             let changed = u.hw_rev != b.hw_rev.trim()
@@ -449,7 +494,14 @@ async fn register(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJso
                 .bind(&serial)
                 .execute(&mut *tx)
                 .await?;
-                log(&mut tx, &serial, "registered", json!({ "again": true, "hw_rev": b.hw_rev, "fw_version": b.fw_version, "station": station }), by.as_deref()).await?;
+                log(
+                    &mut tx,
+                    &serial,
+                    "registered",
+                    json!({ "again": true, "hw_rev": b.hw_rev, "fw_version": b.fw_version, "station": station }),
+                    by.as_deref(),
+                )
+                .await?;
             }
             StatusCode::OK
         }
@@ -483,37 +535,78 @@ struct ListQuery {
     station: Option<String>,
     q: Option<String>,
     limit: Option<i64>,
+    /// `next` from the previous page.
+    cursor: Option<String>,
 }
 
-async fn list(State(ctx): State<Ctx>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Unit>>> {
-    let mut sql = format!("{SELECT} WHERE 1 = 1");
+/// Units per page by default, and at most.
+pub const PAGE: i64 = 200;
+pub const MAX_PAGE: i64 = 1000;
+
+/// One page of units, newest first, with how many match in all.
+#[derive(Debug, Serialize)]
+pub struct UnitPage {
+    pub units: Vec<Unit>,
+    /// Every unit matching the filters, not just this page.
+    pub total: i64,
+    /// Pass as `cursor` for the next page; absent on the last.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// A page boundary: the last unit's `created_at` and serial.
+fn cursor_of(u: &Unit) -> String {
+    format!("{}|{}", to_db(&u.created_at), u.serial)
+}
+
+/// `GET /api/fleet/units`: newest first, a page at a time (keyset, so units
+/// registered meanwhile don't shift or repeat what the next page shows).
+async fn list(State(ctx): State<Ctx>, Query(q): Query<ListQuery>) -> ApiResult<Json<UnitPage>> {
+    let mut filter = String::from(" WHERE 1 = 1");
     let mut binds: Vec<String> = Vec::new();
     if let Some(s) = q.state.as_deref().filter(|s| !s.is_empty()) {
         UnitState::from_db(s).map_err(|_| ApiError::bad_request(format!("No unit state {s:?}.")))?;
-        sql.push_str(" AND u.state = ?");
+        filter.push_str(" AND u.state = ?");
         binds.push(s.to_owned());
     }
     if let Some(c) = q.device_class.as_deref().filter(|s| !s.is_empty()) {
-        sql.push_str(" AND u.device_class = ?");
+        filter.push_str(" AND u.device_class = ?");
         binds.push(c.to_owned());
     }
     if let Some(s) = q.station.as_deref().filter(|s| !s.is_empty()) {
-        sql.push_str(" AND u.station = ?");
+        filter.push_str(" AND u.station = ?");
         binds.push(s.to_owned());
     }
     if let Some(text) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        sql.push_str(" AND (u.serial LIKE ? ESCAPE '\\' OR u.device_kid LIKE ? ESCAPE '\\' OR u.radios LIKE ? ESCAPE '\\' OR u.collar_id = ?)");
+        filter.push_str(" AND (u.serial LIKE ? ESCAPE '\\' OR u.device_kid LIKE ? ESCAPE '\\' OR u.radios LIKE ? ESCAPE '\\' OR u.collar_id = ?)");
         let like = format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         binds.extend([like.clone(), like.clone(), like, text.to_owned()]);
     }
-    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    sql.push_str(&format!(" ORDER BY u.created_at DESC, u.serial DESC LIMIT {limit}"));
+    let count_sql = format!("SELECT COUNT(*) FROM fleet_units u{filter}");
+    let mut count = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds {
+        count = count.bind(b);
+    }
+    let total = count.fetch_one(ctx.db()).await?;
+    let mut page = filter.clone();
+    if let Some(c) = q.cursor.as_deref().filter(|s| !s.is_empty()) {
+        let (at, serial) = c.split_once('|').ok_or_else(|| ApiError::bad_request("That cursor isn't one this server gave."))?;
+        page.push_str(" AND (u.created_at < ? OR (u.created_at = ? AND u.serial < ?))");
+        binds.extend([at.to_owned(), at.to_owned(), serial.to_owned()]);
+    }
+    let limit = q.limit.unwrap_or(PAGE).clamp(1, MAX_PAGE);
+    let sql = format!("{SELECT}{page} ORDER BY u.created_at DESC, u.serial DESC LIMIT {}", limit + 1);
     let mut query = sqlx::query(&sql);
     for b in &binds {
         query = query.bind(b);
     }
     let rows = query.fetch_all(ctx.db()).await?;
-    Ok(Json(rows.iter().map(from_row).collect::<anyhow::Result<_>>()?))
+    let mut units: Vec<Unit> = rows.iter().map(from_row).collect::<anyhow::Result<_>>()?;
+    let next = (units.len() as i64 > limit).then(|| {
+        units.truncate(limit as usize);
+        units.last().map(cursor_of)
+    });
+    Ok(Json(UnitPage { units, total, next: next.flatten() }))
 }
 
 #[derive(Debug, Serialize)]
@@ -594,6 +687,9 @@ struct StateBody {
 
 /// `POST /api/fleet/units/:serial/state`: retire a unit or send it back
 /// (RMA). It keeps its collar, so a repaired unit returns to the same one.
+/// Either starts a new generation: no earlier test run counts, so a unit
+/// back from RMA needs a fresh pass before it is provisioned again. A
+/// retired unit can only come back through RMA.
 async fn set_state(State(ctx): State<Ctx>, identity: Identity, Path(serial): Path<String>, ApiJson(b): ApiJson<StateBody>) -> ApiResult<Json<Unit>> {
     if !matches!(b.state, UnitState::Retired | UnitState::Rma) {
         return Err(ApiError::bad_request("A unit can be set to retired or rma; the rest follow from tests, provisioning and claims."));
@@ -601,16 +697,33 @@ async fn set_state(State(ctx): State<Ctx>, identity: Identity, Path(serial): Pat
     if let Some(n) = &b.note {
         check_text("note", n, 500)?;
     }
-    let unit = find(&ctx, &serial).await?;
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let unit = load(&mut tx, &serial).await?.ok_or_else(|| ApiError::not_found(format!("No unit with serial {serial}.")))?;
     if unit.state == b.state {
         return Ok(Json(unit));
     }
-    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    sqlx::query("UPDATE fleet_units SET state = ?, updated_at = ? WHERE serial = ?").bind(b.state.as_db()).bind(to_db(&now())).bind(&serial).execute(&mut *tx).await?;
-    log(&mut tx, &serial, "state", json!({ "from": unit.state, "to": b.state, "note": b.note }), who(&identity).as_deref()).await?;
+    let at = to_db(&now());
+    let n = sqlx::query(
+        "UPDATE fleet_units SET state = ?, generation = generation + 1, generation_at = ?, updated_at = ? WHERE serial = ? AND state = ? AND generation = ?",
+    )
+    .bind(b.state.as_db())
+    .bind(&at)
+    .bind(&at)
+    .bind(&serial)
+    .bind(unit.state.as_db())
+    .bind(unit.generation)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n != 1 {
+        return Err(ApiError::conflict(format!("{serial} changed meanwhile. Look at it again.")));
+    }
+    log(&mut tx, &serial, "state", json!({ "from": unit.state, "to": b.state, "note": b.note, "generation": unit.generation + 1 }), who(&identity).as_deref())
+        .await?;
+    let unit = load(&mut tx, &serial).await?.ok_or_else(|| ApiError::internal("unit vanished"))?;
     tx.commit().await?;
     publish(&ctx, &serial).await;
-    Ok(Json(find(&ctx, &serial).await?))
+    Ok(Json(unit))
 }
 
 #[derive(Serialize)]
@@ -640,9 +753,14 @@ async fn summary(State(ctx): State<Ctx>) -> ApiResult<Json<Summary>> {
 /// code is forgotten then: claim codes are kept only as long as a claim
 /// takes (protocol v2 `server.md` §10); the factory record's claim check stays.
 pub async fn mark_in_service(ctx: &Ctx, collar_id: &str) -> anyhow::Result<bool> {
-    let serial: Option<String> = sqlx::query_scalar("SELECT serial FROM fleet_units WHERE collar_id = ? AND state = 'claimed'").bind(collar_id).fetch_optional(ctx.db()).await?;
-    let Some(serial) = serial else { return Ok(false) };
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let serial: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT u.serial FROM fleet_units u JOIN collars c ON c.id = u.collar_id WHERE u.collar_id = ? AND u.state = 'claimed' AND {REPORTED_SINCE_CLAIM}"
+    ))
+    .bind(collar_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(serial) = serial else { return Ok(false) };
     let n = sqlx::query("UPDATE fleet_units SET state = 'in_service', claim_code = NULL, updated_at = ? WHERE serial = ? AND state = 'claimed'")
         .bind(to_db(&now()))
         .bind(&serial)
@@ -660,12 +778,18 @@ pub async fn mark_in_service(ctx: &Ctx, collar_id: &str) -> anyhow::Result<bool>
     Ok(n == 1)
 }
 
+/// The collar reported after the unit was (re)claimed: a reclaimed unit
+/// waits for a report under its new key.
+const REPORTED_SINCE_CLAIM: &str = "c.last_seen IS NOT NULL AND (u.claimed_at IS NULL OR c.last_seen >= u.claimed_at)";
+
 /// Claimed units whose collar has reported, in one sweep (the live feed can
 /// drop events; the rollout tick calls this every minute).
 pub async fn sweep_in_service(ctx: &Ctx) -> anyhow::Result<()> {
-    let ids: Vec<String> = sqlx::query_scalar("SELECT u.collar_id FROM fleet_units u JOIN collars c ON c.id = u.collar_id WHERE u.state = 'claimed' AND c.last_seen IS NOT NULL")
-        .fetch_all(ctx.db())
-        .await?;
+    let ids: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT u.collar_id FROM fleet_units u JOIN collars c ON c.id = u.collar_id WHERE u.state = 'claimed' AND {REPORTED_SINCE_CLAIM}"
+    ))
+    .fetch_all(ctx.db())
+    .await?;
     for id in ids {
         mark_in_service(ctx, &id).await?;
     }
