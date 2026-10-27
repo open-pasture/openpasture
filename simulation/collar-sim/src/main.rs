@@ -11,6 +11,7 @@
 //! apply on each collar's own clock, and acks are kept until the server
 //! takes them, so a collar cut off from the server behaves as in the field.
 
+mod farm;
 mod firmware;
 mod herd;
 mod sensors;
@@ -23,7 +24,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use firmware::{Firmware, Profile};
+use firmware::{Firmware, Profile, Role};
 use op_geo::LonLat;
 use op_geo::projection::Projection;
 use op_protocol::{Health, PositionReport, VerifyingKey, WireCue, WireEpisode, WireFix};
@@ -35,23 +36,49 @@ use serde_json::{Value, json};
 use herd::{Animal, Area, Collar, Herd};
 
 #[derive(Parser)]
-#[command(name = "collar-sim", about = "Emulated collars for an openpasture server.")]
+#[command(name = "collar-sim", about = "Simulated collars for an openpasture server. Never point it at a real farm.")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    run: Args,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// A throwaway simulated farm: starts its own server on its own data dir
+    /// and port, makes a farm, two paddocks and a herd, and runs the collars.
+    Farm(farm::FarmArgs),
+}
+
+/// Run collars against a server that is already running.
+#[derive(clap::Args)]
 struct Args {
-    /// The openpasture server.
-    #[arg(long, default_value = "http://127.0.0.1:7878")]
+    /// The openpasture server: a simulated farm's, never a real one.
+    #[arg(long, default_value = "http://127.0.0.1:7991")]
     server: String,
     /// Herd id or name. Default: the first herd.
     #[arg(long)]
     herd: Option<String>,
-    /// Collars to run. Collars linked by an earlier run are reused.
-    #[arg(long, default_value_t = 12)]
-    count: usize,
     /// App token, needed when the server is bound beyond localhost.
     #[arg(long)]
     token: Option<String>,
     /// Where collar keys are kept. Default: ~/.collar-sim/state.json
     #[arg(long)]
     state: Option<PathBuf>,
+    /// Run anyway against port 7878 or a server with real collars. Don't.
+    #[arg(long)]
+    force: bool,
+    #[command(flatten)]
+    sim: Sim,
+}
+
+/// How the simulated herd behaves.
+#[derive(clap::Args, Clone)]
+struct Sim {
+    /// Collars to run. Collars linked by an earlier run are reused.
+    #[arg(long, default_value_t = 12)]
+    count: usize,
     /// Seconds between fixes.
     #[arg(long, default_value_t = 5)]
     fix_secs: u64,
@@ -70,8 +97,15 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     drop: usize,
     /// Collars report the LTE-M cell they measure (signal, quality, band).
+    /// Anchors always do.
     #[arg(long)]
     cell: bool,
+    /// A LoRa herd: this many collars of each herd are anchors (LoRa and
+    /// LTE-M, taking turns relaying), the rest nodes (LoRa only). 0: every
+    /// collar talks to the server itself (LTE-M, firmware 0.2). Each still
+    /// reports over protocol v1 for now; the role is in its device info.
+    #[arg(long, default_value_t = 0)]
+    anchors: usize,
     /// Several herds in one run: `Cows=226,Steers=12` (name or id = collars).
     /// Replaces `--herd` and `--count`.
     #[arg(long, value_delimiter = ',', value_parser = parse_herd)]
@@ -92,12 +126,47 @@ mod args_tests {
 
     #[test]
     fn herds_take_a_name_and_a_count_each() {
-        let a = Args::try_parse_from(["collar-sim", "--herds", "Cows=238,Heifers=12", "--ramp", "60", "--duration", "10"]).unwrap();
+        let a = Cli::try_parse_from(["collar-sim", "--herds", "Cows=238,Heifers=12", "--ramp", "60", "--duration", "10"]).unwrap().run.sim;
         assert_eq!(a.herds, vec![("Cows".to_owned(), 238), ("Heifers".to_owned(), 12)]);
         assert_eq!((a.ramp, a.duration), (60, Some(10)));
-        assert!(Args::try_parse_from(["collar-sim", "--herds", "Cows"]).is_err());
-        let one = Args::try_parse_from(["collar-sim", "--count", "5"]).unwrap();
-        assert!(one.herds.is_empty() && one.count == 5 && one.ramp == 0 && one.duration.is_none());
+        assert!(Cli::try_parse_from(["collar-sim", "--herds", "Cows"]).is_err());
+        let one = Cli::try_parse_from(["collar-sim", "--count", "5"]).unwrap().run.sim;
+        assert!(one.herds.is_empty() && one.count == 5 && one.ramp == 0 && one.duration.is_none() && one.anchors == 0);
+    }
+
+    #[test]
+    fn farm_is_a_subcommand_with_its_own_port() {
+        let c = Cli::try_parse_from(["collar-sim", "farm", "--count", "20", "--anchors", "2"]).unwrap();
+        let Some(Cmd::Farm(f)) = c.cmd else { panic!("farm") };
+        assert_eq!((f.port, f.sim.count, f.sim.anchors, f.force), (farm::DEFAULT_PORT, 20, 2, false));
+        assert!(Cli::try_parse_from(["collar-sim", "farm", "--port", "7878", "--force"]).is_ok());
+    }
+
+    #[test]
+    fn a_plain_run_finds_the_port_it_would_refuse() {
+        assert_eq!(port_of("http://127.0.0.1:7878"), 7878);
+        assert_eq!(port_of("http://localhost:7878/"), 7878);
+        assert_eq!(port_of("https://farm.example.com"), 443);
+        assert_eq!(port_of("http://[::1]:7991"), 7991);
+        let a = Cli::try_parse_from(["collar-sim"]).unwrap().run;
+        assert_eq!(port_of(&a.server), farm::DEFAULT_PORT, "the default is a simulated farm's port");
+        assert!(farm::check_port(port_of("http://127.0.0.1:7878"), false).is_err());
+    }
+
+    #[test]
+    fn the_first_anchors_of_a_herd_are_anchors() {
+        let roles: Vec<Role> = (0..5).map(|i| role_of(i, 2)).collect();
+        assert_eq!(roles, [Role::Anchor, Role::Anchor, Role::Node, Role::Node, Role::Node]);
+        assert_eq!(role_of(0, 0), Role::Direct);
+    }
+}
+
+/// Collar `i` of a herd with `anchors` anchors.
+fn role_of(i: usize, anchors: usize) -> Role {
+    match anchors {
+        0 => Role::Direct,
+        n if i < n => Role::Anchor,
+        _ => Role::Node,
     }
 }
 
@@ -125,8 +194,8 @@ struct State {
     collars: Vec<Linked>,
 }
 
-fn state_path(args: &Args) -> PathBuf {
-    args.state.clone().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".collar-sim").join("state.json"))
+fn state_path(state: Option<&PathBuf>) -> PathBuf {
+    state.cloned().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".collar-sim").join("state.json"))
 }
 
 fn load_state(path: &PathBuf) -> anyhow::Result<State> {
@@ -196,29 +265,69 @@ fn polygon(geometry: &Value) -> Option<op_geo::Polygon> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let server = args.server.trim_end_matches('/').to_owned();
-    let api = Api { http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?, server: server.clone(), token: args.token.clone() };
+    let cli = Cli::parse();
+    match cli.cmd {
+        Some(Cmd::Farm(f)) => farm::run(f).await,
+        None => {
+            let a = cli.run;
+            farm::check_port(port_of(&a.server), a.force)?;
+            let api = Api::new(&a.server, a.token.clone())?;
+            check_server(&api, a.force).await?;
+            run(&api, &a.sim, a.herd.as_deref(), &state_path(a.state.as_ref())).await
+        }
+    }
+}
+
+/// The port in a server URL (80 or 443 when it names none).
+fn port_of(url: &str) -> u16 {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split('/').next().unwrap_or("");
+    match host.rsplit_once(':').and_then(|(_, p)| p.parse().ok()) {
+        Some(p) => p,
+        None if url.starts_with("https://") => 443,
+        None => 80,
+    }
+}
+
+/// Refuse a server that has real collars: the simulator never joins a real farm.
+async fn check_server(api: &Api, force: bool) -> anyhow::Result<()> {
+    let collars = api.get("/api/collars").await.context("is the server running?")?;
+    let real = collars.as_array().into_iter().flatten().filter(|c| c["simulated"] != json!(true)).count();
+    if real > 0 && !force {
+        bail!("{} has {real} real collar{}; the simulator only runs on a simulated farm (collar-sim farm). --force overrides.", api.server, if real == 1 { "" } else { "s" });
+    }
+    Ok(())
+}
+
+impl Api {
+    fn new(server: &str, token: Option<String>) -> anyhow::Result<Self> {
+        Ok(Api { http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?, server: server.trim_end_matches('/').to_owned(), token })
+    }
+}
+
+/// Link (or reuse) the collars and run them until ctrl-c, `--duration` or
+/// every collar was removed in the app.
+async fn run(api: &Api, sim: &Sim, herd: Option<&str>, state: &PathBuf) -> anyhow::Result<()> {
     let st = api.get("/api/state").await.context("is the server running?")?;
     let wanted: Vec<(Option<String>, usize)> =
-        if args.herds.is_empty() { vec![(args.herd.clone(), args.count)] } else { args.herds.iter().map(|(h, n)| (Some(h.clone()), *n)).collect() };
+        if sim.herds.is_empty() { vec![(herd.map(str::to_owned), sim.count)] } else { sim.herds.iter().map(|(h, n)| (Some(h.clone()), *n)).collect() };
     let total: usize = wanted.iter().map(|(_, n)| n).sum();
     let mut tasks = Vec::new();
     let mut first = 0;
     for (herd, count) in wanted {
-        let started = start_herd(&api, &args, &st, herd.as_deref(), count, first, total).await?;
+        let started = start_herd(api, sim, state, &st, herd.as_deref(), count, first, total).await?;
         first += started.len();
         tasks.extend(started);
     }
     let stop = async {
-        match args.duration {
+        match sim.duration {
             Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
             None => std::future::pending().await,
         }
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("stopping"),
-        _ = stop => println!("stopping after {} s", args.duration.unwrap_or(0)),
+        _ = stop => println!("stopping after {} s", sim.duration.unwrap_or(0)),
         _ = futures_all(tasks) => println!("every collar has stopped"),
     }
     Ok(())
@@ -226,9 +335,11 @@ async fn main() -> anyhow::Result<()> {
 
 /// Link (or reuse) `count` collars on one herd and start them. `first` of
 /// `total` is where this herd's collars fall in the `--ramp` order.
+#[allow(clippy::too_many_arguments)]
 async fn start_herd(
     api: &Api,
-    args: &Args,
+    args: &Sim,
+    path: &PathBuf,
     st: &Value,
     wanted: Option<&str>,
     count: usize,
@@ -260,8 +371,7 @@ async fn start_herd(
     let area = shape.as_ref().and_then(Area::from_polygon).context("the herd has no paddock and the farm has no centre")?;
 
     // Reuse collars from earlier runs that still exist; link the rest.
-    let path = state_path(args);
-    let mut state = load_state(&path)?;
+    let mut state = load_state(path)?;
     let existing: Vec<String> = api
         .get(&format!("/api/collars?herd_id={herd_id}"))
         .await?
@@ -276,7 +386,8 @@ async fn start_herd(
         let animals = api.get(&format!("/api/animals?herd_id={herd_id}")).await?;
         let mut tag = animals.as_array().into_iter().flatten().filter_map(|a| a["tag"].as_str()?.parse::<u32>().ok()).max().map_or(101, |t| t.max(100) + 1);
         while mine.len() < count {
-            let linked = api.post("/api/collars", json!({ "name": tag.to_string(), "herd_id": herd_id })).await?;
+            // Linked as simulated, so even firmware 0.1 (no caps) is marked.
+            let linked = api.post("/api/collars", json!({ "name": tag.to_string(), "herd_id": herd_id, "simulated": true })).await?;
             let collar_id = linked["collar"]["id"].as_str().context("collar id")?.to_owned();
             api.post("/api/animals", json!({ "tag": tag.to_string(), "herd_id": herd_id, "collar_id": collar_id })).await?;
             let l = Linked {
@@ -284,13 +395,15 @@ async fn start_herd(
                 herd_id: herd_id.clone(),
                 collar_id,
                 key: linked["key"].as_str().context("key")?.to_owned(),
-                endpoint: linked["endpoint"].as_str().context("endpoint")?.to_owned(),
+                // A server with no collar address set (one on loopback) gives none: the
+                // simulator talks to the server it was pointed at.
+                endpoint: linked["endpoint"].as_str().map_or_else(|| format!("{server}/collar/v1"), str::to_owned),
                 public_key: linked["public_key"].as_str().context("public_key")?.to_owned(),
                 tag: tag.to_string(),
             };
             println!("linked collar {} on animal {tag}", l.collar_id);
             state.collars.push(l.clone());
-            save_state(&path, &state)?;
+            save_state(path, &state)?;
             mine.push(l);
             tag += 1;
         }
@@ -308,14 +421,27 @@ async fn start_herd(
         .collect();
 
     let world: World = Arc::new(Mutex::new(HashMap::new()));
-    println!("running {} {:?} collars, a fix every {} s; ctrl-c to stop", mine.len(), args.caps, args.fix_secs);
+    let anchors = args.anchors.min(mine.len());
+    match anchors {
+        0 => println!("running {} simulated {:?} collars, a fix every {} s; ctrl-c to stop", mine.len(), args.caps, args.fix_secs),
+        n => println!(
+            "running {} simulated {:?} collars ({n} anchors, {} nodes), a fix every {} s; ctrl-c to stop",
+            mine.len(),
+            args.caps,
+            mine.len() - n,
+            args.fix_secs
+        ),
+    }
     let radio = args.cell.then(|| sensors::Radio::near(area.interior()));
     let mut tasks = Vec::new();
     for (i, l) in mine.into_iter().enumerate() {
         let start = last.get(&l.collar_id).copied();
         // With --ramp, collar k of all of them boots k/total of the way through it.
         let boot_ms = args.ramp * 1000 * (first + i) as u64 / total.max(1) as u64;
-        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio, boot_ms };
+        let role = role_of(i, anchors);
+        // Anchors carry LTE-M and measure their cell either way.
+        let radio = if role == Role::Anchor { Some(radio.unwrap_or_else(|| sensors::Radio::near(area.interior()))) } else { radio };
+        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio, boot_ms, role };
         tasks.push(tokio::spawn(run_collar(l, start, area.clone(), world.clone(), api.http.clone(), cfg)));
     }
     Ok(tasks)
@@ -347,6 +473,7 @@ struct Run {
     radio: Option<sensors::Radio>,
     /// Milliseconds after the start that this collar boots (`--ramp`).
     boot_ms: u64,
+    role: Role,
 }
 
 /// The device side of the protocol for one collar.
@@ -446,7 +573,8 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
         if area.margin(p) > 0.0 { p } else { area.interior() }
     });
     let id = l.collar_id.clone();
-    let firmware = Firmware::new(cfg.profile, &l.herd_id, &l.collar_id, &l.endpoint);
+    let mut firmware = Firmware::new(cfg.profile, &l.herd_id, &l.collar_id, &l.endpoint);
+    firmware.role = cfg.role;
     let dev = Device { http, l, server_key };
     let stubborn = rng.gen_bool(0.2);
     let mut collar = Collar::new(Animal::new(pos, stubborn, &mut rng), rng.gen_range(0.82..1.0), Some(area), firmware);

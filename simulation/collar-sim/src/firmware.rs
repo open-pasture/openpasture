@@ -44,9 +44,45 @@ impl Profile {
         self == Self::Legacy
     }
 
+    /// Firmware 0.1 reports no caps (and so can't say it is simulated: the
+    /// link says so instead).
     fn caps(self) -> Vec<String> {
-        if self.is_legacy() { vec![] } else { caps::ALL.iter().map(|c| c.to_string()).collect() }
+        if self.is_legacy() {
+            return vec![];
+        }
+        caps::ALL.iter().chain([SIM_CAP].iter()).map(|c| c.to_string()).collect()
     }
+}
+
+/// The cap every simulated collar reports (registry: a simulated collar MUST
+/// list it), so the server marks it simulated and keeps it out of reports and texts.
+pub const SIM_CAP: &str = caps::SIM;
+
+/// The collar's place in the herd network (registry device classes). For
+/// now every simulated collar still reports for itself over protocol v1;
+/// the class rides in its device info (`device_class`) so the herd-network
+/// view has a herd of nodes and anchors to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// LTE-M only, talking to the server itself (firmware 0.2 today).
+    #[default]
+    Direct,
+    /// LoRa only; in v2 its reports go through the herd's anchors.
+    Node,
+    /// LoRa and LTE-M; in v2 it takes turns relaying for the herd.
+    Anchor,
+}
+
+impl Role {
+    /// The v2 device class name.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Node => "node",
+            Self::Anchor => "anchor",
+        }
+    }
+
 }
 
 /// Where the collar reports: the provisioned endpoint, or one a config
@@ -103,6 +139,7 @@ pub struct Firmware {
     /// Acks not yet delivered, oldest first (NVS ID 2 on the collar).
     acks: Vec<Ack>,
     pub endpoint: Endpoint,
+    pub role: Role,
 }
 
 impl Firmware {
@@ -117,6 +154,7 @@ impl Firmware {
             config_reject: None,
             acks: Vec::new(),
             endpoint: Endpoint::new(endpoint),
+            role: Role::Direct,
         }
     }
 
@@ -163,7 +201,7 @@ impl Firmware {
                 Ack {
                     command_id: v.get("command_id")?.as_str()?.to_owned(),
                     version: u32::try_from(v.get("version")?.as_u64()?).ok()?,
-                    status: AckStatus::Rejected,
+                    status: AckStatus::Rejected.into(),
                     code: Some(code),
                     reason: Some(code.message().to_owned()),
                     at: modem_now,
@@ -251,6 +289,7 @@ impl Firmware {
             limits: Some(self.profile.limits()),
             config_version: self.config.as_ref().map(|c| c.version),
             config_reject: self.config_reject.clone(),
+            device_class: Some(self.role.class().into()),
         })
     }
 
@@ -309,13 +348,27 @@ mod tests {
     fn profiles_say_what_they_are() {
         let v0 = fw(Profile::V0);
         let d = v0.device().unwrap();
-        assert_eq!((d.fw.as_deref(), d.limits, d.caps.len()), (Some(FW), Some(CollarLimits::V0), 6));
+        assert_eq!((d.fw.as_deref(), d.limits, d.caps.len()), (Some(FW), Some(CollarLimits::V0), 7));
+        assert!(d.has(SIM_CAP), "a simulated collar says so");
         assert_eq!(fw(Profile::V1).device().unwrap().limits, Some(CollarLimits::V1));
         let legacy = fw(Profile::Legacy);
         assert!(legacy.device().is_none() && legacy.slots().is_none());
         assert_eq!(legacy.boundary_query(), "have=0");
         assert_eq!(v0.boundary_query(), "have=0&free=16&free_bytes=24576");
         assert_eq!(v0.slots(), Some(vec![]));
+    }
+
+    #[test]
+    fn the_role_rides_in_the_device_info() {
+        let mut f = fw(Profile::V0);
+        assert_eq!(f.device().unwrap().device_class.as_deref(), Some("direct"));
+        f.role = Role::Node;
+        let d = f.device().unwrap();
+        assert_eq!((d.device_class.as_deref(), d.has(SIM_CAP)), (Some("node"), true));
+        f.role = Role::Anchor;
+        assert_eq!(f.device().unwrap().device_class.as_deref(), Some("anchor"));
+        // Only registered caps: the role is a class, not a cap.
+        assert!(f.device().unwrap().caps.iter().all(|c| caps::ALL.contains(&c.as_str()) || c == SIM_CAP));
     }
 
     #[test]
@@ -335,12 +388,12 @@ mod tests {
         // No server: fixes alone apply them at their times.
         assert!(f.tick(t0() + Duration::seconds(119)).is_none());
         let a = f.tick(t0() + Duration::seconds(121)).unwrap();
-        assert_eq!((a.version, a.status, a.at), (2, AckStatus::Applied, t0() + Duration::seconds(121)));
+        assert_eq!((a.version, a.status.known(), a.at), (2, Some(AckStatus::Applied), t0() + Duration::seconds(121)));
         // Past both others at once: the highest applies, the other is dropped.
         let a = f.tick(t0() + Duration::minutes(7)).unwrap();
         assert_eq!((a.version, f.active_version(), f.staged()), (4, Some(4), vec![]));
         // Every ack is owed until delivered, in order.
-        let owed: Vec<(u32, AckStatus)> = f.pending_acks().iter().map(|a| (a.version, a.status)).collect();
+        let owed: Vec<(u32, AckStatus)> = f.pending_acks().iter().map(|a| (a.version, a.status.known().unwrap())).collect();
         assert_eq!(
             owed,
             [
@@ -360,14 +413,14 @@ mod tests {
         l.receive(&wire(1, vec![], None, None), &k, t0());
         l.receive(&wire(2, vec![], Some(t0() + Duration::minutes(2)), None), &k, t0());
         let a = l.receive(&wire(3, vec![], Some(t0() + Duration::minutes(4)), None), &k, t0()).unwrap();
-        assert_eq!((a.status, a.code), (AckStatus::Rejected, None));
+        assert_eq!((a.status.known(), a.code), (Some(AckStatus::Rejected), None));
         assert!(a.reason.is_some());
         // Bytes: a V0 collar full by bytes refuses a big staged record.
         let mut tight = Firmware::new(Profile::V0, "herd_1", "col_a", "https://a.example.com");
         tight.store = SlotStore::new(CollarLimits { slot_bytes: 400, ..CollarLimits::V0 }, Some("herd_1".into()), Some("col_a".into()));
         tight.receive(&wire(1, vec![], None, None), &k, t0());
         let a = tight.receive(&wire(2, vec![], Some(t0() + Duration::minutes(2)), None), &k, t0()).unwrap();
-        assert_eq!((a.status, a.code), (AckStatus::Rejected, Some(RejectCode::SlotsFull)));
+        assert_eq!((a.status.known(), a.code), (Some(AckStatus::Rejected), Some(RejectCode::SlotsFull)));
     }
 
     #[test]

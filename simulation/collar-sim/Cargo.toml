@@ -1,6 +1,6 @@
 [package]
 name = "collar-sim"
-description = "Emulated OpenCollar devices for testing an openpasture server before hardware reports"
+description = "The simulator: simulated OpenCollar devices and throwaway simulated farms for testing openpasture. Never pointed at a real farm."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,6 +23,12 @@ rand.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
+# Reading a data dir's collars (read only) before a simulated farm uses it.
+sqlx.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

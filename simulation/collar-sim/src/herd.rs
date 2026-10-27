@@ -407,7 +407,7 @@ impl Collar {
                 } else {
                     WireCue {
                         at: now,
-                        kind: c.kind,
+                        kind: c.kind.map(Into::into),
                         level: c.volume,
                         dur_ms: Some(u32::from(c.duration_ms)),
                         margin_m,
