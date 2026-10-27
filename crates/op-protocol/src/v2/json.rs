@@ -48,12 +48,41 @@ pub fn int_map_json(m: &IntMap) -> Json {
 }
 
 /// A named field of an integer-keyed map, for maps whose fields are a table
-/// rather than a struct (health, device, anchor).
+/// rather than a struct (health, anchor).
 pub struct Field {
     pub key: u64,
     pub name: &'static str,
     /// For a nested map, its own table.
     pub nested: Option<&'static [Field]>,
+    /// What its value must be when present.
+    pub ty: Ty,
+}
+
+/// The type of a table field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Uint,
+    Int,
+    Bool,
+    Text,
+    Percent,
+    Map,
+}
+
+/// Whether every known field of `m` that is present has its type (unknown
+/// keys pass: they are a later version's).
+pub fn table_ok(m: &IntMap, table: &[Field]) -> bool {
+    m.0.iter().all(|(k, v)| match table.iter().find(|f| f.key == *k) {
+        None => true,
+        Some(f) => match f.ty {
+            Ty::Uint => v.as_u64().is_some(),
+            Ty::Int => v.as_i64().is_some(),
+            Ty::Bool => v.as_bool().is_some(),
+            Ty::Text => v.as_text().is_some_and(|t| t.len() <= 32),
+            Ty::Percent => v.as_u64().is_some_and(|p| p <= 100),
+            Ty::Map => IntMap::from_value(v).is_some_and(|inner| f.nested.is_none_or(|t| table_ok(&inner, t))),
+        },
+    })
 }
 
 /// A map through its table: known keys by name, unknown ones by number.

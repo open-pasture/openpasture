@@ -61,6 +61,26 @@ pub fn frame_key(shared: &[u8; 32], device_id: &[u8; 8], server_kid: &[u8; 8]) -
     hkdf(shared, &[b"frame", device_id, server_kid], 16).try_into().unwrap()
 }
 
+/// The key a server wraps secrets for one collar under (a herd's beacon
+/// key, in its membership): same agreement as the frame key, another label.
+pub fn wrap_key(shared: &[u8; 32], device_id: &[u8; 8], server_kid: &[u8; 8]) -> [u8; 16] {
+    hkdf(shared, &[b"wrap", device_id, server_kid], 16).try_into().unwrap()
+}
+
+/// Length of a beacon's authentication tag.
+pub const BEACON_TAG_BYTES: usize = 8;
+
+/// A beacon's tag: the first 8 bytes of HMAC-SHA-256 under the herd's
+/// beacon key, over every byte of the frame before the tag.
+pub fn beacon_tag(beacon_key: &[u8; 16], frame: &[u8]) -> [u8; BEACON_TAG_BYTES] {
+    hmac_sha256(beacon_key, &[frame])[..BEACON_TAG_BYTES].try_into().unwrap()
+}
+
+/// Equal in constant time.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenError;
 
@@ -72,7 +92,15 @@ impl std::fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
-/// AES-128-CCM: `plaintext` encrypted, followed by the 8-byte tag.
+/// Longest plaintext AES-CCM with L = 2 carries: 2¹⁶ − 1 bytes.
+pub const MAX_CCM_PLAINTEXT: usize = 0xffff;
+/// Longest associated data this implementation takes (the short form of
+/// RFC 3610's length encoding).
+pub const MAX_CCM_AAD: usize = 0xfeff;
+
+/// AES-128-CCM: `plaintext` encrypted, followed by the 8-byte tag. Panics
+/// past [`MAX_CCM_PLAINTEXT`] or [`MAX_CCM_AAD`]: only a sender's own bug
+/// gets there; [`ccm_open`] refuses such input instead.
 pub fn ccm_seal(key: &[u8; 16], nonce: &[u8; NONCE_BYTES], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let aes = Aes128::new(&(*key).into());
     let tag = cbc_mac(&aes, nonce, aad, plaintext);
@@ -83,9 +111,13 @@ pub fn ccm_seal(key: &[u8; 16], nonce: &[u8; NONCE_BYTES], aad: &[u8], plaintext
     out
 }
 
-/// The plaintext of a [`ccm_seal`] output, if the tag verifies.
+/// The plaintext of a [`ccm_seal`] output, if the tag verifies. Input of
+/// any length is safe: what CCM can't carry doesn't authenticate.
 pub fn ccm_open(key: &[u8; 16], nonce: &[u8; NONCE_BYTES], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, OpenError> {
     let split = sealed.len().checked_sub(TAG_BYTES).ok_or(OpenError)?;
+    if split > MAX_CCM_PLAINTEXT || aad.len() > MAX_CCM_AAD {
+        return Err(OpenError);
+    }
     let (ct, tag) = sealed.split_at(split);
     let aes = Aes128::new(&(*key).into());
     let mut pt = ct.to_vec();
@@ -122,7 +154,7 @@ fn ctr(aes: &Aes128, nonce: &[u8; NONCE_BYTES], data: &mut [u8]) {
 }
 
 fn cbc_mac(aes: &Aes128, nonce: &[u8; NONCE_BYTES], aad: &[u8], msg: &[u8]) -> [u8; TAG_BYTES] {
-    assert!(msg.len() <= 0xffff && aad.len() < 0xff00, "CCM lengths");
+    assert!(msg.len() <= MAX_CCM_PLAINTEXT && aad.len() <= MAX_CCM_AAD, "CCM lengths");
     let mut b0 = [0u8; 16];
     // Adata, M' = (8 − 2) / 2, L' = 1.
     b0[0] = if aad.is_empty() { 0 } else { 0x40 } | (((TAG_BYTES as u8 - 2) / 2) << 3) | 0x01;
@@ -178,6 +210,17 @@ mod tests {
         let nonce: [u8; 13] = unhex("00000004030201A0A1A2A3A4A5").try_into().unwrap();
         let sealed = ccm_seal(&key, &nonce, &unhex("0001020304050607"), &unhex("08090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"));
         assert_eq!(sealed, unhex("72C91A36E135F8CF291CA894085C87E3CC15C439C9E43A3BA091D56E10400916"));
+    }
+
+    /// Astra 01 F12: 65 536 bytes of ciphertext plus a tag panicked inside
+    /// CCM instead of failing to authenticate.
+    #[test]
+    fn open_never_panics_on_length() {
+        let key = [0u8; 16];
+        let nonce = [0u8; NONCE_BYTES];
+        assert_eq!(ccm_open(&key, &nonce, &[], &vec![0; MAX_CCM_PLAINTEXT + 1 + TAG_BYTES]), Err(OpenError));
+        assert_eq!(ccm_open(&key, &nonce, &vec![0; MAX_CCM_AAD + 1], &[0; TAG_BYTES]), Err(OpenError));
+        assert_eq!(ccm_open(&key, &nonce, &[], &[0; 3]), Err(OpenError));
     }
 
     #[test]

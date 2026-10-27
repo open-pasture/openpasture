@@ -86,41 +86,51 @@ The spec is `opencollar/protocol/v2/`; the schema is `v2/opencollar.cddl`.
 
 ### v2/messages.json
 
-Header: `keys`, `device_id` (the collar under test, the `device` key's kid), `herd`, `now` (its GNSS time), `nonce` and `claim_code` (its claim state), `limits` (its boundary limits).
+Header: `keys`, `device_id` (the collar under test, the `device` key's kid), `herd`, `now` (its GNSS time), `nonce` and `claim_code` (its claim state), `limits` (its boundary limits), `claimed_at` (its claim time), `pending_handover` (the digest of the handover it holds pending), `zones` and `lease` (the zones and lease it holds, as signed commands), `image_keys` (the firmware keys its bootloader trusts).
 
-`commands: [{ name, state, hex, json, expect }]`: `hex` is a COSE_Sign1 exactly as received; `json` the payload's JSON view (`null` when it doesn't decode); `expect` is `ok` or the reject code. `state` is the collar's: `claimed` (current server key `server`, pending handover key `next_server`, owner key `owner`, herd `herd`) or `unclaimed` (no keys, no herd). Check in this order, the first failure being the code:
+`commands: [{ name, state, clock, hex, json, expect, schema }]`: `hex` is a COSE_Sign1 exactly as received; `json` the payload's JSON view (`null` when it doesn't decode); `expect` is `ok` or the reject code; `clock` false means the collar has no GNSS time yet; `schema` is what the CDDL makes of it (`accept`, `reject`, `skip`). `state` is the collar's: `claimed` (current server key `server`, pending handover key `next_server` staged by the header's handover, owner key `owner`, herd `herd`, claimed at `claimed_at`, holding the header's zones and lease) or `unclaimed` (no keys, no herd). Check in this order, the first failure being the code:
 
 1. Size: over 12 288 bytes is `too_large`.
-2. The envelope: tag 18, four elements, protected header `{1: -8, 4: kid}`, a 64-byte signature (`bad_cbor`; another algorithm is `bad_sig`).
+2. The envelope: tag 18, four elements, protected header `{1: -8, 4: kid}`, an empty unprotected map, a 64-byte signature (`bad_cbor`; another algorithm or a `crit` header is `bad_sig`).
 3. The key: the trusted key with that kid (a bind is checked against the `server_key` it carries); none is `unknown_kid`. The signature over `["Signature1", protected, "opencollar/2", payload]` (`bad_sig`).
-4. The payload: deterministic CBOR, a command type, `herd`, `version`, `issued_at` and the type's required fields (`bad_cbor`).
-5. Who may sign it: a bind only while unclaimed (`claimed`); a confirm only by the pending key naming the current one (`bad_sig`); a handover or release by the server or owner key, an owner command by the owner key (or the server key while there is none), anything else by the server key alone (`unknown_kid`).
+4. The payload: deterministic CBOR with unsigned integer keys and no tags, a command type, `herd`, `version`, `issued_at`, `device` for config, membership, bind, resend and release, and every known field with its type and range (`bad_cbor`).
+5. Who may sign it: a bind only while unclaimed (`claimed`); a confirm only by the pending key naming the current one and the pending handover's digest (`bad_sig`); a rotate handover by the server or owner key; a release, a transfer or an owner command by the owner key (the server key only while there is none); anything else by the server key alone (`unknown_kid`).
 6. A bind's claim: the collar's nonce and the proof for its claim code (`bad_claim`).
-7. Scope: `device` another collar's (`wrong_collar`); `herd` another herd's, except a membership or bind (`wrong_herd`); `expires_at` at or before `now` (`expired`).
-8. The type's own rules: a boundary's shape against `limits` (v1's codes), a config's ranges (`bad_config`), a membership's (`bad_config`); a type the collar doesn't implement is `unsupported`.
+7. Scope: `device` another collar's (`wrong_collar`); `herd` another herd's, except a membership or bind (`wrong_herd`); `expires_at` at or before `now` (`expired`), or present with no clock (`not_now`).
+8. Versions: issued before `claimed_at` (`stale`). No versions are held otherwise.
+9. The type's own rules: a boundary's shape against `limits` (v1's codes), a config's ranges, a membership's (`unsupported` for an unknown plan, else `bad_config`), a handover's deadline (`bad_config`), zones' shapes; a trust update's signature by an image key; a type the collar doesn't implement is `unsupported`.
+10. A boundary against the held zones and lease (`in_exclusion`; waiting is `ok`).
 
-Versions (`stale`) and the slot store come after, as in `slots.json`.
+The slot store comes after, as in `slots.json`.
 
-`documents: [{ name, signer, hex, json }]`: factory records, a firmware manifest and a hello, each a COSE_Sign1 by the named key, with the JSON view of its payload.
+`documents: [{ name, signer, hex, json }]`: factory records, a firmware manifest, a hello and a trust update, each a COSE_Sign1 by the named key, with the JSON view of its payload.
 
 ### v2/records.json
 
-`records: [{ name, hex, json, expect, same_bytes }]`: one uplink record each. Decode the CBOR (`bad_cbor` when it isn't deterministic), then the record; `expect` is `ok` or the code. `json` is its JSON view. A record type, cue kind or outcome the reader doesn't know is kept, named `other`; elements past the known ones are ignored, so re-encoding gives back the same bytes only when `same_bytes`.
+`records: [{ name, hex, json, expect, same_bytes, schema }]`: one uplink record each. Decode the CBOR (`bad_cbor` when it isn't deterministic, has a tag or a map key that isn't an unsigned integer), then the record (`bad_cbor` for a known field of the wrong type or out of range); `expect` is `ok` or the code. `json` is its JSON view. A record type, cue kind or outcome the reader doesn't know is kept, shown as its number; elements past the known ones are ignored, so re-encoding gives back the same bytes only when `same_bytes`. Every record a sender makes is at most `max_record` (109) bytes; a device snapshot comes in parts (`device_part_i_of_n`) that merge back into one.
 
 ### v2/link.json
 
 - `frame_key`: the X25519 shared secret between the `device` and `server` keys and the AES-128 frame key derived from it.
-- `uplinks: [{ name, net, src, fcnt, link, records, hex }]`: sealed uplink frames; open with the frame key and the device id.
-- `beacons: [{ name, json, hex }]`.
-- `fragments: [{ name, message, max_data, msg, frames, received, need }]`: a signed boundary split into fragment frames; after receiving the fragments listed in `received`, the collar's `need` is `{ from, missing }`.
-- `slots: [{ short, cycle_min, fast, k, g, start_ms, minutes, sends }]`: plan 1 airtime slots: the slot index and group of a short address, when its slot starts, and whether it sends in each GNSS minute (Unix time / 60).
+- `beacon_key`: the test herd's beacon key.
+- `uplinks: [{ name, net, src, fcnt, link, records, hex }]`: sealed uplink frames; open with the frame key and the device id. `records` has `null` for a record that is refused (`one_malformed_record_among_valid`: its neighbours are read).
+- `beacons: [{ name, json, hex, expect }]`: check the 8-byte tag with the beacon key (`bad_sig` when it doesn't verify), then read the map between the 9-byte header and the tag.
+- `fragments: [{ name, message, max_data, msg, frames, received, need, expect }]`: a signed boundary split into fragment frames; after receiving the fragments listed in `received`, the collar's `need` is `{ from, missing }`. `expect: refused`: a count no command can have; nothing is allocated for it.
+- `slots: [{ short, cycle_min, groups, fast, k, g, start_ms, minutes, sends }]`: plan 1 airtime slots: the slot index and group of a short address, when its slot starts, and whether it sends in each GNSS minute (Unix time / 60) with that schedule, fast or not.
 - `airtime: [{ sf, bw_khz, bytes, us }]`: time on air of a LoRa packet.
 - `hellos: [{ name, hex, signed }]`: a hello frame and the signed hello in it.
 - `batches: [{ name, signer, hex, frames, reply }]`: an anchor's signed batch (the frames it carries), and a reply.
+- `joins: [{ name, batch, reply, air, collars }]`: two unclaimed collars join at once: their net-0 hellos in the anchor's batch, the server's reply with each one's bind and membership, the fragments the anchor sends to dst 0 (`air`), and for each collar what it keeps (`keeps`: its own bind and membership), the beacon key its membership wraps for it, and its first sealed status (`seq` 0, `fcnt` 0).
+- `replay: [{ name, fcnt, accepted }]`: a server's replay window over a sequence of frame counters.
 
 ### v2/identity.json
 
 - `claim_codes: [{ input, normalized }]`: claim code normalization (`null` when invalid).
 - `claim`: K_claim, `claim_check` and a bind proof for the test collar.
 - `card`: the card text and what it holds.
-- `manifest`: a signed release manifest, and `install: [{ name, class, hw_rev, security_counter, battery, moving, escaping, expect }]`: whether a collar in that state installs it now (`ok`, `incompatible`, `downgrade` or `not_now`).
+- `manifest`: a signed release manifest, and `install: [{ name, state, window, expect }]`: whether a collar in that state (its class, board, counter, battery, GNSS time, last fix, fence state, episode, pen, fast window, staged boundaries) and window (`effective_at`, its own offset) installs it now (`ok`, `incompatible`, `downgrade` or `not_now`).
+- `test_boot: [{ test, no_fix_before, then }]`: what follows a test boot: confirm, or roll back and whether to refuse the digest.
+- `trust_store` and `trust_updates: [{ name, signer, hex, before, expect, after }]`: trust updates applied in turn to a bootloader trusting both release keys.
+- `counters: [{ name, copies, durable, resume_at }]`: a counter's two-copy reservation record in flash, what it reads as, and where the counter resumes; one write torn by a power cut.
+- `zones`: the zones the claimed collar holds and their digest. `overlaps: [{ name, outer, holes, zone, overlaps }]` and `activation: [{ name, boundary, held_epoch, lease, now, then }]` (`activate`, `wait_zones`, `wait_lease`, `wait_clock`, `in_exclusion`).
+- `v1_herd`: a v1 herd id and the v2 herd id derived from it.

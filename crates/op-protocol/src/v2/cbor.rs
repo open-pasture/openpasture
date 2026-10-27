@@ -2,10 +2,15 @@
 //! integers, byte and text strings, arrays, maps, tags, `false`, `true` and
 //! `null`. No floats and no indefinite lengths.
 //!
-//! [`encode`] always writes the deterministic form: shortest heads, map keys
-//! sorted by their encoded bytes. [`decode`] accepts only that form, so a
-//! message has exactly one encoding and decoding then encoding gives back the
-//! bytes received.
+//! [`try_encode`] writes the deterministic form (shortest heads, map keys
+//! sorted by their encoded bytes) and refuses a value that has none: a map
+//! with a repeated key, or nesting deeper than [`MAX_DEPTH`]. [`decode`]
+//! accepts only that form, so a message has exactly one encoding and decoding
+//! then encoding gives back the bytes received.
+//!
+//! Protocol maps have unsigned integer keys only ([`IntMap::from_value`]
+//! refuses anything else), and protocol payloads carry no tags ([`has_tag`]):
+//! the only tag is COSE_Sign1's 18 on the envelope.
 
 use std::fmt;
 
@@ -134,11 +139,21 @@ impl Value {
     }
 }
 
-/// The deterministic encoding of `v`.
+/// The deterministic encoding of `v`. Panics on a value that has none (a
+/// repeated map key, nesting past [`MAX_DEPTH`]): that is a bug in the
+/// caller, never something received, since [`decode`] refuses both. Use
+/// [`try_encode`] for values built from outside input.
 pub fn encode(v: &Value) -> Vec<u8> {
+    try_encode(v).expect("a CBOR value with no deterministic encoding")
+}
+
+/// The deterministic encoding of `v`, or why it has none:
+/// [`CborError::NotDeterministic`] for a repeated map key,
+/// [`CborError::TooDeep`] for nesting past [`MAX_DEPTH`].
+pub fn try_encode(v: &Value) -> Result<Vec<u8>, CborError> {
     let mut out = Vec::new();
-    write(v, &mut out);
-    out
+    write(v, &mut out, 0)?;
+    Ok(out)
 }
 
 fn head(major: u8, n: u64, out: &mut Vec<u8>) {
@@ -161,7 +176,10 @@ fn head(major: u8, n: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn write(v: &Value, out: &mut Vec<u8>) {
+fn write(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), CborError> {
+    if depth > MAX_DEPTH {
+        return Err(CborError::TooDeep);
+    }
     match v {
         Value::Int(i) if *i >= 0 => head(0, u64::try_from(*i).expect("CBOR integer above 2^64 - 1"), out),
         Value::Int(i) => head(1, u64::try_from(-1 - *i).expect("CBOR integer below -2^64"), out),
@@ -176,27 +194,105 @@ fn write(v: &Value, out: &mut Vec<u8>) {
         Value::Array(a) => {
             head(4, a.len() as u64, out);
             for item in a {
-                write(item, out);
+                write(item, out, depth + 1)?;
             }
         }
         Value::Map(m) => {
-            let mut entries: Vec<(Vec<u8>, &Value)> = m.iter().map(|(k, v)| (encode(k), v)).collect();
+            let mut entries = Vec::with_capacity(m.len());
+            for (k, v) in m {
+                let mut key = Vec::new();
+                write(k, &mut key, depth + 1)?;
+                entries.push((key, v));
+            }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            debug_assert!(entries.windows(2).all(|w| w[0].0 != w[1].0), "duplicate CBOR map key");
+            if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(CborError::NotDeterministic);
+            }
             head(5, entries.len() as u64, out);
             for (k, v) in entries {
                 out.extend(k);
-                write(v, out);
+                write(v, out, depth + 1)?;
             }
         }
         Value::Tag(t, inner) => {
             head(6, *t, out);
-            write(inner, out);
+            write(inner, out, depth + 1)?;
         }
         Value::Bool(false) => out.push(0xf4),
         Value::Bool(true) => out.push(0xf5),
         Value::Null => out.push(0xf6),
     }
+    Ok(())
+}
+
+/// Whether `v` holds a tag anywhere. Protocol payloads, records and link
+/// maps never do (`messages.md` §1); a receiver refuses one that does.
+pub fn has_tag(v: &Value) -> bool {
+    match v {
+        Value::Tag(..) => true,
+        Value::Array(a) => a.iter().any(has_tag),
+        Value::Map(m) => m.iter().any(|(k, v)| has_tag(k) || has_tag(v)),
+        _ => false,
+    }
+}
+
+/// [`decode`], refusing any tag: the profile of every protocol payload.
+pub fn decode_untagged(bytes: &[u8]) -> Result<Value, CborError> {
+    let v = decode(bytes)?;
+    if has_tag(&v) {
+        return Err(CborError::Unsupported);
+    }
+    Ok(v)
+}
+
+/// How many bytes the first CBOR item of `bytes` takes, checking only that
+/// it is well formed (RFC 8949 §5.3.1), not that it is deterministic or in
+/// the protocol's subset. Indefinite lengths and truncation are errors: then
+/// nothing after the item can be found. Lets a reader decode the records of
+/// a frame one by one, so one record that breaks the profile costs only
+/// itself.
+pub fn item_len(bytes: &[u8]) -> Result<usize, CborError> {
+    fn skip(b: &[u8], mut i: usize, depth: usize) -> Result<usize, CborError> {
+        if depth > MAX_DEPTH {
+            return Err(CborError::TooDeep);
+        }
+        let first = *b.get(i).ok_or(CborError::Truncated)?;
+        i += 1;
+        let (major, info) = (first >> 5, first & 0x1f);
+        let n: u64 = match info {
+            0..=23 => u64::from(info),
+            24..=27 => {
+                let w = 1usize << (info - 24);
+                let s = b.get(i..i + w).ok_or(CborError::Truncated)?;
+                i += w;
+                s.iter().fold(0u64, |acc, x| (acc << 8) | u64::from(*x))
+            }
+            _ => return Err(CborError::Unsupported),
+        };
+        match major {
+            0 | 1 | 7 => Ok(i),
+            2 | 3 => {
+                let n = usize::try_from(n).map_err(|_| CborError::Truncated)?;
+                if n > b.len() - i {
+                    return Err(CborError::Truncated);
+                }
+                Ok(i + n)
+            }
+            4 | 5 => {
+                let items = if major == 5 { n.checked_mul(2).ok_or(CborError::Truncated)? } else { n };
+                // Every item takes at least one byte.
+                if items > (b.len() - i) as u64 {
+                    return Err(CborError::Truncated);
+                }
+                for _ in 0..items {
+                    i = skip(b, i, depth + 1)?;
+                }
+                Ok(i)
+            }
+            _ => skip(b, i, depth + 1),
+        }
+    }
+    skip(bytes, 0, 0)
 }
 
 /// Decode exactly one item in deterministic form, with nothing after it.
@@ -343,10 +439,11 @@ impl IntMap {
         Self::default()
     }
 
-    /// From a decoded map. Entries whose key isn't an unsigned integer are
-    /// dropped: they are some later version's, and ignored like any unknown key.
+    /// From a decoded map. `None` unless every key is an unsigned integer:
+    /// protocol maps have no other keys, and a map that does is malformed
+    /// (`bad_cbor`), never read with the odd key dropped.
     pub fn from_value(v: &Value) -> Option<Self> {
-        Some(Self(v.as_map()?.iter().filter_map(|(k, v)| Some((k.as_u64()?, v.clone()))).collect()))
+        v.as_map()?.iter().map(|(k, v)| Some((k.as_u64()?, v.clone()))).collect::<Option<_>>().map(Self)
     }
 
     pub fn get(&self, key: u64) -> Option<&Value> {
@@ -421,6 +518,41 @@ mod tests {
         assert_eq!(bad("9bffffffffffffffff"), Err(CborError::Truncated), "a huge length doesn't allocate");
         let deep = "81".repeat(MAX_DEPTH + 1) + "00";
         assert_eq!(bad(&deep), Err(CborError::TooDeep));
+    }
+
+    #[test]
+    fn the_encoder_refuses_what_has_no_deterministic_form() {
+        // Astra 01 F13: in release the encoder emitted a201020103, which its
+        // own decoder refuses.
+        let dup = Value::Map(vec![(Value::uint(1u8), Value::uint(2u8)), (Value::uint(1u8), Value::uint(3u8))]);
+        assert_eq!(try_encode(&dup), Err(CborError::NotDeterministic));
+        assert!(std::panic::catch_unwind(|| encode(&dup)).is_err(), "encode never writes it");
+        let mut deep = Value::uint(0u8);
+        for _ in 0..=MAX_DEPTH {
+            deep = Value::Array(vec![deep]);
+        }
+        assert_eq!(try_encode(&deep), Err(CborError::TooDeep));
+    }
+
+    #[test]
+    fn protocol_maps_have_uint_keys_and_payloads_no_tags() {
+        // {0: 1, false: 2}: the key false must not be dropped or read as 0.
+        let m = decode(&[0xa2, 0x00, 0x01, 0xf4, 0x02]).unwrap();
+        assert_eq!(IntMap::from_value(&m), None);
+        assert_eq!(decode_untagged(&[0xa1, 0x18, 0x63, 0xc1, 0x00]), Err(CborError::Unsupported), "{{99: tag(1, 0)}}");
+        assert!(decode_untagged(&[0xa1, 0x01, 0x02]).is_ok());
+    }
+
+    #[test]
+    fn item_len_finds_items_the_profile_refuses() {
+        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        assert_eq!(item_len(&h("f93c0001")), Ok(3), "a half float");
+        assert_eq!(item_len(&h("1817")), Ok(2), "a long head");
+        assert_eq!(item_len(&h("a2010101020000")), Ok(5));
+        assert_eq!(item_len(&h("c10000")), Ok(2), "a tag");
+        assert_eq!(item_len(&h("9f01ff")), Err(CborError::Unsupported), "indefinite");
+        assert_eq!(item_len(&h("4401")), Err(CborError::Truncated));
+        assert_eq!(item_len(&h("9bffffffffffffffff")), Err(CborError::Truncated));
     }
 
     #[test]

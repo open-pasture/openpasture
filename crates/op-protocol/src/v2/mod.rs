@@ -14,6 +14,9 @@
 //!   ([`tdma`]). Anchors post what they hear in signed batches ([`batch`]).
 //! - Collars are identified by their own key and claimed with a code on
 //!   their card ([`identity`]); firmware comes as signed releases ([`firmware`]).
+//! - Counters never repeat a nonce or a record number ([`counter`]); a
+//!   collar holds permanent no-go zones and needs a lease to activate a
+//!   staged boundary ([`policy`]).
 //!
 //! v1 (HTTP + JSON) stays as it is in the crate root.
 
@@ -21,12 +24,14 @@ pub mod batch;
 pub mod cbor;
 pub mod command;
 pub mod cose;
+pub mod counter;
 pub mod crypto;
 pub mod firmware;
 pub mod fragment;
 pub mod frame;
 pub mod identity;
 pub mod json;
+pub mod policy;
 pub mod record;
 pub mod registry;
 pub mod tdma;

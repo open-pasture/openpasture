@@ -12,6 +12,10 @@
 //! | 5 | `expires_at` | Unix seconds; refused (`expired`) at or after it |
 //! | 6 | `ref` | up to 16 bytes, the server's own id for it |
 //! | 7 | `effective_at` | Unix seconds; when it takes effect (GNSS time) |
+//!
+//! `device` is required for the types that only ever concern one collar
+//! (config, membership, bind, resend, release): one without it is `bad_cbor`,
+//! never read as "every collar in the herd".
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use op_geo::{CollarLimits, LonLat};
@@ -57,9 +61,11 @@ pub enum Body {
     Roster(Roster),
     Bind(Bind),
     Handover(Handover),
-    /// The new key proves itself; key 16 is the kid it replaces.
+    /// The new key proves itself; key 16 is the kid it replaces, key 17 the
+    /// digest of the handover it confirms.
     Confirm {
         replaces: [u8; 8],
+        handover: [u8; 8],
     },
     /// Key 16: the new owner key.
     Owner {
@@ -72,6 +78,13 @@ pub enum Body {
         to: u32,
     },
     Release,
+    Zones(super::policy::Zones),
+    Lease(super::policy::Lease),
+    /// Key 16: a trust update (type 68) signed by a firmware key, for the
+    /// bootloader (`firmware.md`).
+    Trust {
+        update: Vec<u8>,
+    },
     /// A type this build doesn't implement. A collar acks it `unsupported`.
     Other {
         message_type: u64,
@@ -93,8 +106,16 @@ impl Body {
             Self::Firmware(_) => MessageType::Firmware,
             Self::Resend { .. } => MessageType::Resend,
             Self::Release => MessageType::Release,
+            Self::Zones(_) => MessageType::Zones,
+            Self::Lease(_) => MessageType::Lease,
+            Self::Trust { .. } => MessageType::Trust,
             Self::Other { message_type, .. } => MessageType::from_code(*message_type),
         }
+    }
+
+    /// Types that only ever concern one collar: `device` is required.
+    pub fn needs_device(t: MessageType) -> bool {
+        matches!(t, MessageType::Config | MessageType::Membership | MessageType::Bind | MessageType::Resend | MessageType::Release)
     }
 }
 
@@ -112,6 +133,8 @@ pub struct Boundary {
     pub warn_cm: Option<u32>,
     /// 20: hysteresis, centimetres (collar default 100).
     pub hyst_cm: Option<u32>,
+    /// 21: the policy epoch the server checked it against (`policy`).
+    pub policy: Option<u32>,
 }
 
 /// Type 2: one collar's settings (`device` required).
@@ -152,6 +175,12 @@ pub struct Membership {
     pub cycle_s: Option<u32>,
     /// 21: anchors: order of takeover, lower first.
     pub rank: Option<u32>,
+    /// 22: groups of short addresses the net uses (`tdma::Schedule`),
+    /// 1..=cycle; default 1.
+    pub groups: Option<u32>,
+    /// 23: the herd's beacon key, wrapped for this collar
+    /// (`frame::wrap_beacon_key`).
+    pub beacon_key: Option<[u8; super::frame::WRAPPED_KEY_BYTES]>,
 }
 
 /// Type 4: the herd's collars, for its anchors.
@@ -198,9 +227,18 @@ pub struct Handover {
     pub endpoint: Option<String>,
     /// 19
     pub endpoint_pin: Option<[u8; 32]>,
-    /// 20: 1 rotate, 2 transfer; for people only.
+    /// 20: 1 rotate, 2 transfer. A transfer moves ownership too: on
+    /// confirm the owner key becomes `new_owner` (none when absent), and
+    /// while an owner key is enrolled only it may sign one.
     pub reason: Option<u64>,
+    /// 21: a transfer's new owner key.
+    pub new_owner: Option<[u8; 32]>,
 }
+
+/// Handover reason 2: a sale, or any change of who owns the collar.
+pub const TRANSFER: u64 = 2;
+/// Longest a handover may stay pending: 30 days.
+pub const MAX_HANDOVER_S: u64 = 30 * 86_400;
 
 /// Type 9: install a release (see `firmware.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +328,8 @@ impl Command {
                     .put_opt(17, (!x.holes.is_empty()).then(|| Value::Array(x.holes.iter().map(ring_value).collect())))
                     .put_opt(18, x.cue_mode.filter(|c| *c != CueMode::Audio).map(|c| Value::uint(c.code())))
                     .put_opt(19, x.warn_cm.map(Value::uint))
-                    .put_opt(20, x.hyst_cm.map(Value::uint));
+                    .put_opt(20, x.hyst_cm.map(Value::uint))
+                    .put_opt(21, x.policy.map(Value::uint));
             }
             Body::Config(x) => {
                 m.put(16, Value::uint(x.report_s))
@@ -309,7 +348,9 @@ impl Command {
                     .put(18, Value::uint(x.net))
                     .put_opt(19, x.plan.map(Value::uint))
                     .put_opt(20, x.cycle_s.map(Value::uint))
-                    .put_opt(21, x.rank.map(Value::uint));
+                    .put_opt(21, x.rank.map(Value::uint))
+                    .put_opt(22, x.groups.map(Value::uint))
+                    .put_opt(23, x.beacon_key.map(|k| b(&k)));
             }
             Body::Roster(x) => {
                 let members = x.members.iter().map(|p| Value::Array(vec![Value::uint(p.short), b(&p.device), Value::uint(p.role.code())])).collect();
@@ -331,10 +372,11 @@ impl Command {
                     .put(17, Value::uint(x.deadline))
                     .put_opt(18, x.endpoint.clone().map(Value::Text))
                     .put_opt(19, x.endpoint_pin.map(|p| b(&p)))
-                    .put_opt(20, x.reason.map(Value::uint));
+                    .put_opt(20, x.reason.map(Value::uint))
+                    .put_opt(21, x.new_owner.map(|k| b(&k)));
             }
-            Body::Confirm { replaces } => {
-                m.put(16, b(replaces));
+            Body::Confirm { replaces, handover } => {
+                m.put(16, b(replaces)).put(17, b(handover));
             }
             Body::Owner { owner_key } => {
                 m.put(16, b(owner_key));
@@ -346,6 +388,15 @@ impl Command {
                 m.put(16, Value::uint(*from)).put(17, Value::uint(*to));
             }
             Body::Release => {}
+            Body::Zones(z) => {
+                m.put(16, Value::Array(z.zones.iter().map(ring_value).collect())).put(17, Value::uint(z.epoch));
+            }
+            Body::Lease(l) => {
+                m.put(16, Value::uint(l.epoch)).put(17, Value::uint(l.until)).put(18, b(&l.digest));
+            }
+            Body::Trust { update } => {
+                m.put(16, b(update));
+            }
             Body::Other { fields, .. } => {
                 for (k, v) in fields.0.iter().filter(|(k, _)| *k >= 16) {
                     m.put(*k, v.clone());
@@ -368,6 +419,10 @@ impl Command {
             return Err(Reject::BadCbor);
         }
         let herd = m.get(1).and_then(Value::as_bytes).filter(|h| (1..=MAX_HERD_BYTES).contains(&h.len())).ok_or(Reject::BadCbor)?.to_vec();
+        let device = opt_bytes_n(m.get(2))?;
+        if device.is_none() && Body::needs_device(t) {
+            return Err(Reject::BadCbor);
+        }
         let version = m.get(3).and_then(Value::as_u32).filter(|v| *v >= 1).ok_or(Reject::BadCbor)?;
         let reference = m.get(6).map(|v| v.as_bytes().filter(|r| r.len() <= MAX_REF_BYTES).map(<[u8]>::to_vec).ok_or(Reject::BadCbor)).transpose()?;
         let body = match t {
@@ -380,6 +435,7 @@ impl Command {
                 cue_mode: opt_u64(m.get(18))?.map(CueMode::from_code),
                 warn_cm: opt_u32(m.get(19))?,
                 hyst_cm: opt_u32(m.get(20))?,
+                policy: opt_u32(m.get(21))?,
             }),
             MessageType::Config => Body::Config(Config {
                 report_s: m.get(16).and_then(Value::as_u32).ok_or(Reject::BadCbor)?,
@@ -399,6 +455,8 @@ impl Command {
                 plan: opt_u32(m.get(19))?,
                 cycle_s: opt_u32(m.get(20))?,
                 rank: opt_u32(m.get(21))?,
+                groups: opt_u32(m.get(22))?,
+                beacon_key: opt_bytes_n(m.get(23))?,
             }),
             MessageType::Roster => {
                 let members = m
@@ -435,8 +493,9 @@ impl Command {
                 endpoint: opt_text(m.get(18), MAX_ENDPOINT_BYTES)?,
                 endpoint_pin: opt_bytes_n(m.get(19))?,
                 reason: opt_u64(m.get(20))?,
+                new_owner: opt_bytes_n(m.get(21))?,
             }),
-            MessageType::Confirm => Body::Confirm { replaces: bytes_n(m.get(16))? },
+            MessageType::Confirm => Body::Confirm { replaces: bytes_n(m.get(16))?, handover: bytes_n(m.get(17))? },
             MessageType::Owner => Body::Owner { owner_key: bytes_n(m.get(16))? },
             MessageType::Firmware => Body::Firmware(FirmwareUpdate {
                 manifest: m.get(16).and_then(Value::as_bytes).ok_or(Reject::BadCbor)?.to_vec(),
@@ -447,27 +506,25 @@ impl Command {
                 Body::Resend { from: m.get(16).and_then(Value::as_u32).ok_or(Reject::BadCbor)?, to: m.get(17).and_then(Value::as_u32).ok_or(Reject::BadCbor)? }
             }
             MessageType::Release => Body::Release,
+            MessageType::Zones => Body::Zones(super::policy::Zones {
+                zones: m.get(16).and_then(Value::as_array).ok_or(Reject::BadCbor)?.iter().map(ring_from).collect::<Result<_, _>>()?,
+                epoch: m.get(17).and_then(Value::as_u32).filter(|e| *e >= 1).ok_or(Reject::BadCbor)?,
+            }),
+            MessageType::Lease => Body::Lease(super::policy::Lease {
+                epoch: m.get(16).and_then(Value::as_u32).filter(|e| *e >= 1).ok_or(Reject::BadCbor)?,
+                until: uint(m.get(17))?,
+                digest: bytes_n(m.get(18))?,
+            }),
+            MessageType::Trust => Body::Trust { update: m.get(16).and_then(Value::as_bytes).ok_or(Reject::BadCbor)?.to_vec() },
             other => Body::Other { message_type: other.code(), fields: IntMap(m.0.iter().filter(|(k, _)| *k >= 16).cloned().collect()) },
         };
-        Ok(Self {
-            herd,
-            device: opt_bytes_n(m.get(2))?,
-            version,
-            issued_at: uint(m.get(4))?,
-            expires_at: opt_u64(m.get(5))?,
-            reference,
-            effective_at: opt_u64(m.get(7))?,
-            body,
-        })
+        Ok(Self { herd, device, version, issued_at: uint(m.get(4))?, expires_at: opt_u64(m.get(5))?, reference, effective_at: opt_u64(m.get(7))?, body })
     }
 
     /// The JSON view.
     pub fn to_json(&self) -> Json {
         let mut o = serde_json::Map::new();
-        o.insert("type".into(), json!(self.body.message_type().name()));
-        if let Body::Other { message_type, .. } = &self.body {
-            o.insert("type_code".into(), json!(message_type));
-        }
+        o.insert("type".into(), self.body.message_type().to_json());
         o.insert("herd".into(), json!(hex(&self.herd)));
         if let Some(d) = &self.device {
             o.insert("device".into(), json!(hex(d)));
@@ -497,6 +554,7 @@ impl Command {
                 put("cue_mode", x.cue_mode.filter(|c| *c != CueMode::Audio).map(|c| json!(c.name())));
                 put("warn_cm", x.warn_cm.map(|v| json!(v)));
                 put("hyst_cm", x.hyst_cm.map(|v| json!(v)));
+                put("policy", x.policy.map(|v| json!(v)));
             }
             Body::Config(x) => {
                 put("report_s", Some(json!(x.report_s)));
@@ -511,16 +569,18 @@ impl Command {
             }
             Body::Membership(x) => {
                 put("short", Some(json!(x.short)));
-                put("role", Some(json!(x.role.name())));
+                put("role", Some(x.role.to_json()));
                 put("net", Some(json!(x.net)));
                 put("plan", x.plan.map(|v| json!(v)));
                 put("cycle_s", x.cycle_s.map(|v| json!(v)));
                 put("rank", x.rank.map(|v| json!(v)));
+                put("groups", x.groups.map(|v| json!(v)));
+                put("beacon_key", hexed(x.beacon_key.as_ref().map(|k| &k[..])));
             }
             Body::Roster(x) => {
                 put(
                     "members",
-                    Some(Json::Array(x.members.iter().map(|p| json!({"short": p.short, "device": hex(&p.device), "role": p.role.name()})).collect())),
+                    Some(Json::Array(x.members.iter().map(|p| json!({"short": p.short, "device": hex(&p.device), "role": p.role.to_json()})).collect())),
                 );
                 put("revoked", (!x.revoked.is_empty()).then(|| Json::Array(x.revoked.iter().map(|d| json!(hex(d))).collect())));
             }
@@ -539,16 +599,18 @@ impl Command {
                 put("endpoint_pin", hexed(x.endpoint_pin.as_ref().map(|p| &p[..])));
                 put(
                     "reason",
-                    x.reason.map(|v| {
-                        json!(match v {
-                            1 => "rotate",
-                            2 => "transfer",
-                            _ => "other",
-                        })
+                    x.reason.map(|v| match v {
+                        1 => json!("rotate"),
+                        2 => json!("transfer"),
+                        n => json!(n),
                     }),
                 );
+                put("new_owner", hexed(x.new_owner.as_ref().map(|k| &k[..])));
             }
-            Body::Confirm { replaces } => put("replaces", Some(json!(hex(replaces)))),
+            Body::Confirm { replaces, handover } => {
+                put("replaces", Some(json!(hex(replaces))));
+                put("handover", Some(json!(hex(handover))));
+            }
             Body::Owner { owner_key } => put("owner_key", Some(json!(hex(owner_key)))),
             Body::Firmware(x) => {
                 put("manifest", Some(json!(hex(&x.manifest))));
@@ -560,6 +622,16 @@ impl Command {
                 put("to", Some(json!(to)));
             }
             Body::Release => {}
+            Body::Zones(z) => {
+                put("zones", Some(Json::Array(z.zones.iter().map(ring).collect())));
+                put("epoch", Some(json!(z.epoch)));
+            }
+            Body::Lease(l) => {
+                put("epoch", Some(json!(l.epoch)));
+                put("until", Some(json!(l.until)));
+                put("digest", Some(json!(hex(&l.digest))));
+            }
+            Body::Trust { update } => put("update", Some(json!(hex(update)))),
             Body::Other { fields, .. } => put("fields", Some(int_map_json(fields))),
         }
         Json::Object(o)
@@ -568,7 +640,10 @@ impl Command {
     /// What a collar checks once the signature verifies, in order:
     /// `wrong_collar` (another collar's), `wrong_herd` (another herd's; a
     /// membership or bind names the herd it moves the collar to, so it is
-    /// exempt), then `expired` against `now` (GNSS time; skipped without one).
+    /// exempt), then `expired` against `now` (GNSS time). A command with an
+    /// `expires_at` and no trustworthy time yet is `not_now`: the collar
+    /// holds it unapplied until it has GNSS time, then checks again (Astra
+    /// 01 F10: it used to pass).
     pub fn check_scope(&self, device_id: &[u8; 8], herd: Option<&[u8]>, now: Option<u64>) -> Result<(), Reject> {
         if self.device.is_some_and(|d| d != *device_id) {
             return Err(Reject::WrongCollar);
@@ -577,12 +652,11 @@ impl Command {
         if !moves_herd && herd.is_some_and(|h| h != self.herd.as_slice()) {
             return Err(Reject::WrongHerd);
         }
-        if let (Some(exp), Some(now)) = (self.expires_at, now)
-            && now >= exp
-        {
-            return Err(Reject::Expired);
+        match (self.expires_at, now) {
+            (Some(exp), Some(now)) if now >= exp => Err(Reject::Expired),
+            (Some(_), None) => Err(Reject::NotNow),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -692,10 +766,29 @@ pub fn endpoint_ok(e: &str, bench: bool) -> bool {
 }
 
 impl Membership {
-    /// `bad_config`: a short address of 0 or 65535, an unknown role, a cycle
-    /// that isn't a whole number of minutes from 1 to 60.
+    /// `unsupported` for a channel plan this collar doesn't have (it lists
+    /// its plans in its device record); `bad_config` for a short address of
+    /// 0 or 65535, an unknown role, a cycle that isn't a whole number of
+    /// minutes from 1 to 60, `groups` outside 1..=cycle, or a short address
+    /// in a group past `groups` (it would never send).
     pub fn check(&self) -> Result<(), Reject> {
-        let ok = (1..=65_534).contains(&self.short) && self.role.is_known() && self.cycle_s.is_none_or(|c| c % 60 == 0 && (60..=3600).contains(&c));
+        let plan = super::tdma::plan(self.plan.unwrap_or(1)).ok_or(Reject::Unsupported)?;
+        let sched = super::tdma::Schedule::new(self.cycle_s, self.groups).ok_or(Reject::BadConfig)?;
+        let ok = (1..=65_534).contains(&self.short) && self.role.is_known() && plan.slot(self.short).is_some_and(|s| u32::from(s.g) < sched.groups);
+        if ok { Ok(()) } else { Err(Reject::BadConfig) }
+    }
+
+    /// The net's schedule (cycle and groups).
+    pub fn schedule(&self) -> Option<super::tdma::Schedule> {
+        super::tdma::Schedule::new(self.cycle_s, self.groups)
+    }
+}
+
+impl Handover {
+    /// `bad_config` for a deadline not after `issued_at`, or more than 30
+    /// days after it (Astra 01 F10: nothing checked it).
+    pub fn check(&self, issued_at: u64) -> Result<(), Reject> {
+        let ok = self.deadline > issued_at && self.deadline - issued_at <= MAX_HANDOVER_S && self.reason.is_none_or(|r| r == 1 || r == TRANSFER);
         if ok { Ok(()) } else { Err(Reject::BadConfig) }
     }
 }
@@ -707,6 +800,9 @@ pub struct Trust {
     pub server: Option<VerifyingKey>,
     /// A handover's key, waiting for its confirm.
     pub pending: Option<VerifyingKey>,
+    /// The digest of the handover that staged `pending`: a confirm must
+    /// name it.
+    pub pending_handover: Option<[u8; 8]>,
     pub owner: Option<VerifyingKey>,
 }
 
@@ -716,27 +812,85 @@ impl Trust {
         [self.server, self.pending, self.owner].into_iter().flatten().find(|k| key_id(k) == *kid)
     }
 
-    /// Who may sign what, once the signature verifies: a bind only while
-    /// unclaimed (`claimed`); a confirm only by the pending key, naming the
-    /// current one (`bad_sig`); a handover or release by the server or owner
-    /// key; an owner command by the owner key, or the server key while no
-    /// owner key is enrolled; everything else by the server key alone
-    /// (`unknown_kid`).
+    /// Who may sign what, once the signature verifies (`identity.md` §4.4):
+    ///
+    /// - a bind only while unclaimed (`claimed`);
+    /// - a confirm only by the pending key, naming the current key and the
+    ///   digest of the handover that staged it (`bad_sig`; a confirm for
+    ///   another proposal can't commit this one);
+    /// - a release: the owner key when one is enrolled, else the server key
+    ///   (a stolen server key can't erase the owner's recovery);
+    /// - a transfer handover: the owner key when one is enrolled, else the
+    ///   server key; any other handover: the server or owner key;
+    /// - an owner command by the owner key, or the server key while no owner
+    ///   key is enrolled;
+    /// - everything else by the server key alone (`unknown_kid`).
     pub fn authorize(&self, r: &Received) -> Result<(), Reject> {
         let is = |k: &Option<VerifyingKey>| k.is_some_and(|k| key_id(&k) == r.kid);
+        let owner_or_server = is(&self.owner) || (self.owner.is_none() && is(&self.server));
         match &r.command.body {
             Body::Bind(_) if self.server.is_some() => Err(Reject::Claimed),
             Body::Bind(_) => Ok(()),
-            Body::Confirm { replaces } => {
+            Body::Confirm { replaces, handover } => {
                 let names_current = self.server.is_some_and(|k| key_id(&k) == *replaces);
-                if is(&self.pending) && names_current { Ok(()) } else { Err(Reject::BadSig) }
+                let names_proposal = self.pending_handover == Some(*handover);
+                if is(&self.pending) && names_current && names_proposal { Ok(()) } else { Err(Reject::BadSig) }
             }
-            Body::Handover(_) | Body::Release if is(&self.server) || is(&self.owner) => Ok(()),
-            Body::Owner { .. } if is(&self.owner) || (self.owner.is_none() && is(&self.server)) => Ok(()),
+            Body::Release | Body::Owner { .. } if owner_or_server => Ok(()),
+            Body::Handover(h) if h.reason == Some(TRANSFER) && owner_or_server => Ok(()),
+            Body::Handover(h) if h.reason != Some(TRANSFER) && (is(&self.server) || is(&self.owner)) => Ok(()),
             Body::Owner { .. } | Body::Handover(_) | Body::Release => Err(Reject::UnknownKid),
             _ if is(&self.server) => Ok(()),
             _ => Err(Reject::UnknownKid),
         }
+    }
+}
+
+/// What a collar remembers of the commands it took, besides boundaries
+/// (which follow the slot rules): per type, the highest version and the
+/// digest of the command that carried it; and when it was claimed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Versions {
+    pub held: std::collections::BTreeMap<u64, (u32, [u8; 8])>,
+    /// The `issued_at` of the bind that claimed it. Commands issued before
+    /// it are `stale`: a claim starts versions over, and this keeps the
+    /// commands of an earlier claim (even by the same server key) from
+    /// being replayed.
+    pub claimed_at: u64,
+}
+
+/// Whether a command is new or one the collar already took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fresh {
+    New,
+    /// The very command it holds (same digest): acked again with its
+    /// current status, nothing done twice.
+    Repeat,
+}
+
+impl Versions {
+    /// The version rule (`messages.md` §4.6) for anything but a boundary: a
+    /// repeat of the command held is [`Fresh::Repeat`]; anything else at or
+    /// below the held version, or issued before the claim, is `stale`.
+    pub fn check(&self, r: &Received) -> Result<Fresh, Reject> {
+        let c = &r.command;
+        if !matches!(c.body, Body::Bind(_)) && c.issued_at < self.claimed_at {
+            return Err(Reject::Stale);
+        }
+        match self.held.get(&c.body.message_type().code()) {
+            Some((_, d)) if *d == r.digest => Ok(Fresh::Repeat),
+            Some((v, _)) if c.version <= *v => Err(Reject::Stale),
+            _ => Ok(Fresh::New),
+        }
+    }
+
+    /// Record a command taken. A bind starts every version over.
+    pub fn take(&mut self, r: &Received) {
+        if matches!(r.command.body, Body::Bind(_)) {
+            self.held.clear();
+            self.claimed_at = r.command.issued_at;
+        }
+        self.held.insert(r.command.body.message_type().code(), (r.command.version, r.digest));
     }
 }
 
@@ -804,6 +958,95 @@ mod tests {
         c.device = Some(me);
         c.expires_at = Some(100);
         assert_eq!(c.check_scope(&me, None, Some(100)), Err(Reject::Expired));
+        assert_eq!(c.check_scope(&me, None, None), Err(Reject::NotNow), "no clock: wait, never pass");
+        c.expires_at = None;
         c.check_scope(&me, None, None).unwrap();
+    }
+
+    fn signed_body(body: Body, device: Option<[u8; 8]>) -> Vec<u8> {
+        Command { device, body, ..boundary() }.sign(&key())
+    }
+
+    fn opened(bytes: &[u8]) -> Result<Received, Reject> {
+        open(bytes, |_| Some(key().verifying_key()))
+    }
+
+    /// Astra 01 F10: config, membership and the like without `device` were
+    /// accepted as herd-wide.
+    #[test]
+    fn one_collar_types_need_their_device() {
+        let membership =
+            Body::Membership(Membership { short: 12, role: Role::Node, net: 1, plan: None, cycle_s: None, rank: None, groups: None, beacon_key: None });
+        assert_eq!(opened(&signed_body(membership.clone(), None)).unwrap_err(), Reject::BadCbor);
+        assert!(opened(&signed_body(membership, Some([7; 8]))).is_ok());
+        assert_eq!(opened(&signed_body(Body::Config(Config { report_s: 300, ..Default::default() }), None)).unwrap_err(), Reject::BadCbor);
+        assert_eq!(opened(&signed_body(Body::Release, None)).unwrap_err(), Reject::BadCbor);
+        assert_eq!(opened(&signed_body(Body::Resend { from: 1, to: 2 }, None)).unwrap_err(), Reject::BadCbor);
+    }
+
+    #[test]
+    fn membership_and_handover_ranges() {
+        let m = Membership { short: 301, role: Role::Node, net: 1, plan: None, cycle_s: None, rank: None, groups: None, beacon_key: None };
+        assert_eq!(m.check(), Err(Reject::BadConfig), "group 1 of a one-group net");
+        Membership { groups: Some(2), ..m.clone() }.check().unwrap();
+        assert_eq!(Membership { groups: Some(6), ..m.clone() }.check(), Err(Reject::BadConfig), "more groups than minutes in the cycle");
+        assert_eq!(Membership { plan: Some(999), ..m.clone() }.check(), Err(Reject::Unsupported), "a plan this collar doesn't have");
+        let h = Handover { new_key: [1; 32], deadline: 1000 + MAX_HANDOVER_S, endpoint: None, endpoint_pin: None, reason: None, new_owner: None };
+        h.check(1000).unwrap();
+        assert_eq!(Handover { deadline: 1001 + MAX_HANDOVER_S, ..h.clone() }.check(1000), Err(Reject::BadConfig));
+        assert_eq!(Handover { deadline: 1000, ..h }.check(1000), Err(Reject::BadConfig));
+    }
+
+    /// Astra 01 F07: a server-signed release erased an enrolled owner, and
+    /// a server key could sell the collar away from its owner.
+    #[test]
+    fn the_server_key_cant_erase_or_sell_past_the_owner() {
+        let server = key();
+        let owner = SigningKey::from_bytes(&[42; 32]);
+        let trust = Trust { server: Some(server.verifying_key()), owner: Some(owner.verifying_key()), ..Default::default() };
+        let by = |k: &SigningKey, body: Body| {
+            let bytes = Command { device: Some([7; 8]), body, ..boundary() }.sign(k);
+            open(&bytes, |kid| trust.key_for(kid)).unwrap()
+        };
+        assert_eq!(trust.authorize(&by(&server, Body::Release)), Err(Reject::UnknownKid));
+        trust.authorize(&by(&owner, Body::Release)).unwrap();
+        let sale = Handover { new_key: [1; 32], deadline: 2_000_000_000, endpoint: None, endpoint_pin: None, reason: Some(TRANSFER), new_owner: Some([2; 32]) };
+        assert_eq!(trust.authorize(&by(&server, Body::Handover(sale.clone()))), Err(Reject::UnknownKid));
+        trust.authorize(&by(&owner, Body::Handover(sale.clone()))).unwrap();
+        trust.authorize(&by(&server, Body::Handover(Handover { reason: Some(1), new_owner: None, ..sale }))).unwrap();
+        let no_owner = Trust { owner: None, ..trust.clone() };
+        no_owner.authorize(&by(&server, Body::Release)).unwrap();
+    }
+
+    /// Astra 01 F06: a confirm named only the replaced kid, so a late one
+    /// from an earlier proposal could commit a later one.
+    #[test]
+    fn a_confirm_commits_only_its_own_handover() {
+        let next = SigningKey::from_bytes(&[43; 32]);
+        let trust = Trust { server: Some(key().verifying_key()), pending: Some(next.verifying_key()), pending_handover: Some([5; 8]), owner: None };
+        let confirm = |h: [u8; 8]| {
+            let bytes = Command { body: Body::Confirm { replaces: key_id(&key().verifying_key()), handover: h }, ..boundary() }.sign(&next);
+            open(&bytes, |kid| trust.key_for(kid)).unwrap()
+        };
+        trust.authorize(&confirm([5; 8])).unwrap();
+        assert_eq!(trust.authorize(&confirm([6; 8])), Err(Reject::BadSig), "another proposal's confirm");
+    }
+
+    #[test]
+    fn versions_repeat_stale_and_claims() {
+        let mut v = Versions::default();
+        let cfg = |version, issued_at| {
+            let bytes = Command { device: Some([7; 8]), version, issued_at, body: Body::Config(Config { report_s: 300, ..Default::default() }), ..boundary() }
+                .sign(&key());
+            opened(&bytes).unwrap()
+        };
+        let first = cfg(4, 2_000);
+        assert_eq!(v.check(&first), Ok(Fresh::New));
+        v.take(&first);
+        assert_eq!(v.check(&first), Ok(Fresh::Repeat), "the same command: ack it again");
+        assert_eq!(v.check(&cfg(4, 2_001)), Err(Reject::Stale), "another one at the same version");
+        assert_eq!(v.check(&cfg(5, 2_001)), Ok(Fresh::New));
+        v.claimed_at = 3_000;
+        assert_eq!(v.check(&cfg(9, 2_500)), Err(Reject::Stale), "issued before the claim: a replay");
     }
 }

@@ -32,7 +32,16 @@ macro_rules! registry {
                 }
             }
 
-            /// The JSON view's name; `"other"` for unknown codes.
+            /// The JSON view: the name, or the number of a code this build
+            /// doesn't know, so a reader that keeps only JSON keeps the code.
+            pub fn to_json(self) -> serde_json::Value {
+                match self {
+                    $name::Other(c) => serde_json::Value::from(c),
+                    known => serde_json::Value::from(known.name()),
+                }
+            }
+
+            /// The name; `"other"` for unknown codes.
             pub fn name(self) -> &'static str {
                 match self {
                     $($name::$variant => $text,)*
@@ -75,10 +84,19 @@ registry! {
         Firmware = 9 => "firmware",
         Resend = 10 => "resend",
         Release = 11 => "release",
+        /// Permanent no-go zones the collar enforces under every boundary.
+        Zones = 12 => "zones",
+        /// "As of now, the farm's policy is still epoch N": lets staged
+        /// boundaries take effect.
+        Lease = 13 => "lease",
+        /// Carries a signed trust update for the bootloader.
+        Trust = 14 => "trust",
         Factory = 64 => "factory",
         Manifest = 65 => "manifest",
         Batch = 66 => "batch",
         Hello = 67 => "hello",
+        /// A change to the firmware keys a bootloader trusts.
+        TrustUpdate = 68 => "trust_update",
     }
 }
 
@@ -106,8 +124,10 @@ registry! {
 }
 
 registry! {
+    #[derive(Default)]
     DeviceClass {
         /// LoRa only; most collars.
+        #[default]
         Node = 1 => "node",
         /// LoRa and LTE-M, on an animal; takes turns as the herd's link.
         Anchor = 2 => "anchor",
@@ -227,6 +247,9 @@ registry! {
         Incompatible = 30 => "incompatible",
         /// Firmware older than what the collar runs.
         Downgrade = 31 => "downgrade",
+        /// A boundary whose fenced area overlaps a permanent no-go zone the
+        /// collar holds.
+        InExclusion = 32 => "in_exclusion",
     }
 }
 
@@ -268,6 +291,8 @@ mod tests {
         }
         assert_eq!(Reject::from_code(999), Reject::Other(999));
         assert_eq!(Reject::Other(999).name(), "other");
+        assert_eq!(Reject::Other(999).to_json(), serde_json::json!(999), "the JSON view keeps the number");
+        assert_eq!(Reject::BadSig.to_json(), serde_json::json!("bad_sig"));
         assert!(MessageType::Boundary.is_command() && !MessageType::Factory.is_command());
     }
 

@@ -17,6 +17,14 @@ pub fn device_id(device_key: &VerifyingKey) -> [u8; 8] {
     kid(device_key.as_bytes())
 }
 
+/// The v2 herd id of a herd a v1 server knew as `v1_herd_id` (`identity.md`
+/// §10): the first 16 bytes of SHA-256 of `"opencollar/1 herd"` and the id.
+/// v1 ids run to 64 characters; a v2 herd id is at most 16 bytes, so both
+/// sides derive it the same way instead of carrying the old one.
+pub fn herd_from_v1(v1_herd_id: &str) -> [u8; 16] {
+    super::crypto::sha256(&[b"opencollar/1 herd", v1_herd_id.as_bytes()])[..16].try_into().unwrap()
+}
+
 /// Crockford base32, the claim code's alphabet.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Characters in a claim code (80 bits).
@@ -71,6 +79,11 @@ pub fn check_bind(bind: &super::command::Bind, herd: &[u8], device_id: &[u8; 8],
 /// The factory record's `claim_check`: tells a right claim code from a typo.
 pub fn claim_check(claim_key: &[u8; 32]) -> [u8; 16] {
     hmac_sha256(claim_key, &[b"check"])[..16].try_into().unwrap()
+}
+
+/// A list of short texts (caps): every element text of at most 32 bytes.
+fn text_list(v: &Value) -> Option<Vec<String>> {
+    v.as_array()?.iter().map(|c| c.as_text().filter(|t| t.len() <= 32).map(str::to_owned)).collect()
 }
 
 // ---------------------------------------------------------------- card
@@ -185,11 +198,17 @@ impl FactoryRecord {
             fw: text(5, 32)?,
             made_at: m.get(6).and_then(Value::as_u64).ok_or_else(bad)?,
             maker: text(7, 64)?,
-            claim_check: m.get(8).and_then(Value::as_bytes).and_then(|c| c.try_into().ok()),
-            radio: m.get(9).and_then(IntMap::from_value),
-            image_keys: m.get(10).and_then(Value::as_array).ok_or_else(bad)?.iter().filter_map(|k| k.as_bytes()?.try_into().ok()).collect(),
-            test: m.get(11).and_then(IntMap::from_value),
-            caps: m.get(12).and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_text().map(str::to_owned)).collect()).unwrap_or_default(),
+            // Present means it must read (Astra 01 F14: malformed image keys
+            // and caps were dropped one by one).
+            claim_check: m.get(8).map(|c| c.as_bytes().and_then(|c| c.try_into().ok()).ok_or_else(bad)).transpose()?,
+            radio: m.get(9).map(|r| IntMap::from_value(r).ok_or_else(bad)).transpose()?,
+            image_keys: m
+                .get(10)
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(|k| k.as_bytes()?.try_into().ok()).collect::<Option<_>>())
+                .ok_or_else(bad)?,
+            test: m.get(11).map(|t| IntMap::from_value(t).ok_or_else(bad)).transpose()?,
+            caps: m.get(12).map(|c| text_list(c).ok_or_else(bad)).transpose()?.unwrap_or_default(),
         };
         Ok((env, rec))
     }
@@ -209,7 +228,7 @@ impl FactoryRecord {
         let mut o = json!({
             "type": "factory",
             "serial": self.serial,
-            "class": self.class.name(),
+            "class": self.class.to_json(),
             "hw_rev": self.hw_rev,
             "device_key": hex(&self.device_key),
             "device_id": hex(&self.device_id()),
@@ -281,8 +300,8 @@ impl Hello {
         let hello = Self {
             class: DeviceClass::from_code(m.get(16).and_then(Value::as_u64).ok_or(Reject::BadCbor)?),
             fw: m.get(17).and_then(Value::as_text).ok_or(Reject::BadCbor)?.to_owned(),
-            nonce: m.get(18).and_then(Value::as_bytes).and_then(|n| n.try_into().ok()),
-            caps: m.get(19).and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_text().map(str::to_owned)).collect()).unwrap_or_default(),
+            nonce: m.get(18).map(|n| n.as_bytes().and_then(|n| n.try_into().ok()).ok_or(Reject::BadCbor)).transpose()?,
+            caps: m.get(19).map(|c| text_list(c).ok_or(Reject::BadCbor)).transpose()?.unwrap_or_default(),
             device_key,
         };
         Ok((env.kid, hello))
@@ -291,7 +310,7 @@ impl Hello {
     pub fn to_json(&self) -> Json {
         let mut o = json!({
             "type": "hello",
-            "class": self.class.name(),
+            "class": self.class.to_json(),
             "fw": self.fw,
             "caps": self.caps,
             "device_key": hex(&self.device_key),
@@ -316,6 +335,13 @@ mod tests {
         assert_eq!(normalize_claim_code("123"), None);
         let c = new_claim_code();
         assert_eq!(normalize_claim_code(&c), Some(c));
+    }
+
+    #[test]
+    fn v1_herd_ids_map_to_16_bytes() {
+        let a = herd_from_v1("herd_01JB3K9M2XH8D3TV5W7Q4K9M2X");
+        assert_eq!(a, herd_from_v1("herd_01JB3K9M2XH8D3TV5W7Q4K9M2X"));
+        assert_ne!(a, herd_from_v1("herd_01JB3K9M2XH8D3TV5W7Q4K9M2Y"));
     }
 
     #[test]

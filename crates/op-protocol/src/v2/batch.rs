@@ -102,7 +102,16 @@ impl Batch {
             })
             .collect::<Result<_, Reject>>()?;
         let uint = |k| m.get(k).and_then(Value::as_u64).ok_or(Reject::BadCbor);
-        Ok((env.kid, Self { seq: uint(16)?, sent_at: uint(17)?, herd: m.get(18).and_then(Value::as_bytes).map(<[u8]>::to_vec), have: uint(19)?, frames }))
+        Ok((
+            env.kid,
+            Self {
+                seq: uint(16)?,
+                sent_at: uint(17)?,
+                herd: m.get(18).map(|h| h.as_bytes().filter(|h| (1..=16).contains(&h.len())).map(<[u8]>::to_vec).ok_or(Reject::BadCbor)).transpose()?,
+                have: uint(19)?,
+                frames,
+            },
+        ))
     }
 }
 
@@ -157,7 +166,8 @@ impl Reply {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Reject> {
-        let m = IntMap::from_value(&cbor::decode(bytes).map_err(|_| Reject::BadCbor)?).ok_or(Reject::BadCbor)?;
+        let m = IntMap::from_value(&cbor::decode_untagged(bytes).map_err(|_| Reject::BadCbor)?).ok_or(Reject::BadCbor)?;
+        let present = |k: u64, read: &dyn Fn(&Value) -> Option<u64>| m.get(k).map(|v| read(v).ok_or(Reject::BadCbor)).transpose();
         let down = match m.get(2) {
             Some(v) => v
                 .as_array()
@@ -174,13 +184,18 @@ impl Reply {
                 .collect::<Result<_, Reject>>()?,
             None => Vec::new(),
         };
+        // A known field present with the wrong type is `bad_cbor`, never
+        // read as absent.
         Ok(Self {
             ack: m.get(1).and_then(Value::as_u64).ok_or(Reject::BadCbor)?,
             down,
-            next_s: m.get(3).and_then(Value::as_u32),
-            time: m.get(4).and_then(Value::as_u64),
-            drop: m.get(5).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default(),
-            next_anchor: m.get(6).and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()),
+            next_s: present(3, &|v| v.as_u32().map(u64::from))?.map(|n| n as u32),
+            time: present(4, &Value::as_u64)?,
+            drop: match m.get(5) {
+                None => Vec::new(),
+                Some(v) => v.as_array().and_then(|a| a.iter().map(Value::as_u64).collect::<Option<_>>()).ok_or(Reject::BadCbor)?,
+            },
+            next_anchor: present(6, &|v| v.as_u64().filter(|n| (1..=65_534).contains(n)))?.map(|n| n as u16),
         })
     }
 }

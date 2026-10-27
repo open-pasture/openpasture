@@ -67,28 +67,73 @@ pub struct Slot {
     pub g: u16,
 }
 
+/// How a net's minutes are shared out: every collar of a net MUST hold the
+/// same schedule (membership keys 19, 20 and 22), so each slot of each
+/// minute has exactly one owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schedule {
+    /// Report cycle in minutes, 1–60.
+    pub cycle: u32,
+    /// Groups of `slots` short addresses the net uses, 1..=cycle. Short `s`
+    /// is in group `(s − 1) div slots`; one in group ≥ `groups` never sends.
+    pub groups: u32,
+}
+
+impl Schedule {
+    /// From membership's `cycle_s` (default 300) and `groups` (default 1).
+    pub fn new(cycle_s: Option<u32>, groups: Option<u32>) -> Option<Self> {
+        let cycle = cycle_s.unwrap_or(300);
+        let groups = groups.unwrap_or(1);
+        (cycle % 60 == 0 && (60..=3600).contains(&cycle) && (1..=cycle / 60).contains(&groups)).then_some(Self { cycle: cycle / 60, groups })
+    }
+
+    /// Who owns slot `k` in `minute`: the group whose phase it is, or, in a
+    /// spare phase (no group of that number), the group whose fast turn it
+    /// is. `(group, spare)`.
+    pub fn owner(&self, k: u16, minute: u32) -> (u32, bool) {
+        let phase = (u64::from(minute) + u64::from(self.cycle) * 65_536 - u64::from(k)) % u64::from(self.cycle);
+        let phase = phase as u32;
+        if phase < self.groups { (phase, false) } else { ((phase - self.groups) % self.groups, true) }
+    }
+}
+
 impl Plan {
     /// The slot of short address `short` (1–65534).
     pub fn slot(&self, short: u16) -> Option<Slot> {
         (1..=65_534).contains(&short).then(|| Slot { k: (short - 1) % self.slots, g: (short - 1) / self.slots })
     }
 
-    /// Whether `short` sends in GNSS minute `minute` (Unix time / 60) with a
-    /// report cycle of `cycle_min` minutes. Normally once a cycle, in minute
-    /// `(k + g) mod cycle`, which spreads a herd across the cycle and keeps
-    /// collars of one slot index apart; in a fast window, group 0 sends every
-    /// minute. A herd can hold `slots × cycle` collars, and `slots` of them
-    /// can be fast at once.
-    pub fn sends(&self, short: u16, minute: u32, cycle_min: u32, fast: bool) -> bool {
+    /// Whether `short` sends in GNSS minute `minute` (Unix time / 60).
+    ///
+    /// Slot `k` of minute `m` is in phase `p = (m − k) mod cycle`. Phase `p <
+    /// groups` belongs to group `p`: every collar sends once a cycle, in its
+    /// own phase. The other `cycle − groups` phases are **spare**; spare
+    /// phase `j` (counting from `groups`) belongs to group `j mod groups`,
+    /// and a collar in a fast window also sends in its group's spare phases.
+    /// So each slot of each minute has one owner, whoever is fast: a net of
+    /// `slots × groups` collars never collides. With one group (≤ 300
+    /// collars) a fast collar sends every minute; with `groups = cycle`
+    /// there are no spare phases and fast is the normal rate ([`Plan::per_cycle`]).
+    pub fn sends(&self, short: u16, minute: u32, sched: Schedule, fast: bool) -> bool {
         let Some(s) = self.slot(short) else { return false };
-        let cycle = cycle_min.max(1);
-        if u32::from(s.g) >= cycle {
+        if u32::from(s.g) >= sched.groups {
             return false;
         }
-        if fast && s.g == 0 {
-            return true;
-        }
-        minute % cycle == (u32::from(s.k) + u32::from(s.g)) % cycle
+        let (owner, spare) = sched.owner(s.k, minute);
+        owner == u32::from(s.g) && (!spare || fast)
+    }
+
+    /// How many times a cycle a collar of `group` sends: `(normal, fast)`.
+    /// Spare phases go round the groups, so lower groups may get one more.
+    pub fn per_cycle(sched: Schedule, group: u32) -> (u32, u32) {
+        let spare = sched.cycle - sched.groups;
+        let extra = if group < spare { (spare - 1 - group) / sched.groups + 1 } else { 0 };
+        (1, 1 + extra)
+    }
+
+    /// The most collars a net can hold with this schedule.
+    pub fn capacity(&self, sched: Schedule) -> u32 {
+        u32::from(self.slots) * sched.groups
     }
 
     /// When slot `k` starts, ms after the minute.
@@ -117,26 +162,50 @@ impl Plan {
 mod tests {
     use super::*;
 
+    /// Every collar of a full net fast at once, or none, or any mix: no two
+    /// ever share a slot in a minute. (Astra 01 F01: under the old rule,
+    /// short 1 fast and short 301 shared slot 0 in minute 1, and a fast group
+    /// 0 overlapped 1 200 slot-minutes in five minutes of a 1 500-collar net.)
     #[test]
-    fn slots_never_collide() {
+    fn slots_never_collide_fast_or_not() {
         let p = &US915_500;
-        for cycle in [1, 5, 15] {
-            let herd = usize::from(p.slots) * cycle as usize;
-            for minute in 0..cycle * 2 {
-                let mut used = vec![false; usize::from(p.slots)];
-                for short in 1..=herd as u16 {
-                    if p.sends(short, minute, cycle, false) {
-                        let k = usize::from(p.slot(short).unwrap().k);
-                        assert!(!used[k], "cycle {cycle} minute {minute} slot {k}");
-                        used[k] = true;
+        for cycle in [1u32, 2, 5, 15] {
+            for groups in 1..=cycle.min(6) {
+                let sched = Schedule::new(Some(cycle * 60), Some(groups)).unwrap();
+                let herd = p.capacity(sched) as u16;
+                // Pseudo-random mixes of fast and normal collars.
+                for mix in 0u32..4 {
+                    let fast = |short: u16| match mix {
+                        0 => false,
+                        1 => true,
+                        2 => short % 3 == 0,
+                        _ => u32::from(short).wrapping_mul(2_654_435_761) >> 31 == 1,
+                    };
+                    for minute in 29_841_840..29_841_840 + cycle * 2 + 3 {
+                        let mut used = vec![0u16; usize::from(p.slots)];
+                        for short in 1..=herd {
+                            if p.sends(short, minute, sched, fast(short)) {
+                                let k = usize::from(p.slot(short).unwrap().k);
+                                assert_eq!(used[k], 0, "cycle {cycle} groups {groups} mix {mix} minute {minute}: {short} and {} in slot {k}", used[k]);
+                                used[k] = short;
+                            }
+                        }
                     }
                 }
-            }
-            // Everyone sends once per cycle.
-            for short in 1..=herd as u16 {
-                assert_eq!((0..cycle).filter(|m| p.sends(short, *m, cycle, false)).count(), 1);
+                for short in (1..=herd).step_by(37) {
+                    let (normal, fast) = Plan::per_cycle(sched, u32::from(p.slot(short).unwrap().g));
+                    let count = |f| (0..cycle).filter(|m| p.sends(short, 29_841_840 + m, sched, f)).count() as u32;
+                    assert_eq!((count(false), count(true)), (normal, fast), "cycle {cycle} groups {groups} short {short}");
+                }
+                assert!(!p.sends(herd + 1, 29_841_840, sched, true), "a short past the net's groups never sends");
             }
         }
+        // The review's case: short 1 fast and short 301 normal, minute 1.
+        let two = Schedule::new(Some(300), Some(2)).unwrap();
+        assert!(!(p.sends(1, 1, two, true) && p.sends(301, 1, two, false)));
+        assert_eq!(Plan::per_cycle(Schedule::new(Some(300), None).unwrap(), 0), (1, 5), "≤ 300 collars: fast is every minute");
+        assert_eq!(Plan::per_cycle(Schedule::new(Some(300), Some(5)).unwrap(), 4), (1, 1), "a full net has no spare minutes");
+        assert_eq!(Plan::per_cycle(Schedule::new(Some(300), Some(2)).unwrap(), 1), (1, 2), "600 collars: group 1 sends twice a cycle when fast");
     }
 
     #[test]
