@@ -484,7 +484,12 @@ async fn a_code_is_needed_after_the_reply_window_and_accepted_with_it() {
     let r = sms(&t, MIA, &format!("Y {wrong}")).await;
     assert_eq!(r.reply.unwrap().text, format!("No decision waits on code {wrong}."));
     assert_eq!(r.message.error.as_deref(), Some("Wrong code."));
-    // With the code: approved.
+    // Astra 02 F13: the right code from a phone the decision was never texted to is no key.
+    assert_eq!(reply(&t, MIA, &format!("Y {code}")).await, format!("No decision waits on code {code}."));
+    assert_eq!(decision_status(ctx, &dec).await.0, "proposed");
+    // Its text went to Mia 13 h ago: past the reply window, and its code still answers (within a day).
+    asked(&t, MIA, Duration::hours(13), &dec).await;
+    assert_eq!(code.len(), 6);
     assert_eq!(reply(&t, MIA, &format!("Y {code}")).await, "Approved. Cows moving to P2.");
     assert_eq!(decision_status(ctx, &dec).await.0, "applied");
 
@@ -624,6 +629,7 @@ async fn a_code_still_answers_after_its_alert_is_resolved_by_hand() {
     let t = farm().await;
     let ctx = t.ctx();
     let (dec, code) = proposal(&t, &t.f.herd).await;
+    asked(&t, MIA, Duration::hours(13), &dec).await;
     // A hand clicks Resolve on "Move to P2?"; the decision still waits and its alert stays closed.
     let a = t.f.open_kind("decision_waiting").await.remove(0);
     let hank = op_core::users::get_user(ctx, &t.id(HANK)).await.unwrap().unwrap();
@@ -871,7 +877,7 @@ async fn opting_out_stops_alerts_and_briefs_and_start_restores_them() {
     let (_, out) = op_alerts::routing::prefs::get(ctx, &t.id(HANK)).await.unwrap();
     assert!(!out);
     // Back in: tomorrow's brief reaches him.
-    let next = op_alerts::brief_send::run_once(ctx, brief_at + Duration::days(1)).await.unwrap();
+    let next = op_alerts::brief_send::run_once(ctx, later_0630(brief_at, 1)).await.unwrap();
     assert_eq!(next.iter().map(|m| m.address.as_str()).collect::<Vec<_>>(), [HANK]);
     // STOP and START by WhatsApp are confirmed there.
     let r = text(ctx, "whatsapp", &format!("whatsapp:{HANK}"), "stop").await;
@@ -885,6 +891,22 @@ async fn next_0630(_ctx: &Ctx) -> DateTime<Utc> {
     let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
     let day = now().with_timezone(&tz).date_naive() + Duration::days(1);
     op_alerts::brief_send::due_at(day, chrono::NaiveTime::from_hms_opt(6, 30, 0).unwrap(), tz).unwrap()
+}
+
+/// 06:30 America/Chicago `days` calendar days after the 06:30 `at`. Not
+/// `at + 24 h × days`: across a DST change that is 05:30 or 07:30 on the farm.
+fn later_0630(at: DateTime<Utc>, days: u64) -> DateTime<Utc> {
+    let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
+    let day = at.with_timezone(&tz).date_naive() + chrono::Days::new(days);
+    op_alerts::brief_send::due_at(day, chrono::NaiveTime::from_hms_opt(6, 30, 0).unwrap(), tz).unwrap()
+}
+
+#[test]
+fn later_0630_counts_farm_days_across_dst() {
+    // 2026-10-31 06:30 CDT; the clocks go back on 1 November.
+    let at = "2026-10-31T11:30:00Z".parse::<DateTime<Utc>>().unwrap();
+    assert_eq!(later_0630(at, 1), "2026-11-01T12:30:00Z".parse::<DateTime<Utc>>().unwrap());
+    assert_eq!(later_0630(at, 2) - at, Duration::hours(49));
 }
 
 #[tokio::test]
@@ -1420,8 +1442,8 @@ async fn the_brief_goes_at_the_farm_time_once_a_day() {
     // Once a day.
     assert!(op_alerts::brief_send::run_once(ctx, at + mins(1)).await.unwrap().is_empty());
     // A server down at 06:30 sends it on return within two hours, not later.
-    assert_eq!(op_alerts::brief_send::run_once(ctx, at + Duration::days(1) + mins(90)).await.unwrap().len(), 1);
-    assert!(op_alerts::brief_send::run_once(ctx, at + Duration::days(2) + mins(150)).await.unwrap().is_empty());
+    assert_eq!(op_alerts::brief_send::run_once(ctx, later_0630(at, 1) + mins(90)).await.unwrap().len(), 1);
+    assert!(op_alerts::brief_send::run_once(ctx, later_0630(at, 2) + mins(150)).await.unwrap().is_empty());
     // A brief is a prompt: it opens the reply window for a bare Y.
     op_core::messages::mark(ctx, &m.id, "sent", Some("SM1"), None, None).await.unwrap();
     assert!(op_alerts::inbound::act::last_prompt_to(ctx, MIA).await.unwrap().is_some());
@@ -1532,4 +1554,35 @@ fn every_reply_is_gsm7_and_fits_with_worst_case_names() {
     for t in [op_alerts::inbound::act::OPTED_IN, op_alerts::inbound::act::OPTED_OUT, op_alerts::inbound::act::VERIFIED] {
         assert!(op_alerts::text::is_gsm7(t) && op_alerts::text::septets(t) <= 160, "{t}");
     }
+}
+
+/// Astra 02 F13: a code texted to a phone works from it for a day, not for
+/// a decision texted ten days ago; and a burst of guesses reserves its tries
+/// before any is looked at, so no more than five an hour are evaluated.
+#[tokio::test]
+async fn codes_expire_and_a_burst_of_guesses_gets_five_tries() {
+    let t = farm().await;
+    let ctx = t.ctx();
+    let (dec, code) = proposal(&t, &t.f.herd).await;
+    asked(&t, MIA, Duration::days(10), &dec).await;
+    assert_eq!(reply(&t, MIA, &format!("Y {code}")).await, format!("No decision waits on code {code}."));
+    assert_eq!(decision_status(ctx, &dec).await.0, "proposed");
+
+    let mut jobs = Vec::new();
+    for i in 0..30 {
+        let ctx = ctx.clone();
+        jobs.push(tokio::spawn(async move { text(&ctx, "sms", CODY, &format!("Y {}", 100_000 + i)).await }));
+    }
+    let (mut evaluated, mut limited) = (0, 0);
+    for j in jobs {
+        let r = j.await.unwrap();
+        if r.message.error.as_deref() == Some("Wrong code.") {
+            evaluated += 1;
+        }
+        if r.reply.is_some_and(|m| m.text.contains("Too many wrong")) {
+            limited += 1;
+        }
+    }
+    assert!(evaluated <= 5, "{evaluated} guesses evaluated");
+    assert_eq!(evaluated + limited, 30);
 }

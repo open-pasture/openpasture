@@ -23,8 +23,9 @@ describe("what the gate held", () => {
     return e;
   };
   test("a road to confirm", () => {
-    const h = heldBy(refusal({ error: "Crosses County Road.", findings: [{ code: "crosses_road", severity: "critical", text: "Crosses County Road" }], confirm: ["crosses_road"], never: [] }));
+    const h = heldBy(refusal({ error: "Crosses County Road.", findings: [{ code: "crosses_road", severity: "critical", text: "Crosses County Road" }], confirm: ["crosses_road"], never: [], confirm_token: "7:abc" }));
     expect(h?.confirm).toEqual(["crosses_road"]);
+    expect(h?.token).toBe("7:abc");
     expect(h && confirmable(h)).toBe(true);
   });
   test("a no-go zone nobody sends into", () => {

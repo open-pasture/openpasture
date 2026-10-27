@@ -49,15 +49,19 @@ pub async fn list_collars(db: &SqlitePool, herd_id: Option<&str>) -> anyhow::Res
 }
 
 /// A new collar with its key hash.
+/// A new collar, simulated when its herd is (`op_core::sim`).
 pub async fn insert_collar(db: &SqlitePool, id: &str, name: &str, herd_id: &str, key_hash: &str) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO collars (id, name, herd_id, key_hash, state, created_at) VALUES (?, ?, ?, ?, 'unknown', ?)")
-        .bind(id)
-        .bind(name)
-        .bind(herd_id)
-        .bind(key_hash)
-        .bind(to_db(&op_core::time::now()))
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "INSERT INTO collars (id, name, herd_id, key_hash, state, created_at, simulated)
+         VALUES (?1, ?2, ?3, ?4, 'unknown', ?5, COALESCE((SELECT simulated FROM herds WHERE id = ?3), 0))",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(herd_id)
+    .bind(key_hash)
+    .bind(to_db(&op_core::time::now()))
+    .execute(db)
+    .await?;
     Ok(())
 }
 

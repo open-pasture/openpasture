@@ -99,10 +99,12 @@ pub struct Farm {
     pub sim: Sim,
 }
 
-/// Simulated collars on the farm (`op_core::sim`). Herds on simulated
-/// collars only are left out of `herds` (so of every stay); animals on a
-/// simulated collar are left out of per-animal tables. A herd with real and
-/// simulated collars stays in, and the report says so.
+/// What the simulator ran here (`op_core::sim`), as recorded when it was
+/// made: simulated herds (deleted ones too, from their history) are left out
+/// of `herds` (so of every stay), whatever their collars are now; animals of
+/// simulated herds or with anything a simulated collar recorded are left out
+/// of per-animal tables. A real herd with simulated collars (only possible in
+/// data from before they were kept apart) stays in, and the report says so.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sim {
     pub herds: BTreeSet<String>,
@@ -165,7 +167,7 @@ impl Farm {
         let mut out = Vec::new();
         let left: Vec<String> = self.sim.herds.iter().filter(|h| asked(h)).map(|h| self.herd_name(h)).collect();
         if !left.is_empty() {
-            out.push(format!("Left out: {} (simulated collars only).", left.join(", ")));
+            out.push(format!("Left out: {} (simulated).", left.join(", ")));
         }
         for (h, n) in self.sim.mixed.iter().filter(|(h, _)| asked(h)) {
             let collars = if *n == 1 { "1 simulated collar".to_owned() } else { format!("{n} simulated collars") };

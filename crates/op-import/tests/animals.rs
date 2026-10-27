@@ -643,7 +643,7 @@ async fn cards_need_the_collar_address_and_the_current_key() {
     assert_eq!(s, StatusCode::CONFLICT);
     assert!(app.ctx.update_settings(&json!({"server": {"collar_url": "http://192.168.1.20:7878"}})).await.is_err());
 
-    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com/"}})).await.unwrap();
+    app.ctx.set_collar_url(&op_core::settings::CheckedCollarUrl::passed("https://farm.example.com".into())).await.unwrap();
     let (s, v) = app.json("POST", "/api/cards", items).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v.as_array().unwrap().len(), 2);
@@ -659,7 +659,7 @@ async fn cards_need_the_collar_address_and_the_current_key() {
 #[tokio::test]
 async fn a_card_decodes_to_the_provisioning_payload() {
     let app = App::new().await;
-    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com"}})).await.unwrap();
+    app.ctx.set_collar_url(&op_core::settings::CheckedCollarUrl::passed("https://farm.example.com".into())).await.unwrap();
     let herd = app.herd_of(1).await;
     let (_, collar, key) = &herd[0];
     let (s, v) = app.json("POST", "/api/cards", json!({"items": [{"collar_id": collar, "key": key}]})).await;

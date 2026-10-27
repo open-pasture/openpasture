@@ -11,17 +11,25 @@ The rule: **the simulator is never product data and is never pointed at a real f
 
 - Nothing in this directory is compiled into the server or the app. The server tarball carries
   `collar-sim` as a separate binary, described as the simulator.
-- Simulated collars say so. They are linked with `simulated: true` and report the `sim` cap in
-  `device.caps`, and the server keeps `collars.simulated` for good once either happened. The app
-  shows "Simulated" wherever they appear (map, herd list, animal page, status bar), and
-  "Simulated collars" in the status bar when every collar on the farm is.
-- Simulated collars stay out of official records. Reports (NRCS 528, organic season, lease
-  head-days, paddock record, welfare) leave out herds on simulated collars only and animals on
-  simulated collars, and their notes say what was left out; a herd with some simulated collars is
-  named in the notes. Alerts about simulated collars show in the app and are texted, pushed,
-  emailed and briefed to no one.
-- The app's first-run story (14 animals over Flint Hills imagery) is a drawing, not this
-  simulator. It is labelled "Simulated" on screen for as long as it shows and writes nothing.
+- The server decides what is simulated, when it is made, and it never changes. `collar-sim farm`
+  makes its herds with `simulated: true`, which the server takes only while it holds no real herd
+  or collar; a simulated herd takes only collars linked with `simulated: true`, and a real herd
+  only real ones. A collar's report never makes it simulated: the `sim` cap the simulator lists in
+  `device.caps` is informational, so real firmware listing it by mistake is still a real collar
+  whose alerts go out.
+- What the simulator did is marked where it is stored: the herd's history rows and its collars'
+  fixes, cues and episodes. Deleting simulated collars, or the herd, never turns it into farm
+  records.
+- The app shows "Simulated" wherever simulated collars appear (map, herd table and sidebar, animal
+  page, collar console, network view, search, herd panel, alert asks, status bar), and "Simulated
+  collars" in the status bar when every collar on the farm is.
+- Simulated herds stay out of official records. Reports (NRCS 528, organic season, lease
+  head-days, paddock record, welfare) leave them and their animals out, and their notes say what
+  was left out. Alerts about simulated collars or herds show in the app and are texted, pushed,
+  emailed and briefed to no one; a real collar's alert is never muted.
+- In the app, simulation lives in `ui/src/sim/`: the "Simulated" word and its helpers, and the
+  first-run story (14 animals over Flint Hills imagery), a drawing, not this simulator. It is
+  labelled "Simulated" on screen for as long as it shows and writes nothing.
 
 ## A simulated farm in one command
 
@@ -61,8 +69,9 @@ openpasture serve --port 7992 --data-dir /tmp/sim-farm   # a farm made for this,
 collar-sim --server http://127.0.0.1:7992 --token "$(openpasture token --data-dir /tmp/sim-farm)" --count 12
 ```
 
-It refuses port 7878 and a server with any real collar (`--force` overrides). Make a farm and a
-herd in the app first; collars and animals tagged from 101 are linked to the first herd (or
+It refuses port 7878 and a server with any real collar (`--force` overrides). It needs a simulated
+herd (one `collar-sim farm` made, kept with `--keep` or `--data-dir`): the server refuses simulated
+collars on a real herd. Collars and animals tagged from 101 are linked to the first herd (or
 `--herd`, or several with `--herds Cows=238,Heifers=12`). Keys live in `~/.collar-sim/state.json`
 (or `--state`), so a second run reuses its collars.
 

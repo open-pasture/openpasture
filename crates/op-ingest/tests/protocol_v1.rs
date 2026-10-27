@@ -607,7 +607,7 @@ async fn configs_follow_herd_url_moves_and_escapes() {
     app.ctx.update_settings(&json!({"server": {"public_url": "https://farm.example.com"}})).await.unwrap();
     assert!(config_of(&app.report(&key, device(Some(1))).await).is_none(), "still current");
     // The collar address is set: a new endpoint, on the next report.
-    app.ctx.update_settings(&json!({"server": {"collar_url": "https://farm.example.com"}})).await.unwrap();
+    app.ctx.set_collar_url(&op_core::settings::CheckedCollarUrl::passed("https://farm.example.com".into())).await.unwrap();
     let c2 = config_of(&app.report(&key, device(Some(1))).await).unwrap();
     assert_eq!((c2.version, c2.endpoint.as_deref()), (2, Some("https://farm.example.com/collar/v1")));
 
@@ -973,4 +973,66 @@ async fn an_animal_far_outside_its_herds_paddock_gets_no_pen() {
     app.send(&herd, polygon(rect(-400.0, 0.0, 0.0, 200.0), vec![]), json!({})).await;
     app.send(&herd, polygon(rect(0.0, 0.0, 300.0, 200.0), vec![]), json!({})).await;
     assert!(out_a_minute(&app, &herd, &c, -300.0, 100.0).await.is_some(), "on the herd's ground of this morning");
+}
+
+/// Astra 6, 02 F11 / 03 P1-01: changing the collar address mustn't lose
+/// track of collars still on the old one. A collar is on an address once it
+/// reports holding the config that carried it (within the day it tries it);
+/// until then it shows as still on its old one, which must keep working.
+#[tokio::test]
+async fn collars_stay_listed_on_their_old_address_until_they_move() {
+    use op_core::settings::CheckedCollarUrl;
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let (id, key) = app.device(&herd).await;
+    let (_, old_key) = app.device(&herd).await; // a collar that takes no configs
+    let report = |key: String, version: Option<u32>| {
+        let mut d = v0_device();
+        if let Some(v) = version {
+            d["config_version"] = json!(v);
+        }
+        let app = &app;
+        async move { app.report(&key, json!({"device": d})).await }
+    };
+    app.report(&old_key, json!({"device": {"fw": "0.1.0", "caps": ["holes"]}})).await;
+    let endpoint = |id: String| {
+        let db = app.ctx.db().clone();
+        async move { sqlx::query_scalar::<_, Option<String>>("SELECT endpoint FROM collars WHERE id = ?").bind(id).fetch_one(&db).await.unwrap() }
+    };
+    let status = || op_ingest::config::address_status(&app.ctx);
+
+    app.ctx.set_collar_url(&CheckedCollarUrl::passed("https://a.example.com".into())).await.unwrap();
+    op_ingest::config::collar_address_changed(&app.ctx).await;
+    let c = report(key.clone(), None).await;
+    assert_eq!(c["config"]["endpoint"], "https://a.example.com/collar/v1");
+    let v1 = c["config"]["version"].as_u64().unwrap() as u32;
+    assert_eq!(endpoint(id.clone()).await, None, "given, not yet used");
+    let s = status().await.unwrap();
+    assert_eq!((s.moving.len(), s.moving[0].endpoint.as_deref(), s.moving[0].collars, s.fixed), (1, None, 1, 1));
+    report(key.clone(), Some(v1)).await;
+    assert_eq!(endpoint(id.clone()).await.as_deref(), Some("https://a.example.com/collar/v1"), "it reported through it");
+    assert!(status().await.unwrap().moving.is_empty());
+
+    // A new address: the collar is listed on the old one until a report shows it moved.
+    app.ctx.set_collar_url(&CheckedCollarUrl::passed("https://b.example.com".into())).await.unwrap();
+    op_ingest::config::collar_address_changed(&app.ctx).await;
+    let s = status().await.unwrap();
+    assert_eq!(s.moving, vec![op_ingest::config::Moving { endpoint: Some("https://a.example.com/collar/v1".into()), collars: 1 }]);
+    let c = report(key.clone(), Some(v1)).await;
+    assert_eq!(c["config"]["endpoint"], "https://b.example.com/collar/v1");
+    let v2 = c["config"]["version"].as_u64().unwrap() as u32;
+    // Heard from a day later holding it: it may have given up on the new one and gone back.
+    sqlx::query("UPDATE collar_config SET sent_at = '2020-01-01T00:00:00.000Z' WHERE collar_id = ?").bind(&id).execute(app.ctx.db()).await.unwrap();
+    report(key.clone(), Some(v2)).await;
+    assert_eq!(endpoint(id.clone()).await.as_deref(), Some("https://a.example.com/collar/v1"), "not counted as moved");
+    // Heard from soon after: it moved.
+    sqlx::query("UPDATE collar_config SET sent_at = ? WHERE collar_id = ?")
+        .bind(op_core::time::to_db(&Utc::now()))
+        .bind(&id)
+        .execute(app.ctx.db())
+        .await
+        .unwrap();
+    report(key.clone(), Some(v2)).await;
+    assert_eq!(endpoint(id.clone()).await.as_deref(), Some("https://b.example.com/collar/v1"));
+    assert!(status().await.unwrap().moving.is_empty());
 }

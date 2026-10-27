@@ -986,15 +986,28 @@ async fn planned(ctx: &Ctx, n: NewSchedule, occ: Occurrences<'_>) -> ApiResult<(
         let prepared = shape::prepare(ctx, &s.herd_id, &r.geometry, &opts)
             .await
             .map_err(|e| ApiError::bad_request(format!("{} can't go to the collars: {}", what(), e.message)))?;
-        let v = gate::judge(&prepared.findings, &Sender::of(SenderKind::Schedule));
-        if !v.allowed {
-            let said: Vec<&str> = v.hard.iter().map(|f| f.text.as_str()).collect();
-            let msg = format!(
-                "{} can't be scheduled: {}. A scheduled strip can't cross a road or the farm boundary, or take in a no-go zone or a hard hazard.",
-                what(),
-                said.join("; ")
-            );
-            return Err(ApiError::conflict(msg).with_details(serde_json::json!({ "findings": v.hard, "never": v.never })));
+        let sender = Sender::of(SenderKind::Schedule);
+        let check = gate::Check {
+            herd_id: &s.herd_id,
+            geometry: &prepared.geometry,
+            warn_m: prepared.warn_m,
+            findings: &prepared.findings,
+            sender: &sender,
+            decision_id: Some(&s.id),
+            collar_id: None,
+            at: r.at,
+            stage: gate::Stage::Preview,
+            inherited: false,
+        };
+        if let Err(mut e) = gate::preview(ctx, &check).await {
+            if e.status == axum::http::StatusCode::CONFLICT {
+                e.message = format!(
+                    "{} can't be scheduled: {} A scheduled strip can't cross or touch a road or the farm boundary, or take in a no-go zone or a hard hazard.",
+                    what(),
+                    e.message.split(". Only a person").next().unwrap_or(&e.message)
+                );
+            }
+            return Err(e);
         }
     }
     Ok((s, rows))
@@ -1120,12 +1133,21 @@ async fn reissue(ctx: &Ctx, p: &Plan) -> ApiResult<Option<Boundary>> {
     reissue_current(ctx, &p.s, &p.rows).await
 }
 
+/// The current strip again as a new immediate version (collars drop every
+/// staged slot below it): prepared afresh as the schedule sends it, else
+/// (it can't be prepared again: an exclusion drawn over all of it) the
+/// boundary in effect as it is, if the gate still passes it under what it
+/// went out with. Neither passing the gate is `Err`: nothing is sent, and
+/// the caller holds the schedule.
 async fn reissue_current(ctx: &Ctx, s: &Schedule, rows: &[Row]) -> ApiResult<Option<Boundary>> {
     let split = db::herd_boundaries(ctx.db(), &s.herd_id, now()).await?;
     let Some(a) = split.active else { return Ok(None) };
     let geometry = rows.iter().find(|r| r.version == Some(a.version) && r.state == MoveState::Done).map_or_else(|| a.geometry.clone(), |r| r.geometry.clone());
     let opts = by_schedule(SendOpts { warn_m: Some(a.warn_m), hysteresis_m: Some(a.hysteresis_m), ..Default::default() });
-    let b = send_boundary(ctx, &s.herd_id, geometry, opts, &s.id).await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let b = match send_boundary(ctx, &s.herd_id, geometry, opts, &s.id).await {
+        Ok(b) => b,
+        Err(first) => crate::boundary::resend(ctx, &a, None).await.map_err(|e| ApiError::conflict(format!("{first:#}; as it is: {}", e.message)))?,
+    };
     tracing::info!(schedule = %s.id, herd = %s.herd_id, version = b.version, "current strip reissued");
     Ok(Some(b))
 }
@@ -1566,8 +1588,13 @@ async fn drive_locked(ctx: &Ctx, schedule_id: &str, at: DateTime<Utc>) -> anyhow
                 }
             }
             restage_for_exclusions(ctx, &s, &mut rows, at).await?;
-            stage(ctx, &s, &mut rows, at).await?;
-            if !rows.iter().any(Row::pending) {
+            if let Some(why) = stage(ctx, &s, &mut rows, at).await? {
+                // Held for a person: the map now forbids the ground the herd is on, and the
+                // strips staged on the collars can't be withdrawn by a fence the gate passes.
+                s.status = ScheduleStatus::Paused;
+                changed = true;
+                held(ctx, &s, &rows, &why).await;
+            } else if !rows.iter().any(Row::pending) {
                 s.status = ScheduleStatus::Done;
                 s.ended_at = Some(at);
                 tracing::info!(schedule = %s.id, "every strip has opened; schedule done");
@@ -1629,6 +1656,30 @@ async fn give_up(ctx: &Ctx, mut s: Schedule, mut rows: Vec<Row>, gone: Vec<i64>,
     tracing::info!(schedule = %s.id, herd = %s.herd_id, "schedule ended: the herd is off its strips");
     ctx.publish(Event::Schedule { schedule: s });
     Ok(true)
+}
+
+/// A schedule held because its staged strips can't be withdrawn past the
+/// safety gate: said in the activity, with the versions still staged and the
+/// collars holding them (they open them at their times unless a person acts).
+async fn held(ctx: &Ctx, s: &Schedule, rows: &[Row], why: &str) {
+    let staged: Vec<u32> = rows.iter().filter(|r| r.state == MoveState::Staged).filter_map(|r| r.version).collect();
+    let holding = crate::withdraw::holding(ctx, &staged).await.unwrap_or_default();
+    let at = now();
+    let event = op_core::ActivityEvent {
+        id: op_core::id::new_id(op_core::id::EVENT),
+        kind: "schedule.held".into(),
+        source: "system".into(),
+        occurred_at: at,
+        recorded_at: at,
+        title: "Strip schedule held: the herd's ground is now refused by the safety gate".into(),
+        body: Some(format!(
+            "{why} Staged strips {staged:?} can't be withdrawn; {} collar(s) hold them and open them at their times. Move the herd by hand or change the map.",
+            holding.len()
+        )),
+        payload: serde_json::json!({ "schedule_id": s.id, "versions": staged, "collars": holding, "reason": why }),
+        targets: vec![("herd".into(), s.herd_id.clone()), ("schedule".into(), s.id.clone())],
+    };
+    let _ = ctx.store().record_event(&event).await.inspect_err(|e| tracing::warn!("activity log: {e:#}"));
 }
 
 /// `applied_at` from the first `applied` ack of each move that took effect
@@ -1719,15 +1770,10 @@ async fn settle_due(ctx: &Ctx, s: &Schedule, rows: &mut Vec<Row>, gone: &mut Vec
 /// refuses it, that is logged and the current strip goes again at once,
 /// prepared afresh (no-go zones cut out), so collars drop it.
 async fn recheck_activated(ctx: &Ctx, s: &Schedule, rows: &[Row], version: u32, at: DateTime<Utc>) -> anyhow::Result<()> {
-    let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?.active.filter(|a| a.version == version) else { return Ok(()) };
-    let holeless = shape::herd_collars(ctx.db(), &s.herd_id).await?.iter().any(|c| c.parked.is_none() && !c.caps.holds_holes());
-    let found = crate::prepare::map_only(ctx, &active.geometry, at, holeless).await?;
-    let sender = Sender::of(SenderKind::Schedule);
-    let check = gate::Check { herd_id: &s.herd_id, geometry: &active.geometry, findings: &found, sender: &sender, decision_id: Some(&s.id), collar_id: None };
-    if gate::judge(&found, &sender).allowed {
-        return Ok(());
-    }
-    let why = gate::pass(ctx, &check).await.err().map(|e| e.message).unwrap_or_default();
+    let _ = at;
+    let Some(active) = db::herd_boundaries(ctx.db(), &s.herd_id, now()).await?.active.filter(|a| a.version == version) else { return Ok(()) };
+    let Err(refused) = gate::recheck(ctx, &active, gate::Stage::Activation).await else { return Ok(()) };
+    let why = refused.message;
     tracing::warn!(schedule = %s.id, version, "a staged move took effect that the safety gate now refuses ({why}): reissuing the current strip");
     if let Err(e) = reissue_current(ctx, s, rows).await {
         tracing::error!(schedule = %s.id, version, "the current strip can't go again past the safety gate: {}", e.message);
@@ -1739,11 +1785,8 @@ async fn recheck_activated(ctx: &Ctx, s: &Schedule, rows: &[Row], version: u32, 
 /// reads are now, to see one drawn, changed or removed (they are deleted
 /// outright, hence the count), and whether water is required.
 async fn exclusions_mark(ctx: &Ctx) -> anyhow::Result<String> {
-    let (n, last): (i64, Option<String>) =
-        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM features WHERE kind IN ('exclusion', 'no_go', 'road', 'farm_boundary', 'hazard', 'water')")
-            .fetch_one(ctx.db())
-            .await?;
-    Ok(format!("{n} {} {}", last.unwrap_or_default(), gate::settings(ctx).await?.require_water))
+    // The map's policy revision moves with every feature or gate-setting change, deletes included.
+    Ok(gate::revision(ctx.db()).await?.to_string())
 }
 
 /// Per schedule, the exclusions its staged moves were last checked against.
@@ -1818,7 +1861,11 @@ fn staged_prefix(rows: &[Row], at: DateTime<Utc>, split: &HerdBoundaries) -> (Ve
 /// half-way when a pass failed), the current strip goes again first as a new
 /// immediate version, which drops every staged slot on the collars, and the
 /// moves are staged afresh above it.
-async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<()> {
+///
+/// When the current strip can't go again past the safety gate (the map now
+/// forbids the ground the herd is on), nothing is sent and nothing more is
+/// staged: `Some(why)`, and the driver pauses the schedule for a person.
+async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> anyhow::Result<Option<String>> {
     let mut split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
     let (order, prefix) = staged_prefix(rows, at, &split);
     let standing: HashSet<u32> = order[..prefix].iter().filter_map(|&i| rows[i].version).collect();
@@ -1826,39 +1873,17 @@ async fn stage(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc>) -> 
     if !stale.is_empty() {
         tracing::info!(schedule = %s.id, versions = ?stale, "staged moves out of date: the current strip goes again, then staged afresh");
         if let Err(e) = reissue_current(ctx, s, rows).await {
-            // It can't be prepared again as it stands (an exclusion drawn over
-            // all of it): the boundary in effect goes again exactly as it is.
-            tracing::warn!(schedule = %s.id, "current strip not reissued ({}): sent again as it is", e.message);
-            resend_as_is(ctx, s, &split).await?;
+            // Never the refused shape: nothing goes, and a person decides.
+            tracing::error!(schedule = %s.id, versions = ?stale, "current strip can't go again past the safety gate; schedule held: {}", e.message);
+            return Ok(Some(e.message));
         }
         for r in rows.iter_mut() {
             r.unstage();
         }
         split = db::herd_boundaries(ctx.db(), &s.herd_id, at).await?;
     }
-    stage_ahead(ctx, s, rows, at, &split).await
-}
-
-/// The herd's boundary in effect again, unchanged, as a new immediate
-/// version: collars drop every staged slot below it.
-async fn resend_as_is(ctx: &Ctx, s: &Schedule, split: &HerdBoundaries) -> anyhow::Result<()> {
-    let Some(a) = &split.active else { return Ok(()) };
-    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let nb = crate::boundary::NewBoundary {
-        herd_id: &s.herd_id,
-        geometry: &a.geometry,
-        warn_m: a.warn_m,
-        hysteresis_m: a.hysteresis_m,
-        effective_at: None,
-        decision_id: &s.id,
-        created_at: now(),
-        collar_id: None,
-        copy_of: None,
-    };
-    let b = crate::boundary::insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?;
-    tx.commit().await?;
-    crate::boundary::announce(ctx, &b).await;
-    Ok(())
+    stage_ahead(ctx, s, rows, at, &split).await?;
+    Ok(None)
 }
 
 /// [`stage`]'s staging, above what is still staged alive.
@@ -1898,10 +1923,14 @@ async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc
                     let check = gate::Check {
                         herd_id: &s.herd_id,
                         geometry: &p.geometry,
+                        warn_m: p.warn_m,
                         findings: &p.findings,
                         sender: &opts.sender,
                         decision_id: Some(&s.id),
                         collar_id: None,
+                        at: rows[i].at,
+                        stage: gate::Stage::Preview,
+                        inherited: false,
                     };
                     let _ = gate::pass(ctx, &check).await;
                 }
@@ -1922,7 +1951,16 @@ async fn stage_ahead(ctx: &Ctx, s: &Schedule, rows: &mut [Row], at: DateTime<Utc
         if !room.fits(&used, &size) {
             break;
         }
-        let b = send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), opts, &s.id).await?;
+        let b = match send_boundary(ctx, &s.herd_id, rows[i].geometry.clone(), opts, &s.id).await {
+            Ok(b) => b,
+            // The gate refused it as the collars would enforce it (logged there): not staged.
+            Err(e) => {
+                if first_refusal(&s.id, rows[i].strip, rows[i].step, &e.to_string()) {
+                    tracing::warn!(schedule = %s.id, strip = rows[i].strip, step = rows[i].step, "scheduled move can't be staged: {e:#}");
+                }
+                break;
+            }
+        };
         if b.effective_at != Some(rows[i].at) {
             // Its time passed while it was being sent: it went as immediate.
             let r = &mut rows[i];

@@ -38,6 +38,9 @@ pub const MAX_COLLARS: usize = 4096;
 pub const BODY_BYTES: usize = 512;
 /// Largest body read through; bigger ones are refused before any route sees them.
 const READ_LIMIT: usize = 16 << 20;
+/// Most of a collar's request read for the log: the public routes' body cap
+/// (op-server `limits`), so a chunked body is never held past it.
+const REQUEST_LIMIT: usize = 2 << 20;
 /// JSON keys whose values never go in the log.
 const SECRET_KEYS: [&str; 6] = ["key", "k", "token", "app_token", "secret", "password"];
 
@@ -181,7 +184,7 @@ pub async fn record(State(ctx): State<Ctx>, req: Request, next: Next) -> Respons
     let Some(collar_id) = collar_of(&ctx, req.headers()).await else { return next.run(req).await };
     let query = req.uri().query().unwrap_or_default().to_owned();
     let (parts, body) = req.into_parts();
-    let Ok(body) = axum::body::to_bytes(body, READ_LIMIT).await else {
+    let Ok(body) = axum::body::to_bytes(body, REQUEST_LIMIT).await else {
         return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "The request is too large.").into_response();
     };
     let shown = if route == "boundary" { Bytes::from(query.clone()) } else { body.clone() };

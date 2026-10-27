@@ -27,11 +27,21 @@
 //! farm boundary crossed, a no-go zone or a hard hazard (`props.hard`) taken
 //! in, all of it in an exclusion, and no water inside when the farm requires
 //! it ([`crate::gate::GateSettings`]).
+//!
+//! **Contact counts.** A road or a no-go zone within [`CONTACT_M`] of a
+//! boundary is crossed or taken in: touching it at a corner, running along
+//! it, or poking a few centimetres into it. A no-go zone is cut out with
+//! [`NO_GO_STANDOFF_M`] of ground around it, so a boundary shaped here is
+//! clear of that margin. The farm boundary is crossed when any corner of the
+//! shape lies more than [`EDGE_TOLERANCE_M`] past it. When the farm requires
+//! water and none is mapped, every boundary is `no_water`: nothing shows
+//! water inside it. Areas below [`OVERLAP_M2`] are only rounding for the
+//! findings that don't use contact (exclusions, soft hazards, water).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use geo::{Area, BooleanOps, Coord, Euclidean, Length, LineString, MultiLineString, MultiPolygon};
+use geo::{Area, BooleanOps, Coord, Distance, Euclidean, Length, LineString, MultiLineString, MultiPolygon};
 use op_core::check::Finding;
 use op_core::features::{FeatureGeometry, FeatureKind, MapFeature};
 use op_core::time::now;
@@ -50,6 +60,12 @@ use crate::{db, escapes, moves};
 
 /// Overlaps smaller than this (m²) are rounding, not ground.
 pub const OVERLAP_M2: f64 = 1.0;
+/// A road or no-go zone this close (m) to a boundary touches it: crossed or taken in.
+pub const CONTACT_M: f64 = 0.5;
+/// Ground (m) kept clear around a no-go zone cut out of a boundary (more than [`CONTACT_M`]).
+pub const NO_GO_STANDOFF_M: f64 = 1.0;
+/// A corner further than this (m) past the farm boundary crosses it (coordinates round to about 1 cm).
+pub const EDGE_TOLERANCE_M: f64 = 0.05;
 /// A collar that hasn't reported for this long won't take a boundary soon (A-engine's `silent` default).
 pub const OFFLINE_AFTER: Duration = Duration::minutes(20);
 /// Sides of the circle drawn for a hazard point's radius.
@@ -85,7 +101,11 @@ pub(crate) async fn exclude(ctx: &Ctx, geometry: &Polygon, limits: &CollarLimits
     if let Some(loc) = Local::new(geometry) {
         let target = loc.poly(geometry);
         for f in found.into_iter().filter(|f| matches!(f.kind, FeatureKind::Exclusion | FeatureKind::NoGo)) {
-            let Some(p) = f.geometry.polygon() else { continue };
+            let Some(mut p) = f.geometry.polygon() else { continue };
+            // A no-go zone goes with ground around it: the boundary stays clear of touching it.
+            if f.kind == FeatureKind::NoGo {
+                p = grown(&p, NO_GO_STANDOFF_M);
+            }
             let overlap = target.intersection(&loc.poly(&p));
             if overlap.unsigned_area() >= OVERLAP_M2 {
                 pending.push((f, p, loc.to_geojson(&overlap)));
@@ -223,7 +243,7 @@ pub(crate) struct MapRules {
 }
 
 /// No-go zones, hazards, roads, neighbour lines, the farm boundary and water against the sent shape.
-fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: MapRules) -> Vec<Finding> {
+pub(crate) fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: MapRules) -> Vec<Finding> {
     let mut out = Vec::new();
     let shape = loc.poly(sent);
     // What a collar that can't hold holes enforces: the outer ring alone.
@@ -237,14 +257,17 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: Map
                 let zone = loc.rings(rings);
                 let name = name_or(f, "a no-go zone");
                 let overlap = shape.intersection(&zone);
-                let (overlap, text) = if overlap.unsigned_area() >= OVERLAP_M2 {
-                    (overlap, format!("Takes in {name}"))
-                } else if let Some(r) = ring.as_ref().map(|r| r.intersection(&zone)).filter(|o| o.unsigned_area() >= OVERLAP_M2) {
-                    (r, format!("Collars that can't hold holes take in {name}"))
+                let text = if overlap.unsigned_area() >= OVERLAP_M2 {
+                    format!("Takes in {name}")
+                } else if touches(&shape, &zone) {
+                    format!("Touches {name}")
+                } else if ring.as_ref().is_some_and(|r| touches(r, &zone)) {
+                    format!("Collars that can't hold holes take in {name}")
                 } else {
                     continue;
                 };
-                out.push(Finding { code: "enters_no_go".into(), severity: Severity::Critical, text, geometry: loc.to_geojson(&overlap), targets: target(f) });
+                let geometry = loc.to_geojson(&overlap).or_else(|| loc.to_geojson(&MultiPolygon(vec![zone.clone()])));
+                out.push(Finding { code: "enters_no_go".into(), severity: Severity::Critical, text, geometry, targets: target(f) });
             }
             (FeatureKind::Hazard, g) => {
                 let area = match g {
@@ -256,12 +279,14 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: Map
                     FeatureGeometry::LineString(_) => continue,
                 };
                 let overlap = shape.intersection(&area);
-                if overlap.unsigned_area() >= OVERLAP_M2 {
+                let hard = f.props.get("hard").and_then(Value::as_bool).unwrap_or(false);
+                // A hard hazard is a hard limit: touching it counts, as for a no-go zone.
+                if overlap.unsigned_area() >= OVERLAP_M2 || (hard && touches(&shape, &area)) {
                     let text = match f.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                         Some(n) => format!("Takes in {n}"),
                         None => "Takes in a hazard".into(),
                     };
-                    let hard = f.props.get("hard").and_then(Value::as_bool).unwrap_or(false);
+                    let overlap = if overlap.unsigned_area() > 0.0 { overlap } else { MultiPolygon(vec![area.clone()]) };
                     out.push(Finding {
                         code: "overlaps_hazard".into(),
                         severity: if hard { Severity::Critical } else { Severity::Warning },
@@ -272,20 +297,28 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: Map
                 }
             }
             (FeatureKind::Road | FeatureKind::NeighbourLine, FeatureGeometry::LineString(pts)) => {
-                let inside = shape.clip(&MultiLineString(vec![loc.line(pts)]), false);
-                if inside.0.iter().map(|l| l.length::<Euclidean>()).sum::<f64>() < 0.5 {
+                let line = loc.line(pts);
+                let inside = shape.clip(&MultiLineString(vec![line.clone()]), false);
+                let crossed = inside.0.iter().map(|l| l.length::<Euclidean>()).sum::<f64>() >= 0.5;
+                // A road is a hard limit: within CONTACT_M of the boundary (a corner on it, a few
+                // centimetres in, along the edge) counts as crossing it.
+                let road = f.kind == FeatureKind::Road;
+                if !crossed && !(road && line.0.len() >= 2 && Euclidean::distance(&line, &shape) < CONTACT_M) {
                     continue;
                 }
-                let (code, severity, text) = if f.kind == FeatureKind::Road {
-                    ("crosses_road", Severity::Critical, format!("Crosses {}", name_or(f, "a road")))
+                let (code, severity, text) = if road {
+                    let verb = if crossed { "Crosses" } else { "Touches" };
+                    ("crosses_road", Severity::Critical, format!("{verb} {}", name_or(f, "a road")))
                 } else {
                     ("crosses_neighbour_line", Severity::Warning, format!("Crosses {}", name_or(f, "the neighbour line")))
                 };
-                out.push(Finding { code: code.into(), severity, text, geometry: loc.lines_geojson(&inside), targets: target(f) });
+                let geometry = loc.lines_geojson(&inside).or_else(|| loc.lines_geojson(&MultiLineString(vec![line])));
+                out.push(Finding { code: code.into(), severity, text, geometry, targets: target(f) });
             }
             (FeatureKind::FarmBoundary, FeatureGeometry::Polygon(rings)) => {
-                let past = shape.difference(&loc.rings(rings));
-                if past.unsigned_area() >= OVERLAP_M2 {
+                let farm = loc.rings(rings);
+                let past = shape.difference(&farm);
+                if past.unsigned_area() >= OVERLAP_M2 || corner_past(&shape, &farm) {
                     out.push(Finding {
                         code: "crosses_farm_boundary".into(),
                         severity: Severity::Critical,
@@ -315,24 +348,85 @@ fn map_findings(loc: &Local, sent: &Polygon, features: &[MapFeature], rules: Map
             _ => {}
         }
     }
-    // Only a farm that has mapped its water can say none is inside.
+    // Only a farm that has mapped its water can say none is inside; when the
+    // farm requires water, none mapped is no evidence of any, and that refuses.
     if waters > 0 && water_inside.is_empty() {
         let severity = if rules.require_water { Severity::Critical } else { Severity::Warning };
         out.push(Finding { code: "no_water".into(), severity, text: "No water inside".into(), geometry: None, targets: vec![] });
+    } else if waters == 0 && rules.require_water {
+        out.push(Finding {
+            code: "no_water".into(),
+            severity: Severity::Critical,
+            text: "No water mapped, and the farm requires water inside every boundary".into(),
+            geometry: None,
+            targets: vec![],
+        });
     }
     out.extend(water_inside);
     out
 }
 
-/// The map findings alone for `shape` at `at`: no exclusions applied and no
-/// collars looked at. What the gate needs for a sweep step, an escape pen and
-/// a staged boundary taking effect. `holeless`: the collars it goes to
-/// enforce the outer ring alone.
-pub(crate) async fn map_only(ctx: &Ctx, shape: &Polygon, at: DateTime<Utc>, holeless: bool) -> anyhow::Result<Vec<Finding>> {
-    let Some(loc) = Local::new(shape) else { return Ok(vec![]) };
-    let features = op_core::features::list_features(ctx, None, None, Some(at)).await?;
-    let rules = MapRules { holeless, require_water: crate::gate::settings(ctx).await?.require_water };
-    Ok(map_findings(&loc, shape, &features, rules))
+/// Within [`CONTACT_M`] of each other (overlapping, touching, or nearly).
+fn touches(a: &geo::Polygon<f64>, b: &geo::Polygon<f64>) -> bool {
+    !a.exterior().0.is_empty() && !b.exterior().0.is_empty() && Euclidean::distance(a, b) < CONTACT_M
+}
+
+/// Some corner of `shape` lies more than [`EDGE_TOLERANCE_M`] outside `farm`.
+fn corner_past(shape: &geo::Polygon<f64>, farm: &geo::Polygon<f64>) -> bool {
+    use geo::Contains;
+    let edges: Vec<&LineString<f64>> = std::iter::once(farm.exterior()).chain(farm.interiors()).collect();
+    shape.exterior().0.iter().any(|c| {
+        let p = geo::Point(*c);
+        !farm.contains(&p) && edges.iter().map(|e| Euclidean::distance(&p, *e)).fold(f64::INFINITY, f64::min) > EDGE_TOLERANCE_M
+    })
+}
+
+/// `p` (its outer ring) grown by `d` metres all round: the ring with every
+/// point within `d` of it, as edge strips and corner discs joined to it.
+/// Corner discs are drawn outside their circle, so the growth is at least `d` everywhere.
+pub(crate) fn grown(p: &Polygon, d: f64) -> Polygon {
+    let Some(loc) = Local::new(p) else { return p.clone() };
+    let base = loc.rings(&[p.outer_ring()]);
+    let pts: Vec<Coord<f64>> = base.exterior().0.clone();
+    if pts.len() < 4 || d <= 0.0 {
+        return p.clone();
+    }
+    const SIDES: usize = 16;
+    let r = d / (std::f64::consts::PI / SIDES as f64).cos();
+    let mut parts: Vec<geo::Polygon<f64>> = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len = dx.hypot(dy);
+        if len <= 0.0 {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * d, dx / len * d);
+        let quad = vec![
+            Coord { x: a.x + nx, y: a.y + ny },
+            Coord { x: b.x + nx, y: b.y + ny },
+            Coord { x: b.x - nx, y: b.y - ny },
+            Coord { x: a.x - nx, y: a.y - ny },
+            Coord { x: a.x + nx, y: a.y + ny },
+        ];
+        parts.push(geo::Polygon::new(LineString(quad), vec![]));
+    }
+    for c in &pts[..pts.len() - 1] {
+        let mut disc: Vec<Coord<f64>> = (0..SIDES)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / SIDES as f64;
+                Coord { x: c.x + r * t.cos(), y: c.y + r * t.sin() }
+            })
+            .collect();
+        disc.push(disc[0]);
+        parts.push(geo::Polygon::new(LineString(disc), vec![]));
+    }
+    // One at a time: a union of overlapping pieces in one multipolygon isn't their union.
+    let merged = parts.into_iter().fold(MultiPolygon(vec![base.clone()]), |acc, p| acc.union(&MultiPolygon(vec![p])));
+    let Some(outer) = merged.0.iter().max_by(|a, b| a.unsigned_area().total_cmp(&b.unsigned_area())) else { return p.clone() };
+    // Rounding to 7 decimals moves a corner by under a centimetre: well within NO_GO_STANDOFF_M - CONTACT_M.
+    let ring: Vec<LonLat> = outer.exterior().coords().map(|c| loc.back(c)).collect();
+    Polygon::from_ring(ring)
 }
 
 type At<'a> = (&'a str, LonLat);
@@ -478,12 +572,12 @@ pub fn share_inside(of: &Polygon, within: &Polygon) -> f64 {
 }
 
 /// Local metres about a shape's first corner, for areas, overlaps and clipping.
-struct Local {
+pub(crate) struct Local {
     proj: Projection,
 }
 
 impl Local {
-    fn new(p: &Polygon) -> Option<Self> {
+    pub(crate) fn new(p: &Polygon) -> Option<Self> {
         p.outer_ring().first().map(|o| Self { proj: Projection::new(*o) })
     }
 
@@ -615,8 +709,10 @@ mod tests {
         let f = map_findings(&loc, &sent, &[trough, pond], OPEN);
         assert_eq!(codes(&f), ["water_inside"]);
         assert_eq!(f[0].text, "Pond inside");
-        // No water mapped at all: nothing said about water, required or not.
-        assert!(map_findings(&loc, &sent, &[road], MapRules { require_water: true, ..OPEN }).iter().all(|f| !f.code.contains("water")));
+        // No water mapped at all: nothing said about water, unless the farm requires it (then it refuses).
+        assert!(map_findings(&loc, &sent, std::slice::from_ref(&road), OPEN).iter().all(|f| !f.code.contains("water")));
+        let f = map_findings(&loc, &sent, &[road], MapRules { require_water: true, ..OPEN });
+        assert!(f.iter().any(|f| f.code == "no_water" && f.severity == Severity::Critical), "{f:?}");
     }
 
     #[test]
@@ -629,16 +725,64 @@ mod tests {
         let f = map_findings(&loc, &sent, std::slice::from_ref(&creek), OPEN);
         assert_eq!(codes(&f), ["enters_no_go"]);
         assert_eq!((f[0].severity, f[0].text.as_str()), (Severity::Critical, "Takes in creek"));
-        // Made a hole: kept out, unless some collars enforce the outer ring alone.
-        let holed = Polygon::from_rings(rect(0.0, 0.0, 200.0, 100.0), [zone]);
+        // Made a hole with the standoff around it: kept out, unless some collars enforce the outer ring alone.
+        let holed = Polygon::from_rings(rect(0.0, 0.0, 200.0, 100.0), [rect(79.0, 29.0, 121.0, 71.0)]);
         let loc = Local::new(&holed).unwrap();
         assert!(map_findings(&loc, &holed, std::slice::from_ref(&creek), OPEN).is_empty());
+        // A hole exactly on the zone's edge touches it.
+        let flush = Polygon::from_rings(rect(0.0, 0.0, 200.0, 100.0), [zone]);
+        let f = map_findings(&Local::new(&flush).unwrap(), &flush, std::slice::from_ref(&creek), OPEN);
+        assert_eq!(codes(&f), ["enters_no_go"]);
         let f = map_findings(&loc, &holed, std::slice::from_ref(&creek), MapRules { holeless: true, ..OPEN });
         assert_eq!(codes(&f), ["enters_no_go"]);
         assert!(f[0].text.starts_with("Collars that can't hold holes"));
         // Clear of it: nothing.
         let away = Polygon::from_ring(rect(300.0, 0.0, 400.0, 100.0));
         assert!(map_findings(&Local::new(&away).unwrap(), &away, &[creek], OPEN).is_empty());
+    }
+
+    /// Astra 02 F10: contact with a road or no-go zone is a crossing; tolerances are rounding, not permission.
+    #[test]
+    fn touching_a_road_or_no_go_zone_counts() {
+        let sent = Polygon::from_ring(rect(0.0, 0.0, 100.0, 100.0));
+        let loc = Local::new(&sent).unwrap();
+        let road = |pts: Vec<LonLat>| feature(FeatureKind::Road, FeatureGeometry::LineString(pts), Some("lane"), json!({}));
+        // A road ending exactly at a corner, one reaching 0.2 m inside, one 0.3 m off the edge.
+        for r in [road(vec![at(-50.0, -50.0), at(0.0, 0.0)]), road(vec![at(-50.0, 50.0), at(0.2, 50.0)]), road(vec![at(-50.0, -0.3), at(150.0, -0.3)])] {
+            let f = map_findings(&loc, &sent, &[r], OPEN);
+            assert_eq!(codes(&f), ["crosses_road"], "{f:?}");
+            assert_eq!(f[0].severity, Severity::Critical);
+        }
+        // 2 m off: clear.
+        assert!(map_findings(&loc, &sent, &[road(vec![at(-50.0, -2.0), at(150.0, -2.0)])], OPEN).is_empty());
+        // A no-go sliver 3 mm deep along 100 m of edge.
+        let sliver = feature(FeatureKind::NoGo, FeatureGeometry::Polygon(vec![rect(-10.0, 99.997, 110.0, 120.0)]), Some("bank"), json!({}));
+        let f = map_findings(&loc, &sent, &[sliver], OPEN);
+        assert_eq!(codes(&f), ["enters_no_go"]);
+        // A corner 0.2 m past the farm boundary (0.2 m² past it).
+        let spike = Polygon::from_ring(vec![
+            at(0.0, 0.0),
+            at(100.0, 0.0),
+            at(100.0, 100.0),
+            at(51.0, 100.0),
+            at(50.0, 100.2),
+            at(49.0, 100.0),
+            at(0.0, 100.0),
+            at(0.0, 0.0),
+        ]);
+        let farm = feature(FeatureKind::FarmBoundary, FeatureGeometry::Polygon(vec![rect(0.0, 0.0, 100.0, 100.0)]), None, json!({}));
+        assert_eq!(codes(&map_findings(&Local::new(&spike).unwrap(), &spike, std::slice::from_ref(&farm), OPEN)), ["crosses_farm_boundary"]);
+        assert!(map_findings(&loc, &sent, &[farm], OPEN).is_empty(), "on the farm boundary is inside it");
+    }
+
+    #[test]
+    fn a_grown_zone_keeps_the_standoff() {
+        let zone = Polygon::from_ring(vec![at(0.0, 0.0), at(100.0, 0.0), at(50.0, 5.0), at(0.0, 0.0)]);
+        let g = grown(&zone, NO_GO_STANDOFF_M);
+        let loc = Local::new(&zone).unwrap();
+        let d = Euclidean::distance(&loc.poly(&zone).exterior().clone(), &loc.poly(&g).exterior().clone());
+        assert!(d > CONTACT_M && d < NO_GO_STANDOFF_M * 1.1, "{d}");
+        assert!(loc.poly(&g).unsigned_area() > loc.poly(&zone).unsigned_area());
     }
 
     #[test]

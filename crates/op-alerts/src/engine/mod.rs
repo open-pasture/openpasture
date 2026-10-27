@@ -350,7 +350,7 @@ fn told_of(r: &Row) -> Option<HashSet<String>> {
     (r.alert.status != AlertStatus::Open).then(|| r.alert.targets.iter().filter(|(k, _)| k == "collar").map(|(_, id)| id.clone()).collect())
 }
 
-/// Simulated collars and herds of simulated collars only (`op_core::sim`).
+/// Simulated collars and simulated herds, as linked and made (`op_core::sim`).
 #[derive(Default)]
 struct Sim {
     collars: std::collections::BTreeSet<String>,
@@ -363,7 +363,7 @@ impl Sim {
     }
 
     /// The alert is about the simulator only: every collar it names is
-    /// simulated, or it names none and its herd runs on simulated collars.
+    /// simulated, or it names none and its herd was made simulated.
     fn covers(&self, c: &Candidate) -> bool {
         let mut collars = c.targets.iter().filter(|(k, _)| k == "collar").map(|(_, id)| id).peekable();
         if collars.peek().is_some() {
@@ -483,6 +483,9 @@ async fn reconcile(
                 }
                 d => *d = json!({ "simulated": true }),
             }
+        } else if let Value::Object(m) = &mut c.data {
+            // Only the server's own record mutes an alert, never data that came in.
+            m.remove("simulated");
         }
         let severity = effective_severity(cfg, &c);
         if let Some(row) = existing.remove(&c.key) {

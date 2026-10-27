@@ -86,7 +86,20 @@ impl App {
     }
 
     async fn send(&self, g: &Polygon, confirm: &[&str]) -> (StatusCode, Value) {
-        self.req("POST", &format!("/api/herds/{}/boundary", self.herd), None, Some(json!({"geometry": g, "confirm": confirm}))).await
+        self.send_with(g, confirm, None).await
+    }
+
+    async fn send_with(&self, g: &Polygon, confirm: &[&str], token: Option<&str>) -> (StatusCode, Value) {
+        self.req("POST", &format!("/api/herds/{}/boundary", self.herd), None, Some(json!({"geometry": g, "confirm": confirm, "confirm_token": token}))).await
+    }
+
+    /// Send, and when the gate asks, confirm `codes` with the token it gave.
+    async fn send_confirmed(&self, g: &Polygon, codes: &[&str]) -> (StatusCode, Value) {
+        let (s, v) = self.send(g, &[]).await;
+        if s != StatusCode::CONFLICT {
+            return (s, v);
+        }
+        self.send_with(g, codes, v["confirm_token"].as_str()).await
     }
 
     async fn log(&self) -> Vec<Value> {
@@ -128,9 +141,11 @@ async fn a_person_confirms_a_road_by_its_code_and_the_log_keeps_both_tries() {
     assert_eq!(v["confirm"], json!(["crosses_road"]));
     assert!(v["error"].as_str().unwrap().starts_with("Crosses County Road"), "{v}");
     assert_eq!(v["findings"][0]["geometry"]["type"], "LineString", "drawn on the map");
-    // The wrong code doesn't do.
-    assert_eq!(app.send(&poly(0.0, 0.0, 300.0, 200.0), &["crosses_farm_boundary"]).await.0, StatusCode::CONFLICT);
-    let (s, mv) = app.send(&poly(0.0, 0.0, 300.0, 200.0), &["crosses_road"]).await;
+    let token = v["confirm_token"].as_str().unwrap().to_owned();
+    // The wrong code doesn't do, nor the right one without the token for this shape and map.
+    assert_eq!(app.send_with(&poly(0.0, 0.0, 300.0, 200.0), &["crosses_farm_boundary"], Some(&token)).await.0, StatusCode::CONFLICT);
+    assert_eq!(app.send(&poly(0.0, 0.0, 300.0, 200.0), &["crosses_road"]).await.0, StatusCode::CONFLICT);
+    let (s, mv) = app.send_with(&poly(0.0, 0.0, 300.0, 200.0), &["crosses_road"], Some(&token)).await;
     assert_eq!(s, StatusCode::CREATED, "{mv}");
 
     let log = app.log().await;
@@ -189,7 +204,7 @@ async fn every_sender_but_a_person_is_refused_on_a_hard_finding() {
     let f = p.findings.iter().find(|f| f.code == "crosses_farm_boundary").unwrap();
     assert_eq!(f.severity, op_core::Severity::Critical);
 
-    for kind in [SenderKind::Brain, SenderKind::Mcp, SenderKind::Timer, SenderKind::Auto, SenderKind::Schedule, SenderKind::System] {
+    for kind in [SenderKind::Api, SenderKind::Brain, SenderKind::Mcp, SenderKind::Timer, SenderKind::Auto, SenderKind::Schedule, SenderKind::System] {
         let opts = SendOpts { sender: Sender::of(kind), confirm: vec!["crosses_farm_boundary".into()], ..Default::default() };
         let e = op_ingest::start_move_gated(&app.ctx, &app.herd, past.clone(), opts.clone(), &format!("dec_{}", op_core::DbEnum::as_db(&kind))).await;
         let e = e.err().unwrap_or_else(|| panic!("{kind:?} sent it"));
@@ -197,9 +212,12 @@ async fn every_sender_but_a_person_is_refused_on_a_hard_finding() {
         assert!(e.message.contains("Only a person"), "{}", e.message);
         assert!(op_ingest::send_boundary(&app.ctx, &app.herd, past.clone(), opts, "dec_lib").await.is_err());
     }
-    // A person, confirming it by code.
-    let person = Sender::person(&Identity::owner(Via::AppToken), vec!["crosses_farm_boundary".into()]);
+    // A signed-in person, confirming it by code with the token the refusal gave.
+    let person = Sender::person(&Identity::owner(Via::Local), vec!["crosses_farm_boundary".into()]);
     let opts = SendOpts { sender: person.clone(), ..Default::default() };
+    let e = op_ingest::start_move_gated(&app.ctx, &app.herd, past.clone(), opts, "dec_person").await.err().expect("no token: refused");
+    let token = e.details.as_ref().and_then(|d| d["confirm_token"].as_str()).map(str::to_owned);
+    let opts = SendOpts { sender: person.with_token(token), ..Default::default() };
     op_ingest::start_move_gated(&app.ctx, &app.herd, past.clone(), opts, "dec_person").await.unwrap();
     // Inside the farm: anyone.
     let opts = SendOpts { sender: Sender::of(SenderKind::Auto), ..Default::default() };
@@ -208,8 +226,8 @@ async fn every_sender_but_a_person_is_refused_on_a_hard_finding() {
     let log = app.log().await;
     let senders: Vec<(&str, bool)> = log.iter().map(|e| (e["sender"].as_str().unwrap(), e["allowed"].as_bool().unwrap())).collect();
     assert_eq!(senders[0], ("auto", true));
-    assert_eq!(senders[1], ("api", true));
-    for kind in ["brain", "mcp", "timer", "auto", "schedule", "system"] {
+    assert_eq!(senders[1], ("farmer", true));
+    for kind in ["api", "brain", "mcp", "timer", "auto", "schedule", "system"] {
         assert!(senders.contains(&(kind, false)), "{kind} refused and logged");
     }
 }
@@ -224,7 +242,7 @@ async fn water_is_hard_when_the_farm_requires_it() {
     let (s, v) = app.send(&poly(0.0, 0.0, 300.0, 200.0), &[]).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(v["confirm"], json!(["no_water"]));
-    assert_eq!(app.send(&poly(0.0, 0.0, 300.0, 200.0), &["no_water"]).await.0, StatusCode::CREATED);
+    assert_eq!(app.send_confirmed(&poly(0.0, 0.0, 300.0, 200.0), &["no_water"]).await.0, StatusCode::CREATED);
 }
 
 #[tokio::test]

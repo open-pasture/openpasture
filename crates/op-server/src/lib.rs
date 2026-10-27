@@ -5,10 +5,10 @@
 mod auth;
 mod collar_address;
 mod limits;
-pub mod session;
 pub mod live;
 pub mod logging;
 pub mod ops;
+pub mod session;
 mod ui;
 pub mod work;
 // @HUB
@@ -143,13 +143,20 @@ impl ServerHandle {
 }
 
 /// Open the data dir, run migrations, start every crate's background tasks,
-/// and serve. Returns once the listener is bound.
+/// and serve. Returns once everything has started.
+///
+/// The port is bound and `server.json` carries its URL before the database
+/// opens, so during a long upgrade `/healthz` answers 503 with status
+/// `migrating` (or `starting`) and its progress, and every other request 503
+/// with `Retry-After`, instead of the port not answering at all. A desktop
+/// app that finds this data dir locked attaches to that URL and waits while
+/// it says so (see [`ops::healthz`]).
 pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     let data_dir = opts.data_dir.clone().unwrap_or_else(op_core::default_data_dir);
-    let ctx = Ctx::open(&data_dir).await?;
-    let settings = ctx.settings().await?;
-    let bind = opts.bind.clone().unwrap_or(settings.server.bind.clone());
-    let port = if opts.free_port { 0 } else { opts.port.unwrap_or(settings.server.port) };
+    let opening = Ctx::begin_open(&data_dir)?;
+    let stored = op_core::settings::read_stored(&data_dir).await?.unwrap_or_default();
+    let bind = opts.bind.clone().unwrap_or(stored.server.bind.clone());
+    let port = if opts.free_port { 0 } else { opts.port.unwrap_or(stored.server.port) };
 
     let listener = TcpListener::bind((bind.as_str(), port)).await.with_context(|| format!("binding {bind}:{port}"))?;
     let addr = listener.local_addr()?;
@@ -162,14 +169,34 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     } else {
         Some(url.clone())
     };
+    let running =
+        op_core::instance::RunningServer { url: Some(url.clone()), port: Some(addr.port()), lan_url: lan_url.clone(), ..op_core::instance::this_process() };
+    op_core::instance::write_server_file(&data_dir, &running)?;
+
+    // Serve "starting"/"migrating" until the app is ready.
+    let gate = Arc::new(ops::Gate::new(opening.progress()));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let served = gate.clone();
+    let join = tokio::spawn(async move {
+        // The peer address feeds the per-peer limits; connections are capped and idle ones closed.
+        let listener = axum::serve::ListenerExt::tap_io(limits::capped(listener), |_| {});
+        let app = Router::new().fallback(ops::gated).with_state(served);
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .map_err(anyhow::Error::from)
+    });
+    // A start that fails stops serving and frees the port.
+    let stop_serving = StopServing(Some((shutdown_tx, data_dir.clone())));
+
+    let ctx = opening.finish().await?;
     // Collars reach the server at the LAN address unless a public URL is set.
     ctx.set_local_url(lan_url.clone().unwrap_or_else(|| url.clone()));
 
     let info = ServerInfo { data_dir: data_dir.clone(), bind: bind.clone(), port: addr.port(), lan_url: lan_url.clone() };
     let app = build_app(ctx.clone(), info, opts.cors.unwrap_or(cfg!(debug_assertions)));
-
-    let running = op_core::instance::RunningServer { url: Some(url.clone()), port: Some(addr.port()), lan_url: lan_url.clone(), ..op_core::instance::this_process() };
-    op_core::instance::write_server_file(&data_dir, &running)?;
 
     // Tools list in registration order: the engine's farm tools first.
     op_engine::register_tools(&ctx);
@@ -208,20 +235,28 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     // @M
     // @Z
     stop_on_error.disarm();
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let join = tokio::spawn(async move {
-        // The peer address feeds the per-peer limits; connections are capped and idle ones closed.
-        let listener = axum::serve::ListenerExt::tap_io(limits::capped(listener), |_| {});
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .map_err(anyhow::Error::from)
-    });
+    gate.open(app);
+    let shutdown_tx = stop_serving.disarm();
     tracing::info!(%url, data_dir = %data_dir.display(), "openpasture serving");
     Ok(ServerHandle { url, addr, lan_url, ctx, shutdown_tx: Some(shutdown_tx), join })
+}
+
+/// Stops serving and removes `server.json` when `serve` returns early.
+struct StopServing(Option<(oneshot::Sender<()>, PathBuf)>);
+
+impl StopServing {
+    fn disarm(mut self) -> oneshot::Sender<()> {
+        self.0.take().expect("armed").0
+    }
+}
+
+impl Drop for StopServing {
+    fn drop(&mut self) {
+        if let Some((tx, dir)) = self.0.take() {
+            let _ = tx.send(());
+            op_core::instance::remove_server_file(&dir);
+        }
+    }
 }
 
 /// Stops a half-started server's jobs when `serve` returns early.
@@ -333,7 +368,8 @@ struct ServerInfoBody {
 
 /// See [`ServerInfoBody::capabilities`]. A feature that may be missing from a
 /// build or a farm lists itself here.
-pub const CAPABILITIES: &[&str] = &["analytics", "sql", "export", "alerts", "texting", "push", "imports", "reports", "brains", "collar_address_check", "live_ping", "fleet"];
+pub const CAPABILITIES: &[&str] =
+    &["analytics", "sql", "export", "alerts", "texting", "push", "imports", "reports", "brains", "collar_address_check", "live_ping", "fleet"];
 
 async fn server_info(State(ctx): State<Ctx>, info: Arc<ServerInfo>) -> ApiResult<axum::Json<ServerInfoBody>> {
     let settings = ctx.settings().await?;

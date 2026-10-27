@@ -39,8 +39,8 @@ template SID). Without one, WhatsApp only answers people who texted in the last 
 
 | Text | Who | Does |
 | --- | --- | --- |
-| `Y 4821` | manager, owner | approves a move (or a held strip) with the code from its text; a bare `Y` gets the text back with its code. A stay needs no code |
-| `N` | manager, owner | rejects what the last text asked about; 12 h after the farm last texted that phone, add the code (`N 4821`) |
+| `Y 482193` | manager, owner | approves a move (or a held strip) with the code from its text; a bare `Y` gets the text back with its code. A stay needs no code |
+| `N` | manager, owner | rejects what the last text asked about; 12 h after the farm last texted that phone, add the code (`N 482193`) |
 | `LATER` | manager, owner | asks again in an hour |
 | `OK` | hand and up | acks the alerts in the last alert text |
 | `STATUS` | anyone | each herd: head, paddock, moves, open alerts, what waits |
@@ -52,8 +52,9 @@ template SID). Without one, WhatsApp only answers people who texted in the last 
 A breakout of the whole herd is one text per person, not one per animal.
 
 **Approving by text.** A caller ID can be faked, so approving a move always needs the decision's
-code from its text: five wrong codes in an hour and that phone's codes stop counting for the
-hour. Every approval by text is texted to the farm's owners as well ("Mia approved by text from
+6-digit code from its text. A code only works from a phone that decision's text went to, for a day
+after it went; five codes tried in an hour (a right one doesn't count) and that phone's codes stop
+counting for the hour. Every approval by text is texted to the farm's owners as well ("Mia approved by text from
 +1…: Cows: move to P4. Reply STOP MOVE to stop it."), unless it was an owner who approved. A move
 the safety gate holds (it crosses a road or the farm boundary, takes in a hard hazard, has no water
 where the farm wants it) can't be approved by text: the reply names what it found, and it is

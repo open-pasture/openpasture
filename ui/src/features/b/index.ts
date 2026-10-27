@@ -100,9 +100,11 @@ search.register({
     const key = pageKeys(s.animals);
     return findAnimals(q, s.animals, s.collars).flatMap((h) => {
       const c = h.collarId ? s.collars.find((x) => x.id === h.collarId) : undefined;
-      if (c?.last_fix && !c.parked_at) return [{ label: h.label, kind: "animal", run: () => show({ kind: "collar", id: c.id }) }];
+      // The simulator's collars say so in the hit's kind.
+      const kind = c?.simulated ? "simulated" : "animal";
+      if (c?.last_fix && !c.parked_at) return [{ label: h.label, kind, run: () => show({ kind: "collar", id: c.id }) }];
       const a = h.animalId ? s.animals.find((x) => x.id === h.animalId) : undefined;
-      if (a && views.has("herd")) return [{ label: h.label, kind: "animal", run: () => void (location.hash = pageHash(key(a))) }];
+      if (a && views.has("herd")) return [{ label: h.label, kind, run: () => void (location.hash = pageHash(key(a))) }];
       return [];
     });
   },

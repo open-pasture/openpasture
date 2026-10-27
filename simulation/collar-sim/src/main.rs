@@ -294,7 +294,11 @@ async fn check_server(api: &Api, force: bool) -> anyhow::Result<()> {
     let collars = api.get("/api/collars").await.context("is the server running?")?;
     let real = collars.as_array().into_iter().flatten().filter(|c| c["simulated"] != json!(true)).count();
     if real > 0 && !force {
-        bail!("{} has {real} real collar{}; the simulator only runs on a simulated farm (collar-sim farm). --force overrides.", api.server, if real == 1 { "" } else { "s" });
+        bail!(
+            "{} has {real} real collar{}; the simulator only runs on a simulated farm (collar-sim farm). --force overrides.",
+            api.server,
+            if real == 1 { "" } else { "s" }
+        );
     }
     Ok(())
 }
@@ -386,8 +390,14 @@ async fn start_herd(
         let animals = api.get(&format!("/api/animals?herd_id={herd_id}")).await?;
         let mut tag = animals.as_array().into_iter().flatten().filter_map(|a| a["tag"].as_str()?.parse::<u32>().ok()).max().map_or(101, |t| t.max(100) + 1);
         while mine.len() < count {
-            // Linked as simulated, so even firmware 0.1 (no caps) is marked.
-            let linked = api.post("/api/collars", json!({ "name": tag.to_string(), "herd_id": herd_id, "simulated": true })).await?;
+            // Linked as simulated (the server takes that only on a simulated herd, which
+            // `collar-sim farm` makes), so even firmware 0.1 (no caps) is marked.
+            let linked = api.post("/api/collars", json!({ "name": tag.to_string(), "herd_id": herd_id, "simulated": true })).await.with_context(|| {
+                format!(
+                    "linking a simulated collar on {}: the simulator runs only on a simulated herd (collar-sim farm makes one)",
+                    herd["name"].as_str().unwrap_or("")
+                )
+            })?;
             let collar_id = linked["collar"]["id"].as_str().context("collar id")?.to_owned();
             api.post("/api/animals", json!({ "tag": tag.to_string(), "herd_id": herd_id, "collar_id": collar_id })).await?;
             let l = Linked {
@@ -441,7 +451,8 @@ async fn start_herd(
         let role = role_of(i, anchors);
         // Anchors carry LTE-M and measure their cell either way.
         let radio = if role == Role::Anchor { Some(radio.unwrap_or_else(|| sensors::Radio::near(area.interior()))) } else { radio };
-        let cfg = Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio, boot_ms, role };
+        let cfg =
+            Run { fix_secs: args.fix_secs.max(1), batch: args.batch.max(1), profile: args.caps, imu: args.imu, drop: i < args.drop, radio, boot_ms, role };
         tasks.push(tokio::spawn(run_collar(l, start, area.clone(), world.clone(), api.http.clone(), cfg)));
     }
     Ok(tasks)

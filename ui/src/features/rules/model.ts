@@ -16,13 +16,15 @@ export function byLine(r: { created_by: Actor; created_at: string; updated_by?: 
 }
 
 // What the safety gate refused, from its 409: the hard findings, the codes a person may
-// confirm, and those nobody may send.
-export interface Held { error: string; findings: Finding[]; confirm: string[]; never: string[] }
+// confirm, those nobody may send, and the token that binds a confirmation to this exact
+// shape and map revision (sent back with `confirm`).
+export interface Held { error: string; findings: Finding[]; confirm: string[]; never: string[]; token?: string }
 
 export function heldBy(e: unknown): Held | undefined {
   if (!(e instanceof ApiError) || e.status !== 409 || !e.body || !Array.isArray(e.body.findings)) return undefined;
   const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-  return { error: e.message, findings: e.body.findings as Finding[], confirm: list(e.body.confirm), never: list(e.body.never) };
+  const token = typeof e.body.confirm_token === "string" ? e.body.confirm_token : undefined;
+  return { error: e.message, findings: e.body.findings as Finding[], confirm: list(e.body.confirm), never: list(e.body.never), token };
 }
 
 // A person may send it anyway: something to confirm and nothing nobody may send.

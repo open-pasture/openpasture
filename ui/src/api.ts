@@ -164,6 +164,12 @@ export interface ServerInfo {
 // POST /api/server/collar-address/check: the steps that passed, the one that failed and why.
 export type CollarAddressStep = "address" | "dns" | "https" | "server";
 export interface CollarAddressCheck { ok: boolean; url: string; endpoint: string; passed: CollarAddressStep[]; failed?: CollarAddressStep; problem?: string }
+// GET /api/server/collar-address: collars not yet on the current address, by the endpoint they
+// still use (absent: not known yet), and collars that take no configs and keep theirs for good.
+export interface CollarAddressStatus {
+  collar_url?: string; check?: CollarAddressCheck;
+  moving: { endpoint?: string | null; collars: number }[]; fixed: number;
+}
 
 // Live events on /api/live, keyed by `type`. Each stream adds its own events from its
 // ui/src/api/<id>.ts:
@@ -282,7 +288,7 @@ export const api = {
   boundary: (herd_id: string) => get<BoundaryStatus>(`/api/herds/${herd_id}/boundary`),
   // The geometry is the move's target; the server sweeps the active boundary toward it.
   // confirm: hard findings the farmer sends it with anyway, by code (the safety gate).
-  sendBoundary: (herd_id: string, b: { geometry: Polygon; warn_m?: number; hysteresis_m?: number; effective_at?: string; confirm?: string[] }) =>
+  sendBoundary: (herd_id: string, b: { geometry: Polygon; warn_m?: number; hysteresis_m?: number; effective_at?: string; confirm?: string[]; confirm_token?: string }) =>
     post<Move>(`/api/herds/${herd_id}/boundary`, b),
   stopMove: (herd_id: string) => post<Move>(`/api/herds/${herd_id}/move/stop`),
   stopEscape: (collar_id: string) => post<Escape>(`/api/collars/${collar_id}/escape/stop`),
@@ -292,7 +298,7 @@ export const api = {
   decisions: (herd_id?: string, limit?: number) => get<Decision[]>("/api/decisions", { herd_id, limit }),
   decision: (id: string) => get<Decision>(`/api/decisions/${id}`),
   decide: (herd_id: string) => post<Decision>(`/api/herds/${herd_id}/decide`),
-  respond: (id: string, b: { action: "approve" | "reject" | "modify"; geometry?: Polygon; note?: string; confirm?: string[] }) =>
+  respond: (id: string, b: { action: "approve" | "reject" | "modify"; geometry?: Polygon; note?: string; confirm?: string[]; confirm_token?: string }) =>
     post<Decision>(`/api/decisions/${id}/respond`, b),
   brains: () => get<Brain[]>("/api/brains"),
   testBrain: (id: BrainId) => post<BrainTest>(`/api/brains/${id}/test`),
@@ -319,6 +325,7 @@ export const api = {
   server: () => get<ServerInfo>("/api/server"),
   checkCollarAddress: (url: string) => post<CollarAddressCheck>("/api/server/collar-address/check", { url }),
   // Checked again on the server; refused (422) with the reason unless it reaches this server. null clears it.
-  setCollarAddress: (url: string | null) => put<{ collar_url?: string; check?: CollarAddressCheck }>("/api/server/collar-address", { url }),
+  setCollarAddress: (url: string | null) => put<CollarAddressStatus>("/api/server/collar-address", { url }),
+  collarAddress: () => get<CollarAddressStatus>("/api/server/collar-address"),
   me: () => get<Me>("/api/me"),
 };

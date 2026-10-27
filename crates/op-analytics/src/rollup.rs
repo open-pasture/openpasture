@@ -310,31 +310,34 @@ async fn delete_day(ctx: &Ctx, table: &str, ds: i64, de: i64, max_id: i64) -> an
 pub enum Dedupe {
     /// The same row id: rows an earlier run wrote but stopped before deleting.
     Row,
-    /// One fix per collar per instant: a resent report stored again after
-    /// its day was rolled keeps the copy already in the file.
-    Time,
-    /// One cue per collar, instant and kind.
-    TimeKind,
+    /// The same collar and instant, and these columns equal: a resent report
+    /// stored again after its day was rolled keeps the copy already in the
+    /// file. A different record at the same instant is kept.
+    Same(&'static [&'static str]),
 }
+
+/// What makes two fixes at one instant the same fix (migration 0890's key).
+pub const FIX_IDENTITY: &[&str] = &["lon", "lat", "accuracy_m"];
+/// What makes two cues at one instant the same cue (migration 0890's key).
+pub const CUE_IDENTITY: &[&str] = &["kind", "level", "margin_m", "lon", "lat"];
 
 impl Dedupe {
     /// Matches the unique keys on `fixes` and `cues` (migration 0890).
     pub fn of(table: &str) -> Self {
         match table {
-            "fixes" => Dedupe::Time,
-            "cues" => Dedupe::TimeKind,
+            "fixes" => Dedupe::Same(FIX_IDENTITY),
+            "cues" => Dedupe::Same(CUE_IDENTITY),
             _ => Dedupe::Row,
         }
     }
 }
 
-/// Sort key of a row: collar (bytes), time, id; and the cue kind, if any.
+/// Sort key of a row: collar (bytes), time, id; and the identity columns.
 struct Keys {
     collar: StringArray,
     t: Int64Array,
     id: Int64Array,
-    kind: Option<StringArray>,
-    margin: Option<datafusion::arrow::array::Float64Array>,
+    batch: RecordBatch,
 }
 
 impl Keys {
@@ -344,18 +347,19 @@ impl Keys {
             collar: c.str("collar_id").context("telemetry without collar_id")?.clone(),
             t: c.i64("t").context("telemetry without t")?.clone(),
             id: c.i64("id").context("telemetry without id")?.clone(),
-            kind: c.str("kind").cloned(),
-            margin: c.f64("margin_m").cloned(),
+            batch: b.clone(),
         })
     }
 
-    /// The cue kind, derived from the margin for cues from before protocol
-    /// v1 as readers do (outside past the line, else warn).
-    fn kind(&self, i: usize) -> Option<&str> {
-        match self.kind.as_ref().filter(|k| k.is_valid(i)) {
-            Some(k) => Some(k.value(i)),
-            None => self.margin.as_ref().filter(|m| m.is_valid(i)).map(|m| if m.value(i) < 0.0 { "outside" } else { "warn" }),
-        }
+    /// The row's identity columns as text (exact: floats print so they
+    /// read back the same); a column the file lacks or a null is empty.
+    fn identity(&self, i: usize, cols: &[&str]) -> Vec<String> {
+        cols.iter()
+            .map(|name| match self.batch.column_by_name(name) {
+                Some(col) if col.is_valid(i) => datafusion::arrow::util::display::array_value_to_string(col, i).unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect()
     }
 
     fn key(&self, i: usize) -> (&[u8], i64, i64) {
@@ -393,11 +397,11 @@ impl<I: Iterator<Item = anyhow::Result<RecordBatch>>> Cursor<I> {
         self.cur.as_ref().map(|(slot, k)| (*slot, self.row, k.key(self.row)))
     }
 
-    /// Whether the current row is the collar and instant given, and its kind.
-    fn at(&self, collar: &[u8], t: i64) -> Option<Option<String>> {
+    /// Whether the current row is the collar and instant given, and its identity.
+    fn at(&self, collar: &[u8], t: i64, cols: &[&str]) -> Option<Vec<String>> {
         let (_, k) = self.cur.as_ref()?;
         let (c, rt, _) = k.key(self.row);
-        (c == collar && rt == t).then(|| k.kind(self.row).map(str::to_owned))
+        (c == collar && rt == t).then(|| k.identity(self.row, cols))
     }
 
     fn step(&mut self, held: &mut Vec<RecordBatch>) -> anyhow::Result<()> {
@@ -477,24 +481,25 @@ where
     b.advance(&mut held)?;
     let mut picks: Vec<(usize, usize)> = Vec::with_capacity(CHUNK_ROWS);
     loop {
-        let group = match (a.head(), b.head()) {
-            (Some((_, _, ka)), Some((_, _, kb))) if dedupe != Dedupe::Row && (ka.0, ka.1) == (kb.0, kb.1) => Some((ka.0.to_vec(), ka.1)),
+        let group = match (a.head(), b.head(), dedupe) {
+            (Some((_, _, ka)), Some((_, _, kb)), Dedupe::Same(cols)) if (ka.0, ka.1) == (kb.0, kb.1) => Some((ka.0.to_vec(), ka.1, cols)),
             _ => None,
         };
-        if let Some((collar, t)) = group {
+        if let Some((collar, t, cols)) = group {
             // The same collar and instant in both: all of a's rows there,
-            // then b's that aren't already held.
-            let mut kinds = Vec::new();
-            while let Some(kind) = a.at(&collar, t) {
+            // then b's that aren't the same record as one of them.
+            let mut seen = Vec::new();
+            while let Some(id) = a.at(&collar, t, cols) {
                 let (slot, row, _) = a.head().expect("a row");
                 picks.push((slot, row));
-                kinds.push(kind);
+                seen.push(id);
                 a.step(&mut held)?;
             }
-            while let Some(kind) = b.at(&collar, t) {
+            while let Some(id) = b.at(&collar, t, cols) {
                 let (slot, row, _) = b.head().expect("a row");
-                if dedupe == Dedupe::TimeKind && !kinds.contains(&kind) {
+                if !seen.contains(&id) {
                     picks.push((slot, row));
+                    seen.push(id);
                 }
                 b.step(&mut held)?;
             }
@@ -680,7 +685,7 @@ mod tests {
         let old = vec![batch(&[("a", 1, 1), ("a", 5, 3)]), batch(&[("b", 2, 2)])];
         let fresh = vec![batch(&[("a", 1, 8), ("a", 3, 7), ("a", 5, 9)]), batch(&[("b", 2, 2), ("c", 0, 10)])];
         assert_eq!(
-            merged(old, fresh, Dedupe::Time),
+            merged(old, fresh, Dedupe::Same(&[])),
             [("a", 1, 1), ("a", 3, 7), ("a", 5, 3), ("b", 2, 2), ("c", 0, 10)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec()
         );
     }
@@ -689,6 +694,38 @@ mod tests {
     fn a_resent_cue_is_one_cue_but_another_kind_at_the_same_instant_is_kept() {
         let old = vec![cue_batch(&[("a", 5, 1, Some("warn")), ("a", 6, 2, None)])];
         let fresh = vec![cue_batch(&[("a", 5, 7, Some("outside")), ("a", 5, 8, Some("warn")), ("a", 6, 9, None)])];
-        assert_eq!(merged(old, fresh, Dedupe::TimeKind), [("a", 5, 1), ("a", 5, 7), ("a", 6, 2)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec());
+        assert_eq!(merged(old, fresh, Dedupe::Same(&["kind"])), [("a", 5, 1), ("a", 5, 7), ("a", 6, 2)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec());
+    }
+
+    fn fix_batch(rows: &[(&str, i64, i64, f64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("collar_id", DataType::Utf8, true),
+            Field::new("t", DataType::Int64, true),
+            Field::new("lon", DataType::Float64, true),
+            Field::new("lat", DataType::Float64, true),
+            Field::new("accuracy_m", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(datafusion::arrow::array::Float64Array::from(rows.iter().map(|r| r.3).collect::<Vec<_>>())),
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![42.03; rows.len()])),
+                Arc::new(datafusion::arrow::array::Float64Array::from(vec![3.0; rows.len()])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_different_fix_at_a_rolled_instant_is_kept_but_a_resend_is_not() {
+        // The file holds a's fix at t 5 (lon -93.62). Fresh: the same fix resent (id 8)
+        // and a different one at the same instant (id 9, lon -93.61).
+        let old = vec![fix_batch(&[("a", 5, 1, -93.62)])];
+        let fresh = vec![fix_batch(&[("a", 5, 8, -93.62), ("a", 5, 9, -93.61)])];
+        assert_eq!(merged(old, fresh, Dedupe::of("fixes")), [("a", 5, 1), ("a", 5, 9)].map(|(c, t, i)| (c.to_owned(), t, i)).to_vec());
     }
 }

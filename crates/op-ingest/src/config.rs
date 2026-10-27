@@ -102,13 +102,75 @@ pub const NO_COLLAR_ADDRESS: &str =
 /// [`NO_COLLAR_ADDRESS`]).
 pub async fn collar_endpoint(ctx: &Ctx) -> anyhow::Result<Option<String>> {
     let url = ctx.settings().await?.server.collar_url;
-    Ok(url.filter(|u| op_core::settings::collar_url_problem(u).is_none()).map(|u| format!("{}/collar/v1", u.trim_end_matches('/'))).filter(|e| e.len() <= MAX_ENDPOINT_BYTES))
+    Ok(url
+        .filter(|u| op_core::settings::collar_url_problem(u).is_none())
+        .map(|u| format!("{}/collar/v1", u.trim_end_matches('/')))
+        .filter(|e| e.len() <= MAX_ENDPOINT_BYTES))
 }
 
 /// A new collar address goes into every collar that takes configs, now (or
 /// on its next report if that fails).
 pub async fn collar_address_changed(ctx: &Ctx) {
     refresh_quietly(ctx, Scope::All).await;
+}
+
+/// How long a collar tries a new endpoint before it goes back to its old one
+/// (firmware `CONFIG_ENDPOINT_FALLBACK_S`).
+pub const ENDPOINT_FALLBACK: chrono::Duration = chrono::Duration::hours(24);
+
+/// A collar reporting that it holds its current config (`reported` at or
+/// above its version) has moved to that config's endpoint: the report came
+/// through it. Unless the config went out a day or more ago: by then the
+/// collar may have given up on it and be back on its old one.
+pub(crate) async fn confirm_endpoint(conn: &mut sqlx::SqliteConnection, collar_id: &str, reported: Option<u32>, at: DateTime<Utc>) -> anyhow::Result<()> {
+    let Some(r) = reported else { return Ok(()) };
+    sqlx::query(
+        "UPDATE collars SET endpoint = (SELECT json_extract(body, '$.endpoint') FROM collar_config WHERE collar_id = ?1)
+         WHERE id = ?1 AND EXISTS (
+             SELECT 1 FROM collar_config WHERE collar_id = ?1 AND version <= ?2 AND json_extract(body, '$.endpoint') IS NOT NULL
+                 AND (sent_at IS NULL OR sent_at > ?3)
+                 AND json_extract(body, '$.endpoint') IS NOT collars.endpoint)",
+    )
+    .bind(collar_id)
+    .bind(i64::from(r))
+    .bind(to_db(&(at - ENDPOINT_FALLBACK)))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Collars not yet on the current collar endpoint, by the endpoint they are
+/// known to use (`None`: not known yet).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Moving {
+    pub endpoint: Option<String>,
+    pub collars: u32,
+}
+
+/// Where collars stand on the collar address: those that take configs and
+/// haven't moved to the current one yet, and those that take no configs and
+/// so keep the address they were set up with for good.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AddressStatus {
+    pub moving: Vec<Moving>,
+    pub fixed: u32,
+}
+
+pub async fn address_status(ctx: &Ctx) -> anyhow::Result<AddressStatus> {
+    let current = collar_endpoint(ctx).await?;
+    let takes = "caps IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(collars.caps) WHERE value = 'config')";
+    let rows: Vec<(Option<String>, i64)> = sqlx::query_as(&format!(
+        "SELECT endpoint, COUNT(*) FROM collars WHERE {takes} AND endpoint IS NOT ? GROUP BY endpoint ORDER BY COUNT(*) DESC, endpoint"
+    ))
+    .bind(&current)
+    .fetch_all(ctx.db())
+    .await?;
+    let fixed: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM collars WHERE caps IS NOT NULL AND NOT ({takes})")).fetch_one(ctx.db()).await?;
+    Ok(AddressStatus {
+        // With no collar address, nobody is moving anywhere.
+        moving: if current.is_some() { rows.into_iter().map(|(endpoint, n)| Moving { endpoint, collars: n as u32 }).collect() } else { vec![] },
+        fixed: fixed as u32,
+    })
 }
 
 /// When the fast window should reach at least, for something `remaining_m`
@@ -132,15 +194,32 @@ pub(crate) struct Desired {
 /// The next config body, or `None` when the stored one still holds. `reported`
 /// is the version the collar says it has: one above ours (our database is
 /// older than the collar's config) is overtaken by a new version.
+///
+/// The command policy (Astra 02 F11): a config goes out only with a cadence
+/// that passes [`CollarsConfig::validate`], and a collar being moved or
+/// walked back (a fast window wanted) keeps the endpoint it has until that is
+/// over: a new collar address never lands mid-move or mid-escape, where
+/// losing contact matters most.
 pub(crate) fn next_body(stored: Option<&ConfigCommand>, reported: Option<u32>, d: &Desired, at: DateTime<Utc>) -> Option<ConfigCommand> {
     let c = &d.cadence;
+    if let Err(e) = c.validate() {
+        tracing::error!(collar = %d.collar_id, "collar config not issued, its cadence is out of bounds: {}", e.message);
+        return None;
+    }
+    let endpoint = match stored {
+        Some(s) if d.fast_until.is_some() && s.endpoint.is_some() && s.endpoint != d.endpoint => {
+            tracing::info!(collar = %d.collar_id, "new collar address held back until its move or escape is over");
+            s.endpoint.clone()
+        }
+        _ => d.endpoint.clone(),
+    };
     let fast_running = |s: &ConfigCommand| s.fast_until.is_some_and(|t| t > at) && s.fast_report_s.is_some() && s.fast_poll_s.is_some();
     let due = match stored {
         None => true,
         Some(s) => {
             s.collar_id != d.collar_id
                 || s.herd_id.as_deref() != Some(d.herd_id.as_str())
-                || s.endpoint != d.endpoint
+                || s.endpoint != endpoint
                 || (s.report_s, s.poll_s) != (c.report_s, c.poll_s)
                 || reported.is_some_and(|r| r > s.version)
                 || (d.fast_until.is_some()
@@ -165,7 +244,7 @@ pub(crate) fn next_body(stored: Option<&ConfigCommand>, reported: Option<u32>, d
         collar_id: d.collar_id.clone(),
         version: stored.map_or(0, |s| s.version).max(reported.unwrap_or(0)) + 1,
         herd_id: Some(d.herd_id.clone()),
-        endpoint: d.endpoint.clone(),
+        endpoint,
         report_s: c.report_s,
         poll_s: c.poll_s,
         fast_report_s,
@@ -230,7 +309,7 @@ pub(crate) async fn sync(
         .bind(to_db(&at))
         .execute(&mut *conn)
         .await?;
-        tracing::info!(collar = %d.collar_id, version = next.version, herd = ?next.herd_id, fast_until = ?next.fast_until, "collar config");
+        tracing::info!(collar = %d.collar_id, version = next.version, herd = ?next.herd_id, endpoint = ?next.endpoint, fast_until = ?next.fast_until, "collar config");
         current = Some(Stored { cmd: next, reject_version: None });
     }
     Ok(current.filter(|s| reported.is_none_or(|r| s.cmd.version > r) && s.reject_version != Some(s.cmd.version)).map(|s| s.cmd))
@@ -349,6 +428,24 @@ mod tests {
     }
     fn want(fast: Option<DateTime<Utc>>) -> Desired {
         Desired { collar_id: "col_a".into(), herd_id: "herd_1".into(), endpoint: None, cadence: CollarsConfig::default(), fast_until: fast }
+    }
+
+    /// Astra 02 F11: the command policy keeps a collar's endpoint through a
+    /// move or escape, and issues nothing with a cadence out of bounds.
+    #[test]
+    fn a_new_address_waits_for_the_move_and_a_bad_cadence_goes_nowhere() {
+        let old = Desired { endpoint: Some("https://old.example/collar/v1".into()), ..want(None) };
+        let first = next_body(None, None, &old, t0()).unwrap();
+        let moved = Desired { endpoint: Some("https://new.example/collar/v1".into()), ..want(Some(t0() + Duration::minutes(20))) };
+        let during = next_body(Some(&first), Some(first.version), &moved, t0()).unwrap();
+        assert_eq!(during.endpoint.as_deref(), Some("https://old.example/collar/v1"), "kept through the move");
+        assert!(during.fast_until.is_some());
+        assert!(next_body(Some(&during), Some(during.version), &moved, t0()).is_none(), "no churn while it waits");
+        let after = Desired { fast_until: None, ..moved.clone() };
+        assert_eq!(next_body(Some(&during), Some(during.version), &after, t0()).unwrap().endpoint.as_deref(), Some("https://new.example/collar/v1"));
+        let mut bad = want(None);
+        bad.cadence.report_s = 0;
+        assert!(next_body(None, None, &bad, t0()).is_none());
     }
 
     #[test]

@@ -172,7 +172,8 @@ async fn make_farm(api: &Api, sim: &Sim) -> anyhow::Result<()> {
         let first = api.post("/api/paddocks", json!({ "name": format!("Sim {}", 2 * i + 1), "geometry": square(&p, e, -200.0, 200.0) })).await?;
         api.post("/api/paddocks", json!({ "name": format!("Sim {}", 2 * i + 2), "geometry": square(&p, e, 0.0, 200.0) })).await?;
         let paddock = first["id"].as_str().context("paddock id")?;
-        api.post("/api/herds", json!({ "name": name, "species": "cattle", "count": count, "paddock_id": paddock })).await?;
+        // Simulated from the start: the server keeps its collars, history and alerts apart.
+        api.post("/api/herds", json!({ "name": name, "species": "cattle", "count": count, "paddock_id": paddock, "simulated": true })).await?;
     }
     Ok(())
 }

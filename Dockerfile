@@ -43,8 +43,11 @@ VOLUME /data
 EXPOSE 7878
 USER openpasture
 # Asks the server named in /data/server.json for /healthz: unhealthy when it
-# doesn't answer or its database doesn't. A job restarting is "degraded",
-# still healthy; see /api/server for which.
+# doesn't answer, its database doesn't, or a job that drives fences or sends
+# alerts has been failing for 5 minutes ("down", 503). A job restarting for
+# less is "degraded", still healthy; see /api/server for which. While the
+# database is upgrading ("migrating") it stays healthy: killing it half-way
+# would only start the upgrade again.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 CMD ["openpasture", "health"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["openpasture", "serve", "--bind", "0.0.0.0", "--port", "7878"]

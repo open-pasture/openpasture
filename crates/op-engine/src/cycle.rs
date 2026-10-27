@@ -421,10 +421,8 @@ pub async fn respond(ctx: &Ctx, id: &str, action: Response, geometry: Option<Pol
     respond_confirmed(ctx, id, action, geometry, note, actor, vec![]).await
 }
 
-/// [`respond`], with the hard findings the person confirms by code. An
-/// approval or change the safety gate refuses (a hard finding not named in
-/// `confirm`, a no-go zone) is 409 with the findings, and the decision
-/// still waits.
+/// [`respond`], with the hard findings the person confirms by code and no
+/// `confirm_token` (see [`respond_bound`]).
 pub async fn respond_confirmed(
     ctx: &Ctx,
     id: &str,
@@ -434,11 +432,31 @@ pub async fn respond_confirmed(
     actor: Actor,
     confirm: Vec<String>,
 ) -> ApiResult<Decision> {
+    respond_bound(ctx, id, action, geometry, note, actor, confirm, None).await
+}
+
+/// [`respond`], with the hard findings a signed-in person confirms by code
+/// and the `confirm_token` the gate's refusal gave (it binds them to the
+/// exact shape and map revision they saw). An approval or change the safety
+/// gate refuses (a hard finding not confirmed so, a no-go zone, anyone but a
+/// signed-in person) is 409 with the findings and a fresh token, and the
+/// decision still waits.
+#[allow(clippy::too_many_arguments)]
+pub async fn respond_bound(
+    ctx: &Ctx,
+    id: &str,
+    action: Response,
+    geometry: Option<Polygon>,
+    note: Option<String>,
+    actor: Actor,
+    confirm: Vec<String>,
+    token: Option<String>,
+) -> ApiResult<Decision> {
     let d = db::get(ctx, id).await?.ok_or_else(|| ApiError::not_found("No such decision."))?;
     if d.status != DecisionStatus::Proposed {
         return Err(ApiError::conflict(format!("This decision is {}; there is nothing to answer.", d.status.as_db())));
     }
-    let sender = Sender::answered_by(actor.clone(), confirm);
+    let sender = Sender::answered_by(actor.clone(), confirm).with_token(token);
     let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
     let at = time::now();
     let paddocks = ctx.store().list_paddocks().await?;
@@ -475,13 +493,13 @@ pub async fn respond_confirmed(
         }
         Response::Approve => {
             if let Some(g) = &d.geometry {
-                gate_preview(ctx, &d.herd_id, g, &sender).await?;
+                gate_preview(ctx, &d.herd_id, &d.id, g, &sender).await?;
             }
             apply_claimed(ctx, id, Some((&resp, at)), Some(&actor), sender.clone()).await.map_err(|e| ApiError::conflict(short(&e)))?
         }
         Response::Modify => {
             let g = check_geometry(&geometry.ok_or_else(|| ApiError::bad_request("A change needs the farmer's boundary (geometry)."))?)?;
-            gate_preview(ctx, &d.herd_id, &g, &sender).await?;
+            gate_preview(ctx, &d.herd_id, &d.id, &g, &sender).await?;
             resp["geometry"] = json!(g);
             // Record the farmer's boundary on the decision before claiming it.
             let mut m = d.clone();
@@ -548,11 +566,24 @@ async fn answer(ctx: &Ctx, id: &str, status: DecisionStatus, resp: &Value, at: D
 }
 
 /// What the safety gate would make of a person sending `g` now: its refusal
-/// (409 with the findings) before anything is claimed.
-async fn gate_preview(ctx: &Ctx, herd_id: &str, g: &Polygon, sender: &Sender) -> ApiResult<()> {
-    let prepared = op_ingest::prepare(ctx, herd_id, g, &op_ingest::SendOpts::default()).await?;
-    let v = gate::judge(&prepared.findings, sender);
-    if v.allowed { Ok(()) } else { Err(gate::refusal(&v)) }
+/// (409 with the findings and the `confirm_token`) before anything is
+/// claimed. Logged either way (`preview`), against the decision.
+async fn gate_preview(ctx: &Ctx, herd_id: &str, decision_id: &str, g: &Polygon, sender: &Sender) -> ApiResult<()> {
+    let opts = op_ingest::SendOpts::default();
+    let prepared = op_ingest::prepare(ctx, herd_id, g, &opts).await?;
+    let check = gate::Check {
+        herd_id,
+        geometry: &prepared.geometry,
+        warn_m: prepared.warn_m,
+        findings: &prepared.findings,
+        sender,
+        decision_id: Some(decision_id),
+        collar_id: None,
+        at: op_ingest::prepare::activation(&opts),
+        stage: gate::Stage::Preview,
+        inherited: false,
+    };
+    gate::preview(ctx, &check).await
 }
 
 /// The timer's turn: the decision is reviewed again first (the map and the

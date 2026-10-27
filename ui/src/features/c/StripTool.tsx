@@ -122,8 +122,8 @@ export function StripTool({ map, herdId, ctx, done }: ToolProps) {
     if (!strip || !herdId) return;
     setBusy(true);
     try {
-      await gate.run(async (confirm) => {
-        await api.sendBoundary(herdId, { geometry: strip.geometry, confirm });
+      await gate.run(async (confirm, confirm_token) => {
+        await api.sendBoundary(herdId, { geometry: strip.geometry, confirm, confirm_token });
         done();
         await store.refresh();
       });

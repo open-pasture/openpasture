@@ -24,14 +24,27 @@ all-features = false
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
-    # Each entry: the advisory, why it doesn't apply, and when to look again.
+    # Each entry: the advisory, why it doesn't apply, and the date to look
+    # again ("review by YYYY-MM-DD" in its reason). CI fails once that date
+    # passes (scripts/deny-ignores.py), so an ignore can't outlive its reason.
+    #
     # zip < 9: extract() to disk mishandles symlinks and SUID bits. op-import
     # reads entries into memory (by_index, files/read.rs) and never extracts;
     # tauri-plugin-updater's zip path is Windows-only, our updates are tar.gz.
     # Drop these when zip 9 lands in both.
-    { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above" },
-    { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above" },
-    { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above" },
+    { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    # zstd 0.13 / zstd-safe 7: fixed only in zstd 0.14.3 / zstd-safe 8.2,
+    # which arrow-ipc and parquet 59 (datafusion 55) and tantivy-sstable 0.7
+    # can't take (they ask for zstd ^0.13). All three call only zstd::bulk
+    # (Compressor/Decompressor), never the stream encoders' and decoders'
+    # with_context (0391), Seekable (0398) or DCtx::decompress_stream (0403).
+    # The Parquet and index files they read are ones this server wrote.
+    # Drop these when datafusion and tantivy move to zstd 0.14.
+    { id = "RUSTSEC-2026-0391", reason = "stream with_context unused; bulk API only. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0398", reason = "Seekable unused; bulk API only. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0403", reason = "decompress_stream unused; bulk API only. review by 2027-01-31" },
 ]
 
 [licenses]

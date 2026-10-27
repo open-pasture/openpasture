@@ -185,6 +185,9 @@ struct NewHerd {
     #[serde(default)]
     autonomy: Autonomy,
     timer_minutes: Option<u32>,
+    /// Made by the simulator, on a server with no real data (`crate::sim`).
+    #[serde(default)]
+    simulated: bool,
 }
 
 pub const DEFAULT_TIMER_MINUTES: u32 = 60;
@@ -226,7 +229,10 @@ async fn create_herd(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewHerd>) ->
         created_at: time::now(),
     };
     check_herd(&ctx, &herd).await?;
-    ctx.store().insert_herd(&herd).await?;
+    if body.simulated && !crate::sim::may_add_simulated_herd(ctx.db()).await? {
+        return Err(ApiError::conflict(crate::sim::REAL_DATA));
+    }
+    ctx.store().insert_herd_as(&herd, body.simulated).await?;
     // A herd placed in a resting paddock is grazing it now.
     if let Some(pid) = &herd.paddock_id
         && let Some(mut p) = ctx.store().get_paddock(pid).await?
@@ -370,6 +376,11 @@ async fn update_animal(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(b
     a.tag = a.tag.trim().to_owned();
     crate::animals::tidy(&mut a)?;
     check_animal(&ctx, &a, Some(&current)).await?;
+    if a.herd_id != current.herd_id
+        && crate::sim::herd_is_simulated(ctx.db(), &a.herd_id).await? != crate::sim::herd_is_simulated(ctx.db(), &current.herd_id).await?
+    {
+        return Err(ApiError::conflict("An animal stays on the simulated or real side it was made on."));
+    }
     ctx.store().update_animal(&a).await?;
     animals_changed(&ctx, &[&current.herd_id, &a.herd_id], (current.herd_id != a.herd_id).then_some(&current.herd_id)).await?;
     Ok(Json(a))

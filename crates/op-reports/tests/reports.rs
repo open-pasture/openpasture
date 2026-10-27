@@ -23,8 +23,21 @@ struct App {
     router: axum::Router,
 }
 
+/// Several tests compare the report's farm "today" (America/Chicago) with
+/// their own; one that straddled midnight would see two days. Within 30 s of
+/// it, wait until it has passed.
+fn clear_of_farm_midnight() {
+    use chrono::Timelike;
+    let local = chrono::Utc::now().with_timezone(&chrono_tz::America::Chicago);
+    let to_midnight = 86_400 - i64::from(local.num_seconds_from_midnight());
+    if to_midnight <= 30 {
+        std::thread::sleep(std::time::Duration::from_secs(to_midnight as u64 + 1));
+    }
+}
+
 impl App {
     async fn new() -> Self {
+        clear_of_farm_midnight();
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::open(dir.path()).await.unwrap();
         Self::with(dir, ctx)
@@ -273,6 +286,8 @@ async fn backfill_rebuilds_moves_from_applied_decisions() {
     }
     pool.close().await;
 
+    // The upgrade dates herd history from today: don't straddle midnight.
+    clear_of_farm_midnight();
     let ctx = Ctx::open(dir.path()).await.unwrap();
     let rows: Vec<(String, i64, Option<String>, String)> =
         sqlx::query_as("SELECT at, count, paddock_id, source FROM herd_history WHERE herd_id = 'herd_1' ORDER BY id").fetch_all(ctx.db()).await.unwrap();

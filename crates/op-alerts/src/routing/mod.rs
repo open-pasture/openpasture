@@ -425,8 +425,7 @@ async fn first_send(ctx: &Ctx, farm: &Farm, people: &[Person], rows: &[Row], now
     let mut sent = false;
     for p in first {
         // Alerts about the simulator's collars reach no person (the webhook still gets them, marked).
-        let todo: Vec<&Alert> =
-            rows.iter().map(|r| &r.alert).filter(|a| !simulated(a) && !told.contains(&(a.id.clone(), p.user.id.clone()))).collect();
+        let todo: Vec<&Alert> = rows.iter().map(|r| &r.alert).filter(|a| !simulated(a) && !told.contains(&(a.id.clone(), p.user.id.clone()))).collect();
         if todo.is_empty() {
             continue;
         }

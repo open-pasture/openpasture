@@ -176,7 +176,7 @@ export function HerdPanel({ onChange, changing, onFocusCollar, onFocusCollars, o
             {manage && <div className="acts">
               <Button small kind="plain" disabled={busy} onClick={() => act(() => api.respond(live.id, { action: "reject" }))}>{keeps ? "Hold" : "Reject"}</Button>
               {live.geometry && <Button small disabled={busy || changing} onClick={onChange}>Change</Button>}
-              <Button small kind="primary" disabled={busy} onClick={() => act(() => gate.run(async (confirm) => void (await api.respond(live.id, { action: "approve", confirm }))))}>
+              <Button small kind="primary" disabled={busy} onClick={() => act(() => gate.run(async (confirm, confirm_token) => void (await api.respond(live.id, { action: "approve", confirm, confirm_token }))))}>
                 {live.apply_at ? "Send now" : keeps ? "Keep" : "Approve"}
               </Button>
             </div>}

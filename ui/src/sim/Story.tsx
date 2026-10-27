@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { C } from "../map/base";
-import { SIMULATED } from "../sim";
+import { SIMULATED } from ".";
 
 // Behind the first question: a paddock on real rangeland, cut into strips. The fence steps
 // forward, the herd walks after it, and the ground they grazed regrows while it rests.

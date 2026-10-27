@@ -82,7 +82,6 @@ impl Role {
             Self::Anchor => "anchor",
         }
     }
-
 }
 
 /// Where the collar reports: the provisioned endpoint, or one a config

@@ -44,6 +44,7 @@ pub mod schedule;
 // @M
 // @Z
 pub mod wire_log;
+pub mod withdraw;
 
 use op_core::Ctx;
 
@@ -101,11 +102,13 @@ pub fn router() -> axum::Router<Ctx> {
 }
 
 /// Background tasks. Returns once they are spawned: the watcher that
-/// announces staged boundaries when they take effect, the move driver and
-/// the escape driver.
+/// announces staged boundaries when they take effect, the one that checks
+/// staged boundaries again when the map changes, the move driver and the
+/// escape driver.
 pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     register_tools(&ctx);
     boundary::spawn_activation_watcher(ctx.clone());
+    withdraw::spawn_policy_watcher(ctx.clone());
     moves::spawn_driver(ctx.clone());
     escapes::spawn_driver(ctx.clone());
     // @HUB

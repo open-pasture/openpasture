@@ -3,7 +3,7 @@
 //! a question, never a rejection.
 //!
 //! - `y` `yes` `si` `sí` `approve` / `n` `no` `reject`, optionally followed
-//!   by the decision's 4-digit code ("Y 4821") or a list number ("Y 2")
+//!   by the decision's 6-digit code ("Y 482193"; 4-digit codes from before still read) or a list number ("Y 2")
 //! - `later` (optionally with a code or number), `ok`, `status`
 //! - `where is <tag>`, `where <tag>`
 //! - `stop move` (optionally with a code or number)
@@ -61,12 +61,12 @@ fn norm(text: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// A trailing code or list number: `[]` → only, 4 digits → code, 1 or 2 digits → number.
+/// A trailing code or list number: `[]` → only, 6 digits (4 from before) → code, 1 or 2 digits → number.
 fn pick(rest: &[&str]) -> Option<Pick> {
     match rest {
         [] => Some(Pick::Only),
         [n] if n.bytes().all(|b| b.is_ascii_digit()) => match n.len() {
-            4 => Some(Pick::Code((*n).to_owned())),
+            4 | 6 => Some(Pick::Code((*n).to_owned())),
             1 | 2 => n.parse::<usize>().ok().filter(|i| *i > 0).map(Pick::Number),
             _ => None,
         },

@@ -105,17 +105,21 @@ impl Farm {
         let id = format!("col_{n:04}");
         let point = self.spot(n as f64 * 3.0, 20.0);
         let fix = json!({"at": to_db(&seen), "point": point, "accuracy_m": 3.0, "sats": 9});
-        sqlx::query("INSERT INTO collars (id, name, herd_id, state, last_seen, battery, last_fix, created_at) VALUES (?, ?, ?, 'inside', ?, 0.8, ?, ?)")
-            .bind(&id)
-            .bind(format!("C{n}"))
-            .bind(herd)
-            .bind(to_db(&seen))
-            .bind(fix.to_string())
-            // Added a day ago, so its first fit check isn't due (H's fit_check_due).
-            .bind(to_db(&(seen - Duration::days(1))))
-            .execute(self.ctx.db())
-            .await
-            .unwrap();
+        // Simulated when its herd is, as a link makes it (op_core::sim).
+        sqlx::query(
+            "INSERT INTO collars (id, name, herd_id, state, last_seen, battery, last_fix, created_at, simulated)
+             VALUES (?1, ?2, ?3, 'inside', ?4, 0.8, ?5, ?6, COALESCE((SELECT simulated FROM herds WHERE id = ?3), 0))",
+        )
+        .bind(&id)
+        .bind(format!("C{n}"))
+        .bind(herd)
+        .bind(to_db(&seen))
+        .bind(fix.to_string())
+        // Added a day ago, so its first fit check isn't due (H's fit_check_due).
+        .bind(to_db(&(seen - Duration::days(1))))
+        .execute(self.ctx.db())
+        .await
+        .unwrap();
         if let Some(tag) = tag {
             let aid = format!("ani_{n:04}");
             sqlx::query("INSERT INTO animals (id, tag, herd_id, collar_id, created_at) VALUES (?, ?, ?, ?, ?)")

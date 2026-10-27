@@ -100,8 +100,8 @@ async fn check(app: &AppHandle, asked: bool) {
         Ok(Some(update)) => {
             state.available.lock().unwrap().replace(update.version.clone());
             let put_off = state.later.lock().unwrap().as_deref() == Some(update.version.as_str());
-            // Not in the middle of a move unasked: the next check offers it.
-            let moving = !asked && crate::work(app).await.moving();
+            // Not in the middle of a move (or when that can't be read) unasked: the next check offers it.
+            let moving = !asked && crate::work(app).await.maybe_moving();
             if moving {
                 tracing::info!(version = %update.version, "update available; not offered during a move");
             }
@@ -166,10 +166,11 @@ async fn offer(app: &AppHandle, update: Update) {
     match result {
         Ok(()) => {
             // Installed; the running copy carries on until it restarts.
-            if crate::work(app).await.moving() {
+            // Not while a move runs, nor while that can't be read.
+            if crate::work(app).await.maybe_moving() {
                 title("openpasture — restarts once the move is done");
                 tracing::info!(version = %update.version, "update installed; restarting after the move");
-                while crate::work(app).await.moving() {
+                while crate::work(app).await.maybe_moving() {
                     tokio::time::sleep(WHILE_MOVING).await;
                 }
             }

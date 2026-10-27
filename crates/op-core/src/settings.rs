@@ -53,6 +53,34 @@ pub fn validate(s: &Settings) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a settings write can't set the collar address: only the checked
+/// route does ([`crate::Ctx::set_collar_url`]).
+pub const COLLAR_URL_ELSEWHERE: &str =
+    "The collar address is set in Settings, Server, where it is checked to reach this server first (PUT /api/server/collar-address).";
+
+/// A collar address that passed op-server's reachability check (or `None`,
+/// no address). Made only by that check: hold one, and the address is fit to
+/// hand to collars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedCollarUrl(Option<String>);
+
+impl CheckedCollarUrl {
+    /// `url` just passed the full check (form, DNS, https, this server). Only
+    /// `op_server::collar_address` calls this.
+    pub fn passed(url: String) -> Self {
+        Self(Some(url))
+    }
+
+    /// No collar address: collars keep the endpoint they have.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
 /// Why a collar address can't go into collars, or `None` when its form is
 /// fine (whether it reaches this server is op-server's check). Collars talk
 /// only to `https://`, can't reach this machine's loopback, and keep the
@@ -70,7 +98,10 @@ pub fn collar_url_problem(url: &str) -> Option<String> {
         return Some(format!("{host} is this computer: a collar can't reach it. Use a named tunnel or a domain that points here."));
     }
     if host.ends_with(".trycloudflare.com") {
-        return Some("Quick-tunnel names change every time the tunnel starts, and collars keep the address they were given. Use a named tunnel or your own domain.".into());
+        return Some(
+            "Quick-tunnel names change every time the tunnel starts, and collars keep the address they were given. Use a named tunnel or your own domain."
+                .into(),
+        );
     }
     if format!("{}/collar/v1", url.trim_end_matches('/')).len() > op_protocol::config::MAX_ENDPOINT_BYTES {
         return Some("The collar address is too long for a collar to hold.".into());

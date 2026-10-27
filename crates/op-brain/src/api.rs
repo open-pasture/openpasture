@@ -24,7 +24,8 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(4);
 pub(crate) fn client() -> reqwest::Client {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     C.get_or_init(|| {
-        reqwest::Client::builder()
+        // Hosted: public addresses only at connect time, and no redirects (op_core::net).
+        op_core::net::client_builder()
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("openpasture/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -50,7 +51,10 @@ pub(crate) fn api_error(status: reqwest::StatusCode, body: &str) -> String {
 pub(crate) async fn send_json(rb: reqwest::RequestBuilder) -> anyhow::Result<Value> {
     let (client, req) = rb.build_split();
     let req = req?;
-    op_core::net::guard_url(req.url().as_str()).await.map_err(anyhow::Error::msg)?;
+    // The request's own parsed URL is what is checked and sent.
+    if op_core::net::hosted() {
+        op_core::net::check_parsed(req.url()).await.map_err(anyhow::Error::msg)?;
+    }
     let resp = client.execute(req).await.map_err(|e| anyhow::anyhow!("{}", describe(&e)))?;
     let status = resp.status();
     let body = resp.text().await?;

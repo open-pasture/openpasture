@@ -291,7 +291,7 @@ async fn decision_waiting_carries_a_code_that_stays() {
     assert_eq!(a.len(), 1);
     assert_eq!(a[0].title, "Move to P2?");
     let code = a[0].data["code"].as_str().unwrap().to_owned();
-    assert!(code.len() == 4 && code.chars().all(|c| c.is_ascii_digit()), "{code}");
+    assert!(code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()), "{code}");
     assert!(a[0].targets.contains(&("decision".into(), fresh.clone())));
     assert!(a[0].data["days"].as_f64().is_some() && a[0].data["area_ha"].as_f64().is_some());
     f.eval(t + mins(25)).await;

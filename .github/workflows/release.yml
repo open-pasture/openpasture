@@ -1,8 +1,9 @@
 name: Release
 
 # Push a tag like v0.1.0 on a commit whose version files already say 0.1.0
-# (scripts/set-version.py, then commit). The first job stops the release if
-# they disagree. See docs/RELEASING.md.
+# (scripts/set-version.py, then commit). CI runs again on the tagged commit
+# and must pass; then the first job stops the release if the versions
+# disagree. See docs/RELEASING.md.
 #
 # Actions are pinned to commit SHAs. The signing secrets live in the `release`
 # environment (a maintainer approves each run) and are given only to the steps
@@ -25,9 +26,18 @@ env:
   TAURI_CLI: "@tauri-apps/cli@2.12.4"
 
 jobs:
+  # The whole CI workflow, on exactly the tagged commit: formatting, clippy,
+  # every test on Linux and macOS, the UI, licences and advisories, protocol
+  # vectors. Nothing below runs (nothing is built, signed or published)
+  # unless it passes.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   # The tag matches the repo, and the licence notices every artefact ships.
   prepare:
     name: Version and notices
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

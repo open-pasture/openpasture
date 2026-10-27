@@ -96,3 +96,58 @@ async fn a_resent_report_stores_and_announces_nothing_new() {
     assert_eq!(count(&ctx, "SELECT SUM(fixes) FROM health").await, 3);
     assert_eq!(count(&ctx, "SELECT SUM(cues) FROM health").await, 2);
 }
+
+/// A collar linked to a herd in a paddock: its data dir, Ctx, router and key.
+async fn linked_collar() -> (tempfile::TempDir, Ctx, axum::Router, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = Ctx::open(dir.path()).await.unwrap();
+    let router = op_core::router().merge(op_ingest::router()).with_state(ctx.clone());
+    let square = json!({"type": "Polygon", "coordinates": [[at(0.0, 0.0), at(300.0, 0.0), at(300.0, 200.0), at(0.0, 200.0), at(0.0, 0.0)]]});
+    call(&router, "POST", "/api/farm", None, json!({"name": "Home", "timezone": "America/Chicago", "center": MID})).await;
+    let (_, pad) = call(&router, "POST", "/api/paddocks", None, json!({"name": "North", "geometry": square})).await;
+    let (_, herd) = call(&router, "POST", "/api/herds", None, json!({"name": "Cows", "species": "cattle", "count": 1, "paddock_id": pad["id"]})).await;
+    let (s, linked) = call(&router, "POST", "/api/collars", None, json!({"herd_id": herd["id"]})).await;
+    assert_eq!(s, StatusCode::CREATED, "{linked}");
+    let key = linked["key"].as_str().unwrap().to_owned();
+    (dir, ctx, router, key)
+}
+
+#[tokio::test]
+async fn a_different_record_at_an_instant_already_held_is_kept_and_counted() {
+    let (_dir, ctx, router, key) = linked_collar().await;
+    let now = Utc::now();
+    let ts = |d: i64| (now - Duration::seconds(d)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let first = json!({
+        "fixes": [{"at": ts(10), "point": at(150.0, 50.0), "accuracy_m": 2.0, "sats": 9}],
+        "cues": [{"at": ts(10), "kind": "warn", "level": 1, "margin_m": 1.0}],
+    });
+    let (s, v) = call(&router, "POST", "/collar/v1/report", Some(&key), first).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // The same instants with other contents (a clock step, a truncated time):
+    // both kept, both counted, the new cue announced.
+    let mut rx = ctx.subscribe();
+    let second = json!({
+        "fixes": [{"at": ts(10), "point": at(150.0, 80.0), "accuracy_m": 2.0, "sats": 9}],
+        "cues": [{"at": ts(10), "kind": "warn", "level": 2, "margin_m": 0.5}],
+    });
+    let (s, v) = call(&router, "POST", "/collar/v1/report", Some(&key), second.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(count(&ctx, "SELECT COUNT(*) FROM fixes").await, 2);
+    assert_eq!(count(&ctx, "SELECT COUNT(*) FROM cues").await, 2);
+    let mut levels = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        if let Event::Cue { level, .. } = e {
+            levels.push(level);
+        }
+    }
+    assert_eq!(levels, [2]);
+    assert_eq!(count(&ctx, "SELECT IFNULL(SUM(conflicts), 0) FROM health").await, 2);
+
+    // That report resent is a retransmission: nothing new, no conflict.
+    let (s, _) = call(&router, "POST", "/collar/v1/report", Some(&key), second).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(count(&ctx, "SELECT COUNT(*) FROM fixes").await, 2);
+    assert_eq!(count(&ctx, "SELECT COUNT(*) FROM cues").await, 2);
+    assert_eq!(count(&ctx, "SELECT IFNULL(SUM(conflicts), 0) FROM health").await, 2);
+}

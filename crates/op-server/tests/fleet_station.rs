@@ -63,7 +63,14 @@ async fn a_station_token_reaches_its_routes_and_nothing_else() {
     let (s, e) = away(&app, Some(&station), "POST", "/api/fleet/units/OCN-2611-00042/provision", None).await;
     assert_eq!(s, StatusCode::CONFLICT, "not tested yet: {e}");
 
-    for (method, path) in [("GET", "/api/fleet/units"), ("GET", "/api/fleet/units/OCN-2611-00042"), ("POST", "/api/fleet/units/OCN-2611-00042/claim"), ("GET", "/api/state"), ("GET", "/api/fleet"), ("GET", "/api/fleet/stations")] {
+    for (method, path) in [
+        ("GET", "/api/fleet/units"),
+        ("GET", "/api/fleet/units/OCN-2611-00042"),
+        ("POST", "/api/fleet/units/OCN-2611-00042/claim"),
+        ("GET", "/api/state"),
+        ("GET", "/api/fleet"),
+        ("GET", "/api/fleet/stations"),
+    ] {
         assert_eq!(away(&app, Some(&station), method, path, Some(json!({}))).await.0, StatusCode::FORBIDDEN, "{method} {path}");
     }
 

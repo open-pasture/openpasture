@@ -21,13 +21,19 @@ export interface Unit {
   device_pubkey: string; device_kid: string; device_id: string;
   radios: Radios; image_keys?: string[]; caps?: string[];
   state: UnitState; origin: "station" | "card"; station?: string; claim_code?: string;
+  // Goes up on RMA, retire or a new key; only runs of this generation count.
+  generation: number; generation_at?: string;
+  // The claim code was checked here (drawn here, or matched the factory record).
+  claim_checked: boolean;
   collar_id?: string; herd_id?: string;
-  last_test?: { id: string; result: "pass" | "fail"; plan_id: string; plan_version: number; finished_at: string };
+  // The run that decides provisioning: latest by the server's order, this generation, counted.
+  last_test?: { id: string; result: "pass" | "fail"; plan_id: string; plan_version: number; finished_at: string; seq: number };
   maker?: string; maker_kid?: string; maker_verified: boolean; made_at?: string;
   provisioned_at?: string; claimed_at?: string; created_at: string; updated_at: string;
 }
 export interface RecordView { cose: string; record: Record<string, unknown>; maker_kid: string; verified: boolean }
 export interface UnitEvent { at: string; kind: string; detail: Record<string, unknown>; by?: string }
+export interface UnitPage { units: Unit[]; total: number; next?: string }
 export interface UnitDetail {
   unit: Unit; factory_record?: RecordView; runs: TestRun[]; events: UnitEvent[];
   keys: { device_pubkey: string; device_kid: string; from: string; to?: string }[];
@@ -45,6 +51,8 @@ export interface JudgedStep {
 export interface TestRun {
   id: string; serial: string; plan_id: string; plan_version: number; station?: string; fixture_id?: string;
   started_at: string; finished_at: string; received_at: string; result: "pass" | "fail"; failed: string[]; steps: JudgedStep[];
+  // seq: the server's order. counted: false for a late pass or one from before the unit came back.
+  seq: number; generation: number; counted: boolean; run_key?: string;
 }
 
 export interface Provisioning {
@@ -55,6 +63,7 @@ export interface Provisioning {
 export interface Claimed {
   unit: Unit; collar: Collar;
   v1: { key: string; public_key: string; endpoint?: string; line?: string; why?: string };
+  code_checked: boolean; reclaimed?: boolean;
 }
 
 export interface Rate { units: number; passed: number; rate: number }
@@ -62,7 +71,11 @@ export interface StepYield {
   name: string; required: boolean; runs: number; pass: number; fail: number; skip: number; missing: number; rate: number;
   values?: { n: number; min: number; p50: number; max: number; mean: number; unit?: string };
 }
-export interface Yield { plan_id: string; plan_version?: number; runs: number; units: number; first_pass: Rate; final: Rate; steps: StepYield[]; failures: { name: string; fail: number }[] }
+export interface Yield {
+  plan_id: string; plan_version: number; runs: number; units: number; first_pass: Rate; final: Rate; steps: StepYield[]; failures: { name: string; fail: number }[];
+  // Runs judged by other versions of the plan: never in the numbers above.
+  other_versions: { plan_version: number; runs: number }[];
+}
 export interface Throughput {
   from: string; to: string; bucket: "hour" | "day";
   stations: { station: string; runs: number; units: number; pass: number; fail: number; cycle_s_p50?: number; buckets: { at: string; runs: number; pass: number; fail: number }[] }[];
@@ -121,7 +134,7 @@ const enc = encodeURIComponent;
 const unitPath = (serial: string, rest = "") => `/api/fleet/units/${enc(serial)}${rest}`;
 
 export const fleet = {
-  units: (q: { state?: string; device_class?: string; station?: string; q?: string; limit?: number } = {}) => get<Unit[]>("/api/fleet/units", q),
+  units: (q: { state?: string; device_class?: string; station?: string; q?: string; limit?: number; cursor?: string } = {}) => get<UnitPage>("/api/fleet/units", q),
   unit: (serial: string) => get<UnitDetail>(unitPath(serial)),
   setState: (serial: string, state: "retired" | "rma", note?: string) => post<Unit>(unitPath(serial, "/state"), { state, note }),
   provision: (serial: string, b: { claim_code?: string; rotate_claim?: boolean } = {}) => post<Provisioning>(unitPath(serial, "/provision"), b),

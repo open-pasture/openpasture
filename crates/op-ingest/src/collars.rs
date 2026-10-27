@@ -45,7 +45,8 @@ async fn require_herd(ctx: &Ctx, herd_id: &str) -> ApiResult<()> {
 struct NewCollar {
     name: Option<String>,
     herd_id: String,
-    /// Linked by the simulator (`simulation/collar-sim`); never cleared.
+    /// Linked by the simulator (`simulation/collar-sim`). Only a simulated
+    /// herd takes it, and a simulated herd takes nothing else (`op_core::sim`).
     #[serde(default)]
     simulated: bool,
 }
@@ -78,6 +79,9 @@ fn clean_name(name: &str) -> ApiResult<String> {
 /// server's public key for checking boundary signatures.
 async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> ApiResult<(StatusCode, Json<Linked>)> {
     require_herd(&ctx, &body.herd_id).await?;
+    if op_core::sim::herd_is_simulated(ctx.db(), &body.herd_id).await? != body.simulated {
+        return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+    }
     let name = match body.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => clean_name(n)?,
         None => format!("Collar {}", db::list_collars(ctx.db(), Some(&body.herd_id)).await?.len() + 1),
@@ -85,9 +89,6 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
     let collar_id = id::new_id(id::COLLAR);
     let key = keys::new_collar_key();
     db::insert_collar(ctx.db(), &collar_id, &name, &body.herd_id, &keys::hash_key(&key)).await?;
-    if body.simulated {
-        sqlx::query("UPDATE collars SET simulated = 1 WHERE id = ?").bind(&collar_id).execute(ctx.db()).await?;
-    }
     let collar = find(&ctx, &collar_id).await?;
     tracing::info!(collar = %collar.id, "collar linked");
     ctx.publish(Event::Collar { collar: collar.clone() });
@@ -100,11 +101,15 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
 /// report landing at the same time keeps its telemetry.
 async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
-    let immutable = ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason", "simulated"];
+    let immutable =
+        ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason", "simulated"];
     let mut next: Collar = patch::apply(&current, &body, &immutable)?;
     next.name = clean_name(&next.name)?;
     if next.herd_id != current.herd_id {
         require_herd(&ctx, &next.herd_id).await?;
+        if op_core::sim::herd_is_simulated(ctx.db(), &next.herd_id).await? != current.simulated {
+            return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+        }
     }
     if next.animal_id != current.animal_id {
         link_animal(&ctx, &current, next.animal_id.as_deref()).await?;
@@ -157,7 +162,7 @@ async fn hand_over(ctx: &Ctx, collar_id: &str, applied: Option<u32>, heard: bool
         return Ok(());
     }
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let copies = crate::escapes::hand_copies(&mut tx, &collar, at).await?;
+    let copies = crate::escapes::hand_copies(&mut tx, ctx, &collar, at).await?;
     tx.commit().await?;
     tracing::info!(collar = %collar_id, herd = %collar.herd_id, holds = ?holds, copies = ?copies.iter().map(|b| b.version).collect::<Vec<_>>(), "moved collar: its new herd's boundaries as its own copies");
     Ok(())
@@ -306,6 +311,10 @@ pub struct NewLinked {
 /// put on its animal when one is named. All or none: one write transaction.
 pub async fn create_linked_collars(ctx: &Ctx, herd_id: &str, items: &[NewLinked]) -> ApiResult<Vec<(Collar, String)>> {
     require_herd(ctx, herd_id).await?;
+    // These are real collars; a simulated herd takes only the simulator's.
+    if op_core::sim::herd_is_simulated(ctx.db(), herd_id).await? {
+        return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+    }
     let mut made = Vec::with_capacity(items.len());
     for it in items {
         made.push((id::new_id(id::COLLAR), clean_name(&it.name)?, keys::new_collar_key(), it.animal_id.clone()));

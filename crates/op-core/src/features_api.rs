@@ -46,8 +46,9 @@ impl Filter {
 }
 
 fn parse_kind(s: &str) -> ApiResult<FeatureKind> {
-    FeatureKind::from_db(s)
-        .map_err(|_| ApiError::bad_request(format!("Unknown kind {s}. Use exclusion, no_go, water, gate, shade, hazard, road, neighbour_line or farm_boundary.")))
+    FeatureKind::from_db(s).map_err(|_| {
+        ApiError::bad_request(format!("Unknown kind {s}. Use exclusion, no_go, water, gate, shade, hazard, road, neighbour_line or farm_boundary."))
+    })
 }
 
 async fn list(State(ctx): State<Ctx>, Query(q): Query<HashMap<String, String>>) -> ApiResult<Json<Vec<MapFeature>>> {

@@ -109,14 +109,40 @@ pub fn snapshot_dir(db_path: &Path) -> std::path::PathBuf {
     db_path.parent().unwrap_or(Path::new(".")).join(SNAPSHOT_DIR)
 }
 
-/// A consistent copy of the database (`VACUUM INTO`) named for the time and
-/// the newest migration it holds, then all but the newest
+/// A consistent copy of the database named for the time and the newest
+/// migration it holds, readable only by the owner; then all but the newest
 /// [`SNAPSHOTS_KEPT`] snapshots are deleted.
+///
+/// The copy is of the database file itself, taken with the WAL emptied and
+/// writers held off: on APFS, btrfs and XFS that is a copy-on-write clone,
+/// elsewhere a plain file copy, either way far quicker than `VACUUM INTO`
+/// (which rebuilds every table and index: 34 s of a 76 s upgrade at 250
+/// collars x 30 days). If the WAL can't be emptied it falls back to `VACUUM
+/// INTO`. A copy that fails (a full disk) leaves nothing behind.
 pub async fn snapshot(pool: &SqlitePool, dir: &Path, version: i64) -> anyhow::Result<std::path::PathBuf> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::perms::private_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
     let file = dir.join(format!("{SNAPSHOT_PREFIX}{stamp}-v{version:04}.db"));
-    sqlx::query("VACUUM INTO ?").bind(file.to_string_lossy().into_owned()).execute(pool).await.with_context(|| format!("writing {}", file.display()))?;
+    let tmp = dir.join(format!(".{SNAPSHOT_PREFIX}{stamp}.tmp"));
+    let taken = copy_db(pool, &tmp).await;
+    let taken = match taken {
+        Ok(true) => Ok(()),
+        Ok(false) => vacuum_into(pool, &tmp).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = taken {
+        let _ = std::fs::remove_file(&tmp);
+        let need = db_file(pool).await.ok().flatten().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+        return Err(match (need, free_bytes(dir)) {
+            (Some(need), Some(free)) if free < need => {
+                e.context(format!("not enough disk space for the snapshot: it needs about {} MB, {} MB are free", need >> 20, free >> 20))
+            }
+            _ => e,
+        })
+        .with_context(|| format!("writing {}", file.display()));
+    }
+    crate::perms::private_file(&tmp);
+    std::fs::rename(&tmp, &file).with_context(|| format!("writing {}", file.display()))?;
     let mut old: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(SNAPSHOT_PREFIX) && n.ends_with(".db")))
@@ -131,6 +157,128 @@ pub async fn snapshot(pool: &SqlitePool, dir: &Path, version: i64) -> anyhow::Re
     Ok(file)
 }
 
+/// The main database file of `pool`, if it is a file.
+async fn db_file(pool: &SqlitePool) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list").fetch_all(pool).await?;
+    Ok(rows.into_iter().find(|r| r.1 == "main").map(|r| std::path::PathBuf::from(r.2)).filter(|p| !p.as_os_str().is_empty()))
+}
+
+/// Copy the database file to `to` with the WAL empty and a write lock held,
+/// so the file alone is the whole database. False when the WAL couldn't be
+/// emptied (a reader held it) and nothing was copied.
+async fn copy_db(pool: &SqlitePool, to: &Path) -> anyhow::Result<bool> {
+    let Some(src) = db_file(pool).await? else { return Ok(false) };
+    let wal = std::path::PathBuf::from(format!("{}-wal", src.display()));
+    let mut conn = pool.acquire().await?;
+    let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)").fetch_one(&mut *conn).await?;
+    if busy != 0 {
+        return Ok(false);
+    }
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    // Nobody committed between the checkpoint and the lock: the WAL is empty.
+    let empty = std::fs::metadata(&wal).map(|m| m.len() == 0).unwrap_or(true);
+    let copied = if empty {
+        let (from, to) = (src.clone(), to.to_path_buf());
+        tokio::task::spawn_blocking(move || std::fs::copy(&from, &to)).await?.map(|_| true).with_context(|| format!("copying {}", src.display()))
+    } else {
+        Ok(false)
+    };
+    sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+    copied
+}
+
+async fn vacuum_into(pool: &SqlitePool, to: &Path) -> anyhow::Result<()> {
+    // VACUUM INTO accepts an empty file, so it can be created private.
+    crate::perms::create_private(to)?;
+    sqlx::query("VACUUM INTO ?").bind(to.to_string_lossy().into_owned()).execute(pool).await?;
+    Ok(())
+}
+
+/// Free space on the disk holding `path`, where the OS says.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statvfs.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    #[allow(clippy::unnecessary_cast)] // the field types differ by platform
+    (rc == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Where opening the database is: `/healthz` shows it while the server
+/// waits on a long upgrade.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenProgress {
+    /// `opening`, `snapshot` (copying the database before upgrading it),
+    /// `migrating`, or `ready`.
+    pub phase: &'static str,
+    /// Migrations still to run, when upgrading.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<i64>,
+    /// When this phase began.
+    pub since: chrono::DateTime<chrono::Utc>,
+    pub db_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+}
+
+impl Default for OpenProgress {
+    fn default() -> Self {
+        Self { phase: "opening", pending: Vec::new(), since: crate::time::now(), db_bytes: 0, free_bytes: None }
+    }
+}
+
+/// Shared with whoever reports it.
+pub type Progress = std::sync::Arc<std::sync::Mutex<OpenProgress>>;
+
+fn set_phase(progress: Option<&Progress>, phase: &'static str, f: impl FnOnce(&mut OpenProgress)) {
+    if let Some(p) = progress {
+        let mut p = p.lock().unwrap_or_else(|e| e.into_inner());
+        p.phase = phase;
+        p.since = crate::time::now();
+        f(&mut p);
+    }
+}
+
+/// sqlx's checksum (SHA-384 of the file) of 0890 as it was on the
+/// prod/readiness branch before release, when it deduped by time alone.
+/// A database a branch build opened has it applied; [`fix_prerelease_0890`]
+/// brings it to the released 0890.
+const PRERELEASE_0890: &str = "e7c7a75c791f87cf9468690756772dd6542951290f02b2d0b3041fb3c5b8ee5ae15eb1e61e342d8c783a2449c0ccb023";
+
+async fn fix_prerelease_0890(pool: &SqlitePool) -> anyhow::Result<()> {
+    let applied: Option<Vec<u8>> = sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 890").fetch_optional(pool).await.unwrap_or(None);
+    let hex: String = applied.unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect();
+    if hex != PRERELEASE_0890 {
+        return Ok(());
+    }
+    let Some(now) = MIGRATOR.iter().find(|m| m.version == 890 && !m.migration_type.is_down_migration()) else { return Ok(()) };
+    tracing::info!("bringing a pre-release report-idempotency migration (0890) up to date");
+    let mut tx = pool.begin().await?;
+    for stmt in [
+        "ALTER TABLE health ADD COLUMN conflicts INTEGER",
+        "CREATE TABLE collar_records (collar_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, t INTEGER NOT NULL, PRIMARY KEY (collar_id, seq)) WITHOUT ROWID",
+        // Its seq columns stay (unused); their indexes and the time-only keys go.
+        "DROP INDEX IF EXISTS fixes_collar_seq",
+        "DROP INDEX IF EXISTS cues_collar_seq",
+        "DROP INDEX IF EXISTS fixes_collar_t",
+        "CREATE INDEX fixes_collar_t ON fixes(collar_id, t)",
+        "DROP INDEX IF EXISTS cues_collar_t_kind",
+        "CREATE UNIQUE INDEX cues_collar_t_same ON cues(collar_id, t, IFNULL(kind, ''), level, margin_m, IFNULL(lon, 0), IFNULL(lat, 0))",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.with_context(|| format!("updating 0890: {stmt}"))?;
+    }
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 890").bind(now.checksum.as_ref()).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -143,6 +291,11 @@ impl Store {
     }
 
     pub async fn open_file(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with(path, None).await
+    }
+
+    /// [`Store::open_file`], saying where it is in `progress`.
+    pub async fn open_with(path: &Path, progress: Option<&Progress>) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -158,6 +311,11 @@ impl Store {
             .connect_with(opts)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
+        // The database and its WAL and shared-memory files hold the app
+        // token and every farm record: owner-only, whatever the umask.
+        for suffix in ["", "-wal", "-shm"] {
+            crate::perms::private_file(Path::new(&format!("{}{suffix}", path.display())));
+        }
         let status = migration_status(&pool).await?;
         let snapshots = snapshot_dir(path);
         if !status.unknown.is_empty() {
@@ -170,15 +328,39 @@ impl Store {
                 snapshots.display()
             );
         }
+        let upgrading = !status.applied.is_empty() && !status.pending.is_empty();
+        let db_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if let Some(&from) = status.applied.iter().max()
             && !status.pending.is_empty()
         {
+            let free = free_bytes(path.parent().unwrap_or(Path::new(".")));
+            set_phase(progress, "snapshot", |p| {
+                p.pending = status.pending.clone();
+                p.db_bytes = db_bytes;
+                p.free_bytes = free;
+            });
+            tracing::info!(pending = ?status.pending, db_mb = db_bytes >> 20, free_mb = free.map(|f| f >> 20), "snapshotting the database before upgrading it");
+            let started = std::time::Instant::now();
             let file = snapshot(&pool, &snapshots, from).await.context("snapshotting the database before upgrading it")?;
-            tracing::info!(snapshot = %file.display(), pending = ?status.pending, "database snapshot taken before migrating");
+            tracing::info!(snapshot = %file.display(), ms = started.elapsed().as_millis() as u64, "database snapshot taken before migrating");
         }
+        if status.applied.contains(&890) {
+            fix_prerelease_0890(&pool).await?;
+        }
+        if !status.pending.is_empty() {
+            set_phase(progress, "migrating", |p| {
+                p.pending = status.pending.clone();
+                p.db_bytes = db_bytes;
+            });
+        }
+        let started = std::time::Instant::now();
         MIGRATOR.run(&pool).await.context("running migrations")?;
+        if upgrading {
+            tracing::info!(ms = started.elapsed().as_millis() as u64, migrations = ?status.pending, "database upgraded");
+        }
         // Start with an empty WAL rather than one holding every migration's pages.
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await.context("checkpointing after migrations")?;
+        set_phase(progress, "ready", |p| p.pending.clear());
         Ok(Self { pool })
     }
 
@@ -279,17 +461,25 @@ impl Store {
     }
 
     pub async fn insert_herd(&self, h: &Herd) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO herds (id, name, species, count, paddock_id, autonomy, timer_minutes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&h.id)
-            .bind(&h.name)
-            .bind(h.species.as_db())
-            .bind(h.count as i64)
-            .bind(&h.paddock_id)
-            .bind(h.autonomy.as_db())
-            .bind(h.timer_minutes as i64)
-            .bind(to_db(&h.created_at))
-            .execute(&self.pool)
-            .await?;
+        self.insert_herd_as(h, false).await
+    }
+
+    /// A new herd, simulated or real for good (`crate::sim`).
+    pub async fn insert_herd_as(&self, h: &Herd, simulated: bool) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO herds (id, name, species, count, paddock_id, autonomy, timer_minutes, created_at, simulated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&h.id)
+        .bind(&h.name)
+        .bind(h.species.as_db())
+        .bind(h.count as i64)
+        .bind(&h.paddock_id)
+        .bind(h.autonomy.as_db())
+        .bind(h.timer_minutes as i64)
+        .bind(to_db(&h.created_at))
+        .bind(simulated)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

@@ -425,3 +425,34 @@ async fn the_token_rides_in_the_subprotocol_not_the_url() {
     assert!(tokio_tungstenite::connect_async(from_elsewhere("")).await.is_err(), "no token from elsewhere is refused");
     handle.shutdown().await.unwrap();
 }
+
+/// Astra 02 F15: an owner session's socket closes when they sign out, and an
+/// app-token socket when the token is rotated: every credential is checked
+/// again while its socket is open, not only a person's token.
+#[tokio::test]
+async fn signing_out_or_rotating_the_app_token_closes_open_sockets() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let dir = tempfile::tempdir().unwrap();
+    let handle = op_server::serve(op_server::ServeOptions { data_dir: Some(dir.path().into()), free_port: true, ..Default::default() }).await.unwrap();
+    let http = reqwest::Client::new();
+    let url = handle.sign_in_url("test").await.unwrap();
+    let code = url.rsplit('/').next().unwrap().to_owned();
+    let v: Value = http.post(format!("{}/api/session", handle.url())).json(&json!({ "code": code })).send().await.unwrap().json().await.unwrap();
+    let session = v["token"].as_str().unwrap().to_owned();
+    let app_token = handle.ctx().settings().await.unwrap().server.app_token;
+    let open = |token: &str| {
+        let mut req = format!("{}/api/live", handle.url().replace("http://", "ws://")).into_client_request().unwrap();
+        req.headers_mut().insert("sec-websocket-protocol", format!("openpasture, openpasture.token.{token}").parse().unwrap());
+        req
+    };
+    let (mut owner_ws, _) = tokio_tungstenite::connect_async(open(&session)).await.unwrap();
+    let (mut app_ws, _) = tokio_tungstenite::connect_async(open(&app_token)).await.unwrap();
+    assert!(!closed_within(&mut owner_ws, op_server::live::SESSION_CHECK + Duration::from_secs(1)).await, "open while signed in");
+    let out = http.delete(format!("{}/api/session", handle.url())).bearer_auth(&session).send().await.unwrap();
+    assert_eq!(out.status(), 204);
+    assert!(closed_within(&mut owner_ws, op_server::live::SESSION_CHECK + Duration::from_secs(2)).await, "closed once signed out");
+    let rotated = http.post(format!("{}/api/settings/app-token/rotate", handle.url())).bearer_auth(&app_token).send().await.unwrap();
+    assert!(rotated.status().is_success(), "{}", rotated.status());
+    assert!(closed_within(&mut app_ws, op_server::live::SESSION_CHECK + Duration::from_secs(2)).await, "closed once rotated");
+    handle.shutdown().await.unwrap();
+}

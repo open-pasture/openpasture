@@ -90,13 +90,15 @@ async fn a_released_database_upgrades_after_a_snapshot_and_keeps_its_data() {
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, -93.62, 42.03, 3.0),
             ('col_1', 'herd_1', '2026-01-02T00:00:00.000Z', 1767312000000, -93.62, 42.03, 3.0),
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, -93.62, 42.03, 3.0),
-            ('col_2', 'herd_1', '2026-01-02T00:00:00.000Z', 1767312000000, -93.61, 42.03, 3.0)"
+            ('col_2', 'herd_1', '2026-01-02T00:00:00.000Z', 1767312000000, -93.61, 42.03, 3.0),
+            ('col_2', 'herd_1', '2026-01-02T00:00:00.000Z', 1767312000000, -93.60, 42.03, 3.0)"
             .into(),
         "INSERT INTO cues (collar_id, herd_id, at, t, level, margin_m, kind) VALUES
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, 1, 2.0, 'warn'),
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, 3, -1.0, 'outside'),
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, 1, 2.0, 'warn'),
             ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, 3, -1.0, 'outside'),
+            ('col_1', 'herd_1', '2026-01-02T00:01:00.000Z', 1767312060000, 2, 1.0, 'warn'),
             ('col_1', 'herd_1', '2026-01-02T00:02:00.000Z', 1767312120000, 1, 2.0, NULL),
             ('col_1', 'herd_1', '2026-01-02T00:02:00.000Z', 1767312120000, 1, 2.0, NULL),
             ('col_1', 'herd_1', '2026-01-02T00:02:00.000Z', 1767312120000, 3, -1.0, NULL)"
@@ -114,34 +116,57 @@ async fn a_released_database_upgrades_after_a_snapshot_and_keeps_its_data() {
     // The snapshot is the released database as it was.
     let snap = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(dir.path().join(SNAPSHOT_DIR).join(&snaps[0]))).await.unwrap();
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixes").fetch_one(&snap).await.unwrap();
-    assert_eq!(n, 5);
+    assert_eq!(n, 6);
     let max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations").fetch_one(&snap).await.unwrap();
     assert_eq!(max, 880);
     snap.close().await;
 
-    // Upgraded: data read back through the current code, duplicates gone.
+    // Owner-only, whatever the umask: the data dir, the database and the snapshot.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&dir.path().join(DB_FILE)), 0o600);
+        assert_eq!(mode(&dir.path().join(SNAPSHOT_DIR)), 0o700);
+        assert_eq!(mode(&dir.path().join(SNAPSHOT_DIR).join(&snaps[0])), 0o600);
+    }
+
+    // Upgraded: data read back through the current code, identical copies
+    // gone, a different fix or cue at the same instant kept.
     assert_eq!(ctx.store().get_farm().await.unwrap().unwrap().name, "Old farm");
     assert_eq!(ctx.store().list_herds().await.unwrap().len(), 1);
     let s = ctx.settings().await.unwrap();
     assert_eq!((s.server.app_token.as_str(), s.decision_time.as_str()), (token, "05:30"));
     let fixes: Vec<(String, i64)> = sqlx::query_as("SELECT collar_id, t FROM fixes ORDER BY collar_id, t").fetch_all(ctx.db()).await.unwrap();
-    assert_eq!(fixes, [("col_1".into(), 1767312000000), ("col_1".into(), 1767312060000), ("col_2".into(), 1767312000000)]);
+    assert_eq!(fixes, [("col_1".into(), 1767312000000), ("col_1".into(), 1767312060000), ("col_2".into(), 1767312000000), ("col_2".into(), 1767312000000)]);
+    let lons: Vec<f64> = sqlx::query_scalar("SELECT lon FROM fixes WHERE collar_id = 'col_2' ORDER BY id").fetch_all(ctx.db()).await.unwrap();
+    assert_eq!(lons, [-93.61, -93.60], "the conflicting fix survives the upgrade");
     // Firmware 0.1's cues have no kind: a warn and an outside (by margin) at one instant are two.
     let cues: Vec<(i64, Option<String>, i64)> = sqlx::query_as("SELECT t, kind, level FROM cues ORDER BY t, kind, level").fetch_all(ctx.db()).await.unwrap();
-    assert_eq!(cues, [(1767312060000, Some("outside".into()), 3), (1767312060000, Some("warn".into()), 1), (1767312120000, None, 1), (1767312120000, None, 3)]);
+    assert_eq!(
+        cues,
+        [
+            (1767312060000, Some("outside".into()), 3),
+            (1767312060000, Some("warn".into()), 1),
+            (1767312060000, Some("warn".into()), 2),
+            (1767312120000, None, 1),
+            (1767312120000, None, 3)
+        ]
+    );
 
-    // A resent fix or cue is now stored once.
-    let again = "INSERT INTO fixes (collar_id, herd_id, at, t, lon, lat, accuracy_m) VALUES ('col_1', 'herd_1', '2026-01-02T00:00:00.000Z', 1767312000000, -93.62, 42.03, 3.0) ON CONFLICT DO NOTHING";
-    assert_eq!(sqlx::query(again).execute(ctx.db()).await.unwrap().rows_affected(), 0);
+    // A resent cue is now stored once (fixes: by ingest, op-ingest tests/replay.rs).
     let legacy =
         "INSERT INTO cues (collar_id, at, t, level, margin_m) VALUES ('col_1', '2026-01-02T00:02:00.000Z', 1767312120000, 1, 2.0) ON CONFLICT DO NOTHING";
     assert_eq!(sqlx::query(legacy).execute(ctx.db()).await.unwrap().rows_affected(), 0);
-    // A record the collar numbered is unique by its number too, whatever its time.
-    let seq = |t: i64| {
-        format!(
-            "INSERT INTO fixes (collar_id, at, t, lon, lat, accuracy_m, seq) VALUES ('col_3', '2026-01-02T00:00:00.000Z', {t}, -93.6, 42.0, 3.0, 7) ON CONFLICT DO NOTHING"
-        )
-    };
+    // A different cue at an instant already held is a conflict, stored.
+    let other =
+        "INSERT INTO cues (collar_id, at, t, level, margin_m) VALUES ('col_1', '2026-01-02T00:02:00.000Z', 1767312120000, 2, 0.5) ON CONFLICT DO NOTHING";
+    assert_eq!(sqlx::query(other).execute(ctx.db()).await.unwrap().rows_affected(), 1);
+    let conflicts: Option<i64> = sqlx::query_scalar("SELECT conflicts FROM health LIMIT 1").fetch_optional(ctx.db()).await.unwrap().flatten();
+    assert_eq!(conflicts, None, "health.conflicts exists");
+    // A record the collar numbered (v2) is stored once by its number, whatever its time.
+    let seq = |t: i64| format!("INSERT INTO collar_records (collar_id, seq, type, t) VALUES ('col_3', 7, 'status', {t}) ON CONFLICT DO NOTHING");
     assert_eq!(sqlx::query(&seq(1)).execute(ctx.db()).await.unwrap().rows_affected(), 1);
     assert_eq!(sqlx::query(&seq(2)).execute(ctx.db()).await.unwrap().rows_affected(), 0);
     drop(ctx);
@@ -189,4 +214,102 @@ async fn a_database_from_a_newer_release_is_refused_with_a_way_back() {
     pool.close().await;
     let err = format!("{:#}", Ctx::open(dir.path()).await.err().expect("refused"));
     assert!(err.contains("newer openpasture") && err.contains("99999") && err.contains(SNAPSHOT_DIR), "{err}");
+}
+
+#[test]
+fn migration_versions_are_unique() {
+    let mut seen = std::collections::BTreeMap::new();
+    for m in MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()) {
+        if let Some(other) = seen.insert(m.version, m.description.clone()) {
+            panic!(
+                "migrations {:04}_{} and {:04}_{} share a version: every database would fail to open; renumber one",
+                m.version, other, m.version, m.description
+            );
+        }
+    }
+}
+
+/// 0890 as the prod/readiness branch had it before release (time-only dedupe).
+const PRERELEASE_0890: &str = "
+DELETE FROM fixes WHERE EXISTS (SELECT 1 FROM fixes f WHERE f.collar_id = fixes.collar_id AND f.t = fixes.t AND f.id < fixes.id);
+DROP INDEX IF EXISTS fixes_collar_t;
+CREATE UNIQUE INDEX fixes_collar_t ON fixes(collar_id, t);
+CREATE UNIQUE INDEX cues_collar_t_kind ON cues(collar_id, t, COALESCE(kind, CASE WHEN margin_m < 0 THEN 'outside' ELSE 'warn' END));
+ALTER TABLE fixes ADD COLUMN seq INTEGER;
+ALTER TABLE cues ADD COLUMN seq INTEGER;
+CREATE UNIQUE INDEX fixes_collar_seq ON fixes(collar_id, seq) WHERE seq IS NOT NULL;
+CREATE UNIQUE INDEX cues_collar_seq ON cues(collar_id, seq) WHERE seq IS NOT NULL;
+";
+
+#[tokio::test]
+async fn a_branch_database_with_the_prerelease_0890_is_brought_up_to_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = released_db(dir.path()).await;
+    sqlx::raw_sql(PRERELEASE_0890).execute(&pool).await.unwrap();
+    let old_sum: Vec<u8> = (0..48)
+        .map(|i| {
+            u8::from_str_radix(&"e7c7a75c791f87cf9468690756772dd6542951290f02b2d0b3041fb3c5b8ee5ae15eb1e61e342d8c783a2449c0ccb023"[i * 2..i * 2 + 2], 16)
+                .unwrap()
+        })
+        .collect();
+    sqlx::query("INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time) VALUES (890, 'report idempotency', CURRENT_TIMESTAMP, 1, ?, 0)")
+        .bind(old_sum)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let ctx = Ctx::open(dir.path()).await.expect("opens instead of 'migration 890 was previously applied but has been modified'");
+    let sum: Vec<u8> = sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 890").fetch_one(ctx.db()).await.unwrap();
+    assert_eq!(sum, MIGRATOR.iter().find(|m| m.version == 890).unwrap().checksum.to_vec());
+    // Its keys are the released ones: a different fix or cue at one instant is kept.
+    for lon in [-93.62, -93.61] {
+        let sql = "INSERT INTO fixes (collar_id, at, t, lon, lat, accuracy_m) VALUES ('c', '2026-01-02T00:00:00.000Z', 1, ?, 42.0, 3.0) ON CONFLICT DO NOTHING";
+        assert_eq!(sqlx::query(sql).bind(lon).execute(ctx.db()).await.unwrap().rows_affected(), 1);
+    }
+    for level in [1, 2, 2] {
+        sqlx::query(
+            "INSERT INTO cues (collar_id, at, t, level, margin_m, kind) VALUES ('c', '2026-01-02T00:00:00.000Z', 1, ?, 1.0, 'warn') ON CONFLICT DO NOTHING",
+        )
+        .bind(level)
+        .execute(ctx.db())
+        .await
+        .unwrap();
+    }
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cues WHERE collar_id = 'c'").fetch_one(ctx.db()).await.unwrap();
+    assert_eq!(n, 2);
+    let _: Option<i64> = sqlx::query_scalar("SELECT conflicts FROM health LIMIT 1").fetch_optional(ctx.db()).await.unwrap().flatten();
+    let _: Option<i64> = sqlx::query_scalar("SELECT seq FROM collar_records LIMIT 1").fetch_optional(ctx.db()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_snapshot_that_cant_be_written_stops_the_upgrade_and_leaves_the_database_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    released_db(dir.path()).await.close().await;
+    // Something in the way of the backups folder (as a full disk would stop the copy).
+    std::fs::write(dir.path().join(SNAPSHOT_DIR), b"not a folder").unwrap();
+    let err = format!("{:#}", Ctx::open(dir.path()).await.err().expect("refused"));
+    assert!(err.contains("snapshot"), "{err}");
+    let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(dir.path().join(DB_FILE))).await.unwrap();
+    let max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
+    assert_eq!(max, 880, "nothing migrated without a snapshot");
+    pool.close().await;
+    // Cleared, it upgrades.
+    std::fs::remove_file(dir.path().join(SNAPSHOT_DIR)).unwrap();
+    let ctx = Ctx::open(dir.path()).await.unwrap();
+    assert_eq!(snapshots(dir.path()).len(), 1);
+    assert!(op_core::store::migration_status(ctx.db()).await.unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn opening_reports_its_progress_and_ends_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    released_db(dir.path()).await.close().await;
+    let opening = Ctx::begin_open(dir.path()).unwrap();
+    let progress = opening.progress();
+    assert_eq!(progress.lock().unwrap().phase, "opening");
+    let _ctx = opening.finish().await.unwrap();
+    let p = progress.lock().unwrap().clone();
+    assert_eq!(p.phase, "ready");
+    assert!(p.pending.is_empty() && p.db_bytes > 0, "{p:?}");
 }

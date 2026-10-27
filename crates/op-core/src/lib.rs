@@ -11,6 +11,7 @@ pub mod instance;
 pub mod keys;
 pub mod net;
 pub mod patch;
+pub mod perms;
 mod routes;
 pub mod secrets;
 pub mod settings;

@@ -20,7 +20,8 @@ async fn the_collar_address_is_checked_before_it_is_saved() {
     let body: Value = res.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("https://"), "{body}");
 
-    let check: Value = http.post(url("/api/server/collar-address/check")).json(&json!({"url": "https://127.0.0.1"})).send().await.unwrap().json().await.unwrap();
+    let check: Value =
+        http.post(url("/api/server/collar-address/check")).json(&json!({"url": "https://127.0.0.1"})).send().await.unwrap().json().await.unwrap();
     assert_eq!((check["ok"].as_bool(), check["failed"].as_str()), (Some(false), Some("address")), "{check}");
 
     let res = http.put(url("/api/server/collar-address")).json(&json!({"url": "https://collar-address-check.invalid"})).send().await.unwrap();
@@ -30,8 +31,30 @@ async fn the_collar_address_is_checked_before_it_is_saved() {
     // The nonce route answers only for a check in flight.
     assert_eq!(http.get(url("/collar/v1/reach/nope")).send().await.unwrap().status(), 404);
 
+    // Astra 6, 03 P1-01: a generic settings write set an unreachable address
+    // (200), and the next collar linked was handed it. Now only the checked
+    // route sets it, whatever the generic write is.
+    for body in [json!({"server": {"collar_url": "https://unreachable-review.invalid"}}), json!({"server": {"collar_url": null}, "decision_time": "06:30"})] {
+        let res = http.put(url("/api/settings")).json(&body).send().await.unwrap();
+        assert!(res.status() == 409 || body["server"]["collar_url"].is_null(), "{body}: {}", res.status());
+    }
+    assert_eq!(handle.ctx().settings().await.unwrap().server.collar_url, None, "a generic write sets no collar address");
+    let err = handle.ctx().update_settings(&json!({"server": {"collar_url": "https://unreachable-review.invalid"}})).await.unwrap_err();
+    assert_eq!(err.status.as_u16(), 409);
+
     // Cleared with null.
-    handle.ctx().update_settings(&json!({"server": {"collar_url": "https://farm.example.com"}})).await.unwrap();
+    handle.ctx().set_collar_url(&op_core::settings::CheckedCollarUrl::passed("https://farm.example.com".into())).await.unwrap();
+    // A generic write that leaves it as it is still saves; one that changes it doesn't.
+    let res =
+        http.put(url("/api/settings")).json(&json!({"server": {"collar_url": "https://farm.example.com"}, "decision_time": "07:00"})).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    for body in [json!({"server": {"collar_url": null}}), json!({"server": {"collar_url": "https://other.example.com"}})] {
+        let res = http.put(url("/api/settings")).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 409, "{body}");
+    }
+    assert_eq!(handle.ctx().settings().await.unwrap().server.collar_url.as_deref(), Some("https://farm.example.com"));
+    let status: Value = http.get(url("/api/server/collar-address")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(status, json!({"collar_url": "https://farm.example.com", "moving": [], "fixed": 0}));
     let res = http.put(url("/api/server/collar-address")).json(&json!({"url": null})).send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(handle.ctx().settings().await.unwrap().server.collar_url, None);

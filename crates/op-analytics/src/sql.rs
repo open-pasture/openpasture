@@ -6,10 +6,17 @@
 //! `fixes` and `cues` look like one table each.
 //!
 //! One query can't take the server down: the session has no table functions
-//! (`range`, `generate_series`), its operators share a [`MEMORY_LIMIT`] pool
-//! (a query past it fails, "resources exhausted"), at most [`AT_ONCE`]
-//! queries run at a time (others wait up to [`QUEUE_WAIT`], then 503), and
-//! each has [`TIMEOUT`].
+//! (`range`, `generate_series`), no recursive CTEs, and none of the scalar
+//! functions that make a value far bigger than what they read
+//! ([`AMPLIFYING`]: `repeat`, the pads, `replace`, `array_repeat`, …): the
+//! memory pool only counts joins, sorts and aggregates, not a scalar's
+//! result, so a value is only ever as big as the rows it came from. Its
+//! operators share a [`MEMORY_LIMIT`] pool (a query past it fails,
+//! "resources exhausted"), the answer is at most [`MAX_ROWS`] rows and
+//! [`MAX_RESULT_BYTES`] of JSON, at most [`AT_ONCE`] queries run at a time
+//! (others wait up to [`QUEUE_WAIT`], then 503), and each has [`TIMEOUT`].
+//! This is not a process memory limit: an isolated query worker with an OS
+//! limit would be (docs/internal/fix-2026-10-27/safety.md).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +43,14 @@ use crate::telemetry::{BATCH_ROWS, Rolled, not_rolled_sql};
 
 /// Most rows a query returns.
 pub const MAX_ROWS: usize = 10_000;
+/// Most JSON a query's answer holds (bytes); the rows after are cut (`truncated`).
+pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+/// Longest query text.
+pub const MAX_QUERY_BYTES: usize = 16 * 1024;
+/// Scalar functions whose result can be far bigger than their input (or
+/// nested, grow without bound): not in a `run_sql` session.
+pub const AMPLIFYING: [&str; 11] =
+    ["repeat", "lpad", "rpad", "replace", "regexp_replace", "array_repeat", "array_resize", "list_repeat", "list_resize", "range", "generate_series"];
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 /// Memory one query's joins, sorts and aggregates may hold.
 pub const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
@@ -100,18 +115,26 @@ pub async fn run(ctx: &Ctx, query: &str, max_rows: usize) -> Result<SqlResult, A
     }
 }
 
-/// A session for one query: memory capped, no table functions.
+/// A session for one query: memory capped, no table functions, no
+/// recursive CTEs, no [`AMPLIFYING`] scalar functions.
 fn session() -> Result<SessionContext, ApiError> {
     let runtime = RuntimeEnvBuilder::new().with_memory_limit(MEMORY_LIMIT, 1.0).build_arc().map_err(df_err)?;
-    let session = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let config = SessionConfig::new().set_bool("datafusion.execution.enable_recursive_ctes", false);
+    let session = SessionContext::new_with_config_rt(config, runtime);
     let functions: Vec<String> = session.state().table_functions().keys().cloned().collect();
     for f in functions {
         session.deregister_udtf(&f);
+    }
+    for f in AMPLIFYING {
+        session.deregister_udf(f);
     }
     Ok(session)
 }
 
 async fn run_inner(ctx: &Ctx, query: &str, max_rows: usize) -> Result<(Vec<String>, Vec<Vec<Value>>, bool), ApiError> {
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(ApiError::bad_request(format!("The query is longer than {} KB.", MAX_QUERY_BYTES / 1024)));
+    }
     let session = session()?;
     let state = session.state();
     let stmt = state.sql_to_statement(query, &Dialect::Generic).map_err(df_err)?;
@@ -134,13 +157,19 @@ async fn run_inner(ctx: &Ctx, query: &str, max_rows: usize) -> Result<(Vec<Strin
     let columns: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
     let mut stream = df.execute_stream().await.map_err(df_err)?;
     let mut rows = Vec::new();
+    let mut bytes = 0usize;
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(df_err)?;
         for i in 0..batch.num_rows() {
             if rows.len() >= max_rows {
                 return Ok((columns, rows, true));
             }
-            rows.push(batch.columns().iter().map(|c| cell_json(c.as_ref(), i)).collect());
+            let row: Vec<Value> = batch.columns().iter().map(|c| cell_json(c.as_ref(), i)).collect();
+            bytes += serde_json::to_vec(&row).map_or(0, |v| v.len());
+            if bytes > MAX_RESULT_BYTES {
+                return Ok((columns, rows, true));
+            }
+            rows.push(row);
         }
     }
     Ok((columns, rows, truncated))
@@ -238,9 +267,31 @@ mod tests {
     async fn a_session_has_no_table_functions_and_a_memory_cap() {
         let s = session().unwrap();
         assert!(s.state().table_functions().is_empty());
-        let e = s.sql("SELECT count(*) FROM range(1, 10000000000)").await.err().expect("no range()");
+        let e = s.sql("SELECT count(*) FROM range(1, 10000000000)").await.expect_err("no range()");
         assert!(e.to_string().contains("range"), "{e}");
         assert!(matches!(s.runtime_env().memory_pool.memory_limit(), datafusion::execution::memory_pool::MemoryLimit::Finite(n) if n == MEMORY_LIMIT));
+    }
+
+    /// Astra 02 F14: nothing in a query makes a value bigger than its rows.
+    #[tokio::test]
+    async fn no_value_grows_past_what_it_reads() {
+        let s = session().unwrap();
+        for q in [
+            "SELECT length(repeat('x', 300000000)) AS bytes",
+            "SELECT length(lpad('x', 300000000)) AS bytes",
+            "SELECT length(replace(replace('x', 'x', 'xxxxxxxxxx'), 'x', 'xxxxxxxxxx'))",
+            "SELECT cardinality(array_repeat(1, 300000000))",
+            "WITH RECURSIVE r(s) AS (SELECT 'x' UNION ALL SELECT s || s FROM r) SELECT length(s) FROM r LIMIT 40",
+        ] {
+            let r = match s.sql(q).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            assert!(r.is_err(), "{q} ran");
+        }
+        // Ordinary functions are still there.
+        let ok = s.sql("SELECT upper(concat('a', 'b')) AS x, length('abc') AS n").await.unwrap().collect().await.unwrap();
+        assert_eq!(ok[0].num_rows(), 1);
     }
 
     #[test]

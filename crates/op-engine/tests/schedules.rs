@@ -292,7 +292,9 @@ async fn n_on_a_stay_holds_today_s_strip_and_y_keeps_the_schedule() {
     assert_eq!(d.status, DecisionStatus::Proposed);
     let applied = t.ok("POST", &format!("/api/decisions/{}/respond", d.id), Some(json!({ "action": "approve" }))).await;
     assert_eq!(applied["status"], "applied");
-    assert_eq!(opens(&moves(&t, &id).await)[0].1, shifted[0].1 + Duration::days(1));
+    // One farm day later (not 24 h: across a DST change that is 23 or 25).
+    let (before, after) = (shifted[0].1.with_timezone(&chicago()), opens(&moves(&t, &id).await)[0].1.with_timezone(&chicago()));
+    assert_eq!((before.date_naive() + Duration::days(1), before.time()), (after.date_naive(), after.time()));
 }
 
 #[tokio::test]

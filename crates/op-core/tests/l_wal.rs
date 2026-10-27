@@ -10,7 +10,7 @@ async fn wal_after_writes(checkpointer: bool) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let ctx = op_core::Ctx::open(dir.path()).await.unwrap();
     if checkpointer {
-        op_core::store::spawn_checkpointer(&ctx, Duration::from_millis(20));
+        op_core::store::spawn_checkpointer(&ctx, Duration::from_millis(1));
     }
     sqlx::query("CREATE TABLE l_blob (b BLOB)").execute(ctx.db()).await.unwrap();
     // 200 small commits of 40 KB: about 2,000 pages of WAL in all.
@@ -19,7 +19,21 @@ async fn wal_after_writes(checkpointer: bool) -> u64 {
         let mut tx = op_core::store::begin_immediate(ctx.db()).await.unwrap();
         sqlx::query("INSERT INTO l_blob (b) VALUES (?)").bind(&blob).execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(3)).await;
+        if checkpointer {
+            // Wait for a checkpoint that began after this commit to finish
+            // (two heartbeats: the job beats, checkpoints, beats again), as
+            // the server's one-second cadence gives a collar's next report.
+            // Waiting on the job, not a fixed sleep, holds on a loaded machine.
+            let beats = || ctx.tasks().list().into_iter().find(|t| t.name == "store.checkpoint").map_or(0, |t| t.beats);
+            let from = beats();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while beats() < from + 2 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the checkpointer runs");
+        }
     }
     let size = std::fs::metadata(dir.path().join("openpasture.db-wal")).map(|m| m.len()).unwrap_or(0);
     ctx.shutdown();

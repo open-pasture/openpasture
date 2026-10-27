@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { SIMULATED } from "../../sim";
 import { api, type Herd, type ParkReason } from "../../api";
 import { kAnimals, type ImportPreview, type ImportResult, type Mapping, type RowError } from "../../api/k-animals";
 import { guarded, herdBulk, herdColumns, type HerdBulk, type HerdRow } from "../../registry";
@@ -91,7 +92,7 @@ function HerdTable({ select }: { select: string[] }) {
     }
     core.push(
       { id: "collar", order: 70, label: "collar", width: 150, sort: by((r) => r.collar?.name), cell: (r) => r.collar && (
-        <span className={r.collar.parked_at ? "dim" : undefined}>{r.collar.name}{r.collar.parked_reason && <span className="dim">  {r.collar.parked_reason}</span>}</span>
+        <span className={r.collar.parked_at ? "dim" : undefined}>{r.collar.name}{r.collar.simulated && <i className="sim">{SIMULATED}</i>}{r.collar.parked_reason && <span className="dim">  {r.collar.parked_reason}</span>}</span>
       ) },
       { id: "battery", order: 80, label: "battery", width: 80, sort: by((r) => r.collar?.battery), cell: (r) => (
         <span className={r.collar?.battery !== undefined && r.collar.battery < 0.2 ? "low" : undefined}>{battery(r.collar?.battery)}</span>

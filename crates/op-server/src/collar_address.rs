@@ -9,7 +9,14 @@
 //!
 //! - `POST /api/server/collar-address/check {url}`: the check alone.
 //! - `PUT /api/server/collar-address {url}`: check, then save and hand the new
-//!   address to every collar that takes configs. `null` clears it.
+//!   address to every collar that takes configs. `null` clears it. This is
+//!   the only way to set it: generic settings writes refuse it (409).
+//! - `GET /api/server/collar-address`: the address and where collars stand on
+//!   it. A collar keeps its old address until a report through the new one
+//!   shows it moved (and goes back to the old one if the new one fails for a
+//!   day), so an older address has to keep working while any collar is still
+//!   on it: `moving` lists those, `fixed` counts collars that take no configs
+//!   and so stay on the address they were set up with.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -17,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use op_core::settings::CheckedCollarUrl;
 use op_core::{ApiError, ApiJson, ApiResult, Ctx};
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +41,7 @@ pub fn router() -> Router<Ctx> {
     Router::new()
         .route("/collar/v1/reach/{nonce}", get(reach))
         .route("/api/server/collar-address/check", post(post_check))
-        .route("/api/server/collar-address", put(put_address))
+        .route("/api/server/collar-address", get(get_address).put(put_address))
 }
 
 /// 204 when the nonce is one this process is waiting for, else 404.
@@ -101,25 +109,33 @@ struct Saved {
     collar_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     check: Option<Check>,
+    #[serde(flatten)]
+    status: op_ingest::config::AddressStatus,
+}
+
+/// The collar address and where collars stand on it.
+async fn get_address(State(ctx): State<Ctx>) -> ApiResult<Json<Saved>> {
+    let collar_url = ctx.settings().await?.server.collar_url;
+    Ok(Json(Saved { collar_url, check: None, status: op_ingest::config::address_status(&ctx).await? }))
 }
 
 /// Save the collar address once it passes the check (422 with the reason
 /// otherwise); every collar that takes configs gets it in its next one.
 async fn put_address(State(ctx): State<Ctx>, ApiJson(body): ApiJson<PutBody>) -> ApiResult<Json<Saved>> {
     let (url, check) = match body.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-        None => (None, None),
+        None => (CheckedCollarUrl::none(), None),
         Some(u) => {
             let c = check(u).await;
             if !c.ok {
                 return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, c.problem.unwrap_or_else(|| "The collar address didn't pass the check.".into())));
             }
-            (Some(c.url.clone()), Some(c))
+            (CheckedCollarUrl::passed(c.url.clone()), Some(c))
         }
     };
-    let saved = ctx.update_settings(&serde_json::json!({ "server": { "collar_url": url } })).await?;
+    let saved = ctx.set_collar_url(&url).await?;
     tracing::info!(collar_url = ?saved.server.collar_url, "collar address saved");
     op_ingest::config::collar_address_changed(&ctx).await;
-    Ok(Json(Saved { collar_url: saved.server.collar_url, check }))
+    Ok(Json(Saved { collar_url: saved.server.collar_url, check, status: op_ingest::config::address_status(&ctx).await? }))
 }
 
 /// Check that collars could use `url` to reach this server.
@@ -144,12 +160,19 @@ pub async fn check(url: &str) -> Check {
             if addrs.is_empty() {
                 return c.fail(Step::Dns, format!("No address found for {host}. Check the name, or give DNS a few minutes to catch up."));
             }
-            if addrs.iter().all(|a| a.ip().is_loopback()) {
+            // `::ffff:127.0.0.1` is loopback too.
+            if addrs.iter().all(|a| a.ip().to_canonical().is_loopback() || a.ip().is_unspecified()) {
                 return c.fail(Step::Dns, format!("{host} points at this computer itself, which a collar can't reach."));
             }
         }
         Ok(Err(_)) => return c.fail(Step::Dns, format!("No address found for {host}. Check the name, or give DNS a few minutes to catch up.")),
         Err(_) => return c.fail(Step::Dns, format!("Looking up {host} took too long.")),
+    }
+    // Hosted: a collar address is on the public internet, never this service's own network.
+    if op_core::net::hosted()
+        && let Err(why) = op_core::net::check_public(&url).await
+    {
+        return c.fail(Step::Dns, why);
     }
     c.passed.push(Step::Dns);
 
@@ -175,7 +198,9 @@ pub async fn check(url: &str) -> Check {
                     c.passed.push(Step::Server);
                     c
                 }
-                s if s.is_redirection() => c.fail(Step::Server, format!("{host} redirects elsewhere. Collars don't follow redirects; give the address it redirects to.")),
+                s if s.is_redirection() => {
+                    c.fail(Step::Server, format!("{host} redirects elsewhere. Collars don't follow redirects; give the address it redirects to."))
+                }
                 StatusCode::NOT_FOUND => {
                     c.fail(Step::Server, format!("{host} answered, but not as this server. Check the tunnel or proxy points at this computer and port."))
                 }
@@ -187,7 +212,8 @@ pub async fn check(url: &str) -> Check {
 
 /// GET without redirects, as a collar would.
 async fn ask(url: &str) -> Result<StatusCode, reqwest::Error> {
-    let client = reqwest::Client::builder().timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()?;
+    // Hosted: names resolve to public addresses only, at connect time (op_core::net).
+    let client = op_core::net::client_builder().timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build()?;
     let res = client.get(url).send().await?;
     Ok(StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
 }
@@ -213,7 +239,9 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_addresses_collars_cant_use_before_asking_the_network() {
-        for (url, step) in [("http://farm.example.com", Step::Address), ("https://127.0.0.1:7878", Step::Address), ("https://x.trycloudflare.com", Step::Address)] {
+        for (url, step) in
+            [("http://farm.example.com", Step::Address), ("https://127.0.0.1:7878", Step::Address), ("https://x.trycloudflare.com", Step::Address)]
+        {
             let c = check(url).await;
             assert!(!c.ok, "{url}");
             assert_eq!(c.failed, Some(step), "{url}");

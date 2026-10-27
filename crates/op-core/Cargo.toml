@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 op-protocol.workspace = true
 op-geo.workspace = true
+libc.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -26,6 +27,7 @@ tzf-rs.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 geo.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

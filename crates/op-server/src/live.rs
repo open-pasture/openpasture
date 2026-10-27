@@ -16,11 +16,10 @@ use std::time::Duration;
 
 use axum::Extension;
 use axum::extract::State;
-use axum::http::{HeaderMap, header};
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use futures::SinkExt;
-use op_core::people::SessionToken;
 use op_core::{Ctx, Identity};
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -28,7 +27,7 @@ use crate::coalesce::{self, Out};
 
 const RESYNC: &str = r#"{"type":"resync"}"#;
 const PING: &str = r#"{"type":"ping"}"#;
-/// How often a socket opened with a person's token checks it still holds.
+/// How often a socket checks the sign-in it was opened with still holds.
 pub const SESSION_CHECK: Duration = Duration::from_secs(5);
 /// How often the server pings, and how long a silent socket lives.
 pub const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -47,11 +46,11 @@ pub fn protocol_token(headers: &HeaderMap) -> Option<String> {
         .find_map(|p| p.trim().strip_prefix(TOKEN_PROTOCOL).filter(|t| !t.is_empty()).map(str::to_owned))
 }
 
-pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity, token: Option<Extension<SessionToken>>) -> Response {
+pub async fn handler(ws: WebSocketUpgrade, State(ctx): State<Ctx>, identity: Identity, credential: Option<Extension<crate::auth::Credential>>) -> Response {
     // Subscribed before the upgrade answers, so a client that just connected
     // misses nothing published after that.
     let rx = coalesce::hub(&ctx).subscribe();
-    let token = token.map(|Extension(SessionToken(id))| id);
+    let token = credential.map(|Extension(crate::auth::Credential(t))| t);
     ws.protocols([PROTOCOL]).on_upgrade(move |socket| stream(socket, ctx, identity, token, rx))
 }
 
@@ -82,10 +81,11 @@ async fn stream(mut socket: WebSocket, ctx: Ctx, identity: Identity, token: Opti
                     break;
                 }
             }
-            // A revoked token, a disabled person or a changed role closes the socket.
+            // Whatever it signed in with, checked again: signed out, revoked, run out,
+            // rotated, a disabled person or a changed role closes the socket (a failed check too).
             _ = check.tick(), if token.is_some() => {
-                let id = token.as_deref().unwrap_or_default();
-                if !op_core::live::session_holds(ctx.store(), id, identity.role).await.unwrap_or(true) {
+                let t = token.as_deref().unwrap_or_default();
+                if !crate::auth::still_signed_in(&ctx, t, &identity).await {
                     let _ = socket.send(Message::Close(None)).await;
                     break;
                 }

@@ -2,7 +2,7 @@
 //! (`RUST_LOG`) over text lines, to stdout or to a log file that rotates by
 //! size so a server left running for a season can't fill the disk.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -54,8 +54,9 @@ pub struct RollingFile {
 
 impl RollingFile {
     pub fn open(dir: &Path, name: &str, max_bytes: u64, keep: usize) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new().create(true).append(true).open(dir.join(name))?;
+        // Request lines and errors name farm records and peers: owner-only.
+        op_core::perms::private_dir(dir)?;
+        let file = op_core::perms::append_private(&dir.join(name))?;
         let size = file.metadata()?.len();
         Ok(Self { dir: dir.to_path_buf(), name: name.to_owned(), max_bytes, keep, file, size })
     }
@@ -73,7 +74,7 @@ impl RollingFile {
                 std::fs::rename(&from, self.path(n + 1))?;
             }
         }
-        self.file = OpenOptions::new().create(true).append(true).open(self.path(0))?;
+        self.file = op_core::perms::append_private(&self.path(0))?;
         self.size = 0;
         Ok(())
     }
@@ -112,6 +113,22 @@ mod tests {
         let read = |n: &str| std::fs::read_to_string(dir.path().join(n)).unwrap();
         assert!(read("server.log").starts_with("08 ") && read("server.log.1").starts_with("06 ") && read("server.log.2").starts_with("04 "));
         assert!(std::fs::metadata(dir.path().join("server.log")).unwrap().len() <= 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_and_their_folder_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mut f = RollingFile::open(&dir, "server.log", 100, 2).unwrap();
+        for _ in 0..3 {
+            f.write_all(&[b'x'; 60]).unwrap();
+        }
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("server.log")), 0o600);
+        assert_eq!(mode(&dir.join("server.log.1")), 0o600, "rotated files too");
     }
 
     #[test]

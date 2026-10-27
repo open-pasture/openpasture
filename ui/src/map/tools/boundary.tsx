@@ -30,8 +30,8 @@ export function BoundaryTool({ map, draw, herdId, ctx, done }: ToolProps) {
   const send = () => {
     const g = current(draw);
     if (!g || !herdId) return;
-    return attempt(() => gate.run(async (confirm) => {
-      await api.sendBoundary(herdId, { geometry: g, ...opts, confirm });
+    return attempt(() => gate.run(async (confirm, confirm_token) => {
+      await api.sendBoundary(herdId, { geometry: g, ...opts, confirm, confirm_token });
       done();
       await store.refresh();
     }), { busy: setBusy, failed: setErr });

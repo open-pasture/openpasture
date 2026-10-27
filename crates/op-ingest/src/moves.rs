@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-use crate::boundary::{NewBoundary, announce, insert_boundary};
+use crate::boundary::announce;
+use crate::gate::{Authorized, NewBoundary, Stage};
 use crate::planner::{self, Frame, Plan, PlanInput, Rear, Space};
 use crate::shape::{Prepared, prepare};
 use crate::{SendOpts, config, db};
@@ -560,18 +561,33 @@ async fn prepare_step(ctx: &Ctx, herd_id: &str, polygon: &Polygon, warn_m: f64, 
 /// A step about to be stored passes the safety gate as a sweep step,
 /// carrying what a person confirmed for the move's target. `findings` are
 /// the step's own (from [`prepare_step`]); the last step is the target
-/// itself, checked against the map as it is now.
-async fn gate_step(ctx: &Ctx, herd_id: &str, decision_id: &str, out: &Outcome, findings: Vec<op_core::check::Finding>, confirm: &[String]) -> ApiResult<()> {
-    let Next::Send { polygon, last, .. } = &out.next else { return Ok(()) };
-    let findings = if *last {
-        let holeless = crate::shape::herd_collars(ctx.db(), herd_id).await?.iter().any(|c| c.parked.is_none() && !c.caps.holds_holes());
-        crate::prepare::map_only(ctx, polygon, now(), holeless).await?
-    } else {
-        findings
+/// itself, checked against the map as it is now. Nothing to send is `None`.
+async fn gate_step(
+    ctx: &Ctx,
+    herd_id: &str,
+    decision_id: &str,
+    out: &Outcome,
+    warn_m: f64,
+    findings: Vec<op_core::check::Finding>,
+    confirm: &[String],
+) -> ApiResult<Option<Authorized>> {
+    let Next::Send { polygon, last, .. } = &out.next else { return Ok(None) };
+    // The last step is the target: its prepared findings are judged afresh on the map as it is now.
+    let findings = if *last { vec![] } else { findings };
+    let sender = crate::gate::Sender { kind: crate::gate::SenderKind::Sweep, by: None, confirm: confirm.to_vec(), token: None };
+    let check = crate::gate::Check {
+        herd_id,
+        geometry: polygon,
+        warn_m,
+        findings: &findings,
+        sender: &sender,
+        decision_id: Some(decision_id),
+        collar_id: None,
+        at: now(),
+        stage: Stage::Send,
+        inherited: false,
     };
-    let sender = crate::gate::Sender { kind: crate::gate::SenderKind::Sweep, by: None, confirm: confirm.to_vec() };
-    let check = crate::gate::Check { herd_id, geometry: polygon, findings: &findings, sender: &sender, decision_id: Some(decision_id), collar_id: None };
-    crate::gate::pass(ctx, &check).await.map(|_| ())
+    crate::gate::pass(ctx, &check).await.map(Some)
 }
 
 /// How many of `animals` a prepared step leaves without the room the plan
@@ -686,22 +702,29 @@ pub async fn start_move_gated(ctx: &Ctx, herd_id: &str, target: Polygon, opts: S
     let check = crate::gate::Check {
         herd_id,
         geometry: &prepared.geometry,
+        warn_m: prepared.warn_m,
         findings: &prepared.findings,
         sender: &opts.sender,
         decision_id: Some(decision_id),
         collar_id: None,
+        at: crate::prepare::activation(&opts),
+        stage: Stage::Send,
+        inherited: false,
     };
-    crate::gate::pass(ctx, &check).await?;
+    let auth = crate::gate::pass(ctx, &check).await?;
     let confirm = if opts.sender.kind.is_person() { opts.sender.confirm.clone() } else { vec![] };
-    begin(ctx, herd_id, prepared, opts.effective_at, decision_id, None, &confirm).await
+    begin(ctx, herd_id, prepared, Some(auth), opts.effective_at, decision_id, None, &confirm).await
 }
 
 /// Start a move toward a prepared target that passed the gate (see
-/// [`start_move`]). Its sweep steps carry `confirm`, what a person confirmed for it.
+/// [`start_move`]; `target_auth` is what the gate gave for it). Its sweep
+/// steps carry `confirm`, what a person confirmed for it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn begin(
     ctx: &Ctx,
     herd_id: &str,
     target: Prepared,
+    target_auth: Option<Authorized>,
     effective_at: Option<DateTime<Utc>>,
     decision_id: &str,
     farmer: Option<FarmerDecision<'_>>,
@@ -717,12 +740,14 @@ pub(crate) async fn begin(
     let sit = situation(ctx, herd_id, at, None, Some(at)).await?;
     let positions = sit.positions.len();
     let first = MoveState { target: &target, warn_m, step: 0, sweep: &Sweep::default(), stragglers: &[] };
+    let mut step_auth = None;
     let (mut out, plan_ms) = match next_step(ctx, herd_id, &first, sit, at, hysteresis_m).await? {
         // The target itself (the herd is in it) passed the gate already; a first step passes now.
         Some((out, _, ms, findings)) => {
-            if matches!(out.next, Next::Send { last: false, .. }) {
-                gate_step(ctx, herd_id, decision_id, &out, findings, confirm).await?;
-            }
+            step_auth = match (&out.next, target_auth) {
+                (Next::Send { polygon, last: true, .. }, Some(a)) if a.hash() == crate::gate::geometry_hash(polygon) => Some(a),
+                _ => gate_step(ctx, herd_id, decision_id, &out, warn_m, findings, confirm).await?,
+            };
             (out, ms)
         }
         // No first step keeps every animal inside its collar's fence yet: the driver tries again as the herd moves.
@@ -771,9 +796,9 @@ pub(crate) async fn begin(
         .await?;
     let replaced = rows.iter().map(|r| move_from_row(r).map(|r| r.m)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut boundary = None;
-    if let Next::Send { polygon, last, remaining_m } = &out.next {
+    if let (Next::Send { polygon, last, remaining_m }, Some(auth)) = (&out.next, step_auth) {
         let nb = NewBoundary { herd_id, geometry: polygon, warn_m, hysteresis_m, effective_at, decision_id, created_at: at, collar_id: None, copy_of: None };
-        let b = insert_boundary(&mut tx, &nb).await?;
+        let b = crate::gate::insert(&mut tx, ctx, auth, &nb).await?;
         sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&b.id).bind(decision_id).execute(&mut *tx).await?;
         m.step = 1;
         m.remaining_m = round_m(*remaining_m);
@@ -882,13 +907,13 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
     }
     let mut m = row.m.clone();
     let state = MoveState { target: &m.target, warn_m: row.warn_m, step: m.step, sweep: &row.sweep, stragglers: &m.stragglers };
-    let (mut out, sit, plan_ms) = match next_step(ctx, herd_id, &state, sit, at, row.hysteresis_m).await {
+    let (mut out, sit, plan_ms, step_auth) = match next_step(ctx, herd_id, &state, sit, at, row.hysteresis_m).await {
         Ok(Some((out, sit, ms, findings))) => {
             let confirm = crate::gate::confirmed_for(ctx, &m.decision_id).await?;
-            if let Err(e) = gate_step(ctx, herd_id, &m.decision_id, &out, findings, &confirm).await {
-                return refused_step(ctx, &row.m, at, &e.message).await;
+            match gate_step(ctx, herd_id, &m.decision_id, &out, row.warn_m, findings, &confirm).await {
+                Ok(auth) => (out, sit, ms, auth),
+                Err(e) => return refused_step(ctx, &row.m, at, &e.message).await,
             }
-            (out, sit, ms)
         }
         Ok(None) => {
             tracing::warn!(herd = %herd_id, r#move = %m.id, "sweep step not sent: no step keeps every animal inside the fence its collar holds");
@@ -911,7 +936,7 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
 
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let mut boundary = None;
-    if let Next::Send { polygon, last, remaining_m } = &out.next {
+    if let (Next::Send { polygon, last, remaining_m }, Some(auth)) = (&out.next, step_auth) {
         m.step += 1;
         m.remaining_m = round_m(*remaining_m);
         if *last {
@@ -930,7 +955,14 @@ pub async fn drive(ctx: &Ctx, herd_id: &str, at: DateTime<Utc>) -> anyhow::Resul
             collar_id: None,
             copy_of: None,
         };
-        let b = insert_boundary(&mut tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))?;
+        let b = match crate::gate::insert(&mut tx, ctx, auth, &nb).await {
+            Ok(b) => b,
+            Err(e) if e.status == axum::http::StatusCode::CONFLICT => {
+                drop(tx);
+                return refused_step(ctx, &row.m, at, &e.message).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!(e.message)),
+        };
         sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&b.id).bind(&m.decision_id).execute(&mut *tx).await?;
         boundary = Some(b);
     }

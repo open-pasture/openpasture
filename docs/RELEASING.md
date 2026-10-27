@@ -50,7 +50,10 @@ names the missing ones. There is no unsigned fallback.
 
 ## Cut a release
 
-1. `main` is green in CI.
+1. `main` is green in CI, and the `protocol vectors` job compared them (not skipped: `OPENCOLLAR_REF`
+   in `.github/workflows/ci.yml` names an opencollar commit on GitHub). The release workflow
+   runs all of CI again on the tagged commit and builds nothing unless it passes (`windows
+   (server)` excepted while it is marked `continue-on-error`).
 2. On a branch, set the version and name the release in the changelog:
 
    ```

@@ -3,6 +3,7 @@ import { api, type Brain, type BrainTest, type CollarAddressCheck, type CollarAd
 import { guarded, interleave, SETTINGS, settingsSections, type SettingsSection } from "../registry";
 import { useAction } from "../store/action";
 import { useCan } from "../store/me";
+import { useRead } from "../store/reads";
 import { loadServer, useServer } from "../store/server";
 import { ActionError } from "../shell/ActionError";
 import { isDesktop } from "../shell/desktop";
@@ -256,6 +257,7 @@ function CollarAddress({ saved, suggest, onSaved }: { saved?: string; suggest?: 
   });
   const same = typed === (saved ?? "");
   const fresh = checked && checked.url === typed;
+  const status = useRead(() => api.collarAddress(), [saved]);
   return (
     <form className="caddr" onSubmit={(e) => { e.preventDefault(); if (typed) void check.run(typed); }}>
       <div className="line">
@@ -279,8 +281,26 @@ function CollarAddress({ saved, suggest, onSaved }: { saved?: string; suggest?: 
           <div className="line"><Button small kind="primary" disabled={use.busy} onClick={() => void use.run(checked.url)}>Use for collars</Button></div>
         </div>
       )}
+      {status.data && <Moving status={status.data} />}
       <ActionError action={check} />
       <ActionError action={use} />
     </form>
+  );
+}
+// Collars keep their old address until a report through the new one shows they moved (and go
+// back to it if the new one fails for a day), so an older address must keep working until then.
+function Moving({ status }: { status: { moving: { endpoint?: string | null; collars: number }[]; fixed: number } }) {
+  const n = (k: number) => `${k} collar${k === 1 ? "" : "s"}`;
+  const old = status.moving.filter((m) => m.endpoint);
+  const unknown = status.moving.filter((m) => !m.endpoint).reduce((t, m) => t + m.collars, 0);
+  if (!old.length && !unknown && !status.fixed) return null;
+  return (
+    <>
+      {old.map((m) => (
+        <p key={m.endpoint!} className="cnote">{n(m.collars)} still reach this server through <span className="mono">{m.endpoint!.replace(/\/collar\/v1$/, "")}</span>. Keep it working until they move.</p>
+      ))}
+      {unknown > 0 && <p className="dim cnote">{n(unknown)} haven't reported through this address yet.</p>}
+      {status.fixed > 0 && <p className="dim cnote">{n(status.fixed)} take no new address and keep the one they were set up with.</p>}
+    </>
   );
 }

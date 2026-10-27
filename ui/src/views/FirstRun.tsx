@@ -7,7 +7,7 @@ import { createMap, fitPolys, onLoad } from "../map/base";
 import { addFarmLayers, Labels, paddockLabels, setPaddocks } from "../map/layers";
 import { createDraw, current, type Draw } from "../map/draw";
 import { Button, Icon, Input, Mark, Segmented } from "../ui";
-import { Story } from "./Story";
+import { Story } from "../sim/Story";
 
 // Flint Hills, Kansas: open rangeland under the first question.
 const RANGE: LonLat = [-96.476, 38.59];

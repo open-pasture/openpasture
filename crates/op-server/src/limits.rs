@@ -118,8 +118,9 @@ pub async fn limit_public(State(p): State<Arc<Public>>, req: Request, next: Next
     if length.is_some_and(|n| n > PUBLIC_BODY_BYTES) {
         return refuse(StatusCode::PAYLOAD_TOO_LARGE, "The request is too large.", None);
     }
+    // Counted per collar key as the collar endpoints read it (scheme and spaces don't make a new one).
     if path == "/collar/v1/report"
-        && let Some(key) = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(key) = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).map(collar_key)
         && !p.reports.allow(&op_core::keys::hash_key(key), REPORTS_PER_MINUTE)
     {
         return refuse(StatusCode::TOO_MANY_REQUESTS, "Too many reports from this collar. Report less often.", Some(10));
@@ -127,6 +128,9 @@ pub async fn limit_public(State(p): State<Arc<Public>>, req: Request, next: Next
     let Ok(_permit) = p.in_flight.clone().try_acquire_owned() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "Busy. Try again shortly.", Some(5));
     };
+    // A body without a length (chunked) is cut at the same cap as it streams in: nothing
+    // downstream (the wire log, the JSON reader) ever buffers more.
+    let req = req.map(|b| axum::body::Body::new(http_body_util::Limited::new(b, PUBLIC_BODY_BYTES as usize)));
     let res = match tokio::time::timeout(PUBLIC_TIMEOUT, next.run(req)).await {
         Ok(r) => r,
         Err(_) => return refuse(StatusCode::SERVICE_UNAVAILABLE, "That took too long. Try again.", Some(5)),
@@ -135,6 +139,14 @@ pub async fn limit_public(State(p): State<Arc<Public>>, req: Request, next: Next
         p.failed.allow(peer);
     }
     res
+}
+
+/// The key in an `Authorization` header as the collar endpoints read it:
+/// `Bearer `/`bearer ` off, spaces trimmed.
+fn collar_key(header: &str) -> &str {
+    let h = header.trim();
+    let rest = if h.len() > 7 && h[..7].eq_ignore_ascii_case("bearer ") { &h[7..] } else { h };
+    rest.trim()
 }
 
 /// No framing, no type sniffing, no referrer, on every response.

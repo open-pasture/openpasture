@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
-import type { Animal, Collar } from "./api";
-import { allSimulated, collarCount, herdWord, isSimulated, mapWord, SIMULATED, simulatedAlert, simulatedAnimals } from "./sim";
-import { Story } from "./views/Story";
+import type { Animal, Collar } from "../api";
+import { allSimulated, collarCount, herdWord, isSimulated, mapWord, SIMULATED, simulatedAlert, simulatedAnimals } from ".";
+import { Story } from "./Story";
 
 const collar = (id: string, o: Partial<Collar> = {}): Collar => ({ id, name: id, herd_id: "h1", state: "inside", ...o });
 
@@ -62,13 +62,40 @@ describe("the first-run story", () => {
   });
 
   test("writes nothing: no api, no store", async () => {
-    const src = await Bun.file(new URL("./views/Story.tsx", import.meta.url)).text();
-    expect(src).not.toMatch(/from "\.\.\/(api|store)/);
+    const src = await Bun.file(new URL("./Story.tsx", import.meta.url)).text();
+    expect(src).not.toMatch(/from "\.\.\/(api|store|registry)/);
+    expect(src).not.toMatch(/\bfetch\(|localStorage|indexedDB|WebSocket/);
   });
 
   test("keeps the word while it fades out", () => {
     const html = renderToStaticMarkup(createElement(Story, { active: false }));
     expect(html).toContain("story off");
     expect(html).toContain(SIMULATED);
+  });
+});
+
+// Astra 6, 03 P2-06: rows listing collars or animals showed no mark, and the first-run
+// simulation lived among the product's views.
+describe("simulation is marked where collars and animals are listed, and kept in one place", () => {
+  const LISTINGS = [
+    "features/k-animals/HerdView.tsx", // the herd table
+    "features/k-animals/Sidebar.tsx", // the herd sidebar
+    "features/k-animals/AnimalPage.tsx", // an animal's page
+    "features/fleet/Network.tsx", // anchors, members, gaps
+    "features/fleet/Console.tsx", // one collar's console
+    "features/b/index.ts", // search hits
+    "views/HerdPanel.tsx", // the herd panel's collars
+    "shell/Desk.tsx", // vitals and alert asks
+  ];
+  for (const f of LISTINGS)
+    test(f, async () => {
+      const src = await Bun.file(new URL(`../${f}`, import.meta.url)).text();
+      expect(src).toMatch(/\.simulated\b|simulatedAlert|herdWord|isSimulated/);
+    });
+
+  test("the first-run story is in the simulation area, not among the views", async () => {
+    expect(await Bun.file(new URL("../views/Story.tsx", import.meta.url)).exists()).toBe(false);
+    const first = await Bun.file(new URL("../views/FirstRun.tsx", import.meta.url)).text();
+    expect(first).toContain('from "../sim/Story"');
   });
 });

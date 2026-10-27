@@ -9,11 +9,12 @@ import { Button } from "../../ui";
 import { confirmable, heldBy, type Held } from "./model";
 
 // `run(send)`: send with nothing confirmed; if the gate holds it, `panel` shows why and
-// sends again confirming what it found when the farmer says so.
-export function useGate(): { run: (send: (confirm: string[]) => Promise<void>) => Promise<void>; panel: ReactNode; held?: Held } {
+// sends again confirming what it found, with the gate's token for what the farmer saw,
+// when they say so.
+export function useGate(): { run: (send: (confirm: string[], token?: string) => Promise<void>) => Promise<void>; panel: ReactNode; held?: Held } {
   const [held, setHeld] = useState<Held>();
   const [again, setAgain] = useState<() => Promise<void>>();
-  const run = useCallback(async (send: (confirm: string[]) => Promise<void>) => {
+  const run = useCallback(async (send: (confirm: string[], token?: string) => Promise<void>) => {
     setHeld(undefined);
     try {
       await send([]);
@@ -21,7 +22,7 @@ export function useGate(): { run: (send: (confirm: string[]) => Promise<void>) =
       const h = heldBy(e);
       if (!h) throw e;
       setHeld(h);
-      setAgain(() => () => send(h.confirm).then(() => setHeld(undefined)));
+      setAgain(() => () => send(h.confirm, h.token).then(() => setHeld(undefined)));
       if (h.findings[0]) flyToCause(h.findings[0]);
     }
   }, []);

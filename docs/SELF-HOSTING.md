@@ -164,29 +164,42 @@ app marks simulated collars "Simulated" (`simulation/README.md`).
 monitor can probe it:
 
 ```
-{"status":"ok","version":"0.2.2","db":"ok","jobs":[{"name":"alerts.engine","status":"running","restarts":0}, …]}
+{"status":"ok","version":"0.2.2","db":"ok","jobs":[{"name":"alerts.engine","status":"running","restarts":0,"critical":true}, …]}
 ```
 
 - `ok` (200): the database answers and every background job is running on time.
 - `degraded` (200): a job is restarting after a crash, or hasn't reported in for several of its
   intervals. The server still answers; Settings > Server (`GET /api/server`, `tasks`) shows which
   job, its last error and how often it restarted.
-- `down` (503): the database doesn't answer, or the server is stopping.
+- `down` (503): the database doesn't answer, the server is stopping, or a critical job has been
+  failing for 5 minutes: it has crashed twice or more without a 5-minute healthy run between, or
+  stopped reporting in. Critical jobs are the ones that drive fences and tell you: `ingest.moves`,
+  `ingest.escapes`, `ingest.schedules`, `ingest.activations`, `engine.scheduler`,
+  `alerts.engine` and `notify.workers`. `failing` names them and each job has `down_since`. The
+  alert engine may be the broken job, so don't count on a text: point a monitor at `/healthz`.
+- `migrating` or `starting` (503, `Retry-After: 5`): the server has its port but is still opening
+  the database, for an upgrade possibly minutes on a large farm. `progress` says where:
+  `{"phase":"snapshot"|"migrating","pending":[890, …],"since":…,"db_bytes":…,"free_bytes":…}`.
+  Every other request gets 503 with `"status":"migrating"` until it is done. Leave it running.
 
 Every background job (the alert engine, the move, escape and schedule drivers, the boundary
 activation watcher, the decision scheduler, outgoing texts, the telemetry rollup, the WAL
 checkpointer) runs under a supervisor: one that panics or stops on its own is logged at `error`
 and started again after 1 s, doubling to at most a minute.
 
-`openpasture health` asks the server named in `server.json` (or `--url http://…`) and exits
-non-zero unless it answers 200; the Docker image uses it as its `HEALTHCHECK`.
+`openpasture health` asks the server named in `server.json` (or `--url http://…`) and exits 0 for
+`ok`, `degraded`, `starting` and `migrating`, non-zero for `down` or no answer; the Docker image
+uses it as its `HEALTHCHECK`, so Docker marks the container unhealthy when a critical job stays
+down, but doesn't count an upgrade in progress against it (restarting a server mid-upgrade only
+starts the upgrade again).
 
 Logs go to stdout (`journalctl -u openpasture`, `docker logs`). Set `OPENPASTURE_LOG_DIR` to write
 them to `<dir>/server.log` instead, rotated at 10 MB with 5 old files kept (`server.log.1` is the
 newest). The desktop app logs to `<data dir>/logs/desktop.log`, rotated the same way. `RUST_LOG`
 sets the level (default `info`). Each request is one `info` line with target `request`: method,
-path, status, milliseconds and peer, with `token`, `key`, `code`, `secret` and `sig` query values
-replaced by `REDACTED`. At 250 collars that is about 360,000 lines a day; to keep only errors from
+path, status, milliseconds and peer, with the values of query parameters whose names contain
+`token`, `key`, `code`, `secret`, `sig`, `signature` or `password` replaced by `REDACTED`. Names
+are matched in any case and as the server decodes them, so `%74oken=` is redacted too. At 250 collars that is about 360,000 lines a day; to keep only errors from
 requests use `RUST_LOG=info,request=warn`.
 
 A request that fails inside the server gets `{"error": "Something went wrong on the server (ref
@@ -205,8 +218,16 @@ files of older telemetry (`telemetry/`), `secrets.json` (API keys, 0600), `serve
 and `openpasture.lock` and `server.json` while a server runs. Lose the server key and every collar
 has to be provisioned again, so back it up with the rest.
 
-`secrets.json` and `server_ed25519.key` are in plain text. Keep backups encrypted (restic, borg,
-`age`, or an encrypted disk): anyone with the key can sign boundaries your collars will apply.
+`secrets.json` and `server_ed25519.key` are in plain text, and the database holds the app token.
+Keep backups encrypted (restic, borg, `age`, or an encrypted disk): anyone with the key can sign
+boundaries your collars will apply.
+
+On Linux and macOS the server keeps all of it owner-only whatever the umask: the data directory,
+`backups/` and `logs/` are made 0700 when it starts, and the database (with its `-wal` and `-shm`),
+each snapshot, the keys, `secrets.json` and the log files 0600. Run it as its own user. On Windows
+the data directory under your profile (`%APPDATA%`) inherits its ACL (you, SYSTEM and
+Administrators); if you put it elsewhere, give it one like it (`icacls DIR /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"`). Copies you make (the
+`sqlite3 .backup` below, rsync) don't inherit this: keep them private too.
 
 `--data-dir DIR` or `OPENPASTURE_DATA_DIR` picks the directory; otherwise it is
 `~/.local/share/openpasture` on Linux and `~/Library/Application Support/openpasture` on macOS.
@@ -225,8 +246,18 @@ uses (`disk`: database, WAL, telemetry, snapshots, logs, total and the disk's fr
 
 Replace the binary (or pull the new image) and start it again. Migrations run at start and never
 drop your data. When a release brings new migrations, the server first writes a consistent copy
-of the database (`VACUUM INTO`) to `<data dir>/backups/pre-migrate-<time>-v<last migration>.db`
-and keeps the newest 3. If it can't (a full disk), it stops without migrating.
+of the database to `<data dir>/backups/pre-migrate-<time>-v<last migration>.db` (0600) and keeps
+the newest 3. The copy is of the database file with its WAL emptied and writers held off: on APFS
+(macOS), btrfs and XFS a copy-on-write clone that takes no space until the database changes,
+elsewhere (ext4) a full copy, so leave free space at least the size of `openpasture.db`; the log
+says the size and the free space before it starts. If the copy fails (a full disk), nothing is
+migrated, the partial copy is removed and the server stops saying how much space it needed; free
+some and start it again.
+
+On 250 collars x 30 days (10.8 M fixes, a 2 GB database) the upgrade past 0.2.2 took about 10 s on
+a Mac with an SSD; slower disks take longer. While it runs the server already has its
+port and answers `/healthz` with `migrating` (above), and `server.json` has its URL, so the desktop
+app and scripts can tell an upgrade from a hang.
 
 An older binary can't open a database a newer one migrated. It stops with "was last opened by a
 newer openpasture" and names the snapshot folder. To go back a version: stop the server, move

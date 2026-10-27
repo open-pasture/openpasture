@@ -81,7 +81,25 @@ async fn one_collar_reports_at_most_thirty_times_a_minute_and_bodies_are_capped(
     let r = send(&app, "POST", "/collar/v1/report", "100.64.0.1:4000", &[("authorization", &key)], Body::from(json!({ "fixes": [] }).to_string())).await;
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers().contains_key("retry-after"));
+    // Astra 02 F16: the same key with other spaces or the scheme's case is the same collar.
+    let bare = linked["key"].as_str().unwrap();
+    for spaced in [format!("Bearer  {bare}"), format!("bearer {bare}  "), format!("Bearer {bare}\t")] {
+        let r = send(&app, "POST", "/collar/v1/report", "100.64.0.1:4000", &[("authorization", &spaced)], Body::from(json!({ "fixes": [] }).to_string())).await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS, "{spaced:?}");
+    }
     // A body that says it is over 2 MB is refused before it is read.
     let r = send(&app, "POST", "/collar/v1/ack", "100.64.0.1:4000", &[("authorization", &key), ("content-length", "3000000")], Body::empty()).await;
     assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // Astra 02 F16: a chunked body (no length) is cut at the cap as it streams in, not read on.
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let track = read.clone();
+    let chunk = 256 * 1024;
+    let stream = futures::stream::iter((0..12).map(move |_| {
+        track.fetch_add(chunk, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b' '; chunk]))
+    }));
+    let r = send(&app, "POST", "/collar/v1/ack", "100.64.0.1:4000", &[("authorization", &key)], Body::from_stream(stream)).await;
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let n = read.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(n <= 2 * 1024 * 1024 + chunk, "{n} bytes read past the 2 MB cap");
 }

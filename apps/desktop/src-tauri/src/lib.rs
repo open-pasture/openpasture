@@ -92,8 +92,9 @@ pub fn run() {
             updater::start(app.handle());
 
             let handle = app.handle().clone();
+            let waiting = window.clone();
             tauri::async_runtime::spawn(async move {
-                match open_server(data_dir.clone()).await {
+                match open_server(data_dir.clone(), move |msg| say_waiting(&waiting, msg)).await {
                     Ok(server) => {
                         let (url, note) = match &server {
                             Server::Own(h) => (h.url().to_string(), None),
@@ -159,29 +160,68 @@ fn show(app: &AppHandle) {
     }
 }
 
-/// What this app's own server is doing; nothing for a server in another process.
-pub async fn work(app: &AppHandle) -> op_server::work::Work {
-    let ctx = match &*app.state::<Running>().0.lock().unwrap() {
-        Some(Server::Own(h)) => h.ctx().clone(),
-        _ => return Default::default(),
-    };
-    op_server::work::current(&ctx).await.unwrap_or_default()
+/// What this app's own server is doing, as far as it can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    Known(op_server::work::Work),
+    /// The work couldn't be read: a move may be running.
+    Unknown,
 }
 
-/// Quit at once when nothing is moving; during a move or escape, ask.
+impl Busy {
+    /// A move or escape is running, or there's no telling: quitting or
+    /// restarting now could freeze a fence mid-way.
+    pub fn maybe_moving(&self) -> bool {
+        match self {
+            Busy::Known(w) => w.moving(),
+            Busy::Unknown => true,
+        }
+    }
+
+    /// What to ask before quitting; `None` when nothing can be moving.
+    pub fn quit_question(&self) -> Option<String> {
+        let stops = "If openpasture quits, the fence stops where it is until you open it again.";
+        match self {
+            Busy::Unknown => Some(format!("openpasture can't tell right now whether a move is running. {stops}")),
+            Busy::Known(w) if w.moving() => {
+                let what = match (w.moves, w.escapes) {
+                    (0, 1) => "An animal is being brought back".to_owned(),
+                    (0, n) => format!("{n} animals are being brought back"),
+                    (1, 0) => "A move is running".to_owned(),
+                    _ => "Moves are running".to_owned(),
+                };
+                Some(format!("{what}. {stops}"))
+            }
+            Busy::Known(_) => None,
+        }
+    }
+}
+
+/// What this app's own server is doing; nothing for a server in another
+/// process (quitting this app doesn't stop it). A failed read is
+/// [`Busy::Unknown`], never "nothing moving".
+pub async fn work(app: &AppHandle) -> Busy {
+    let ctx = match &*app.state::<Running>().0.lock().unwrap() {
+        Some(Server::Own(h)) => h.ctx().clone(),
+        _ => return Busy::Known(Default::default()),
+    };
+    match op_server::work::current(&ctx).await {
+        Ok(w) => Busy::Known(w),
+        Err(e) => {
+            tracing::warn!(error = format!("{e:#}"), "reading the server's work");
+            Busy::Unknown
+        }
+    }
+}
+
+/// Quit at once when nothing is moving; during a move or escape, or when
+/// that can't be read, ask.
 async fn confirm_quit(app: &AppHandle) {
-    let w = work(app).await;
-    if w.moving() {
-        let what = match (w.moves, w.escapes) {
-            (0, 1) => "An animal is being brought back".to_owned(),
-            (0, n) => format!("{n} animals are being brought back"),
-            (1, 0) => "A move is running".to_owned(),
-            _ => "Moves are running".to_owned(),
-        };
+    if let Some(question) = work(app).await.quit_question() {
         show(app);
         let dialog = app
             .dialog()
-            .message(format!("{what}. If openpasture quits, the fence stops where it is until you open it again."))
+            .message(question)
             .title("Quit openpasture?")
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::OkCancelCustom("Quit".into(), "Keep running".into()));
@@ -193,33 +233,107 @@ async fn confirm_quit(app: &AppHandle) {
     app.exit(0);
 }
 
-/// Open the server running from this data dir, else start one.
-async fn open_server(data_dir: PathBuf) -> anyhow::Result<Server> {
-    if let Some(url) = running_url(&data_dir) {
-        return Ok(Server::Other { url });
+/// Open the server running from this data dir, else start one. Another
+/// process holding the data dir may still be opening or upgrading its
+/// database: wait for it ([`wait_ready`]), telling the window why.
+async fn open_server(data_dir: PathBuf, waiting: impl Fn(&str)) -> anyhow::Result<Server> {
+    if op_core::instance::running(&data_dir).is_some_and(|s| s.url.is_some()) {
+        return Ok(Server::Other { url: wait_ready(&data_dir, &waiting).await? });
     }
     match start_server(&data_dir).await {
         Ok(h) => Ok(Server::Own(h)),
         // Started between the look above and the lock: open that one.
-        Err(e) if e.downcast_ref::<AlreadyRunning>().is_some() => {
-            for _ in 0..50 {
-                if let Some(url) = running_url(&data_dir) {
-                    return Ok(Server::Other { url });
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e)
-        }
+        Err(e) if e.downcast_ref::<AlreadyRunning>().is_some() => Ok(Server::Other { url: wait_ready(&data_dir, &waiting).await? }),
         Err(e) => Err(e),
     }
 }
 
-/// The URL of a server another process runs from `data_dir`, once it answers.
-fn running_url(data_dir: &Path) -> Option<String> {
-    let s = op_core::instance::running(data_dir)?;
-    let url = s.url?;
-    let addr = url.strip_prefix("http://")?.parse::<std::net::SocketAddr>().ok()?;
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok().map(|_| url)
+/// How long another server may give no answer at all before we give up on it.
+const NO_ANSWER: Duration = Duration::from_secs(10);
+/// How often its health is asked while it starts.
+const POLL: Duration = Duration::from_millis(500);
+
+/// What a server's `/healthz` said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Health {
+    /// 200: ok or degraded; attach.
+    Ready,
+    /// 503 starting or migrating: keep waiting, however long it takes.
+    Opening { migrating: bool },
+    /// It says it is down.
+    Down,
+}
+
+/// Read a `/healthz` answer: the status code and the JSON `status`.
+fn health_of(code: u16, body: &str) -> Option<Health> {
+    let status = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v["status"].as_str().map(str::to_owned));
+    match (code, status.as_deref()) {
+        (200, _) => Some(Health::Ready),
+        (_, Some("down")) => Some(Health::Down),
+        (503, Some("migrating")) => Some(Health::Opening { migrating: true }),
+        (503, Some("starting")) => Some(Health::Opening { migrating: false }),
+        _ => None,
+    }
+}
+
+/// GET `<url>/healthz` over plain http on loopback (the server's own URL in
+/// server.json); `None` when nothing answers or the answer can't be read.
+async fn health(url: &str) -> Option<Health> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = url.strip_prefix("http://")?.trim_end_matches('/').parse::<std::net::SocketAddr>().ok()?;
+    let ask = async {
+        let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
+        s.write_all(format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.ok()?;
+        let mut buf = Vec::new();
+        s.take(1 << 20).read_to_end(&mut buf).await.ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let code = text.split_whitespace().nth(1)?.parse::<u16>().ok()?;
+        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        health_of(code, body.trim())
+    };
+    tokio::time::timeout(Duration::from_secs(3), ask).await.ok().flatten()
+}
+
+/// Wait for the server another process runs from `data_dir` to be ready and
+/// return its URL. No time limit while it says it is starting or upgrading
+/// its database (that can take long on a big farm); gives up when it says it
+/// is down, or after [`NO_ANSWER`] with no answer at all.
+async fn wait_ready(data_dir: &Path, waiting: &impl Fn(&str)) -> anyhow::Result<String> {
+    let mut quiet_since = std::time::Instant::now();
+    let mut said = "";
+    loop {
+        let url = op_core::instance::running(data_dir).and_then(|s| s.url);
+        let h = match &url {
+            Some(u) => health(u).await,
+            None => None,
+        };
+        let say = match (&h, url) {
+            (Some(Health::Ready), Some(url)) => {
+                waiting("");
+                return Ok(url);
+            }
+            (Some(Health::Down), _) => {
+                anyhow::bail!("The openpasture already running from this folder says it is down. Its log says why (openpasture > Reveal Logs).")
+            }
+            (Some(Health::Opening { migrating: true }), _) => "Upgrading the database…",
+            (Some(_), _) => "Opening the database…",
+            (None, _) => {
+                if quiet_since.elapsed() >= NO_ANSWER {
+                    anyhow::bail!("Another openpasture holds this folder but isn't answering. Quit it (or restart the computer) and open openpasture again.");
+                }
+                ""
+            }
+        };
+        if h.is_some() {
+            quiet_since = std::time::Instant::now();
+        }
+        if !say.is_empty() && say != said {
+            tracing::info!(what = say, "waiting for the server already running from this folder");
+            waiting(say);
+            said = say;
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Bind 127.0.0.1 on the settings port. If another program has that port,
@@ -281,6 +395,12 @@ fn navigate(window: &WebviewWindow, url: &str) {
     }
 }
 
+/// Say on the bundled page what the app is waiting for ("" hides it).
+fn say_waiting(window: &WebviewWindow, msg: &str) {
+    let msg = serde_json::to_string(msg).unwrap_or_default();
+    let _ = window.eval(format!("(function f(){{ if (window.__opWaiting) window.__opWaiting({msg}); else setTimeout(f, 50); }})()"));
+}
+
 /// Show the start-up error on the bundled page.
 fn failed(window: &WebviewWindow, msg: &str) {
     let msg = serde_json::to_string(msg).unwrap_or_default();
@@ -295,5 +415,41 @@ fn reveal_logs(app: &AppHandle) {
         tracing::warn!(error = %e, "revealing the logs");
         let dialog = app.dialog().message(format!("The log is at {}.", file.display())).title("Logs");
         std::thread::spawn(move || dialog.blocking_show());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Busy, Health, health_of};
+    use op_server::work::Work;
+
+    /// Astra 6, 03 P1-11: a failed read of the server's work counted as
+    /// "nothing moving", so Cmd-Q quit and an update restarted mid-move.
+    #[test]
+    fn unknown_work_is_treated_as_moving() {
+        assert!(Busy::Unknown.maybe_moving());
+        assert!(Busy::Unknown.quit_question().unwrap().contains("can't tell"));
+
+        let idle = Busy::Known(Work { live_collars: 40, ..Default::default() });
+        assert!(!idle.maybe_moving());
+        assert_eq!(idle.quit_question(), None);
+
+        let moving = Busy::Known(Work { moves: 1, ..Default::default() });
+        assert!(moving.maybe_moving());
+        assert!(moving.quit_question().unwrap().starts_with("A move is running."));
+        let escapes = Busy::Known(Work { escapes: 2, ..Default::default() });
+        assert!(escapes.quit_question().unwrap().starts_with("2 animals are being brought back."));
+    }
+
+    /// Astra 6, 03 P2-01 (with fix-ops-ci's server side): the server answers
+    /// before its database is open; the app attaches only once it is ready.
+    #[test]
+    fn healthz_answers_are_read_as_the_contract_says() {
+        assert_eq!(health_of(200, r#"{"status":"ok"}"#), Some(Health::Ready));
+        assert_eq!(health_of(200, r#"{"status":"degraded"}"#), Some(Health::Ready));
+        assert_eq!(health_of(503, r#"{"status":"migrating","progress":{"phase":"migrating"}}"#), Some(Health::Opening { migrating: true }));
+        assert_eq!(health_of(503, r#"{"status":"starting"}"#), Some(Health::Opening { migrating: false }));
+        assert_eq!(health_of(503, r#"{"status":"down"}"#), Some(Health::Down));
+        assert_eq!(health_of(502, "Bad Gateway"), None, "not an answer from openpasture");
     }
 }

@@ -13,7 +13,9 @@
 //! - `GET /collar/v1/boundary?have=&free=&free_bytes=`: the boundary in effect
 //!   when it is newer than `have`, else the lowest staged one above `have`
 //!   while the collar has a free slot and room for it; versions it refused
-//!   for good are skipped. Each command is fitted to the collar's caps.
+//!   for good are skipped. Each command is fitted to the collar's caps and
+//!   checked by the safety gate as that collar would enforce it, on the map
+//!   as it is now (409 when refused: [`crate::gate::deliverable`]).
 //! - `POST /collar/v1/ack`: received, applied or rejected (with a `code`).
 
 use axum::extract::{FromRequestParts, Query, State};
@@ -153,19 +155,17 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     if let Some(d) = &rep.device {
         let caps_json = (!d.caps.is_empty()).then(|| serde_json::to_string(&d.caps)).transpose().map_err(anyhow::Error::from)?;
         let limits_json = d.limits.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?;
-        // A collar that once said it is simulated stays so (op_core::sim).
-        let simulated = collar.simulated || op_core::sim::in_caps(&d.caps);
-        sqlx::query("UPDATE collars SET fw = ?, caps = ?, limits = ?, simulated = ? WHERE id = ?")
+        // Simulated is the server's to say, at link time (op_core::sim): a
+        // report never changes it, whatever caps it lists.
+        sqlx::query("UPDATE collars SET fw = ?, caps = ?, limits = ? WHERE id = ?")
             .bind(&d.fw)
             .bind(caps_json)
             .bind(limits_json)
-            .bind(simulated)
             .bind(&collar.id)
             .execute(&mut *tx)
             .await?;
         collar.fw = d.fw.clone();
         collar.caps = d.caps.clone();
-        collar.simulated = simulated;
     }
     if let Some(list) = &rep.slots {
         slots::replace(&mut tx, &collar.id, list, received).await?;
@@ -174,6 +174,9 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         Some(d) => config::sync(&mut tx, &ctx, d, config_version, config_reject.as_ref(), received).await?,
         None => None,
     };
+    if desired.is_some() {
+        config::confirm_endpoint(&mut tx, &collar.id, config_version, received).await?;
+    }
     if config.is_some() {
         config::mark_sent(&mut tx, &collar.id, received).await?;
     }
@@ -197,7 +200,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             .map(|v| v as u32)
             .collect();
         if escapes::out_of_step(&held, &holds, &rejected) && !escapes::on_escape(&mut tx, &collar.id).await? {
-            let copies = escapes::hand_copies(&mut tx, &collar, received).await?;
+            let copies = escapes::hand_copies(&mut tx, &ctx, &collar, received).await?;
             tracing::info!(collar = %collar.id, holds = ?holds, copies = ?copies.iter().map(|b| b.version).collect::<Vec<_>>(), "collar out of step: its herd's boundaries again");
             latest_version = copies.iter().map(|b| b.version).max().or(latest_version);
         }
@@ -206,7 +209,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     // grazing: only who it is, what it holds, its battery, health and last
     // contact are kept.
     if collar.parked_at.is_some() {
-        insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (rep.fixes.len(), rep.cues.len())).await?;
+        insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (rep.fixes.len(), rep.cues.len(), 0)).await?;
         collar.last_seen = Some(received);
         if rep.battery.is_some() {
             collar.battery = rep.battery;
@@ -282,13 +285,16 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         }
     }
     // A resent report stores nothing new: fixes and cues already held are skipped.
-    let new_fixes = insert_fixes(&mut tx, &collar, &herd_id, &fix_rows).await?;
+    let (new_fixes, fix_conflicts) = insert_fixes(&mut tx, &collar, &herd_id, &fix_rows).await?;
     // One fix event per report (the newest), so a burst of reports can't
     // flood the live feed.
     if let Some((fix, fix_state)) = latest_event {
         events.push(Event::Fix { collar_id: collar.id.clone(), animal_id: collar.animal_id.clone(), herd_id: herd_id.clone(), fix, state: fix_state });
     }
-    let new_cues = insert_cues(&mut tx, &collar, &herd_id, &rep.cues, rep.boundary_version).await?;
+    let (new_cues, cue_conflicts) = insert_cues(&mut tx, &collar, &herd_id, &rep.cues, rep.boundary_version).await?;
+    if fix_conflicts + cue_conflicts > 0 {
+        tracing::warn!(collar = %collar.id, fixes = fix_conflicts, cues = cue_conflicts, "records at the same instant as a different one: both kept (health.conflicts)");
+    }
     // Only cues stored now are announced, so a resent report can't count twice.
     for (cue, _) in rep.cues.iter().zip(&new_cues).filter(|(_, new)| **new) {
         // Firmware 0.1 sends no kind: outside when past the line, else warn.
@@ -300,7 +306,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         insert_episode(&mut tx, &collar, &herd_id, e, rep.boundary_version).await?;
     }
     let stored_cues = new_cues.iter().filter(|n| **n).count();
-    insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (new_fixes, stored_cues)).await?;
+    insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (new_fixes, stored_cues, fix_conflicts + cue_conflicts)).await?;
 
     collar.last_seen = Some(received);
     if rep.battery.is_some() {
@@ -346,13 +352,23 @@ struct FixRow {
 const ROWS_PER_INSERT: usize = 64;
 
 /// A report's fixes in as few statements as fit (one for any usual report).
-/// A fix the collar already sent (same time) is skipped. Returns how many
-/// were stored.
-async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id: &str, rows: &[FixRow]) -> ApiResult<usize> {
-    let mut stored = 0;
+/// A fix the collar already sent (same instant and position) is skipped:
+/// nothing but this stores fixes, inside the report's write transaction, so
+/// the lookup by `fixes_collar_t` here is what keeps them unique (migration
+/// 0890 says why not an index). A different fix at an instant already held
+/// is stored and counted as a conflict. Returns how many were stored, and
+/// the conflicts.
+async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id: &str, rows: &[FixRow]) -> ApiResult<(usize, usize)> {
+    // The same fix twice in one report: once (the statement below can't see
+    // its own rows).
+    let mut seen = std::collections::HashSet::new();
+    let rows: Vec<&FixRow> =
+        rows.iter().filter(|r| seen.insert((unix_ms(&r.fix.at), r.fix.point[0].to_bits(), r.fix.point[1].to_bits(), r.fix.accuracy_m.to_bits()))).collect();
+    let mut new_t: Vec<i64> = Vec::with_capacity(rows.len());
     for chunk in rows.chunks(ROWS_PER_INSERT) {
         let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop) ",
+            "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop) \
+             SELECT * FROM (",
         );
         q.push_values(chunk, |mut b, r| {
             b.push_bind(&collar.id)
@@ -372,22 +388,47 @@ async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id:
                 .push_bind(r.paddock_id.as_deref())
                 .push_bind(r.hdop);
         });
-        q.push(" ON CONFLICT DO NOTHING");
-        stored += q.build().execute(&mut *tx).await?.rows_affected() as usize;
+        // VALUES columns are column1… in order: collar_id 1, t 5, lon 6, lat 7, accuracy_m 8.
+        q.push(
+            ") AS v WHERE NOT EXISTS (SELECT 1 FROM fixes f WHERE f.collar_id = v.column1 AND f.t = v.column5 \
+             AND f.lon = v.column6 AND f.lat = v.column7 AND f.accuracy_m = v.column8) RETURNING t",
+        );
+        new_t.extend(q.build_query_scalar::<i64>().fetch_all(&mut *tx).await?);
     }
-    Ok(stored)
+    let conflicts = conflicts(tx, "fixes", &collar.id, &new_t).await?;
+    Ok((new_t.len(), conflicts))
 }
 
-/// A report's cues, as [`insert_fixes`]: a cue already held (same time and
-/// kind) is skipped. Returns, per cue, whether it was stored now.
+/// How many of `new_t` (rows just stored) share their instant with another
+/// row of the collar's.
+async fn conflicts(tx: &mut sqlx::SqliteConnection, table: &str, collar_id: &str, new_t: &[i64]) -> ApiResult<usize> {
+    let mut n = 0;
+    for chunk in new_t.chunks(ROWS_PER_INSERT * 4) {
+        let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("SELECT t FROM {table} WHERE collar_id = "));
+        q.push_bind(collar_id).push(" AND t IN (");
+        let mut list = q.separated(", ");
+        for t in chunk {
+            list.push_bind(*t);
+        }
+        q.push(") GROUP BY t HAVING COUNT(*) > 1");
+        let shared: Vec<i64> = q.build_query_scalar().fetch_all(&mut *tx).await?;
+        n += chunk.iter().filter(|t| shared.contains(t)).count();
+    }
+    Ok(n)
+}
+
+/// A report's cues, as [`insert_fixes`]: a cue already held (same instant,
+/// kind, level, margin and position) is skipped. Returns, per cue, whether
+/// it was stored now, and how many stored share their instant with another.
 async fn insert_cues(
     tx: &mut sqlx::SqliteConnection,
     collar: &Collar,
     herd_id: &str,
     cues: &[op_protocol::WireCue],
     report_version: Option<u32>,
-) -> ApiResult<Vec<bool>> {
+) -> ApiResult<(Vec<bool>, usize)> {
     let mut stored = Vec::with_capacity(cues.len());
+    let mut new_t = Vec::new();
     for chunk in cues.chunks(ROWS_PER_INSERT) {
         let mut q = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "INSERT INTO cues (collar_id, herd_id, animal_id, at, t, level, margin_m, lon, lat, boundary_version, kind, ring, dur_ms) ",
@@ -407,13 +448,13 @@ async fn insert_cues(
                 .push_bind(cue.ring.map(i64::from))
                 .push_bind(cue.dur_ms.map(i64::from));
         });
-        // The kind as the unique key has it (derived for firmware 0.1's cues).
-        q.push(" ON CONFLICT DO NOTHING RETURNING t, COALESCE(kind, CASE WHEN margin_m < 0 THEN 'outside' ELSE 'warn' END)");
-        let mut new: Vec<(i64, String)> = q.build_query_as().fetch_all(&mut *tx).await?;
+        // What tells the stored ones apart (the unique key less the position).
+        q.push(" ON CONFLICT DO NOTHING RETURNING t, IFNULL(kind, ''), level, margin_m");
+        let mut new: Vec<(i64, String, i64, f64)> = q.build_query_as().fetch_all(&mut *tx).await?;
+        new_t.extend(new.iter().map(|k| k.0));
         for cue in chunk {
-            let kind = cue.kind.as_ref().map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
-            let key = (unix_ms(&cue.at), kind.to_owned());
-            match new.iter().position(|k| *k == key) {
+            let key = (unix_ms(&cue.at), cue.kind.as_ref().map_or("", |k| k.as_str()), cue.level as i64, cue.margin_m);
+            match new.iter().position(|k| (k.0, k.1.as_str(), k.2, k.3) == key) {
                 Some(i) => {
                     new.swap_remove(i);
                     stored.push(true);
@@ -422,7 +463,8 @@ async fn insert_cues(
             }
         }
     }
-    Ok(stored)
+    let conflicts = conflicts(tx, "cues", &collar.id, &new_t).await?;
+    Ok((stored, conflicts))
 }
 
 /// One episode, stored once however often the collar resends it.
@@ -458,7 +500,8 @@ async fn insert_episode(
 
 /// One `health` row per report: battery and receiver, cell, motion and power
 /// health over time. `stored` is the fixes and cues the report added (none
-/// for a resent one), so summing them counts each fix and cue once.
+/// for a resent one), so summing them counts each fix and cue once, and the
+/// conflicts among them (records at an instant held with other contents).
 async fn insert_health(
     tx: &mut sqlx::SqliteConnection,
     collar_id: &str,
@@ -466,13 +509,13 @@ async fn insert_health(
     received: DateTime<Utc>,
     rep: &PositionReport,
     health: &op_protocol::Health,
-    stored: (usize, usize),
+    stored: (usize, usize, usize),
 ) -> ApiResult<()> {
     let cell = health.cell.clone().unwrap_or_default();
     sqlx::query(
         "INSERT INTO health (collar_id, herd_id, at, t, battery, sats, cn0, ttf_s, fixes, cues, boundary_version,
-             fix_attempts, fix_ok, rsrp_dbm, rsrq_db, snr_db, cell_mode, band, cell_id, tac, still_s, tilt_deg, temp_c, battery_v, charging, uptime_s, reset)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             fix_attempts, fix_ok, rsrp_dbm, rsrq_db, snr_db, cell_mode, band, cell_id, tac, still_s, tilt_deg, temp_c, battery_v, charging, uptime_s, reset, conflicts)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(collar_id)
     .bind(herd_id)
@@ -501,6 +544,7 @@ async fn insert_health(
     .bind(health.charging)
     .bind(health.uptime_s.map(|s| s.min(i64::MAX as u64) as i64))
     .bind(&health.reset)
+    .bind((stored.2 > 0).then_some(stored.2 as i64))
     .execute(&mut *tx)
     .await?;
     Ok(())
@@ -528,7 +572,9 @@ async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Wa
     let split = escapes::collar_boundaries(ctx.db(), &device.collar, now()).await?;
     let rejected = db::rejected_versions(ctx.db(), &device.collar.id).await?;
     let wanted = |b: &&Boundary| b.version > have && !rejected.contains(&b.version);
+    // Each command is checked by the gate as this collar would enforce it, on the map as it is now.
     if let Some(a) = split.active.as_ref().filter(wanted) {
+        crate::gate::deliverable(&ctx, a, &device.collar.id, &caps).await?;
         return Ok(Json(shape::command_for(&ctx, a, &caps)?).into_response());
     }
     let free = match q.free {
@@ -539,6 +585,7 @@ async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Wa
         && let Some(s) = split.staged.iter().find(wanted)
         && q.free_bytes.is_none_or(|room| shape::record_bytes(s, &caps).is_ok_and(|n| n <= room))
     {
+        crate::gate::deliverable(&ctx, s, &device.collar.id, &caps).await?;
         return Ok(Json(shape::command_for(&ctx, s, &caps)?).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())

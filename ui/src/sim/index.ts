@@ -1,7 +1,9 @@
-import type { Alert, Animal, Collar } from "./api";
+import type { Alert, Animal, Collar } from "../api";
 
+// The app's simulation area (see simulation/README.md): nothing here is farm data.
 // The simulator (`simulation/collar-sim`) runs collars that aren't on any animal. The server
-// marks them `simulated`; the app says so wherever they show, in this one plain word.
+// marks them `simulated` when it links them; the app says so wherever they show, in this one
+// plain word. The first-run story (Story.tsx) is the app's only other simulation, and says so too.
 export const SIMULATED = "Simulated";
 
 export const isSimulated = (c: Pick<Collar, "simulated"> | undefined): boolean => !!c?.simulated;

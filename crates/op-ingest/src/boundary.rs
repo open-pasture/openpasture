@@ -14,7 +14,7 @@ use op_geo::Polygon;
 use op_protocol::wire_time;
 use serde::Deserialize;
 
-use crate::gate::{self, Check, Sender};
+use crate::gate::{self, Check, NewBoundary, Sender, Stage};
 use crate::moves::{self, FarmerDecision};
 use crate::shape::{Prepared, prepare};
 use crate::{db, slots};
@@ -34,6 +34,9 @@ pub struct SendOpts {
     /// Hard findings a person confirms by code ([`crate::gate`]).
     #[serde(default)]
     pub confirm: Vec<String>,
+    /// The `confirm_token` the gate's refusal gave: the shape and map revision the person saw.
+    #[serde(default)]
+    pub confirm_token: Option<String>,
     /// Who sends it, for the gate. Set by the caller, never read from a request.
     #[serde(skip)]
     pub sender: Sender,
@@ -53,72 +56,64 @@ async fn send(ctx: &Ctx, herd_id: &str, geometry: Polygon, opts: SendOpts, decis
         return Err(ApiError::not_found("No such herd."));
     }
     let prepared = prepare(ctx, herd_id, &geometry, &opts).await?;
-    let check =
-        Check { herd_id, geometry: &prepared.geometry, findings: &prepared.findings, sender: &opts.sender, decision_id: Some(decision_id), collar_id: None };
-    gate::pass(ctx, &check).await?;
+    let check = Check {
+        herd_id,
+        geometry: &prepared.geometry,
+        warn_m: prepared.warn_m,
+        findings: &prepared.findings,
+        sender: &opts.sender,
+        decision_id: Some(decision_id),
+        collar_id: None,
+        at: crate::prepare::activation(&opts),
+        stage: Stage::Send,
+        inherited: false,
+    };
+    let auth = gate::pass(ctx, &check).await?;
     let Prepared { geometry, warn_m, hysteresis_m, .. } = prepared;
     let created_at = now();
     // Wire times are whole seconds; a time already past means now.
     let effective_at = opts.effective_at.map(wire_time::trunc_secs).filter(|t| *t > created_at);
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let b = NewBoundary { herd_id, geometry: &geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at, collar_id: None, copy_of: None };
-    let boundary = insert_boundary(&mut tx, &b).await?;
+    let boundary = gate::insert(&mut tx, ctx, auth, &b).await?;
     sqlx::query("UPDATE decisions SET boundary_id = ? WHERE id = ?").bind(&boundary.id).bind(decision_id).execute(&mut *tx).await?;
     tx.commit().await?;
     announce(ctx, &boundary).await;
     Ok(boundary)
 }
 
-pub(crate) struct NewBoundary<'a> {
-    pub herd_id: &'a str,
-    pub geometry: &'a Polygon,
-    pub warn_m: f64,
-    pub hysteresis_m: f64,
-    pub effective_at: Option<DateTime<Utc>>,
-    pub decision_id: &'a str,
-    pub created_at: DateTime<Utc>,
-    /// One collar's own boundary (an escape) instead of the herd's.
-    pub collar_id: Option<&'a str>,
-    /// The herd version whose shape a collar's own boundary carries.
-    pub copy_of: Option<u32>,
-}
-
-/// Insert with the next version. Versions come from one sequence across all
-/// herds, so a collar moved to another herd always finds that herd's next
-/// boundary newer than what it holds. The caller holds a write transaction.
-pub(crate) async fn insert_boundary(tx: &mut sqlx::SqliteConnection, b: &NewBoundary<'_>) -> ApiResult<Boundary> {
-    let id = id::new_id(id::BOUNDARY);
-    // The next version comes from the version index (db::sql::NEXT_VERSION).
-    let (next,): (i64,) = sqlx::query_as(db::sql::NEXT_VERSION).fetch_one(&mut *tx).await?;
-    let (version,): (i64,) = sqlx::query_as(
-        "INSERT INTO boundaries (id, herd_id, version, geometry, warn_m, hysteresis_m, effective_at, decision_id, created_at, collar_id, copy_of)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING version",
-    )
-    .bind(&id)
-    .bind(b.herd_id)
-    .bind(next)
-    .bind(serde_json::to_string(b.geometry).map_err(anyhow::Error::from)?)
-    .bind(b.warn_m)
-    .bind(b.hysteresis_m)
-    .bind(b.effective_at.as_ref().map(to_db))
-    .bind(b.decision_id)
-    .bind(to_db(&b.created_at))
-    .bind(b.collar_id)
-    .bind(b.copy_of.map(i64::from))
-    .fetch_one(&mut *tx)
-    .await?;
-    Ok(Boundary {
-        id,
-        herd_id: b.herd_id.to_owned(),
-        version: version as u32,
-        geometry: b.geometry.clone(),
+/// A stored herd boundary sent again as it is, under what it went out with
+/// (the same shape, so what a person confirmed for it stands), judged on the
+/// map now: a new version (immediate unless `effective_at` is ahead), so
+/// collars drop every staged slot below it. Refused (the map now forbids
+/// it) is 409, logged, nothing stored.
+pub(crate) async fn resend(ctx: &Ctx, b: &Boundary, effective_at: Option<DateTime<Utc>>) -> ApiResult<Boundary> {
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    let auth = match gate::reauthorize_in(&mut tx, b, None, Stage::Copy).await {
+        Ok(a) => a,
+        Err(e) => {
+            // The refusal row stays.
+            tx.commit().await?;
+            return Err(e);
+        }
+    };
+    let created_at = now();
+    let effective_at = effective_at.map(wire_time::trunc_secs).filter(|t| *t > created_at);
+    let nb = NewBoundary {
+        herd_id: &b.herd_id,
+        geometry: &b.geometry,
         warn_m: b.warn_m,
         hysteresis_m: b.hysteresis_m,
-        effective_at: b.effective_at,
-        decision_id: b.decision_id.to_owned(),
-        created_at: b.created_at,
-        collar_id: b.collar_id.map(str::to_owned),
-    })
+        effective_at,
+        decision_id: &b.decision_id,
+        created_at,
+        collar_id: None,
+        copy_of: None,
+    };
+    let boundary = gate::insert(&mut tx, ctx, auth, &nb).await?;
+    tx.commit().await?;
+    announce(ctx, &boundary).await;
+    Ok(boundary)
 }
 
 /// Log and publish a stored boundary.
@@ -247,23 +242,27 @@ async fn post_boundary(
     if ctx.store().get_herd(&herd_id).await?.is_none() {
         return Err(ApiError::not_found("No such herd."));
     }
-    body.opts.sender = Sender::person(&identity, body.opts.confirm.clone());
+    body.opts.sender = Sender::person(&identity, body.opts.confirm.clone()).with_token(body.opts.confirm_token.clone());
     let prepared = prepare(&ctx, &herd_id, &body.geometry, &body.opts).await?;
     let decision_id = id::new_id(id::DECISION);
     let check = Check {
         herd_id: &herd_id,
         geometry: &prepared.geometry,
+        warn_m: prepared.warn_m,
         findings: &prepared.findings,
         sender: &body.opts.sender,
         decision_id: Some(&decision_id),
         collar_id: None,
+        at: crate::prepare::activation(&body.opts),
+        stage: Stage::Send,
+        inherited: false,
     };
-    gate::pass(&ctx, &check).await?;
+    let auth = gate::pass(&ctx, &check).await?;
     let paddocks = ctx.store().list_paddocks().await?;
     let to_paddock = prepared.geometry.interior_point().and_then(|c| db::paddock_for_point(&paddocks, c)).map(|p| p.id.clone());
     let target = prepared.geometry.clone();
     let farmer = FarmerDecision { to_paddock_id: to_paddock.as_deref(), reasoning: "Boundary drawn by the farmer." };
-    let started = moves::begin(&ctx, &herd_id, prepared, body.opts.effective_at, &decision_id, Some(farmer), &body.opts.confirm).await?;
+    let started = moves::begin(&ctx, &herd_id, prepared, Some(auth), body.opts.effective_at, &decision_id, Some(farmer), &body.opts.confirm).await?;
 
     if let Some(r) = sqlx::query("SELECT * FROM decisions WHERE id = ?").bind(&decision_id).fetch_optional(ctx.db()).await? {
         let decision = decision_from_row(&r)?;
@@ -307,7 +306,8 @@ pub fn spawn_activation_watcher(ctx: Ctx) {
 }
 
 /// Announce herd boundaries whose `effective_at` falls in `(from, to]` and
-/// that are in effect at `to`. Returns what was announced.
+/// that are in effect at `to`, each checked by the gate again as it takes
+/// effect ([`crate::withdraw::took_effect_refused`] when refused). Returns what was announced.
 pub async fn announce_activations(ctx: &Ctx, from: DateTime<Utc>, to: DateTime<Utc>) -> anyhow::Result<Vec<Boundary>> {
     let rows = sqlx::query(db::sql::TAKING_EFFECT).bind(to_db(&from)).bind(to_db(&to)).fetch_all(ctx.db()).await?;
     let mut out = Vec::new();
@@ -317,6 +317,11 @@ pub async fn announce_activations(ctx: &Ctx, from: DateTime<Utc>, to: DateTime<U
         if active.is_some_and(|a| a.version == b.version) {
             tracing::info!(herd = %b.herd_id, version = b.version, "staged boundary in effect");
             ctx.publish(Event::Boundary { herd_id: b.herd_id.clone(), boundary: b.clone() });
+            // The map may have changed since it was staged: checked again as it takes effect,
+            // and replaced at once when the gate now refuses it.
+            if let Err(e) = gate::recheck(ctx, &b, Stage::Activation).await {
+                crate::withdraw::took_effect_refused(ctx, &b, &e.message).await;
+            }
             out.push(b);
         }
     }

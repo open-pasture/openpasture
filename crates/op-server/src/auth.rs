@@ -116,6 +116,8 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
     let Some(given) = given_token(&req) else {
         return ApiError::unauthorized("Sign in first: open the sign-in link from this machine, or use a token.").into_response();
     };
+    // Long-lived streams (the live feed) check it again while they run.
+    req.extensions_mut().insert(Credential(given.clone()));
     let app_token = match st.ctx.settings().await {
         Ok(s) => s.server.app_token,
         Err(e) => return ApiError::from(e).into_response(),
@@ -162,6 +164,44 @@ pub async fn guard(State(st): State<AuthState>, mut req: Request, next: Next) ->
         };
     }
     failed(&st, peer, "Wrong token.")
+}
+
+/// The token a request signed in with, for a stream to check again while it runs ([`still_signed_in`]).
+#[derive(Clone)]
+pub struct Credential(pub String);
+
+/// Whether `token` still signs in as `identity` would now: the app token not
+/// rotated, the owner session or person's token not signed out, revoked or
+/// run out, the person enabled with the same role, a brain token unexpired.
+/// Anything else, a check that fails included, is no.
+pub async fn still_signed_in(ctx: &Ctx, token: &str, identity: &Identity) -> bool {
+    match signed_in_as(ctx, token).await {
+        Ok(Some(now)) => now.role == identity.role && now.via == identity.via && now.user_id == identity.user_id,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("checking a live sign-in: {e:#}");
+            false
+        }
+    }
+}
+
+async fn signed_in_as(ctx: &Ctx, token: &str) -> anyhow::Result<Option<Identity>> {
+    if eq(token.as_bytes(), ctx.settings().await?.server.app_token.as_bytes()) {
+        return Ok(Some(people::with_owner_person(ctx, Identity::owner(Via::AppToken)).await));
+    }
+    if ctx.check_brain_token(token).is_some() {
+        return Ok(Some(Identity::brain()));
+    }
+    if token.starts_with(session::SESSION_PREFIX) {
+        return Ok(match session::session_for_token(ctx, token).await? {
+            Some(_) => Some(session::owner_identity(ctx).await),
+            None => None,
+        });
+    }
+    if token.starts_with(people::TOKEN_PREFIX) {
+        return Ok(people::session_for_token(ctx, token).await?.map(|s| s.identity));
+    }
+    Ok(None)
 }
 
 fn failed(st: &AuthState, peer: std::net::IpAddr, msg: &str) -> Response {

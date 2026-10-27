@@ -264,9 +264,8 @@ async fn sql_is_read_only_and_json_friendly() {
     let (status, res) = app.sql("SELECT key_hash FROM collars").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
     // Row limit.
-    let (_, res) = app
-        .sql("WITH d AS (SELECT * FROM (VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)) t(x)) SELECT d1.x FROM d d1, d d2, d d3, d d4, d d5")
-        .await;
+    let (_, res) =
+        app.sql("WITH d AS (SELECT * FROM (VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)) t(x)) SELECT d1.x FROM d d1, d d2, d d3, d d4, d d5").await;
     assert_eq!(res["rows"].as_array().unwrap().len(), 10_000);
     assert_eq!(res["truncated"], json!(true));
     // No table functions: a query can't make rows from nothing.

@@ -218,14 +218,40 @@ async fn in_window(ctx: &Ctx, cfg: &TextingConfig, address: &str, now: DateTime<
     Ok(last_prompt_to(ctx, address).await?.is_some_and(|t| now - t <= Duration::hours(cfg.approve_window_h as i64)))
 }
 
-async fn wrong_codes(ctx: &Ctx, address: &str, now: DateTime<Utc>) -> anyhow::Result<i64> {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE address = ? AND direction = 'in' AND error = ? AND created_at >= ?")
-        .bind(address)
-        .bind(WRONG_CODE)
-        .bind(to_db(&(now - Duration::hours(1))))
-        .fetch_one(ctx.db())
-        .await?;
-    Ok(n)
+/// Reserve one code try for `address` before the code is looked at: at most
+/// [`MAX_WRONG_CODES`] an hour, counted in one statement, so a burst of
+/// texts can't all get past the count. `None`: none left. A right code gives
+/// its try back ([`refund`]).
+async fn reserve_try(ctx: &Ctx, address: &str, now: DateTime<Utc>) -> anyhow::Result<Option<i64>> {
+    let r = sqlx::query(
+        "INSERT INTO sms_code_attempts (address, at) SELECT ?1, ?2
+         WHERE (SELECT COUNT(*) FROM sms_code_attempts WHERE address = ?1 AND at >= ?3) < ?4",
+    )
+    .bind(address)
+    .bind(to_db(&now))
+    .bind(to_db(&(now - Duration::hours(1))))
+    .bind(MAX_WRONG_CODES)
+    .execute(ctx.db())
+    .await?;
+    Ok((r.rows_affected() == 1).then(|| r.last_insert_rowid()))
+}
+
+async fn refund(ctx: &Ctx, attempt: i64) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM sms_code_attempts WHERE id = ?").bind(attempt).execute(ctx.db()).await?;
+    Ok(())
+}
+
+/// How long a decision's code answers from a phone after its text went
+/// there: at least a day, or the reply window when that is longer.
+pub const CODE_VALID_H: i64 = 24;
+
+/// Decisions `code` answers for a text from `address`: their code, and their
+/// text went to this phone within [`CODE_VALID_H`]. A code is no key to
+/// decisions texted to someone else, or long ago.
+async fn decisions_for_code(ctx: &Ctx, cfg: &TextingConfig, address: &str, code: &str, now: DateTime<Utc>) -> anyhow::Result<Vec<String>> {
+    let valid = CODE_VALID_H.max(cfg.approve_window_h as i64);
+    let asked = prompted_decisions(ctx, address, now - Duration::hours(valid)).await?;
+    Ok(decisions_by_code(ctx, code).await?.into_iter().filter(|d| asked.contains(d)).collect())
 }
 
 /// Decisions whose newest `decision_waiting` alert carries `code`, open or
@@ -368,14 +394,17 @@ async fn pick_decision(
     let max = reply_max(&msg.channel);
     match pick {
         Pick::Code(code) => {
-            if wrong_codes(ctx, &msg.address, now).await? >= MAX_WRONG_CODES {
+            let Some(attempt) = reserve_try(ctx, &msg.address, now).await? else {
                 return Ok(Err(Out::say("Too many wrong codes from this number. Try again in an hour.")));
-            }
+            };
             let mut found = Vec::new();
-            for id in decisions_by_code(ctx, code).await? {
+            for id in decisions_for_code(ctx, cfg, &msg.address, code, now).await? {
                 if let Some(d) = decision(ctx, &id).await?.filter(|d| d.status == DecisionStatus::Proposed) {
                     found.push(d);
                 }
+            }
+            if !found.is_empty() {
+                refund(ctx, attempt).await?;
             }
             match found.len() {
                 0 => Ok(Err(Out { text: Some(format!("No decision waits on code {code}.")), note: Some(WRONG_CODE.into()), ..Default::default() })),
@@ -885,12 +914,15 @@ async fn stop_move(ctx: &Ctx, cfg: &TextingConfig, msg: &MessageLog, user: &User
     }
     let herd_id = match pick {
         Pick::Code(code) => {
-            if wrong_codes(ctx, &msg.address, now).await? >= MAX_WRONG_CODES {
+            let Some(attempt) = reserve_try(ctx, &msg.address, now).await? else {
                 return Ok(Out::say("Too many wrong codes from this number. Try again in an hour."));
-            }
-            let ids = decisions_by_code(ctx, code).await?;
+            };
+            let ids = decisions_for_code(ctx, cfg, &msg.address, code, now).await?;
             match running.iter().find(|(_, d)| ids.contains(d)) {
-                Some((h, _)) => h.clone(),
+                Some((h, _)) => {
+                    refund(ctx, attempt).await?;
+                    h.clone()
+                }
                 None => return Ok(Out { text: Some(format!("No running move has code {code}.")), note: Some(WRONG_CODE.into()), ..Default::default() }),
             }
         }

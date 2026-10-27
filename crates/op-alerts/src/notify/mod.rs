@@ -341,7 +341,8 @@ pub(crate) fn http() -> &'static reqwest::Client {
 
 /// The settings of [`http`], for a client that needs more (push's resolver).
 pub(crate) fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    // Hosted: names resolve to public addresses only, at connect time (op_core::net).
+    op_core::net::client_builder()
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())

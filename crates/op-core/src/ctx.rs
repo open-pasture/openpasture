@@ -70,26 +70,31 @@ impl Drop for BrainToken {
     }
 }
 
-/// `OPENPASTURE_DATA_DIR`, else the platform data dir
-/// (`~/Library/Application Support/openpasture` on macOS).
-pub fn default_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("OPENPASTURE_DATA_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    dirs::data_dir().map(|d| d.join("openpasture")).unwrap_or_else(|| PathBuf::from("openpasture-data"))
+/// A data dir whose lock is held and whose database is about to open (see
+/// [`Ctx::begin_open`]).
+pub struct Opening {
+    data_dir: PathBuf,
+    lock: Arc<DirLock>,
+    shutdown: watch::Sender<bool>,
+    progress: crate::store::Progress,
 }
 
-impl Ctx {
-    /// Open the data directory: take its lock (one server per data dir, see
-    /// [`instance`]), then the database (with migrations), secrets, server
-    /// key and settings (created with defaults on first run).
-    pub async fn open(data_dir: impl Into<PathBuf>) -> anyhow::Result<Ctx> {
-        let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let lock = instance::acquire(&data_dir, Box::new(move || !*shutdown_rx.borrow()))?;
-        instance::write_server_file(&data_dir, &instance::this_process())?;
-        let store = Store::open(&data_dir).await?;
+impl Opening {
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// Where opening the database is (snapshot, migrations), while
+    /// [`Opening::finish`] runs.
+    pub fn progress(&self) -> crate::store::Progress {
+        self.progress.clone()
+    }
+
+    /// Open the database (snapshot and migrations when upgrading), secrets,
+    /// server key and settings.
+    pub async fn finish(self) -> anyhow::Result<Ctx> {
+        let Opening { data_dir, lock, shutdown, progress } = self;
+        let store = Store::open_with(&data_dir.join(crate::store::DB_FILE), Some(&progress)).await?;
         // Paddock areas stored before op-geo measured rings whichever way they wind.
         crate::area_repair::repair_paddock_areas(store.pool()).await?;
         let signing_key = keys::load_or_create(&data_dir)?;
@@ -114,6 +119,38 @@ impl Ctx {
         ctx.set_local_url(format!("http://127.0.0.1:{}", s.server.port));
         ctx.set_public_url(s.server.public_url.clone());
         Ok(ctx)
+    }
+}
+
+/// `OPENPASTURE_DATA_DIR`, else the platform data dir
+/// (`~/Library/Application Support/openpasture` on macOS).
+pub fn default_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("OPENPASTURE_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    dirs::data_dir().map(|d| d.join("openpasture")).unwrap_or_else(|| PathBuf::from("openpasture-data"))
+}
+
+impl Ctx {
+    /// Open the data directory: take its lock (one server per data dir, see
+    /// [`instance`]), then the database (with migrations), secrets, server
+    /// key and settings (created with defaults on first run).
+    pub async fn open(data_dir: impl Into<PathBuf>) -> anyhow::Result<Ctx> {
+        Ctx::begin_open(data_dir)?.finish().await
+    }
+
+    /// The first half of [`Ctx::open`]: the data dir is created owner-only,
+    /// its lock taken and `server.json` written; the database isn't opened
+    /// yet. A server binds its port in between, so that during a long
+    /// upgrade it can say so ([`Opening::progress`]) instead of not
+    /// answering.
+    pub fn begin_open(data_dir: impl Into<PathBuf>) -> anyhow::Result<Opening> {
+        let data_dir = data_dir.into();
+        crate::perms::private_dir(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let lock = instance::acquire(&data_dir, Box::new(move || !*shutdown_rx.borrow()))?;
+        instance::write_server_file(&data_dir, &instance::this_process())?;
+        Ok(Opening { data_dir, lock, shutdown, progress: Default::default() })
     }
 
     pub fn store(&self) -> &Store {
@@ -200,15 +237,29 @@ impl Ctx {
         settings::parse_stored(&raw)
     }
 
+    /// Save whole settings; the collar address must be the one stored
+    /// ([`Ctx::set_collar_url`] changes it).
     pub async fn save_settings(&self, s: &Settings) -> anyhow::Result<()> {
         settings::validate(s).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(s.server.collar_url == self.settings().await?.server.collar_url, settings::COLLAR_URL_ELSEWHERE);
         self.store().set_setting(settings::KEY, s).await
     }
 
     /// Merge a partial settings object and save. Errors are farmer-readable.
     /// Read, merge and write happen in one write transaction, so two updates
-    /// at once can't lose each other's fields.
+    /// at once can't lose each other's fields. The collar address can't
+    /// change here (409): it goes into collars, so only
+    /// [`Ctx::set_collar_url`], after the reachability check, sets it.
     pub async fn update_settings(&self, partial: &Value) -> Result<Settings, crate::ApiError> {
+        self.write_settings(partial, None).await
+    }
+
+    /// Set the collar address, which passed op-server's check.
+    pub async fn set_collar_url(&self, checked: &settings::CheckedCollarUrl) -> Result<Settings, crate::ApiError> {
+        self.write_settings(&serde_json::json!({ "server": { "collar_url": checked.url() } }), Some(checked)).await
+    }
+
+    async fn write_settings(&self, partial: &Value, collar_url: Option<&settings::CheckedCollarUrl>) -> Result<Settings, crate::ApiError> {
         let _ = self.settings().await?; // creates the row with defaults the first time
         let mut tx = crate::store::begin_immediate(self.db()).await?;
         let row: Option<(String,)> =
@@ -219,6 +270,9 @@ impl Ctx {
         };
         let next: Settings = crate::patch::apply(&current, partial, &[])?;
         settings::validate(&next).map_err(crate::ApiError::bad_request)?;
+        if next.server.collar_url != current.server.collar_url && collar_url.is_none_or(|c| c.url() != next.server.collar_url.as_deref()) {
+            return Err(crate::ApiError::conflict(settings::COLLAR_URL_ELSEWHERE));
+        }
         sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .bind(settings::KEY)
             .bind(serde_json::to_string(&next).map_err(anyhow::Error::from)?)

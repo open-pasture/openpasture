@@ -15,6 +15,7 @@ op-engine.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
+tower.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
@@ -27,6 +28,7 @@ libc.workspace = true
 reqwest.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+http-body-util.workspace = true
 # @HUB
 op-alerts.workspace = true
 op-import.workspace = true
@@ -59,7 +61,6 @@ op-fleet.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 tokio-tungstenite.workspace = true
-tower.workspace = true
 http-body-util.workspace = true
 # @HUB
 # @HUB-UI

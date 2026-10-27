@@ -64,7 +64,8 @@ impl Rule for DecisionWaiting {
             let key = format!("decision_waiting:{}", d.id);
             let code = match existing_code(ctx, &key).await? {
                 Some(c) => c,
-                None => format!("{:04}", rand::thread_rng().gen_range(1000..=9999)),
+                // Six digits: a code only works from a phone it was texted to, within the approval window.
+                None => format!("{:06}", rand::thread_rng().gen_range(100_000..=999_999)),
             };
             let mut data = json!({ "herd": herd.name, "code": code, "action": d.action.map(|a| a.as_db()) });
             if let Some(t) = d.apply_at {

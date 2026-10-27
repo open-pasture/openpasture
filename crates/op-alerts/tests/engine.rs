@@ -732,7 +732,7 @@ async fn approval_codes_stay_out_of_the_api_and_live_events() {
     f.decision("MOVE", "proposed", t0() - mins(31), None).await;
     f.eval(t0()).await;
     let a = f.open_kind("decision_waiting").await.remove(0);
-    assert!(a.data["code"].as_str().is_some_and(|c| c.len() == 4), "kept for the text and the replies");
+    assert!(a.data["code"].as_str().is_some_and(|c| c.len() == 6), "kept for the text and the replies");
     let mut seen = 0;
     while let Ok(e) = rx.try_recv() {
         if let Event::Alert { alert } = e {

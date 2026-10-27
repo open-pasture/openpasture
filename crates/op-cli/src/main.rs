@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let (status, body) = get(&format!("{}/healthz", url.trim_end_matches('/')))?;
             println!("{body}");
-            if status != 200 {
+            if !healthy(status, &body) {
                 std::process::exit(1);
             }
         }
@@ -151,6 +151,18 @@ async fn repair_settings(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `/healthz` says the server is up: 200 (`ok`, `degraded`), or
+/// 503 while it is `starting` or `migrating` (working, not to be restarted
+/// half-way through an upgrade). A critical job failing too long is 503
+/// `down`: unhealthy.
+fn healthy(status: u16, body: &str) -> bool {
+    if status == 200 {
+        return true;
+    }
+    let said = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v["status"].as_str().map(str::to_owned));
+    status == 503 && matches!(said.as_deref(), Some("starting" | "migrating"))
+}
+
 /// A plain HTTP/1.0 GET (no TLS): the status code and body.
 fn get(url: &str) -> anyhow::Result<(u16, String)> {
     let rest = url.strip_prefix("http://").ok_or_else(|| anyhow::anyhow!("only http:// URLs: {url}"))?;
@@ -164,4 +176,20 @@ fn get(url: &str) -> anyhow::Result<(u16, String)> {
     let status = res.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow::anyhow!("not an HTTP reply from {url}"))?;
     let body = res.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
     Ok((status, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::healthy;
+
+    #[test]
+    fn health_exit_follows_the_status() {
+        assert!(healthy(200, r#"{"status":"ok"}"#));
+        assert!(healthy(200, r#"{"status":"degraded"}"#));
+        assert!(healthy(503, r#"{"status":"migrating","progress":{"phase":"migrating"}}"#));
+        assert!(healthy(503, r#"{"status":"starting"}"#));
+        assert!(!healthy(503, r#"{"status":"down","failing":["ingest.moves"]}"#));
+        assert!(!healthy(503, "not json"));
+        assert!(!healthy(500, r#"{"status":"migrating"}"#));
+    }
 }

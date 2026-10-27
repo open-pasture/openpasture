@@ -207,6 +207,14 @@ pub fn fence_geometry(b: &Boundary, caps: &CollarCaps) -> Polygon {
     }
 }
 
+/// The shape a collar with `caps` would enforce for `g` stored with `warn_m`:
+/// the rings of its command, exactly as [`command_for`] builds it. `None`
+/// when no command can be built for it (that collar can't take it at all).
+pub(crate) fn command_shape(g: &Polygon, warn_m: f64, caps: &CollarCaps) -> Option<Polygon> {
+    let fitted = fit_for(g, &caps.fit_limits(), warn_m);
+    BoundaryCommand::from_shape("check".to_owned(), 1, &fitted, None).ok().map(|c| c.polygon())
+}
+
 /// Flash bytes the command for `b` takes in a collar with `caps`.
 pub(crate) fn record_bytes(b: &Boundary, caps: &CollarCaps) -> ApiResult<usize> {
     Ok(unsigned_command(b, caps)?.record_bytes())

@@ -1,6 +1,8 @@
-//! Simulated collars (`op_core::sim`): linked as simulated, or saying so with
-//! the `sim` cap, they carry `simulated: true` in REST and live events, and
-//! stay simulated.
+//! Simulated collars (`op_core::sim`): the server decides at link time. A
+//! simulated herd (made only on a server with no real data) takes only
+//! simulated collars, a real herd only real ones; they carry
+//! `simulated: true` in REST and live events and stay so. A report never
+//! changes it: a real collar listing the `sim` cap stays real.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -41,20 +43,34 @@ impl App {
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
-    async fn herd(&self) -> String {
+    async fn farm(&self) {
         let (s, _) = self.req("POST", "/api/farm", None, Some(json!({"name": "Home", "timezone": "UTC", "center": [-92.405, 38.125]}))).await;
         assert_eq!(s, StatusCode::CREATED);
-        let (_, herd) = self.req("POST", "/api/herds", None, Some(json!({"name": "Cows", "species": "cattle", "count": 1}))).await;
+    }
+
+    async fn new_herd(&self, name: &str, simulated: bool) -> (StatusCode, Value) {
+        self.req("POST", "/api/herds", None, Some(json!({"name": name, "species": "cattle", "count": 1, "simulated": simulated}))).await
+    }
+
+    /// A farm and one herd, real or simulated.
+    async fn herd(&self, simulated: bool) -> String {
+        self.farm().await;
+        let (s, herd) = self.new_herd("Cows", simulated).await;
+        assert_eq!(s, StatusCode::CREATED, "{herd}");
         herd["id"].as_str().unwrap().to_owned()
     }
 
-    /// (collar id, key, the collar as linked).
-    async fn link(&self, herd: &str, simulated: Option<bool>) -> (String, String, Value) {
+    async fn try_link(&self, herd: &str, simulated: Option<bool>) -> (StatusCode, Value) {
         let mut body = json!({ "herd_id": herd });
         if let Some(s) = simulated {
             body["simulated"] = json!(s);
         }
-        let (s, c) = self.req("POST", "/api/collars", None, Some(body)).await;
+        self.req("POST", "/api/collars", None, Some(body)).await
+    }
+
+    /// (collar id, key, the collar as linked).
+    async fn link(&self, herd: &str, simulated: Option<bool>) -> (String, String, Value) {
+        let (s, c) = self.try_link(herd, simulated).await;
         assert_eq!(s, StatusCode::CREATED, "{c}");
         (c["collar"]["id"].as_str().unwrap().to_owned(), c["key"].as_str().unwrap().to_owned(), c["collar"].clone())
     }
@@ -77,7 +93,7 @@ const FW02: [&str; 6] = ["holes", "slots", "collar_id", "cue_mode", "episodes", 
 #[tokio::test]
 async fn a_collar_linked_as_simulated_says_so_everywhere() {
     let app = App::new().await;
-    let herd = app.herd().await;
+    let herd = app.herd(true).await;
     let mut bus = app.ctx.subscribe();
     let (id, _, linked) = app.link(&herd, Some(true)).await;
     assert_eq!(linked["simulated"], json!(true));
@@ -94,18 +110,31 @@ async fn a_collar_linked_as_simulated_says_so_everywhere() {
     assert!(ev.simulated);
     assert_eq!(serde_json::to_value(&ev).unwrap()["simulated"], json!(true));
 
-    // A real collar has no such field at all.
-    let (real, _, linked) = app.link(&herd, None).await;
+    // A simulated herd takes no real collar.
+    let (s, v) = app.try_link(&herd, None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+
+    // A real herd beside it: real collars only, and they have no such field at all.
+    let (s, cows) = app.new_herd("Real cows", false).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let cows = cows["id"].as_str().unwrap().to_owned();
+    let (s, v) = app.try_link(&cows, Some(true)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a real herd takes no simulated collar: {v}");
+    let (real, _, linked) = app.link(&cows, None).await;
     assert!(linked.get("simulated").is_none(), "{linked}");
     assert!(app.get(&real).await.get("simulated").is_none());
 
-    // Nobody can PATCH it away.
+    // Nobody can PATCH it away, or move a collar across.
     let (s, _) = app.req("PATCH", &format!("/api/collars/{id}"), None, Some(json!({"simulated": false, "name": "Sim 1"}))).await;
     assert_eq!(s, StatusCode::OK);
     let c = app.get(&id).await;
     assert_eq!((c["simulated"].clone(), c["name"].clone()), (json!(true), json!("Sim 1")));
     let (_, c) = app.req("PATCH", &format!("/api/collars/{real}"), None, Some(json!({"simulated": true}))).await;
     assert!(c.get("simulated").is_none(), "a real collar can't be marked simulated by hand");
+    for (collar, to) in [(&id, &cows), (&real, &herd)] {
+        let (s, v) = app.req("PATCH", &format!("/api/collars/{collar}"), None, Some(json!({"herd_id": to}))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    }
 
     let sims = op_core::sim::collars(app.ctx.db()).await.unwrap();
     assert!(sims.contains(&id) && !sims.contains(&real));
@@ -113,37 +142,56 @@ async fn a_collar_linked_as_simulated_says_so_everywhere() {
 }
 
 #[tokio::test]
-async fn the_sim_cap_marks_a_collar_for_good() {
+async fn simulated_herds_only_go_on_a_server_with_no_real_data() {
     let app = App::new().await;
-    let herd = app.herd().await;
+    let real = app.herd(false).await;
+    let (s, v) = app.new_herd("Sim", true).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a real herd is here: {v}");
+    // Nor can a real herd be turned into one.
+    let (_, h) = app.req("PATCH", &format!("/api/herds/{real}"), None, Some(json!({"simulated": true}))).await;
+    assert!(h.get("simulated").is_none_or(|v| v == &json!(false)), "{h}");
+    assert!(!op_core::sim::herd_is_simulated(app.ctx.db(), &real).await.unwrap());
+    assert!(sqlx::query("UPDATE herds SET simulated = 1 WHERE id = ?").bind(&real).execute(app.ctx.db()).await.is_err(), "not even in the database");
+}
+
+/// Astra 6, 03 P1-03 / 02 F09: a real collar reported `sim` in its caps, was
+/// classified simulated for good, and its alerts reached no one.
+#[tokio::test]
+async fn a_real_collar_reporting_the_sim_cap_stays_real() {
+    let app = App::new().await;
+    let herd = app.herd(false).await;
     let (id, key, _) = app.link(&herd, None).await;
 
     // Firmware 0.2 without the cap: real.
     app.report(&key, &FW02).await;
     assert!(app.get(&id).await.get("simulated").is_none());
 
-    // The simulator's caps: simulated.
+    // The simulator's caps from a real collar's key: still real. The cap is kept as reported.
     let mut caps = FW02.to_vec();
     caps.extend(["sim", "lora"]);
     app.report(&key, &caps).await;
     let c = app.get(&id).await;
-    assert_eq!(c["simulated"], json!(true));
+    assert!(c.get("simulated").is_none(), "{c}");
     assert!(c["caps"].as_array().unwrap().contains(&json!("sim")));
 
-    // A later report without it doesn't clear it: what it recorded stays marked.
+    // real -> sim cap -> real: still real, nothing muted or left out.
     app.report(&key, &FW02).await;
-    assert_eq!(app.get(&id).await["simulated"], json!(true));
-    assert!(op_core::sim::all_simulated(app.ctx.db()).await.unwrap());
-    assert_eq!(op_core::sim::herds(app.ctx.db()).await.unwrap().into_iter().collect::<Vec<_>>(), vec![herd]);
+    assert!(app.get(&id).await.get("simulated").is_none());
+    assert!(op_core::sim::collars(app.ctx.db()).await.unwrap().is_empty());
+    assert!(op_core::sim::herds(app.ctx.db()).await.unwrap().is_empty());
+    assert!(!op_core::sim::all_simulated(app.ctx.db()).await.unwrap());
+
+    // And no write anywhere can make it simulated now.
+    assert!(sqlx::query("UPDATE collars SET simulated = 1 WHERE id = ?").bind(&id).execute(app.ctx.db()).await.is_err());
 }
 
 #[tokio::test]
 async fn a_reported_device_class_places_the_collar_in_the_herd_network() {
     let app = App::new().await;
-    let herd = app.herd().await;
+    let herd = app.herd(true).await;
     let (anchor, akey, _) = app.link(&herd, Some(true)).await;
     let (node, nkey, _) = app.link(&herd, Some(true)).await;
-    let (plain, pkey, _) = app.link(&herd, None).await;
+    let (plain, pkey, _) = app.link(&herd, Some(true)).await;
     for (key, class) in [(&akey, Some("anchor")), (&nkey, Some("node")), (&pkey, None)] {
         let mut device = json!({ "fw": "0.2.0", "caps": FW02 });
         if let Some(c) = class {

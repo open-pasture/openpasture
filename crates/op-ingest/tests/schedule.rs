@@ -1172,3 +1172,32 @@ async fn an_exclusion_over_the_strip_the_herd_is_on_still_restages_the_strips_ah
     dev.store.tick(start + Duration::seconds(1)).expect("strip 2 opens");
     assert!(!dev.store.active().unwrap().cmd.polygon().contains(wet));
 }
+
+/// Astra 02 F03: when the map forbids the ground the herd is on, the
+/// schedule never sends the refused boundary again as it is: nothing new
+/// goes out, the schedule is held (paused) and the activity says why.
+#[tokio::test]
+async fn a_refused_reissue_holds_the_schedule_and_sends_nothing() {
+    let a = App::new().await;
+    let (h, p) = a.herd("Cows").await;
+    let _dev = a.collar(&h, CollarLimits::V0).await;
+    a.on_strip_one(&h).await;
+    let start = whole(Utc::now() + Duration::minutes(10));
+    let s = a.schedule(&h, &p, start, BackFence { enabled: false, ..Default::default() }).await;
+    sched::drive(&a.ctx, &s.id, Utc::now()).await.unwrap();
+    let before = a.status(&h).await;
+    assert!(!before["staged"].as_array().unwrap().is_empty());
+    let (rc, rv) =
+        a.call("POST", "/api/features", Some(json!({"kind": "no_go", "name": "Whole farm unsafe", "geometry": rect(-20.0, -20.0, 320.0, 220.0)}))).await;
+    assert_eq!(rc, StatusCode::CREATED, "{rv}");
+    sched::drive(&a.ctx, &s.id, Utc::now()).await.unwrap();
+    let after = a.status(&h).await;
+    assert_eq!(after["active"]["version"], before["active"]["version"], "nothing sent: {after}");
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM boundaries").fetch_one(a.ctx.db()).await.unwrap();
+    let versions = before["staged"].as_array().unwrap().len() + 1;
+    assert_eq!(n as usize, versions, "no new boundary stored");
+    let s = sched::get(&a.ctx, &s.id).await.unwrap().unwrap();
+    assert_eq!(s.status, ScheduleStatus::Paused);
+    let (held,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE kind = 'schedule.held'").fetch_one(a.ctx.db()).await.unwrap();
+    assert_eq!(held, 1);
+}

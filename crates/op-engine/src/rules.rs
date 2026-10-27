@@ -323,6 +323,8 @@ pub struct Ground {
     pub name: String,
     pub shape: Shape,
     pub paddock_id: Option<String>,
+    /// How far the mapped feature itself reaches past its shape (a hazard point's `radius_m`).
+    pub extent_m: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,7 +340,13 @@ pub type Day = (u32, u32);
 /// What a rule says, as far as words can be read without a model.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Reading {
+    /// The ground it names, when it names exactly one.
     pub ground: Option<Ground>,
+    /// Every ground it names ("North Pasture or Creek": both).
+    pub grounds: Vec<Ground>,
+    /// Words this reader doesn't follow ("except", "unless", "only", …): the
+    /// map can't settle it, a reviewer or a person does.
+    pub unsupported: bool,
     /// It keeps animals out of (or away from) the ground.
     pub keep_out: bool,
     /// How far from the ground (m).
@@ -366,6 +374,10 @@ fn mentions(text: &[String], name: &str) -> bool {
 }
 
 const KEEP_OUT: [&str; 6] = ["never", "no", "not", "dont", "avoid", "without"];
+/// Words that turn a plain keep-out into something else ("anywhere except", "only", "unless"):
+/// a rule with one of them isn't settled on the map.
+const UNSUPPORTED: [&str; 14] =
+    ["except", "unless", "only", "but", "other", "otherwise", "anywhere", "everywhere", "outside", "if", "when", "while", "instead", "rather"];
 const KEEP_OUT_PAIRS: [[&str; 2]; 8] =
     [["keep", "out"], ["keep", "off"], ["stay", "out"], ["stay", "off"], ["stay", "away"], ["away", "from"], ["clear", "of"], ["out", "of"]];
 /// Words for every herd.
@@ -448,22 +460,28 @@ fn distance_at(ws: &[String], i: usize) -> Option<f64> {
 /// Read a rule (see [`Reading`]).
 pub fn read(text: &str, world: &World) -> Reading {
     let ws = words(text);
-    let mut r = Reading::default();
-    r.keep_out = ws.iter().any(|w| KEEP_OUT.contains(&w.as_str()))
-        || ws.windows(2).any(|p| KEEP_OUT_PAIRS.iter().any(|k| p[0] == k[0] && p[1] == k[1]))
-        || ws.iter().any(|w| w == "leave") && (0..ws.len()).any(|i| distance_at(&ws, i).is_some());
-    // The longest name wins; a paddock over a feature of the same length.
-    let mut best: Option<(usize, Ground)> = None;
-    let mut consider = |name: &str, g: Ground, bonus: usize| {
-        if mentions(&ws, name) {
-            let score = words(name).len() * 2 + bonus;
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                best = Some((score, g));
-            }
+    let mut r = Reading {
+        keep_out: ws.iter().any(|w| KEEP_OUT.contains(&w.as_str()))
+            || ws.windows(2).any(|p| KEEP_OUT_PAIRS.iter().any(|k| p[0] == k[0] && p[1] == k[1]))
+            || ws.iter().any(|w| w == "leave") && (0..ws.len()).any(|i| distance_at(&ws, i).is_some()),
+        unsupported: ws.iter().any(|w| UNSUPPORTED.contains(&w.as_str())),
+        ..Default::default()
+    };
+    // Every ground named. A name inside a longer one named at the same place
+    // ("North" in "North Pasture") is that longer one.
+    let mut found: Vec<(Vec<(usize, usize)>, Ground)> = Vec::new();
+    let mut consider = |name: &str, g: Ground| {
+        let n = words(name);
+        if n.is_empty() {
+            return;
+        }
+        let at: Vec<(usize, usize)> = (0..ws.len().saturating_sub(n.len() - 1)).filter(|&i| ws[i..i + n.len()] == n[..]).map(|i| (i, i + n.len())).collect();
+        if !at.is_empty() && !found.iter().any(|(_, f)| f.name == g.name && f.shape == g.shape) {
+            found.push((at, g));
         }
     };
     for p in &world.paddocks {
-        consider(&p.name, Ground { name: p.name.clone(), shape: Shape::Area(p.geometry.clone()), paddock_id: Some(p.id.clone()) }, 1);
+        consider(&p.name, Ground { name: p.name.clone(), shape: Shape::Area(p.geometry.clone()), paddock_id: Some(p.id.clone()), extent_m: 0.0 });
     }
     for f in world.features.iter().filter(|f| f.kind != FeatureKind::NoGo) {
         let Some(name) = f.name.as_deref() else { continue };
@@ -473,9 +491,17 @@ pub fn read(text: &str, world: &World) -> Reading {
             FeatureGeometry::LineString(pts) => Shape::Line(pts.clone()),
             FeatureGeometry::Point(p) => Shape::Point(*p),
         };
-        consider(name, Ground { name: name.to_owned(), shape, paddock_id: f.paddock_id.clone() }, 0);
+        let extent_m = f.props.get("radius_m").and_then(Value::as_f64).filter(|r| r.is_finite() && *r > 0.0).unwrap_or(0.0);
+        consider(name, Ground { name: name.to_owned(), shape, paddock_id: f.paddock_id.clone(), extent_m });
     }
-    r.ground = best.map(|(_, g)| g);
+    let inside = |a: (usize, usize), b: (usize, usize)| b.0 <= a.0 && a.1 <= b.1 && b != a;
+    let kept: Vec<Ground> = found
+        .iter()
+        .filter(|(at, _)| at.iter().any(|&a| !found.iter().any(|(other, _)| other.iter().any(|&b| inside(a, b)))))
+        .map(|(_, g)| g.clone())
+        .collect();
+    r.ground = (kept.len() == 1).then(|| kept[0].clone());
+    r.grounds = kept;
     r.distance_m = (0..ws.len()).find_map(|i| distance_at(&ws, i)).unwrap_or(0.0);
     for i in 0..ws.len() {
         match ws[i].as_str() {
@@ -512,8 +538,8 @@ pub fn read(text: &str, world: &World) -> Reading {
             r.herds.push(h.id.clone());
         }
     }
-    // Words of the ground's own name ("bull pasture") don't name animals.
-    let named: Vec<String> = r.ground.as_ref().map(|g| words(&g.name)).unwrap_or_default();
+    // Words of the grounds' own names ("bull pasture") don't name animals.
+    let named: Vec<String> = r.grounds.iter().flat_map(|g| words(&g.name)).collect();
     let herd_words: Vec<String> = world.herds.iter().flat_map(|h| words(&h.name)).collect();
     let animal = |w: &String| CLASSES.contains(&w.as_str()) && !herd_words.contains(w) && !named.contains(w);
     r.vague = r.herds.is_empty() && ws.iter().any(animal) && !ws.iter().any(|w| ALL.contains(&w.as_str()));
@@ -571,10 +597,10 @@ fn next_window(r: &Reading, world: &World) -> (Option<DateTime<Utc>>, Option<Dat
 /// ground, for every herd, with no animals it can't place.
 pub fn suggest(r: &Reading, world: &World) -> Option<Suggestion> {
     let g = r.ground.as_ref()?;
-    if !r.keep_out || !r.herds.is_empty() || r.vague {
+    if !r.keep_out || !r.herds.is_empty() || r.vague || r.unsupported {
         return None;
     }
-    let geometry = buffered(g, r.distance_m)?;
+    let geometry = buffered(g, r.distance_m + g.extent_m)?;
     let dated = r.from.is_some() || r.until.is_some();
     let (active_from, active_until) = if dated { next_window(r, world) } else { (None, None) };
     let away = if r.distance_m > 0.0 { format!(" and {:.0} m around it", r.distance_m) } else { String::new() };
@@ -690,12 +716,29 @@ pub fn buffered(g: &Ground, distance_m: f64) -> Option<Polygon> {
     Some(op_geo::shape::fit(&p, &op_geo::CollarLimits { outer: 256, holes: 0, hole_vertices: 0, total: 256, ..op_geo::CollarLimits::V0 }))
 }
 
-/// Whether `shape` comes onto the ground or within `distance_m` of it.
+/// Whether `shape` comes onto the ground (as far as the mapped feature
+/// reaches: a hazard point's radius) or within `distance_m` of it. A point
+/// or line with no reach is touched when the shape comes within half a
+/// metre of it: it is never "clear" just for having no area.
 fn touches(shape: &Polygon, g: &Ground, distance_m: f64) -> bool {
-    let Some(o) = anchor(&g.shape) else { return false };
+    use geo::{Distance, Euclidean};
+    let Some(o) = anchor(&g.shape) else { return true };
     let loc = Local(Projection::new(o));
-    let Some(zone) = loc.grown(&g.shape, distance_m) else { return false };
-    MultiPolygon(vec![loc.poly(shape)]).intersection(&zone).unsigned_area() >= OVERLAP_M2
+    let target = loc.poly(shape);
+    match loc.grown(&g.shape, distance_m + g.extent_m) {
+        Some(zone) => MultiPolygon(vec![target]).intersection(&zone).unsigned_area() >= OVERLAP_M2,
+        None => {
+            let d = match &g.shape {
+                Shape::Point(p) => {
+                    let [x, y] = loc.0.forward(*p);
+                    Euclidean::distance(&geo::Point::new(x, y), &target)
+                }
+                Shape::Line(l) => Euclidean::distance(&LineString(l.iter().map(|c| loc.0.forward(*c)).map(|[x, y]| Coord { x, y }).collect()), &target),
+                Shape::Area(_) => 0.0,
+            };
+            d < 0.5
+        }
+    }
 }
 
 // ---- checking a decision --------------------------------------------------------------------
@@ -721,15 +764,21 @@ pub struct RuleCheck {
 /// A rule checked on the map where its words allow (see [`read`]); `None`
 /// when only a reviewer can tell.
 pub fn check_on_map(r: &Reading, world: &World, herd_id: &str, geometry: Option<&Polygon>) -> Option<(Verdict, String)> {
-    let g = r.ground.as_ref().filter(|_| r.keep_out)?;
+    // Only a plain keep-out of named ground, read in full: words it doesn't follow are a reviewer's or a person's.
+    if !r.keep_out || r.grounds.is_empty() || r.unsupported {
+        return None;
+    }
     if !in_force(r, today(world)) {
         return Some((Verdict::Complies, "not in force today".into()));
     }
     let Some(shape) = geometry else { return Some((Verdict::Complies, "no new ground".into())) };
-    if !touches(shape, g, r.distance_m) {
-        let near = if r.distance_m > 0.0 { format!("{:.0} m clear of {}", r.distance_m, g.name) } else { format!("clear of {}", g.name) };
+    // Every ground it names, as far as each reaches on the map.
+    let Some(g) = r.grounds.iter().find(|g| touches(shape, g, r.distance_m)) else {
+        let names: Vec<&str> = r.grounds.iter().map(|g| g.name.as_str()).collect();
+        let names = names.join(" and ");
+        let near = if r.distance_m > 0.0 { format!("{:.0} m clear of {names}", r.distance_m) } else { format!("clear of {names}") };
         return Some((Verdict::Complies, near));
-    }
+    };
     if !r.herds.is_empty() && !r.herds.iter().any(|h| h == herd_id) {
         return Some((Verdict::Complies, "about another herd".into()));
     }
@@ -835,8 +884,10 @@ pub async fn review(ctx: &Ctx, d: &Decision, herd: &Herd, automatic: bool) -> an
 }
 
 /// The second brain pass: the farm's brain asked whether the decision
-/// follows the rules the map couldn't settle. Anything but a clear
-/// COMPLIES is a doubt, and so is a brain that can't answer.
+/// follows the rules the map couldn't settle, one structured answer per
+/// rule ([`read_review`]). Only an explicit, unconditional PASS for a rule
+/// lets it go on its own; anything else is a doubt, and so is a brain that
+/// can't answer.
 async fn reviewer(ctx: &Ctx, d: &Decision, herd: &Herd, all: &[FarmRule], open: &[&FarmRule], world: &World) -> Vec<RuleCheck> {
     let unsure = |why: &str| {
         open.iter().map(|r| RuleCheck { rule_id: r.id.clone(), verdict: Verdict::Unsure, by: "reviewer".into(), why: why.to_owned() }).collect::<Vec<_>>()
@@ -845,7 +896,8 @@ async fn reviewer(ctx: &Ctx, d: &Decision, herd: &Herd, all: &[FarmRule], open: 
         Ok(b) => b,
         Err(e) => return unsure(&format!("no reviewer ({e})")),
     };
-    let numbered: Vec<String> = open.iter().map(|r| format!("{}: {}", quoted(all, &r.id), r.text)).collect();
+    let _ = all;
+    let numbered: Vec<Value> = open.iter().enumerate().map(|(i, r)| json!({ "rule": i + 1, "text": r.text })).collect();
     let covers: Vec<Value> = match &d.geometry {
         Some(g) => world
             .paddocks
@@ -865,8 +917,10 @@ async fn reviewer(ctx: &Ctx, d: &Decision, herd: &Herd, all: &[FarmRule], open: 
         "rules_to_check": numbered,
     });
     let question = "You check one grazing decision against the farm's own rules before it goes to the collars without a person \
-looking. Read the decision and the rules in the context. Answer with COMPLIES, VIOLATES or UNSURE as the first word, then one short \
-sentence naming the rule and why. Say UNSURE when anything is unclear: a person will look."
+looking. Read the decision and the rules in the context. Answer with JSON only, nothing else: {\"rules\": [{\"rule\": <number>, \
+\"verdict\": \"PASS\" or \"FAIL\" or \"UNSURE\", \"why\": \"one short sentence\"}]}, one entry for every rule in rules_to_check, \
+numbered as there. PASS only when the decision follows the rule as things stand now, with no condition still to be met. Anything \
+the context doesn't show, or that depends on something not yet done, is UNSURE: a person will look."
         .to_owned();
     // No tools: it judges from what it is given (anonymous lists none).
     let req = op_brain::AskRequest { question, context, tools: ctx.tool_runner(Identity::anonymous(), &[]), max_chars: 400, log: None };
@@ -875,16 +929,41 @@ sentence naming the rule and why. Say UNSURE when anything is unclear: a person 
         Ok(Err(e)) => return unsure(&format!("the reviewer couldn't answer ({e})")),
         Err(_) => return unsure("the reviewer took too long"),
     };
-    let first = answer.split_whitespace().next().unwrap_or_default().trim_matches(|c: char| !c.is_alphabetic()).to_ascii_uppercase();
-    let why = answer.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-    let why = if why.is_empty() { "no reason given".to_owned() } else { why };
-    let verdict = match first.as_str() {
-        "COMPLIES" => Verdict::Complies,
-        "VIOLATES" => Verdict::Violates,
-        _ => Verdict::Unsure,
-    };
-    tracing::info!(decision = %d.id, verdict = ?verdict, "rule review");
-    open.iter().map(|r| RuleCheck { rule_id: r.id.clone(), verdict, by: "reviewer".into(), why: why.clone() }).collect()
+    let verdicts = read_review(&answer, open.len());
+    tracing::info!(decision = %d.id, verdicts = ?verdicts.iter().map(|(v, _)| *v).collect::<Vec<_>>(), "rule review");
+    open.iter().zip(verdicts).map(|(r, (verdict, why))| RuleCheck { rule_id: r.id.clone(), verdict, by: "reviewer".into(), why }).collect()
+}
+
+/// Words that make a PASS conditional or doubtful.
+const HEDGES: [&str; 16] = [
+    "only if", "unless", "unsure", "not sure", "if ", "assum", "depend", "maybe", "might", "unclear", "cannot", "can't", "has not", "hasn't", "not yet",
+    "provided",
+];
+
+/// The reviewer's answer for `n` rules (numbered from 1), in order. Only a
+/// JSON answer with an entry for the rule whose verdict is exactly `PASS`
+/// and whose reason is given and unconditional complies; `FAIL` violates;
+/// anything else (no JSON, a missing or repeated rule, another word, a
+/// condition in the reason) is unsure.
+pub fn read_review(answer: &str, n: usize) -> Vec<(Verdict, String)> {
+    let unsure = |why: &str| vec![(Verdict::Unsure, why.to_owned()); n];
+    let text = answer.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return unsure("the reviewer's answer wasn't the structured PASS asked for") };
+    let Some(items) = v.get("rules").and_then(Value::as_array) else { return unsure("the reviewer's answer named no rules") };
+    (1..=n)
+        .map(|i| {
+            let mine: Vec<&Value> = items.iter().filter(|x| x.get("rule").and_then(Value::as_u64) == Some(i as u64)).collect();
+            let [item] = mine.as_slice() else { return (Verdict::Unsure, "the reviewer didn't answer for this rule once".to_owned()) };
+            let why = item.get("why").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
+            let lower = why.to_lowercase();
+            match item.get("verdict").and_then(Value::as_str) {
+                Some("PASS") if !why.is_empty() && !HEDGES.iter().any(|h| lower.contains(h)) => (Verdict::Complies, why),
+                Some("PASS") => (Verdict::Unsure, if why.is_empty() { "no reason given".to_owned() } else { format!("a conditional PASS: {why}") }),
+                Some("FAIL") => (Verdict::Violates, if why.is_empty() { "no reason given".to_owned() } else { why }),
+                _ => (Verdict::Unsure, if why.is_empty() { "no clear answer".to_owned() } else { why }),
+            }
+        })
+        .collect()
 }
 
 /// A decision's action changes what the collars get.
@@ -1019,6 +1098,56 @@ mod tests {
         // Words without ground: the reviewer's.
         assert!(check_on_map(&read("Move them early on hot days", &w), &w, "herd_c", None).is_none());
         assert!(suggest(&read("Move them early on hot days", &w), &w).is_none());
+    }
+
+    /// Astra 02 F07: every named ground counts, and a point's mapped reach.
+    #[test]
+    fn every_named_ground_and_a_points_reach_count() {
+        let mut w = world(5, 10);
+        let r = read("Never graze North or Creek", &w);
+        assert_eq!(r.grounds.len(), 2);
+        assert!(r.ground.is_none(), "two grounds: nothing to convert into one feature");
+        assert!(suggest(&r, &w).is_none());
+        assert_eq!(check_on_map(&r, &w, "herd_c", Some(&rect(10.0, 10.0, 90.0, 90.0))).unwrap().0, Verdict::Violates, "Creek is the second name");
+        assert_eq!(check_on_map(&r, &w, "herd_c", Some(&rect(10.0, 500.0, 90.0, 590.0))).unwrap().0, Verdict::Complies);
+        // "North" inside "North Pasture" is that paddock, not two.
+        w.paddocks.push(paddock("pad_np", "North Pasture", rect(0.0, 600.0, 100.0, 700.0)));
+        let r = read("Never graze North Pasture", &w);
+        assert_eq!(r.grounds.len(), 1);
+        assert_eq!(r.ground.as_ref().unwrap().paddock_id.as_deref(), Some("pad_np"));
+        // A hazard point with a radius, inside the target: taken in. Without one: still touched.
+        let quarry = |props: Value| -> MapFeature {
+            serde_json::from_value(json!({ "id": "fea_q", "kind": "hazard", "name": "Quarry", "geometry": { "type": "Point", "coordinates": at(50.0, 50.0) }, "props": props, "created_at": now(), "updated_at": now() })).unwrap()
+        };
+        for props in [json!({ "radius_m": 3.0 }), json!({})] {
+            w.features = vec![quarry(props)];
+            let r = read("Never graze Quarry", &w);
+            assert_eq!(check_on_map(&r, &w, "herd_c", Some(&rect(10.0, 10.0, 90.0, 90.0))).unwrap().0, Verdict::Violates);
+        }
+        w.features = vec![quarry(json!({ "radius_m": 3.0 }))];
+        assert_eq!(check_on_map(&read("Never graze Quarry", &w), &w, "herd_c", Some(&rect(55.0, 10.0, 90.0, 90.0))).unwrap().0, Verdict::Complies);
+        // Words it doesn't follow: not settled on the map.
+        assert!(check_on_map(&read("Don't graze anywhere except North", &w), &w, "herd_c", Some(&rect(10.0, 10.0, 90.0, 90.0))).is_none());
+    }
+
+    /// Astra 02 F08: only an explicit, unconditional, structured PASS complies.
+    #[test]
+    fn only_a_structured_pass_lets_a_rule_go() {
+        let pass = r#"{"rules":[{"rule":1,"verdict":"PASS","why":"Creek is not the paddock named."}]}"#;
+        assert_eq!(read_review(pass, 1)[0].0, Verdict::Complies);
+        for answer in [
+            "COMPLIES only if the supervisor checks the weather; that has not happened and I am unsure.",
+            r#"{"rules":[{"rule":1,"verdict":"PASS","why":"Complies only if the supervisor checks the weather."}]}"#,
+            r#"{"rules":[{"rule":1,"verdict":"PASS"}]}"#,
+            r#"{"rules":[{"rule":1,"verdict":"COMPLIES","why":"fine"}]}"#,
+            r#"{"rules":[{"rule":2,"verdict":"PASS","why":"fine"}]}"#,
+            r#"{"rules":[{"rule":1,"verdict":"PASS","why":"fine"},{"rule":1,"verdict":"FAIL","why":"no"}]}"#,
+        ] {
+            assert_eq!(read_review(answer, 1)[0].0, Verdict::Unsure, "{answer}");
+        }
+        let two = r#"{"rules":[{"rule":1,"verdict":"PASS","why":"clear of North."},{"rule":2,"verdict":"FAIL","why":"takes in Creek."}]}"#;
+        let v = read_review(two, 2);
+        assert_eq!((v[0].0, v[1].0), (Verdict::Complies, Verdict::Violates));
     }
 
     #[test]

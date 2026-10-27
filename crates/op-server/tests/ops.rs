@@ -114,3 +114,92 @@ fn an_internal_error_reaches_the_client_as_a_reference_only() {
     let r = e.message.split("(ref ").nth(1).and_then(|s| s.split(')').next()).expect("a reference");
     assert_eq!(r.len(), 10);
 }
+
+fn job(name: &'static str, critical: bool, down_for: Option<chrono::Duration>, at: chrono::DateTime<chrono::Utc>) -> op_core::tasks::TaskInfo {
+    use op_core::tasks::{TaskInfo, TaskStatus};
+    TaskInfo {
+        name,
+        status: if down_for.is_some() { TaskStatus::Restarting } else { TaskStatus::Running },
+        started_at: at,
+        every_s: None,
+        last_beat_at: None,
+        restarts: if down_for.is_some() { 5 } else { 0 },
+        beats: 0,
+        last_error: None,
+        last_error_at: None,
+        critical,
+        down_since: down_for.map(|d| at - d),
+    }
+}
+
+#[test]
+fn healthz_is_down_when_a_critical_job_has_failed_for_five_minutes() {
+    use axum::http::StatusCode;
+    use op_server::ops::health_of;
+    let at = op_core::time::now();
+    let min = chrono::Duration::minutes;
+
+    // A critical job failing for a minute: degraded, still 200.
+    let (code, h) = health_of(true, false, &[job("ingest.moves", true, Some(min(1)), at)], at);
+    assert_eq!((code, h.status), (StatusCode::OK, "degraded"));
+    // For six: down, 503, and named.
+    let (code, h) = health_of(true, false, &[job("ingest.moves", true, Some(min(6)), at), job("test.fine", false, None, at)], at);
+    assert_eq!((code, h.status, h.failing), (StatusCode::SERVICE_UNAVAILABLE, "down", vec!["ingest.moves"]));
+    // A non-critical job failing for an hour only degrades.
+    let (code, h) = health_of(true, false, &[job("analytics.rollup", false, Some(min(60)), at)], at);
+    assert_eq!((code, h.status), (StatusCode::OK, "degraded"));
+    let (code, h) = health_of(true, false, &[job("ingest.moves", true, None, at)], at);
+    assert_eq!((code, h.status), (StatusCode::OK, "ok"));
+    let (code, _) = health_of(false, false, &[], at);
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn while_the_database_opens_healthz_says_migrating_and_the_rest_waits() {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let progress = op_core::store::Progress::default();
+    {
+        let mut p = progress.lock().unwrap();
+        p.phase = "migrating";
+        p.pending = vec![890, 907];
+    }
+    let gate = Arc::new(op_server::ops::Gate::new(progress.clone()));
+    let app = axum::Router::new().fallback(op_server::ops::gated).with_state(gate.clone());
+    let get = |path: &str| Request::get(path).body(Body::empty()).unwrap();
+    let json = |res: axum::response::Response| async move { serde_json::from_slice::<Value>(&res.into_body().collect().await.unwrap().to_bytes()).unwrap() };
+
+    let res = app.clone().oneshot(get("/healthz")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json(res).await;
+    assert_eq!(body["status"], "migrating");
+    assert_eq!(body["progress"]["pending"], json!([890, 907]));
+
+    let res = app.clone().oneshot(get("/api/state")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.headers()[header::RETRY_AFTER], "5");
+    assert_eq!(json(res).await["status"], "migrating");
+
+    progress.lock().unwrap().phase = "opening";
+    assert_eq!(json(app.clone().oneshot(get("/healthz")).await.unwrap()).await["status"], "starting");
+
+    // Started: everything goes to the app.
+    gate.open(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })));
+    let res = app.oneshot(get("/healthz")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn server_json_names_the_url_and_healthz_answers_once_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = serve(opts(dir.path())).await.unwrap();
+    let body: Value = reqwest::get(format!("{}/healthz", handle.url())).await.unwrap().json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert!(body["jobs"].as_array().unwrap().iter().any(|j| j["name"] == "ingest.moves" && j["critical"] == true), "{body}");
+    handle.shutdown().await.unwrap();
+}

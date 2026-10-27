@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-use crate::boundary::{NewBoundary, insert_boundary};
+use crate::gate::{Authorized, NewBoundary, Stage};
 use crate::moves::{FRESH_FIX, STEP_EVERY, stride};
 use crate::planner::{self, Frame, Plan, PlanInput};
 use crate::{config, db};
@@ -341,10 +341,10 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         tracing::info!(collar = %collar_id, "escape: an exclusion lies between the animal and the herd, no pen");
         return Ok(None);
     };
-    if !gate_pen(ctx, &collar, &active, &polygon, at).await? {
+    let Some(auth) = gate_pen(ctx, &collar, &active, &polygon).await? else {
         hold_off(collar_id, at);
         return Ok(None);
-    }
+    };
 
     let mut e = Escape {
         id: id::new_id(id::ESCAPE),
@@ -360,7 +360,15 @@ async fn maybe_start(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::R
         ended_at: None,
     };
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
+    let b = match insert_own(&mut tx, ctx, auth, &collar, &active, &polygon, None, None, at).await {
+        Ok(b) => b,
+        Err(e) if refused(&e) => {
+            drop(tx);
+            hold_off(collar_id, at);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
     e.version = Some(b.version);
     sqlx::query(
         "INSERT INTO escapes (id, herd_id, collar_id, status, boundary_id, step, remaining_m, pen, started_at, updated_at)
@@ -484,43 +492,56 @@ pub fn plausible(fixes: &[(DateTime<Utc>, LonLat, f64)], since: DateTime<Utc>, h
     Ok(())
 }
 
-/// Whether a pen may go: it passes the gate as an escape pen with the hard
-/// findings it has that the herd's boundary doesn't (judged as the collar
-/// enforces it). Logged either way; refused is `false`.
-async fn gate_pen(ctx: &Ctx, collar: &Collar, herd: &Boundary, pen: &Polygon, at: DateTime<Utc>) -> anyhow::Result<bool> {
-    let caps = crate::shape::herd_collars(ctx.db(), &collar.herd_id).await?.into_iter().find(|c| c.id == collar.id).map(|c| c.caps);
-    let holeless = caps.is_none_or(|c| !c.holds_holes());
-    let known = crate::prepare::map_only(ctx, &herd.geometry, at, holeless).await?;
-    let found = crate::prepare::map_only(ctx, pen, at, holeless).await?;
-    let new: Vec<op_core::check::Finding> = found.into_iter().filter(|f| !known.iter().any(|k| k.code == f.code && k.targets == f.targets)).collect();
+/// Whether a pen may go: the whole pen, as the collar would enforce it,
+/// passes the gate as an escape pen. What the herd's own boundary takes in
+/// is no excuse: a pen never goes into a no-go zone or across a road, whatever
+/// the herd's boundary does. Logged either way; refused is `None`.
+async fn gate_pen(ctx: &Ctx, collar: &Collar, herd: &Boundary, pen: &Polygon) -> anyhow::Result<Option<Authorized>> {
     let sender = crate::gate::Sender::of(crate::gate::SenderKind::Escape);
     let check = crate::gate::Check {
         herd_id: &collar.herd_id,
         geometry: pen,
-        findings: &new,
+        warn_m: herd.warn_m,
+        findings: &[],
         sender: &sender,
         decision_id: Some(&herd.decision_id),
         collar_id: Some(&collar.id),
+        at: now(),
+        stage: Stage::Send,
+        inherited: false,
     };
     match crate::gate::pass(ctx, &check).await {
-        Ok(_) => Ok(true),
+        Ok(a) => Ok(Some(a)),
         Err(e) if e.status == axum::http::StatusCode::CONFLICT => {
             tracing::warn!(collar = %collar.id, "escape: no pen, {}", e.message);
-            Ok(false)
+            Ok(None)
         }
         Err(e) => Err(anyhow::anyhow!(e.message)),
     }
 }
 
+/// The gate refused (409), not a failure.
+fn refused(e: &anyhow::Error) -> bool {
+    e.to_string().starts_with(GATE_REFUSED)
+}
+
+/// How [`insert_own`] marks a refusal by the gate.
+const GATE_REFUSED: &str = "gate refused: ";
+
 /// A pen as it goes to the collar: the exclusions in effect that it takes
 /// in are kept out of it, as on any herd boundary. `None` when that leaves
 /// the animal out of it, or most of the herd's ground (an exclusion between
-/// them): there is no pen to walk it back on.
+/// them), or an exclusion or no-go zone covers the pen (nothing to keep
+/// out): there is no pen to walk it back on.
 async fn fenced(ctx: &Ctx, herd: &Boundary, pen: &Polygon, animal: LonLat, limits: &CollarLimits, at: DateTime<Utc>) -> anyhow::Result<Option<Polygon>> {
     let gap = op_geo::shape::min_gap_m(herd.warn_m) + op_geo::shape::SERVER_SLACK_M;
     let ex = crate::prepare::exclude(ctx, pen, limits, herd.warn_m, gap, at).await?;
-    if ex.placed.iter().all(|p| p.placement == op_geo::exclude::Placement::Drop) {
+    if ex.placed.is_empty() {
         return Ok(Some(pen.clone()));
+    }
+    // One that would be dropped covers the pen: no pen, never the pen as it was.
+    if ex.placed.iter().any(|p| p.placement == op_geo::exclude::Placement::Drop && overlaps(pen, &p.feature)) {
+        return Ok(None);
     }
     let shaped = ex.fitted;
     let ok = shaped.contains(animal)
@@ -529,10 +550,18 @@ async fn fenced(ctx: &Ctx, herd: &Boundary, pen: &Polygon, animal: LonLat, limit
     Ok(ok.then_some(shaped))
 }
 
+/// Whether a feature's polygon overlaps `pen` at all (a dropped placement can also mean it misses).
+fn overlaps(pen: &Polygon, f: &op_core::features::MapFeature) -> bool {
+    f.geometry.polygon().is_some_and(|p| crate::prepare::share_inside(pen, &p) > 0.0)
+}
+
 /// A boundary for one collar under the decision its herd is on: a pen, or
-/// (`copy_of`) a copy of a herd boundary.
+/// (`copy_of`) a copy of a herd boundary, with what the gate gave for it.
+#[allow(clippy::too_many_arguments)]
 async fn insert_own(
     tx: &mut sqlx::SqliteConnection,
+    ctx: &Ctx,
+    auth: Authorized,
     collar: &Collar,
     herd: &Boundary,
     geometry: &Polygon,
@@ -551,7 +580,9 @@ async fn insert_own(
         collar_id: Some(&collar.id),
         copy_of,
     };
-    insert_boundary(tx, &nb).await.map_err(|e| anyhow::anyhow!(e.message))
+    crate::gate::insert(tx, ctx, auth, &nb)
+        .await
+        .map_err(|e| if e.status == axum::http::StatusCode::CONFLICT { anyhow::anyhow!("{GATE_REFUSED}{}", e.message) } else { anyhow::anyhow!(e.message) })
 }
 
 /// One pass for a collar's open escape.
@@ -592,13 +623,21 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
             if waiting(collar_id, at) {
                 return Ok(());
             }
-            if !gate_pen(ctx, &collar, &active, &polygon, at).await? {
+            let Some(auth) = gate_pen(ctx, &collar, &active, &polygon).await? else {
                 hold_off(collar_id, at);
                 return Ok(());
-            }
+            };
             let mut e = row.e.clone();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-            let b = insert_own(&mut tx, &collar, &active, &polygon, None, None, at).await?;
+            let b = match insert_own(&mut tx, ctx, auth, &collar, &active, &polygon, None, None, at).await {
+                Ok(b) => b,
+                Err(e) if refused(&e) => {
+                    drop(tx);
+                    hold_off(collar_id, at);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             e.step += 1;
             e.remaining_m = round_m(remaining_m);
             e.geometry = Some(polygon);
@@ -638,14 +677,29 @@ async fn drive(ctx: &Ctx, collar_id: &str, at: DateTime<Utc>) -> anyhow::Result<
 /// fallen out of step ([`out_of_step`]). Read under the caller's write
 /// transaction, so the copies are of the herd's newest boundaries. The copy
 /// of the one in effect comes first.
-pub(crate) async fn hand_copies(tx: &mut sqlx::SqliteConnection, collar: &Collar, at: DateTime<Utc>) -> anyhow::Result<Vec<Boundary>> {
+pub(crate) async fn hand_copies(tx: &mut sqlx::SqliteConnection, ctx: &Ctx, collar: &Collar, at: DateTime<Utc>) -> anyhow::Result<Vec<Boundary>> {
     let split = db::herd_boundaries_in(tx, &collar.herd_id, at).await?;
     let mut out = Vec::with_capacity(1 + split.staged.len());
-    if let Some(active) = &split.active {
-        out.push(insert_own(tx, collar, active, &active.geometry, Some(active.version), None, at).await?);
-    }
-    for b in &split.staged {
-        out.push(insert_own(tx, collar, b, &b.geometry, Some(b.version), b.effective_at, at).await?);
+    let wanted = split.active.iter().map(|b| (b, None)).chain(split.staged.iter().map(|b| (b, b.effective_at)));
+    for (b, effective_at) in wanted {
+        // Each copy is judged afresh, for this collar, under what the herd's boundary went out with.
+        let auth = match crate::gate::reauthorize_in(tx, b, Some(&collar.id), Stage::Copy).await {
+            Ok(a) => a,
+            Err(e) if e.status == axum::http::StatusCode::CONFLICT => {
+                tracing::warn!(collar = %collar.id, version = b.version, "no copy for this collar: {}", e.message);
+                if effective_at.is_none() {
+                    // Without the one in effect, copies of what is staged above it would go out of order.
+                    break;
+                }
+                continue;
+            }
+            Err(e) => return Err(anyhow::anyhow!(e.message)),
+        };
+        match insert_own(tx, ctx, auth, collar, b, &b.geometry, Some(b.version), effective_at, at).await {
+            Ok(c) => out.push(c),
+            Err(e) if refused(&e) => tracing::warn!(collar = %collar.id, version = b.version, "no copy for this collar: {e:#}"),
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
@@ -667,7 +721,7 @@ async fn end(ctx: &Ctx, row: EscapeRow, collar: Option<&Collar>, status: EscapeS
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let mut copy = None;
     if let Some(c) = collar {
-        let copies = hand_copies(&mut tx, c, at).await?;
+        let copies = hand_copies(&mut tx, ctx, c, at).await?;
         copy = copies.into_iter().next().filter(|b| b.effective_at.is_none());
     }
     e.status = status;

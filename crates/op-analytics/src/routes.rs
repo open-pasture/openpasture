@@ -1029,7 +1029,14 @@ pub fn walk_rows_sql(herd: bool) -> String {
 /// from every hot fix when the range holds at most [`WALK_ROWS`], else from
 /// one fix a bucket (a day of 250 collars is 4.3 M fixes; its walks come from
 /// 1,440 a collar). Dwell is [`hot_dwell`]'s; cues are the scan's.
-async fn hot_behaviour(ctx: &Ctx, from: i64, to: i64, herd: Option<&str>, collar: Option<&str>, per: &mut BTreeMap<String, CollarBehaviour>) -> anyhow::Result<()> {
+async fn hot_behaviour(
+    ctx: &Ctx,
+    from: i64,
+    to: i64,
+    herd: Option<&str>,
+    collar: Option<&str>,
+    per: &mut BTreeMap<String, CollarBehaviour>,
+) -> anyhow::Result<()> {
     let counts = match collar {
         Some(c) => {
             let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 AND (?4 IS NULL OR herd_id = ?4)")
@@ -1070,14 +1077,15 @@ async fn hot_behaviour(ctx: &Ctx, from: i64, to: i64, herd: Option<&str>, collar
         }
     }
     if let (Some(c), true) = (collar, total <= WALK_ROWS) {
-        let rows: Vec<(i64, f64, f64, Option<f64>)> =
-            sqlx::query_as("SELECT t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t, id")
-                .bind(c)
-                .bind(from)
-                .bind(to)
-                .bind(herd)
-                .fetch_all(ctx.db())
-                .await?;
+        let rows: Vec<(i64, f64, f64, Option<f64>)> = sqlx::query_as(
+            "SELECT t, lon, lat, accuracy_m FROM fixes WHERE collar_id = ?1 AND t >= ?2 AND t < ?3 AND (?4 IS NULL OR herd_id = ?4) ORDER BY t, id",
+        )
+        .bind(c)
+        .bind(from)
+        .bind(to)
+        .bind(herd)
+        .fetch_all(ctx.db())
+        .await?;
         let w = per.entry(c.to_owned()).or_default();
         for (t, lon, lat, acc) in rows {
             w.walk.push(t, [lon, lat], acc);
@@ -1387,7 +1395,14 @@ pub async fn hot_dwell(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, index
 }
 
 /// [`hot_dwell`] of one collar's fixes only, when `collar` is given.
-pub async fn hot_dwell_for(ctx: &Ctx, from: i64, end: i64, herd: Option<&str>, collar: Option<&str>, index: &PaddockIndex) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
+pub async fn hot_dwell_for(
+    ctx: &Ctx,
+    from: i64,
+    end: i64,
+    herd: Option<&str>,
+    collar: Option<&str>,
+    index: &PaddockIndex,
+) -> anyhow::Result<HashMap<DwellKey, DwellAgg>> {
     let sql = hot_dwell_sql_for(herd.is_some(), collar.is_some());
     let mut q = sqlx::query(&sql).bind(from).bind(end).bind(herd).bind(MAX_DWELL_GAP_MS);
     if let Some(c) = collar {

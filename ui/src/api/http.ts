@@ -11,6 +11,8 @@
 // A GET is a view read unless its path is an analytics one, anything else is an act. The store
 // marks its reads core with scoped(). Each lane has a timeout; a caller's AbortSignal (scoped,
 // or useReads in store/reads.ts) cancels a read queued or in flight.
+// A request holds its slot, its timeout, its cancel and its slow mark until its whole body is
+// read (or it fails), not just until the headers arrive: a body that stalls still counts.
 
 export type Query = Record<string, string | number | boolean | undefined | null>;
 
@@ -124,8 +126,9 @@ function markSlow(delta: 1 | -1) {
   if (was !== slowCount > 0) slowSubs.forEach((f) => f(slowCount > 0));
 }
 
-// One fetch in its lane, with the lane's timeout and the caller's signal.
-async function send(lane: Lane, url: string, init: RequestInit, scope: Scope): Promise<Response> {
+// One fetch in its lane, with the lane's timeout and the caller's signal, and `read` of its
+// response inside the same: the slot is released only once the body is read or abandoned.
+async function send<T>(lane: Lane, url: string, init: RequestInit, scope: Scope, read: (res: Response) => Promise<T>): Promise<T> {
   await slot(lane, scope.signal);
   const ac = new AbortController();
   let timedOut = false;
@@ -144,10 +147,16 @@ async function send(lane: Lane, url: string, init: RequestInit, scope: Scope): P
   const cancel = () => ac.abort();
   scope.signal?.addEventListener("abort", cancel, { once: true });
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const res = await fetch(url, { ...init, signal: ac.signal });
+    return await read(res);
   } catch (e) {
-    if (timedOut) throw new ApiError(0, "The server took too long to answer.");
+    if (timedOut) {
+      ac.abort(); // a body still streaming stops here
+      throw new ApiError(0, "The server took too long to answer.");
+    }
     if (scope.signal?.aborted) throw new Aborted();
+    if (e instanceof ApiError) throw e;
+    ac.abort();
     throw new ApiError(0, "Couldn't reach the server.", e);
   } finally {
     clearTimeout(timer);
@@ -179,12 +188,13 @@ export async function req<T>(method: string, path: string, body?: unknown, q?: Q
     payload = JSON.stringify(body);
     h["Content-Type"] ??= "application/json";
   }
-  const res = await send(lane, path + qs(q), { method, headers: h, body: payload }, scope);
-  if (res.status === 401) unauthorized();
-  if (!res.ok) throw await failure(res);
-  if (res.status === 204) return undefined as T;
-  const type = res.headers.get("Content-Type") ?? "";
-  return (type.includes("json") ? res.json() : res.text()) as Promise<T>;
+  return send(lane, path + qs(q), { method, headers: h, body: payload }, scope, async (res) => {
+    if (res.status === 401) unauthorized();
+    if (!res.ok) throw await failure(res);
+    if (res.status === 204) return undefined as T;
+    const type = res.headers.get("Content-Type") ?? "";
+    return (await (type.includes("json") ? res.json() : res.text())) as T;
+  });
 }
 
 async function failure(res: Response) {
@@ -218,10 +228,12 @@ export const del = (p: string, q?: Query) => req<void>("DELETE", p, undefined, q
 export async function downloadBlob(path: string, filename: string, q?: Query, init?: { method: "POST"; body: unknown }) {
   const headers = authHeaders();
   if (init) headers["Content-Type"] = "application/json";
-  const res = await send(init ? "act" : "analytics", path + qs(q), init ? { method: init.method, headers, body: JSON.stringify(init.body) } : { headers }, { timeoutMs: 300_000 });
-  if (res.status === 401) unauthorized();
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
-  const url = URL.createObjectURL(await res.blob());
+  const blob = await send(init ? "act" : "analytics", path + qs(q), init ? { method: init.method, headers, body: JSON.stringify(init.body) } : { headers }, { timeoutMs: 300_000 }, async (res) => {
+    if (res.status === 401) unauthorized();
+    if (!res.ok) throw new ApiError(res.status, await errorText(res));
+    return res.blob();
+  });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;

@@ -7,6 +7,7 @@ import type { Collar } from "../../api";
 import type { HerdRow } from "../../registry";
 import { useStore } from "../../store";
 import { LOW_BATTERY } from "../../store/live";
+import { SIMULATED } from "../../sim";
 import { Input } from "../../ui";
 import { battery, herdRows, pageHash, pageKeys, rowLabel, rowText } from "./herd";
 
@@ -71,7 +72,7 @@ function Row({ row, href, on }: { row: HerdRow; href: string; on: boolean }) {
       <a href={href} aria-current={on ? "true" : undefined} data-state={c?.state ?? "none"}>
         <i className="ast" aria-hidden="true" />
         <span className="atag mono">{row.animal?.tag ?? c?.name}</span>
-        <span className="aname">{row.animal?.name ?? (row.animal ? "" : "no animal")}</span>
+        <span className="aname">{row.animal?.name ?? (row.animal ? "" : "no animal")}{c?.simulated && <i className="sim">{SIMULATED}</i>}</span>
         <span className={"abat mono" + (low ? " low" : "")}>{battery(c?.battery)}</span>
       </a>
     </li>
