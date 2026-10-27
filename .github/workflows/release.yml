@@ -1,7 +1,12 @@
 name: Release
 
-# Push a tag like v0.1.0. The tag is the version: every job writes it into
-# Cargo.toml, Cargo.lock and tauri.conf.json before building.
+# Push a tag like v0.1.0 on a commit whose version files already say 0.1.0
+# (scripts/set-version.py, then commit). The first job stops the release if
+# they disagree. See docs/RELEASING.md.
+#
+# Actions are pinned to commit SHAs. The signing secrets live in the `release`
+# environment (a maintainer approves each run) and are given only to the steps
+# that use them.
 
 on:
   push:
@@ -17,27 +22,68 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/open-pasture/openpasture
+  TAURI_CLI: "@tauri-apps/cli@2.12.4"
 
 jobs:
+  # The tag matches the repo, and the licence notices every artefact ships.
+  prepare:
+    name: Version and notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Tag matches the version files
+        run: python3 scripts/set-version.py --check "$GITHUB_REF_NAME"
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-about@0.9.2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+        working-directory: ui
+      - run: python3 scripts/third-party-notices.py
+      # The release notes are the CHANGELOG section for this version.
+      - name: Release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## " v "( |$)" {f=1; next} /^## /{f=0} f' CHANGELOG.md \
+            | sed -e '/./,$!d' > changes.md
+          if [ ! -s changes.md ]; then
+            echo "::warning::CHANGELOG.md has no section for $version; the release notes list only the downloads."
+          fi
+          cat changes.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: notices
+          path: |
+            THIRD-PARTY-NOTICES
+            changes.md
+          if-no-files-found: error
+
   macos-desktop:
     name: macOS desktop (universal, signed, notarized)
+    needs: prepare
     runs-on: macos-15
     timeout-minutes: 120
-    env:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      # Signs the update the installed apps download (see docs/RELEASING.md).
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    environment: release
     steps:
       # Never ship an unsigned app: stop here if any signing secret is missing.
       - name: Check signing secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           missing=()
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_TEAM_ID \
@@ -46,24 +92,39 @@ jobs:
             [ -n "${!name}" ] || missing+=("$name")
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error title=Signing secrets missing::Missing secrets: ${missing[*]}. The macOS app and its updates are only released signed (and the app notarized). Add them as described in docs/RELEASING.md, then re-run this job."
+            echo "::error title=Signing secrets missing::Missing secrets: ${missing[*]}. The macOS app and its updates are only released signed (and the app notarized). Add them to the release environment as described in docs/RELEASING.md, then re-run this job."
             exit 1
           fi
 
-      - uses: actions/checkout@v4
-
-      - name: Set version from tag
-        run: python3 scripts/set-version.py "$GITHUB_REF_NAME"
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: oven-sh/setup-bun@v2
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+
+      # Third-party actions run before any key is on the runner.
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: universal
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notices
+
+      - name: Build UI
+        run: bun install --frozen-lockfile && bun run build
+        working-directory: ui
 
       - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           keychain="$RUNNER_TEMP/build.keychain"
           echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
@@ -82,29 +143,41 @@ jobs:
           fi
 
       - name: Write App Store Connect API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$key_path"
           chmod 600 "$key_path"
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
-      - name: Build UI
-        run: bun install --frozen-lockfile && bun run build
-        working-directory: ui
-
       # Tauri signs with APPLE_SIGNING_IDENTITY (the config's "-" is only for
       # local builds) and notarizes the .app with the API key, then staples it.
       # It then packs the stapled .app as openpasture.app.tar.gz for the
-      # updater and signs that with TAURI_SIGNING_PRIVATE_KEY.
+      # updater and signs that with TAURI_SIGNING_PRIVATE_KEY. The licence
+      # files go into Contents/Resources.
       - name: Build, sign and notarize
         working-directory: apps/desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          # Tauri would import APPLE_CERTIFICATE into a second keychain; it is imported above.
-          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-          config=$(jq -nc --arg id "$APPLE_SIGNING_IDENTITY" '{bundle: {createUpdaterArtifacts: true, macOS: {signingIdentity: $id}}}')
-          bunx @tauri-apps/cli@^2 build --target universal-apple-darwin --bundles app,dmg --config "$config"
+          config=$(jq -nc --arg id "$APPLE_SIGNING_IDENTITY" '{bundle: {
+            createUpdaterArtifacts: true,
+            macOS: {signingIdentity: $id},
+            resources: {"../../../THIRD-PARTY-NOTICES": "THIRD-PARTY-NOTICES", "../../../LICENSE": "LICENSE", "../../../NOTICE": "NOTICE"}}}')
+          bunx "$TAURI_CLI" build --target universal-apple-darwin --bundles app,dmg --config "$config"
 
       - name: Sign, notarize and staple the DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           bundle=target/universal-apple-darwin/release/bundle
@@ -118,6 +191,13 @@ jobs:
           xcrun stapler staple out/openpasture-macos.dmg
           cp out/openpasture-macos.dmg "out/openpasture-${version}-macos-universal.dmg"
 
+      # Nothing after this needs a key; remove them before any later action runs.
+      - name: Remove keychain and key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain" || true
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+
       # The installed apps read latest.json from releases/latest; it points
       # at this tag's archive. A universal build serves both architectures.
       - name: Update archive and latest.json
@@ -128,9 +208,11 @@ jobs:
           cp "$archive" out/openpasture-macos.app.tar.gz
           cp "$archive.sig" out/openpasture-macos.app.tar.gz.sig
           url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/openpasture-macos.app.tar.gz"
+          notes="openpasture $version"
+          [ -s changes.md ] && notes=$(cat changes.md)
           jq -n --arg version "$version" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                --arg sig "$(cat "$archive.sig")" --arg url "$url" \
-            '{version: $version, notes: "openpasture \($version)", pub_date: $date,
+                --arg sig "$(cat "$archive.sig")" --arg url "$url" --arg notes "$notes" \
+            '{version: $version, notes: $notes, pub_date: $date,
               platforms: {"darwin-aarch64": {signature: $sig, url: $url}, "darwin-x86_64": {signature: $sig, url: $url}}}' \
             > out/latest.json
           cat out/latest.json
@@ -145,12 +227,15 @@ jobs:
           xcrun stapler validate "$app"
           spctl --assess --type open --context context:primary-signature --verbose=4 out/openpasture-macos.dmg
           xcrun stapler validate out/openpasture-macos.dmg
+          for f in THIRD-PARTY-NOTICES LICENSE NOTICE; do
+            test -s "$app/Contents/Resources/$f" || { echo "::error::$f is missing from the app bundle"; exit 1; }
+          done
           # The app inside the update archive is the notarized, stapled one.
           mkdir "$RUNNER_TEMP/update" && tar -xzf out/openpasture-macos.app.tar.gz -C "$RUNNER_TEMP/update"
           codesign --verify --deep --strict "$RUNNER_TEMP/update/openpasture.app"
           xcrun stapler validate "$RUNNER_TEMP/update/openpasture.app"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-desktop
           path: |
@@ -160,14 +245,9 @@ jobs:
             out/latest.json
           if-no-files-found: error
 
-      - name: Remove keychain and key
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/build.keychain" || true
-          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
-
   server:
     name: Server ${{ matrix.name }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -189,24 +269,33 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - name: Set version from tag
-        run: python3 scripts/set-version.py "$GITHUB_REF_NAME"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: ${{ matrix.target }}
-      - uses: oven-sh/setup-bun@v2
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add ${{ matrix.target }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notices
       - name: Build UI
         run: bun install --frozen-lockfile && bun run build
         working-directory: ui
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p op-cli -p collar-sim
       - name: Package
-        run: scripts/package-server.sh ${{ matrix.target }} openpasture-server-${{ matrix.name }}
-      - uses: actions/upload-artifact@v4
+        run: |
+          scripts/package-server.sh ${{ matrix.target }} openpasture-server-${{ matrix.name }}
+          tar -tzf out/openpasture-server-${{ matrix.name }}.tar.gz | grep -qx './THIRD-PARTY-NOTICES' \
+            || { echo "::error::THIRD-PARTY-NOTICES is missing from the tarball"; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: server-${{ matrix.name }}
           path: out/*.tar.gz
@@ -214,6 +303,7 @@ jobs:
 
   docker:
     name: Docker ${{ matrix.platform }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -228,18 +318,23 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Set version from tag
-        run: python3 scripts/set-version.py "$GITHUB_REF_NAME"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Into the build context: the Dockerfile copies it to /usr/share/doc/openpasture.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notices
+      - run: test -s THIRD-PARTY-NOTICES
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         env:
           # No build-record artifact; the release job has no use for it.
           DOCKER_BUILD_RECORD_UPLOAD: false
@@ -259,7 +354,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/digests"
           digest="${{ steps.build.outputs.digest }}"
           touch "$RUNNER_TEMP/digests/${digest#sha256:}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digest-${{ matrix.runner }}
           path: ${{ runner.temp }}/digests/*
@@ -274,13 +369,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: ${{ runner.temp }}/digests
           pattern: digest-*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -296,6 +391,10 @@ jobs:
           for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${tags[@]}" "${refs[@]}"
           docker buildx imagetools inspect "$IMAGE:$version"
+      - name: The image carries the notices
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker run --rm --entrypoint cat "$IMAGE:$version" /usr/share/doc/openpasture/THIRD-PARTY-NOTICES | head -n 3
 
   release:
     name: GitHub release
@@ -304,18 +403,22 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
       # Only the release files: the Docker jobs also leave digest files and
       # build-record artifacts in this run, and the build records can't be
       # extracted by download-artifact.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           pattern: '{macos-desktop,server-*}'
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notices
+          path: notices
       - name: Checksums
-        working-directory: assets
         run: |
+          cp notices/THIRD-PARTY-NOTICES assets/
+          cd assets
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Publish release
@@ -324,15 +427,21 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           repo="${{ github.repository }}"
-          cat > notes.md <<NOTES
-          openpasture ${version}.
+          {
+            if [ -s notices/changes.md ]; then
+              cat notices/changes.md
+              echo
+            fi
+            cat <<NOTES
+          ### Downloads
 
           - macOS app (Apple Silicon and Intel, signed and notarized): \`openpasture-macos.dmg\`. Installed apps offer this update themselves.
-          - Server binaries with \`collar-sim\`: \`openpasture-server-<os>-<arch>.tar.gz\` for linux-x64, linux-arm64, macos-arm64, macos-x64
+          - Server binaries with \`collar-sim\`, the simulator: \`openpasture-server-<os>-<arch>.tar.gz\` for linux-x64, linux-arm64, macos-arm64, macos-x64
           - Docker: \`docker pull ${IMAGE}:${version}\`
 
-          Check downloads against \`SHA256SUMS\`. Setup: https://github.com/${repo}#readme
+          Check downloads against \`SHA256SUMS\`. Third-party licences: \`THIRD-PARTY-NOTICES\` (also inside each download). Setup: https://github.com/${repo}#readme
           NOTES
+          } > notes.md
           flags=()
           [[ "$version" == *-* ]] && flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" assets/* "${flags[@]}" \

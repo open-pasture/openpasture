@@ -8,3 +8,13 @@ docs/BRIEF.md
 .DS_Store
 *.db
 *.db-*
+# Build output and secrets (mirrors .gitignore): never in the build context.
+out
+.env
+.env.*
+*.p8
+*.p12
+*.key
+*.pem
+secrets.json
+apps/desktop/src-tauri/gen

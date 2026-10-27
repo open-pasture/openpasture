@@ -1,0 +1,18 @@
+Rust crates (the server, the desktop app and collar-sim)
+============================================================
+
+{{#each overview}}
+{{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+{{{name}}} ({{id}})
+------------------------------------------------------------
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}{{#unless crate.source}} (openpasture){{/unless}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

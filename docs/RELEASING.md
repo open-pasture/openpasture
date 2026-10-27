@@ -10,10 +10,20 @@ A release is a tag push. `.github/workflows/release.yml` then builds, in paralle
 | `openpasture-server-macos-arm64.tar.gz`, `openpasture-server-macos-x64.tar.gz` | macOS |
 | `ghcr.io/open-pasture/openpasture:<version>` and `:latest` | native amd64 and arm64 runners, one multi-arch manifest |
 | `openpasture-macos.app.tar.gz`, `.sig` and `latest.json` | the macOS job: the same notarized app, packed and signed for the in-app updater |
+| `THIRD-PARTY-NOTICES` | every crate and web package in the builds, with its licence |
 | `SHA256SUMS` | all of the above files |
 
-Each tarball holds `openpasture`, `collar-sim`, `LICENSE` and a `README.md`. The Linux builds
-link glibc 2.35, so they run on Ubuntu 22.04+, Debian 12 and Raspberry Pi OS bookworm.
+Each tarball holds `openpasture`, `collar-sim` (the simulator), `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES` and
+a `README.md`. The Linux builds link glibc 2.35, so they run on Ubuntu 22.04+, Debian 12 and
+Raspberry Pi OS bookworm. The macOS server binaries aren't signed or notarized (only the app
+is); the server README covers the `xattr` step. The app carries the licence files in
+`Contents/Resources`, and the Docker image in `/usr/share/doc/openpasture/`.
+
+The first job, **Version and notices**, stops the release if the tag disagrees with the
+version files, then writes `THIRD-PARTY-NOTICES` (`scripts/third-party-notices.py`: cargo-about
+for the crates, `ui/node_modules` for the web packages) and takes the release notes from the
+tag's section of `CHANGELOG.md`. The macOS job runs in the `release` environment: it waits for
+a maintainer to approve it, and only it can read the signing secrets.
 
 The GitHub release is published only when every build passes, and the Docker `latest` tag only
 moves then too. Because the macOS file name never changes,
@@ -41,25 +51,36 @@ names the missing ones. There is no unsigned fallback.
 ## Cut a release
 
 1. `main` is green in CI.
-2. Set the version in the repo so source builds report it too, and commit:
+2. On a branch, set the version and name the release in the changelog:
 
    ```
-   scripts/set-version.py 0.2.0      # Cargo.toml, Cargo.lock, tauri.conf.json
-   git commit -am "Release 0.2.0"
-   git push
+   git switch -c release/0.2.0
+   scripts/set-version.py 0.2.0      # Cargo.toml, Cargo.lock, tauri.conf.json, ui/package.json
    ```
 
-3. Tag and push:
+   In `CHANGELOG.md`, rename `## Unreleased` to `## 0.2.0 (YYYY-MM-DD)` and add a new empty
+   `## Unreleased` above it. Append the release's new migrations to
+   `crates/op-core/migrations/SHIPPED` under a `# v0.2.0` line
+   (`cargo test -p op-core --test migrations -- --nocapture` prints the lines); from then on they
+   can't be edited, and new migrations must be numbered above them. Commit ("Release 0.2.0"), open
+   a pull request, and merge it once CI passes.
+
+3. Tag the merge commit on `main` and push the tag:
 
    ```
+   git switch main && git pull
    git tag v0.2.0
    git push origin v0.2.0
    ```
 
-The tag is the version: every release job runs `scripts/set-version.py "$tag"` before building,
-so a tag that disagrees with the files still produces correctly numbered builds. A tag with a
-suffix (`v0.2.0-rc.1`) is published as a pre-release: it moves neither `releases/latest` nor the
-Docker `latest` tag.
+4. Approve the `release` environment when the run asks (Actions > the run > **Review
+   deployments**).
+
+The tag must match the files: the first job runs `scripts/set-version.py --check "$tag"` and
+stops the release if any version differs, so a release can't ship numbered differently from its
+source. CI runs `scripts/set-version.py --check` on every pull request, so the files always agree
+with each other. A tag with a suffix (`v0.2.0-rc.1`) is published as a pre-release: it moves
+neither `releases/latest` nor the Docker `latest` tag; set the files to `0.2.0-rc.1` first.
 
 Watch it with `gh run watch -R open-pasture/openpasture`. If a job fails, fix the cause and use
 **Re-run failed jobs**; nothing is published until the last job. To redo a published release,
@@ -76,9 +97,13 @@ organisation must allow public packages (Organisation settings > Packages).
 ```
 bun run desktop:release    # universal .app and .dmg, ad-hoc signed, not notarized
 cargo build --release --target aarch64-apple-darwin -p op-cli -p collar-sim
+scripts/third-party-notices.py                                                  # needs cargo-about
 scripts/package-server.sh aarch64-apple-darwin openpasture-server-macos-arm64   # out/*.tar.gz
 docker build -t openpasture .
 ```
+
+Without `THIRD-PARTY-NOTICES` the tarball and image still build, but lack the notices; don't
+hand those out. `cargo install --locked cargo-about --features cli` installs the generator.
 
 ## Apple signing, once
 
@@ -134,22 +159,27 @@ base64 -i developer-id.p12 | tr -d '\n' > developer-id.p12.b64
 
 ### 4. Add the GitHub secrets
 
+The secrets belong to the `release` environment, not the repository, so only the approved
+macOS job can read them. Create the environment once (Settings > Environments > New
+environment, `release`; add yourself under **Required reviewers**; under **Deployment branches
+and tags** allow only tags matching `v*`).
+
 With the GitHub CLI signed in as an admin of the repo (`gh auth status`), from the folder with
-the files:
+the files (every `gh secret set` below takes `--env release`):
 
 ```
 REPO=open-pasture/openpasture
 
-gh secret set APPLE_CERTIFICATE          -R $REPO < developer-id.p12.b64
-gh secret set APPLE_CERTIFICATE_PASSWORD -R $REPO      # paste the .p12 password when prompted
-gh secret set APPLE_SIGNING_IDENTITY     -R $REPO --body "Developer ID Application: Your Name (AB12CD34EF)"
-gh secret set APPLE_TEAM_ID              -R $REPO --body "AB12CD34EF"
-gh secret set APPLE_API_ISSUER           -R $REPO --body "00000000-0000-0000-0000-000000000000"
-gh secret set APPLE_API_KEY              -R $REPO --body "KEYID12345"
-gh secret set APPLE_API_PRIVATE_KEY      -R $REPO < AuthKey_KEYID12345.p8
-openssl rand -base64 32 | tr -d '\n' | gh secret set KEYCHAIN_PASSWORD -R $REPO
+gh secret set APPLE_CERTIFICATE          -R $REPO --env release < developer-id.p12.b64
+gh secret set APPLE_CERTIFICATE_PASSWORD -R $REPO --env release      # paste the .p12 password when prompted
+gh secret set APPLE_SIGNING_IDENTITY     -R $REPO --env release --body "Developer ID Application: Your Name (AB12CD34EF)"
+gh secret set APPLE_TEAM_ID              -R $REPO --env release --body "AB12CD34EF"
+gh secret set APPLE_API_ISSUER           -R $REPO --env release --body "00000000-0000-0000-0000-000000000000"
+gh secret set APPLE_API_KEY              -R $REPO --env release --body "KEYID12345"
+gh secret set APPLE_API_PRIVATE_KEY      -R $REPO --env release < AuthKey_KEYID12345.p8
+openssl rand -base64 32 | tr -d '\n' | gh secret set KEYCHAIN_PASSWORD -R $REPO --env release
 
-gh secret list -R $REPO
+gh secret list -R $REPO --env release
 ```
 
 | Secret | What it is |
@@ -174,9 +204,9 @@ The updates are signed with a minisign key, separate from Apple's. The public ha
 only archives signed by the private half. To make one:
 
 ```
-bunx @tauri-apps/cli@^2 signer generate -w updater.key -p "<password>" --ci
-gh secret set TAURI_SIGNING_PRIVATE_KEY          -R $REPO < updater.key
-gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R $REPO --body "<password>"
+bunx @tauri-apps/cli@2.12.4 signer generate -w updater.key -p "<password>" --ci
+gh secret set TAURI_SIGNING_PRIVATE_KEY          -R $REPO --env release < updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R $REPO --env release --body "<password>"
 ```
 
 and put the contents of `updater.key.pub` in `tauri.conf.json`. Keep `updater.key` and the

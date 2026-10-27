@@ -1,0 +1,84 @@
+# cargo deny check: licences, security advisories, banned or duplicate crates,
+# and where crates come from. CI runs it on every pull request.
+#
+# The Apache-2.0 crates (op-protocol, op-geo) must never depend on AGPL code,
+# or collar firmware and other clients couldn't use them. CI checks that with
+# `cargo tree` rooted at each of them (the `licences` job in ci.yml), since a
+# deny.toml applies one licence list to the whole workspace.
+
+[graph]
+# The platforms we build and ship.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# Vulnerabilities and unsound code fail anywhere in the graph. "Unmaintained"
+# fails only for our direct dependencies: deep in tauri's and gtk's trees
+# (proc-macro-error, zbus_names, zvariant) we can't act on it.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # Each entry: the advisory, why it doesn't apply, and when to look again.
+    # zip < 9: extract() to disk mishandles symlinks and SUID bits. op-import
+    # reads entries into memory (by_index, files/read.rs) and never extracts;
+    # tauri-plugin-updater's zip path is Windows-only, our updates are tar.gz.
+    # Drop these when zip 9 lands in both.
+    { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above" },
+    { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above" },
+    { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+# Permissive licences, plus the weak-copyleft MPL-2.0 (file-level, fine to
+# link), and AGPL-3.0-only for openpasture's own crates.
+allow = [
+    "0BSD",
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "zlib-acknowledgement",
+]
+exceptions = [
+    # Time zone boundaries from OpenStreetMap, compiled into the binary.
+    # Credited in THIRD-PARTY-NOTICES.
+    { crate = "tzf-dist", allow = ["ODbL-1.0"] },
+]
+
+[bans]
+# Duplicates are common in a tree this size (datafusion, tauri); report them
+# without failing.
+multiple-versions = "warn"
+# "deny" once every crate but op-protocol and op-geo sets publish = false
+# (cargo-deny only exempts unpublished crates).
+wildcards = "warn"
+# Workspace path dependencies carry no version; that's fine.
+allow-wildcard-paths = true
+deny = [
+    # OpenSSL: the tree is rustls + ring only, so builds need no system TLS.
+    { crate = "openssl-sys", reason = "use rustls" },
+    { crate = "native-tls", reason = "use rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

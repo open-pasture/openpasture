@@ -3,6 +3,9 @@
 Decided 2026-09-26, updated 2026-09-28. This is the Rust rewrite of `openpasture-agent-kit`: the software
 that runs collars, stores their data, analyses it, and decides where the herd goes.
 
+These are the original decisions. What exists today is in [`ARCHITECTURE.md`](ARCHITECTURE.md);
+anything below marked **(planned)** isn't built yet.
+
 ## Decisions
 
 | Question | Decision |
@@ -10,10 +13,10 @@ that runs collars, stores their data, analyses it, and decides where the herd go
 | Relation to the Python kit | Full rewrite in Rust. The kit stays as a reference and is archived once its features are ported. Skills and the `seed/` knowledge corpus move over as-is. |
 | First user | DIY builders and researchers: a few collars, raw data, room to tinker. |
 | Field-ready target | One cattle operation: 250 head, 250 collars, a manager and hands who mostly text. |
-| Platforms | Desktop (macOS, Windows, Linux) and the web. On a phone the same UI installs as an app over https. |
+| Platforms | Desktop and the web. On a phone the same UI installs as an app over https. The desktop app is macOS today; Windows and Linux desktop builds are **(planned)**. |
 | UI | Tauri 2 shell, React + MapLibre GL UI, all heavy work in Rust. The same UI is served by the server as a web app. |
 | Self-hosting | One server binary with embedded storage. Runs on a VPS, a Pi, or a farm PC. Our paid hosting runs the same binary. |
-| Embedded mode | The desktop app can be the server: local database and collar ingest, reachable by collars through a tunnel. It can also connect to a remote server. |
+| Embedded mode | The desktop app can be the server: local database and collar ingest. Collars reach it through a proxy or tunnel you run yourself (`SELF-HOSTING.md`); a built-in tunnel is **(planned)**. Connecting the app to a remote server is **(planned)**. |
 | Licence | AGPL-3.0 for the app. Apache-2.0 for the protocol and geometry crates so collars and other software can use them without the AGPL. |
 | Agent brains | Codex CLI (the user's ChatGPT subscription), Claude Code CLI (the user's Claude subscription), API keys (Anthropic, OpenAI, any OpenAI-compatible endpoint including Ollama), and the openpasture hosted brain (our subscription). |
 | Analytics in V1 | Collar and fence health, animal behaviour, grazing and pasture, raw data export. |
@@ -55,11 +58,11 @@ openpasture/
     op-import       animal CSV, paddock files, position history, collar cards
     op-server       axum: merges every router, /api/live, static UI
     op-cli          the `openpasture` binary: serve, token, version
-  tools/collar-sim  simulated collars that speak the real protocol (dev tool)
+  simulation/collar-sim  simulated collars that speak the real protocol (test tool)
   apps/desktop      Tauri 2 shell, embeds op-server
   ui/               React + MapLibre + Vite, shared by desktop, web and phone
-  skills/           markdown skills, ported from the kit
-  seed/             knowledge corpus, ported from the kit
+  skills/           the daily decision's instructions
+  seed/principles/  grazing principles corpus
 ```
 
 ## Data layer
@@ -91,8 +94,9 @@ Follows `opencollar/protocol/README.md`.
 - **Per-collar keys.** Each collar gets a key when it is linked to a farm.
   Boundaries are signed (Ed25519) so a collar only accepts its own server's.
   This answers the protocol's open authentication question.
-- **Reachability in embedded mode:** a built-in Tailscale Funnel or Cloudflare
-  Tunnel option, or a LAN address for bench testing.
+- **Reachability in embedded mode:** a LAN address for bench testing, or a
+  tunnel you run yourself. A built-in Tailscale Funnel or Cloudflare Tunnel
+  option is **(planned)**.
 - **The simulator speaks the same wire protocol,** so everything can be built
   and tested without a collar, and a DIY builder can try the app on day one.
 
@@ -112,8 +116,9 @@ decision (`STAY`, `MOVE`, `NEEDS_INFO`, reasoning, confidence, boundary).
 The CLI backends run the official CLIs as the user signed them in. We never read
 or copy their tokens.
 
-The same tools the brain uses are exposed through MCP and the CLI, so Claude,
-ChatGPT, Codex or any agent can run the farm directly. Every boundary still
+The same tools the brain uses are exposed through MCP, so Claude, ChatGPT,
+Codex or any agent can run the farm directly. The same tools on the command
+line are **(planned)**; the CLI has `serve`, `token` and `version` today. Every boundary still
 comes from a recorded decision (the kit's cloud-boundary rule).
 
 ## Analytics
@@ -139,18 +144,21 @@ The cloud wraps this binary. It does not fork it.
    from the firmware host tests and the kit's `rings.py`, the simulator, CI.
 2. **Collar loop.** HTTP ingest, store, live map, draw a boundary, send it,
    see the ack. First with the simulator, then with the V0 collar. Closes the
-   prototype checklist's telemetry and boundary items.
+   prototype checklist's telemetry and boundary items. Done with the simulator;
+   a real collar on the bench, through `tools/collar-bridge`, is in progress.
 3. **Collar analytics.** Health dashboards, tracks and replay, export, SQL console.
 4. **Brains and decisions.** Brain trait and all backends, decision cycle port,
    MCP server, morning brief.
 5. **Grazing analytics.** Land reports, knowledge search, paddock history and signals.
 6. **Packaging.** Signed desktop builds, server binaries and a Docker image,
-   self-hosting docs, embedded-mode tunnel.
+   self-hosting docs. Done except the embedded-mode tunnel **(planned)**.
 7. **Field-ready.** 250 collars on one farm: people and roles, alerts and texting, exclusions,
    strip schedules staged on the collars, pre-send checks, animals and imports, reports, the
    welfare record, the phone layout and Web Push.
 
 ## Still open
 
-- CoAP vs MQTT for V1 collars. Leaning CoAP. Decide after measuring power on V0.
+- CoAP vs MQTT for V1 collars. Superseded 2026-10-26: production collars are LoRa-first
+  with cellular anchor collars, on openpasture's own open protocol (v2, drafted in
+  opencollar's `protocol/v2/`). See `ARCHITECTURE.md`.
 - Trademark check on "OpenCollar" before anything is sold under the name.

@@ -1,0 +1,45 @@
+name: Collar or hardware report
+description: A collar, the bench setup, or the link between a collar and the server.
+labels: [collar]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If a collar did something unsafe on an animal (a cue that wouldn't stop, a boundary it
+        shouldn't have accepted), say so in the first line. Report suspected security problems
+        privately instead: see SECURITY.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What the collar did, what you expected, and whether an animal was wearing it.
+    validations:
+      required: true
+  - type: input
+    id: collar
+    attributes:
+      label: Collar
+      description: OpenCollar firmware version and board, or the make and model of another collar.
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: openpasture version
+      description: "`openpasture version`, or About in the app."
+  - type: dropdown
+    id: link
+    attributes:
+      label: Link to the server
+      options:
+        - Cellular (LTE-M / NB-IoT)
+        - LoRa via a lead collar
+        - USB serial bridge (bench)
+        - collar-sim
+        - Other
+  - type: textarea
+    id: console
+    attributes:
+      label: Collar console and server log
+      description: The collar's console page or wire log, and the server log around the problem. Remove keys first.
+      render: text

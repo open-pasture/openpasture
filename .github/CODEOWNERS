@@ -1,0 +1,11 @@
+# Every change needs a maintainer's review.
+* @codybmenefee
+
+# Paths where a mistake reaches a collar, a key or a release. Listed so the
+# rule survives when more maintainers are added above.
+/crates/op-protocol/ @codybmenefee
+/crates/op-geo/ @codybmenefee
+/crates/op-ingest/ @codybmenefee
+/.github/ @codybmenefee
+/scripts/ @codybmenefee
+/apps/desktop/src-tauri/tauri.conf.json @codybmenefee

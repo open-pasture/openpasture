@@ -1,0 +1,7 @@
+# The Rust release CI, release builds and the Dockerfile use. rustup installs
+# it on first use. Bump it here, in the Dockerfile's rust image, and let CI
+# prove it.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

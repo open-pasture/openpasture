@@ -14,26 +14,64 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The opencollar commit whose protocol vectors op-protocol must match byte for byte.
+  # Move it forward in the same pull request that changes the vectors on either side.
+  OPENCOLLAR_REF: cf55e72f0eaf9d046da2a63c76aa2d5dc1ba7f50
+
+# Actions are pinned to commit SHAs (Dependabot keeps them current). The Rust
+# toolchain comes from rust-toolchain.toml and bun from .bun-version.
 
 jobs:
   fmt:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          components: rustfmt
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
       - run: cargo fmt --all --check
+
+  versions:
+    name: versions agree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Cargo.toml, Cargo.lock, tauri.conf.json and ui/package.json.
+      - run: python3 scripts/set-version.py --check
 
   ui:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ui
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('ui/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
       - run: bun install --frozen-lockfile
-        working-directory: ui
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run test
       - run: bun run build
-        working-directory: ui
+      # Packages that ship in the bundle: any advisory fails.
+      - name: Audit shipped packages
+        run: bun audit --prod
+      # Dev tools (vite, typescript): high and critical fail.
+      - name: Audit dev packages
+        run: bun audit --audit-level=high
 
   rust:
     strategy:
@@ -41,19 +79,124 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
       - name: Linux packages for the desktop crate
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # op-server embeds ui/dist; build it once up front.
       - name: Build UI
         run: bun install --frozen-lockfile && bun run build
         working-directory: ui
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+
+  # The server and the Apache crates build on Windows; the desktop app is macOS-only for now.
+  windows:
+    name: windows (server)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build UI
+        run: bun install --frozen-lockfile && bun run build
+        working-directory: ui
+      - run: cargo build --locked -p op-cli -p collar-sim
+      - run: cargo test --locked -p op-protocol -p op-geo
+
+  # Licences, advisories and banned crates (deny.toml); the Apache crates
+  # never reach AGPL code; the notices a release ships can be generated.
+  licences:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny@0.20.2,cargo-about@0.9.2
+      - run: cargo deny --locked check
+      - name: op-protocol and op-geo depend on no AGPL or GPL crate
+        run: |
+          for crate in op-protocol op-geo; do
+            tree=$(cargo tree --locked -p "$crate" -e normal,build --prefix none --format '{p} {l}')
+            echo "$tree"
+            if grep -E 'GPL' <<<"$tree"; then
+              echo "::error::$crate (Apache-2.0) depends on a GPL-family crate; see deny.toml"
+              exit 1
+            fi
+          done
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+        working-directory: ui
+      - run: python3 scripts/third-party-notices.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES
+          if-no-files-found: error
+
+  # op-protocol's test vectors are the collar firmware's too: every copy in
+  # opencollar must be byte-identical to ours.
+  vectors:
+    name: protocol vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: open-pasture/opencollar
+          ref: ${{ env.OPENCOLLAR_REF }}
+          path: opencollar
+          persist-credentials: false
+      - name: Compare vectors
+        run: |
+          status=0
+          shopt -s nullglob
+          ours_all=(crates/op-protocol/vectors/*.json crates/op-protocol/tests/vectors/*.json)
+          [ ${#ours_all[@]} -gt 0 ] || { echo "::error::no vectors in crates/op-protocol"; exit 1; }
+          for ours in "${ours_all[@]}"; do
+            name=$(basename "$ours")
+            # v1 vectors: the firmware's copy, and the spec's once it holds them.
+            copies=$(ls opencollar/firmware/tests/host/vectors/"$name" opencollar/protocol/vectors/"$name" \
+                        opencollar/protocol/vectors/v1/"$name" 2>/dev/null || true)
+            if [ -z "$copies" ]; then
+              echo "::error::$name has no copy in opencollar@$OPENCOLLAR_REF"
+              status=1
+            fi
+            for theirs in $copies; do
+              if cmp -s "$ours" "$theirs"; then
+                echo "same: $name = ${theirs#opencollar/}"
+              else
+                echo "::error::$name differs from opencollar/${theirs#opencollar/}"
+                status=1
+              fi
+            done
+          done
+          exit $status

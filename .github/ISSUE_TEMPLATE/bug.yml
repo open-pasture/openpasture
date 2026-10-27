@@ -1,0 +1,43 @@
+name: Bug
+description: Something in the app, the server or the docs doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`openpasture version`, or About in the app."
+    validations:
+      required: true
+  - type: dropdown
+    id: runs
+    attributes:
+      label: How it runs
+      options:
+        - macOS app
+        - Server binary (Linux)
+        - Server binary (macOS)
+        - Docker
+        - Built from source
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The server log around the problem. Remove tokens, keys and phone numbers first.
+      render: text

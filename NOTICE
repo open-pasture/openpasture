@@ -1,0 +1,18 @@
+openpasture
+Copyright 2026 Cody Menefee (openpasture)
+
+This repository is open source under two licences:
+  - The app (server, desktop app, web UI and tools): GNU Affero General
+    Public License v3.0 only (LICENSE)
+  - crates/op-protocol and crates/op-geo: Apache License 2.0 (the LICENSE
+    file in each crate), so collar firmware and other software can use the
+    protocol and geometry without the AGPL
+Third-party code keeps its own licence. Release builds list every
+third-party crate and package with its licence text in
+THIRD-PARTY-NOTICES.
+
+Names and logo. These licences don't grant rights to the names
+"openpasture" or "OpenCollar" or to the openpasture logo. You may say
+your product is based on or compatible with openpasture. Don't name or
+brand your product, fork or service in a way that suggests it comes from,
+or is endorsed by, openpasture.
