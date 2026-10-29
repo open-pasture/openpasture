@@ -1,0 +1,2 @@
+# Protocol vectors are compared byte for byte with opencollar's copies; never rewrite line endings.
+crates/op-protocol/vectors/** -text

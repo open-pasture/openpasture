@@ -7,15 +7,17 @@ import { bearing, days, depth, facts, handleAt, labelAt, lengthwise, snap, tethe
 const sw: LonLat = [-93.625, 42.03];
 // 400 m east-west by 150 m north-south.
 const wide = rect(sw, 400, 150);
+// Bearings wrap at 360, so due north can come back as 359.9999… on some platforms.
+const turn = (a: number, b: number) => ((((a - b) % 360) + 540) % 360) - 180;
 
 describe("orientation", () => {
   test("bearings are compass degrees", () => {
-    expect(bearing(sw, offset(sw, 0, 100))).toBeCloseTo(0, 6);
-    expect(bearing(sw, offset(sw, 100, 0))).toBeCloseTo(90, 6);
-    expect(bearing(sw, offset(sw, 0, -100))).toBeCloseTo(180, 6);
-    expect(bearing(sw, offset(sw, -100, 0))).toBeCloseTo(270, 6);
-    expect(bearing(sw, offset(sw, 100, 100))).toBeCloseTo(45, 4);
-    expect(bearing(sw, toward(sw, 123, 80))).toBeCloseTo(123, 4);
+    expect(turn(bearing(sw, offset(sw, 0, 100)), 0)).toBeCloseTo(0, 6);
+    expect(turn(bearing(sw, offset(sw, 100, 0)), 90)).toBeCloseTo(0, 6);
+    expect(turn(bearing(sw, offset(sw, 0, -100)), 180)).toBeCloseTo(0, 6);
+    expect(turn(bearing(sw, offset(sw, -100, 0)), 270)).toBeCloseTo(0, 6);
+    expect(turn(bearing(sw, offset(sw, 100, 100)), 45)).toBeCloseTo(0, 4);
+    expect(turn(bearing(sw, toward(sw, 123, 80)), 123)).toBeCloseTo(0, 4);
   });
 
   test("depth is measured along the advance direction", () => {

@@ -159,7 +159,9 @@ async fn a_day_streams_to_parquet_in_short_write_locks_while_reports_land() {
     let worst = worst.load(Ordering::Relaxed);
     assert_eq!(rolled.iter().find(|r| r.table == "fixes").unwrap().rows as i64, rows);
     assert!(landed > 5, "{landed} reports landed while it ran");
-    assert!(worst < 250, "a report waited {worst} ms");
+    // A day held in one write lock makes a report wait the whole rollup (seconds); a chunk
+    // takes tens of ms. The margin is for shared CI runners.
+    assert!(worst < 1000, "a report waited {worst} ms");
 
     let (n, groups) = parquet_rows(&op_analytics::telemetry::day_path(app.ctx.data_dir(), "fixes", time::from_unix_ms(day0).date_naive()));
     assert_eq!(n, rows);
