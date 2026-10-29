@@ -119,7 +119,7 @@ tokio-tungstenite = "0.26"
 # @HUB
 # Texting and alerts: Twilio signatures (HMAC-SHA1), webhook signatures
 # (HMAC-SHA256), SMTP. lettre uses rustls with the ring provider, like reqwest.
-hmac = "0.12"
+hmac = "0.13"
 sha1 = "0.10"
 hex = "0.4"
 form_urlencoded = "1.2"
