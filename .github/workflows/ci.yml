@@ -21,13 +21,8 @@ env:
   # byte (scripts/compare-vectors.sh). Move it forward in the same pull request
   # that changes the vectors on either side. It must be a commit on GitHub.
   #
-  # Empty: the comparison is skipped with a warning. It is empty until the
-  # opencollar commit carrying cue.json, the set_herd slots.json and the v2
-  # vectors is pushed (locally b5252a9, "Protocol v2 draft for LoRa-first
-  # herds"; open-pasture/opencollar main is still at cf55e72, which lacks
-  # them). Once pushed, the one-line change is:
-  #   OPENCOLLAR_REF: <full SHA of that commit on github.com/open-pasture/opencollar>
-  OPENCOLLAR_REF: ""
+  # Empty: the comparison is skipped with a warning.
+  OPENCOLLAR_REF: "798f5e719f6d5d0f45004d0b375fb90361c4d636"
 
 # Actions are pinned to commit SHAs (Dependabot keeps them current). The Rust
 # toolchain comes from rust-toolchain.toml and bun from .bun-version.
