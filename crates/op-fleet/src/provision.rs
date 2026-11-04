@@ -384,6 +384,8 @@ struct ClaimBody {
     claim_code: Option<String>,
     /// The card's QR text, `OC2:<serial>:<device key>:<claim code>`.
     card: Option<String>,
+    /// Cross-farm handover token from `POST /api/collars/{id}/release` (`OPT1:…`).
+    transfer_token: Option<String>,
     /// The unit's factory record (hex), when the maker sent one with it.
     factory_record: Option<String>,
     herd_id: String,
@@ -462,10 +464,13 @@ async fn claim_serial(
     claim(&ctx, &identity, unit, &b).await
 }
 
-/// `POST /api/fleet/claim`: by claim code, or by card.
+/// `POST /api/fleet/claim`: by claim code, card, or cross-farm transfer token.
 async fn claim_any(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJson<ClaimBody>) -> ApiResult<(StatusCode, Json<Claimed>)> {
     require_claim_role(&identity)?;
     let caller = caller_key(&identity);
+    if let Some(token) = &b.transfer_token {
+        return claim_transfer(&ctx, &identity, &caller, token, &b).await;
+    }
     let unit = match (&b.card, &b.claim_code) {
         (Some(text), _) => {
             let card = Card::parse(text).ok_or_else(|| ApiError::bad_request("That isn't an OpenCollar card (OC2:serial:key:code)."))?;
@@ -501,9 +506,111 @@ async fn claim_any(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJs
                 }
             }
         }
-        (None, None) => return Err(ApiError::bad_request("Send the claim code or the card.")),
+        (None, None) => return Err(ApiError::bad_request("Send the claim code, the card, or a transfer token.")),
     };
     claim(&ctx, &identity, unit, &b).await
+}
+
+/// Claim from a releasing farm's `OPT1:…` token: keep the collar id, mint a new key.
+async fn claim_transfer(ctx: &Ctx, identity: &Identity, caller: &str, token_text: &str, b: &ClaimBody) -> ApiResult<(StatusCode, Json<Claimed>)> {
+    let token = crate::transfer_token::parse(token_text).ok_or_else(|| ApiError::bad_request("That isn't a transfer token (OPT1:…)."))?;
+    let target = claim_limit::target_for_serial(&token.serial);
+    claim_limit::may_try(ctx, caller, Some(&token.serial), &target).await?;
+    if token.expires_at < now() {
+        audit_attempt(ctx, identity, Some(&token.serial), None, "wrong_code", json!({ "via": "transfer", "reason": "expired" })).await;
+        return Err(claim_limit::wrong(ctx, caller, Some(&token.serial), &target).await);
+    }
+    if b.card.is_some() || b.claim_code.is_some() {
+        return Err(ApiError::bad_request("A transfer token is claimed alone (no card or claim_code beside it)."));
+    }
+    if ctx.store().get_herd(&b.herd_id).await?.is_none() {
+        return Err(ApiError::bad_request("No such herd."));
+    }
+    if op_core::sim::herd_is_simulated(ctx.db(), &b.herd_id).await? {
+        return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+    }
+    if units::get_unit(ctx, &token.serial).await?.is_some() {
+        return Err(ApiError::conflict(format!("{} is already registered here.", token.serial)));
+    }
+    if sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM collars WHERE id = ?)").bind(&token.collar_id).fetch_one(ctx.db()).await? != 0 {
+        return Err(ApiError::conflict(format!("Collar {} is already on this farm.", token.collar_id)));
+    }
+    let name = match b.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) if n.len() > 200 => return Err(ApiError::bad_request("The collar name is too long.")),
+        Some(n) => n.to_owned(),
+        None => token.serial.clone(),
+    };
+    if let Some(aid) = &b.animal_id {
+        let a = ctx.store().get_animal(aid).await?.ok_or_else(|| ApiError::bad_request("No such animal."))?;
+        if a.herd_id != b.herd_id {
+            return Err(ApiError::bad_request(format!("{} is in another herd.", a.tag)));
+        }
+        if a.removed_at.is_some() {
+            return Err(ApiError::bad_request(format!("{} is no longer on the farm.", a.tag)));
+        }
+        if a.collar_id.is_some() {
+            return Err(ApiError::conflict(format!("{} already wears a collar.", a.tag)));
+        }
+    }
+
+    let pk = op_protocol::decode_public_key(&token.device_pubkey).map_err(|_| ApiError::bad_request("The transfer token's device key isn't valid."))?;
+    let kid = crate::keys::kid(&pk);
+    let bearer = op_core::keys::new_collar_key();
+    let at = to_db(&now());
+    let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    sqlx::query(
+        "INSERT INTO fleet_units (serial, device_class, hw_rev, fw_version, device_pubkey, device_kid, state, origin, claim_code, claim_checked,
+           collar_id, claimed_at, created_at, updated_at)
+         VALUES (?, 'unknown', '', '', ?, ?, 'claimed', 'card', NULL, 1, ?, ?, ?, ?)",
+    )
+    .bind(&token.serial)
+    .bind(&token.device_pubkey)
+    .bind(&kid)
+    .bind(&token.collar_id)
+    .bind(&at)
+    .bind(&at)
+    .bind(&at)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO fleet_unit_keys (serial, device_pubkey, device_kid, from_at) VALUES (?, ?, ?, ?)")
+        .bind(&token.serial)
+        .bind(&token.device_pubkey)
+        .bind(&kid)
+        .bind(&at)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO collars (id, name, herd_id, key_hash, state, created_at, animal_id) VALUES (?, ?, ?, ?, 'unknown', ?, ?)")
+        .bind(&token.collar_id)
+        .bind(&name)
+        .bind(&b.herd_id)
+        .bind(op_core::keys::hash_key(&bearer))
+        .bind(&at)
+        .bind(&b.animal_id)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(aid) = &b.animal_id {
+        let n = sqlx::query("UPDATE animals SET collar_id = ? WHERE id = ? AND herd_id = ? AND collar_id IS NULL AND removed_at IS NULL")
+            .bind(&token.collar_id)
+            .bind(aid)
+            .bind(&b.herd_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n != 1 {
+            return Err(ApiError::conflict("The animal took another collar meanwhile. Nothing was claimed."));
+        }
+    }
+    units::log(
+        &mut tx,
+        &token.serial,
+        "claimed",
+        json!({ "collar_id": token.collar_id, "herd_id": b.herd_id, "animal_id": b.animal_id, "via": "transfer" }),
+        who(identity).as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
+    tracing::info!(serial = %token.serial, collar = %token.collar_id, herd = %b.herd_id, "unit claimed from transfer token");
+    finish_claim(ctx, identity, &token.serial, &token.collar_id, &b.herd_id, b.animal_id.clone(), bearer, false, StatusCode::CREATED).await
 }
 
 /// What a card names here.

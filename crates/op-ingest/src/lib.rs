@@ -9,9 +9,11 @@ mod collars;
 mod db;
 mod device;
 pub mod escapes;
+mod export;
 pub mod gate;
 pub mod moves;
 pub mod planner;
+pub mod release;
 // @HUB
 // @HUB-UI
 // @E-lib
@@ -63,6 +65,8 @@ pub fn router() -> axum::Router<Ctx> {
     let mut app = axum::Router::new();
     for part in [
         collars::router(),
+        release::router(),
+        export::router(),
         boundary::router(),
         moves::router(),
         escapes::router(),
