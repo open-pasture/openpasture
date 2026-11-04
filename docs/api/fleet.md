@@ -218,18 +218,31 @@ claim code alone, or by the scanned card. A server that never saw the unit regis
 card (`origin: "card"`; class, board and firmware from `factory_record` when given, else
 `unknown`).
 
+**Who may claim:** hand, manager or owner (any herd on this farm — roles are farm-wide; there is
+no per-herd membership). Viewers get **403**
+`{"error":"Viewers can't add collars. Ask a farm hand, manager or owner.","code":"claim_requires_hand"}`.
+Unauthenticated callers get **401**.
+
 - **The typo check** (`identity.md` §3, key 8): whenever there is a factory record (sent with the
   card, or stored here), the card's code must match its `claim_check` before anything is stored;
   a mismatch is a wrong code (404). A card with no record is taken at its word: `code_checked` is
   false and the collar checks the code when the bind reaches it. Either way the unit stays
   `claimed` (not `in_service`) until the collar reports.
-- **Reclaim after a reset**: a unit in service here has forgotten its code. Its card, whose code
+- **Claim code erased at claim time** (not at first report): the code is single-use. Reclaim after
+  a factory reset still works from the card against the factory record's claim check while the
+  unit is `in_service`.
+- **Reclaim after a reset**: a unit in service here has no claim code. Its card, whose code
   matches the stored factory record's claim check, claims it again: the same collar (history,
   herd, animal), a new collar key (the old one stops working), fence state starting over, the
   unit `claimed` until it reports under the new key. Returns **200** with `reclaimed: true`. The
   body's `herd_id` must be the collar's herd and `animal_id`, if given, its animal (409
-  otherwise: move it from the collar's page afterwards). This needs the stored record, so units
-  this server didn't record a claim check for can't be reclaimed this way.
+  otherwise: move it with `/transfer` afterwards). **The card alone is enough** (no
+  proof-from-collar). This needs the stored record, so units this server didn't record a claim
+  check for can't be reclaimed this way.
+- **Notice + 24h undo**: managers and owners see a live `claimed` event; an activity log line is
+  stored. `undo_id` / `undo_until` on the response (and event) allow
+  `POST /api/collars/{id}/undo` within 24 hours to reverse the claim (unit returns to
+  `provisioned` with a fresh code).
 
 Returns 201:
 
@@ -240,21 +253,35 @@ Claimed {
   v1: { key, public_key, endpoint?, line?, why? },   // firmware that speaks protocol v1: shown once
   code_checked: boolean,                      // see the typo check
   reclaimed?: true,                           // a reset unit claimed again (200)
+  undo_id?, undo_until?,                      // 24h reverse via POST /api/collars/{id}/undo
 }
 ```
 
-- Wrong or unknown claim code: 404 (no hint which part was wrong). Five wrong codes a minute per
-  caller: 429.
+- Wrong or unknown claim code: 404 (identical message; serials are not enumerable). Five wrong
+  codes a minute per caller, per serial and per attempt target; a global ceiling (60/min); after
+  a full window on a serial/target, exponential lockout (1–60 min). All counters persist across
+  restart (`claim_lockouts`). **429** includes `Retry-After`.
 - The unit must be `provisioned` (409 otherwise; a claimed one names the herd it is in).
 - `v1.line` is `provision {"v":1,…}` for a v1 collar's console; without a collar address it is
   absent and `why` says so.
-- The unit turns `in_service` on the collar's first report, and its claim code is forgotten then
-  (`server.md` §10: claim codes only as long as a claim takes).
+- The unit turns `in_service` on the collar's first report.
+
+### Same-farm transfer
+
+`POST /api/collars/{id}/transfer` `{ to_herd_id, animal_id? }` (hand and up): moves a collar
+between herds on **this farm** only. Preserves collar id, key and history; clears fence state and
+hands the new herd's boundary (same logic as `PATCH /api/collars/{id}` with a new `herd_id`).
+Detaches any animal on the old herd; if `animal_id` is given it must already be in the destination
+herd. Stops an open escape first. No approval. Managers/owners get a live `collar_moved` notice
+and an activity line; `POST /api/collars/{id}/undo` within 24 hours restores the previous herd and
+re-copies that herd's **current** fence (not a byte-for-byte restore of the prior applied
+version). Cross-farm handover (release / transfer code / export) is a separate flow.
 
 ### Live events
 
 On `/api/live`, managers and up: `{"type":"fleet_unit","unit":Unit}` on every registration, test,
-provisioning, claim and state change, and `{"type":"fleet_test","run":TestRun}` for each run.
+provisioning, claim and state change; `{"type":"fleet_test","run":TestRun}` for each run;
+`{"type":"claimed",…}` and `{"type":"collar_moved",…}` notices (with optional `undo_id`).
 
 ## Units
 

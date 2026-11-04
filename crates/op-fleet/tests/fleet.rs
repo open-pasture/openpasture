@@ -209,7 +209,11 @@ async fn a_unit_from_registration_to_service() {
     assert_eq!(c["v1"]["key"].as_str().unwrap().len(), 64);
     assert!(c["v1"]["why"].as_str().unwrap().contains("collar address"));
     assert_eq!(f.ctx.store().get_animal("ani_1").await.unwrap().unwrap().collar_id.as_deref(), Some(collar_id.as_str()));
+    assert!(c["unit"].get("claim_code").is_none(), "claim code erased at claim time");
+    // Code is gone: lookup by code alone is a 404. By serial: already claimed.
     let (s, e) = f.call("POST", "/api/fleet/claim", Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "code erased at claim: {e}");
+    let (s, e) = f.call("POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
     assert_eq!(s, StatusCode::CONFLICT, "{e}");
     assert!(e["error"].as_str().unwrap().contains("Cows"));
     assert_eq!(f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 9))).await.0, StatusCode::CONFLICT);
@@ -219,7 +223,7 @@ async fn a_unit_from_registration_to_service() {
     assert!(op_fleet::units::mark_in_service(&f.ctx, &collar_id).await.unwrap());
     let (_, d) = f.call("GET", &format!("/api/fleet/units/{serial}"), None).await;
     assert_eq!(d["unit"]["state"], "in_service");
-    assert!(d["unit"].get("claim_code").is_none(), "kept only as long as a claim takes");
+    assert!(d["unit"].get("claim_code").is_none(), "erased at claim; stays gone in service");
     let kinds: Vec<&str> = d["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["registered", "tested", "tested", "provisioned", "provisioned", "claimed", "in_service"]);
     assert_eq!(d["runs"].as_array().unwrap().len(), 2);
@@ -297,7 +301,8 @@ async fn another_server_claims_from_the_card() {
     assert_eq!((c["code_checked"].as_bool(), c["unit"]["claim_checked"].as_bool()), (Some(false), Some(false)), "said plainly: {c}");
     assert_eq!(c["unit"]["state"], "claimed", "claimed, not in service, until the collar reports");
     let (s, e) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_1" }))).await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "the same serial now has another code here: {e}");
+    assert_eq!(s, StatusCode::CONFLICT, "already claimed (code was erased at claim): {e}");
+    assert!(e["error"].as_str().unwrap().contains("already claimed"), "{e}");
 
     let farm3 = farm().await;
     let (s, c) = farm3.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "factory_record": record, "herd_id": "herd_1" }))).await;
@@ -943,4 +948,55 @@ async fn every_unit_of_a_thousand_is_listed() {
     assert!(one.get("next").is_none());
     let (_, q) = f.call("GET", "/api/fleet/units?q=OCN-2611-0099", None).await;
     assert_eq!(q["total"], 10);
+}
+
+fn hand() -> Identity {
+    Identity { role: Role::Hand, user_id: Some("usr_h".into()), name: Some("Hal".into()), via: Via::UserToken }
+}
+
+fn viewer() -> Identity {
+    Identity { role: Role::Viewer, user_id: Some("usr_v".into()), name: Some("Vic".into()), via: Via::UserToken }
+}
+
+#[tokio::test]
+async fn hands_may_claim_viewers_may_not() {
+    let f = farm().await;
+    let p = provisioned(&f, "OCN-2611-00301", 31).await;
+    let code = p["claim_code"].as_str().unwrap().to_owned();
+    let body = json!({ "claim_code": code, "herd_id": f.herd });
+    let (s, e) = f.call_as(viewer(), "POST", "/api/fleet/claim", Some(body.clone())).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{e}");
+    assert_eq!(e["error"], "Viewers can't add collars. Ask a farm hand, manager or owner.");
+    assert_eq!(e["code"], "claim_requires_hand");
+    let (s, c) = f.call_as(hand(), "POST", "/api/fleet/claim", Some(body)).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+    assert!(c["undo_id"].as_str().is_some(), "claim carries a 24h undo: {c}");
+}
+
+#[tokio::test]
+async fn wrong_codes_are_rate_limited_with_retry_after() {
+    let f = farm().await;
+    let p = provisioned(&f, "OCN-2611-00302", 32).await;
+    let serial = "OCN-2611-00302";
+    let who = hand();
+    for i in 0..op_fleet::provision::CLAIM_TRIES_PER_MINUTE {
+        let wrong = json!({ "claim_code": "0000000000000000", "herd_id": f.herd });
+        let (s, e) = f.call_as(who.clone(), "POST", &format!("/api/fleet/units/{serial}/claim"), Some(wrong)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "fail {i}: {e}");
+    }
+    let wrong = json!({ "claim_code": "0000000000000000", "herd_id": f.herd });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/fleet/units/{serial}/claim"))
+        .header("content-type", "application/json")
+        .body(Body::from(wrong.to_string()))
+        .unwrap();
+    let res = f.app(who).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(res.headers().get("retry-after").is_some(), "Retry-After on 429");
+    // The real code still works once the caller is a different person (serial lock may apply).
+    let other = Identity { role: Role::Manager, user_id: Some("usr_other".into()), name: Some("Pat".into()), via: Via::UserToken };
+    // Serial was locked after 5 fails — other callers also wait.
+    let (s, e) = f.call_as(other, "POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": p["claim_code"], "herd_id": f.herd }))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{e}");
 }
