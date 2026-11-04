@@ -103,9 +103,20 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
     Ok((StatusCode::CREATED, Json(Linked { collar, key, endpoint, no_endpoint, public_key: ctx.public_key_b64() })))
 }
 
+/// Optional identity: present when op-server / `with_identity` layered it in,
+/// absent on bare feature-router tests. Never 500s with "Identity missing".
+struct OptIdentity(Option<Identity>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for OptIdentity {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(parts.extensions.get::<Identity>().cloned()))
+    }
+}
+
 /// PATCH writes only what was sent (`name`, `herd_id`, `animal_id`), so a
 /// report landing at the same time keeps its telemetry.
-async fn update(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
+async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, OptIdentity(identity): OptIdentity, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
     let immutable =
         ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason", "simulated"];
@@ -118,7 +129,7 @@ async fn update(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<Strin
         sqlx::query("UPDATE collars SET name = ? WHERE id = ?").bind(&next.name).bind(&id).execute(ctx.db()).await?;
     }
     if next.herd_id != current.herd_id {
-        relocate_collar(&ctx, Some(&identity), &current, &next.herd_id, None, false).await?;
+        relocate_collar(&ctx, identity.as_ref(), &current, &next.herd_id, None, false).await?;
     }
     let next = find(&ctx, &id).await?;
     ctx.publish(Event::Collar { collar: next.clone() });
