@@ -11,23 +11,45 @@
 //! key onto a v2 collar is the bind command, which needs the collar's claim
 //! nonce from its hello; the collar ingest sends it.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{LazyLock, Mutex};
-use std::time::{Duration as StdDuration, Instant};
-
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use op_core::time::{now, to_db};
-use op_core::{ApiError, ApiJson, ApiResult, Collar, Ctx, Event, Identity, id};
+use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Collar, Ctx, Event, Identity, Role, id};
+use op_protocol::v2::crypto::ct_eq;
 use op_protocol::v2::identity::{Card, normalize_claim_code};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::claim_limit;
 use crate::record::RecordView;
 use crate::units::{self, Origin, Unit, UnitState};
 use crate::{keys, who};
+
+/// Wrong claim codes allowed per caller per minute (also per serial / target).
+pub const CLAIM_TRIES_PER_MINUTE: usize = claim_limit::TRIES_PER_MINUTE;
+
+/// Viewers may not claim; hands and up may. Matches op-server policy.
+const CLAIM_VIEWER_MSG: &str = "Viewers can't add collars. Ask a farm hand, manager or owner.";
+const CLAIM_VIEWER_CODE: &str = "claim_requires_hand";
+
+fn require_claim_role(identity: &Identity) -> ApiResult<()> {
+    if identity.is_anonymous() {
+        return Err(ApiError::unauthorized("Sign in first."));
+    }
+    if !identity.can(Role::Hand) {
+        return Err(ApiError::forbidden(CLAIM_VIEWER_MSG).with_details(json!({ "code": CLAIM_VIEWER_CODE })));
+    }
+    Ok(())
+}
+
+/// Constant-time compare of a stored claim code to a normalized attempt.
+fn codes_equal(stored: Option<&str>, given: &str) -> bool {
+    let dummy = "????????????????";
+    let a = stored.unwrap_or(dummy);
+    ct_eq(a.as_bytes(), given.as_bytes()) && stored.is_some()
+}
 
 pub fn router() -> Router<Ctx> {
     Router::new()
@@ -316,32 +338,44 @@ async fn provision(State(ctx): State<Ctx>, identity: Identity, Path(serial): Pat
 
 // ---- claim ---------------------------------------------------------------------------------
 
-/// Wrong claim codes allowed per caller per minute.
-pub const CLAIM_TRIES_PER_MINUTE: usize = 5;
-
-static WRONG_CODES: LazyLock<Mutex<HashMap<String, VecDeque<Instant>>>> = LazyLock::new(Mutex::default);
-
-fn caller_key(ctx: &Ctx, identity: &Identity) -> String {
-    format!("{}|{}", ctx.data_dir().display(), identity.user_id.clone().unwrap_or_else(|| format!("{:?}", identity.via)))
+fn caller_key(identity: &Identity) -> String {
+    identity.user_id.clone().unwrap_or_else(|| format!("{:?}", identity.via))
 }
 
-/// Whether this caller may try another code now.
-fn may_try(key: &str) -> bool {
-    let mut map = WRONG_CODES.lock().unwrap_or_else(|e| e.into_inner());
-    let q = map.entry(key.to_owned()).or_default();
-    while q.front().is_some_and(|t| t.elapsed() >= StdDuration::from_secs(60)) {
-        q.pop_front();
+async fn audit_attempt(ctx: &Ctx, identity: &Identity, serial: Option<&str>, serial_unknown: Option<&str>, outcome: &str, detail: Value) {
+    let at = now();
+    let mut payload = detail;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("outcome".into(), json!(outcome));
+        obj.insert("caller_id".into(), json!(caller_key(identity)));
+        if let Some(s) = serial {
+            obj.insert("serial".into(), json!(s));
+        }
+        if let Some(h) = serial_unknown {
+            obj.insert("serial_hash".into(), json!(claim_limit::serial_hash(h)));
+        }
     }
-    q.len() < CLAIM_TRIES_PER_MINUTE
-}
-
-fn wrong_code(key: &str) -> ApiError {
-    WRONG_CODES.lock().unwrap_or_else(|e| e.into_inner()).entry(key.to_owned()).or_default().push_back(Instant::now());
-    ApiError::not_found("That claim code doesn't match a unit here. Check it against the card.")
-}
-
-fn too_many() -> ApiError {
-    ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many wrong claim codes. Wait a minute and try again.")
+    let mut targets = vec![("farm".into(), "farm".into())];
+    if let Some(s) = serial {
+        targets.push(("unit".into(), s.to_owned()));
+    }
+    let e = ActivityEvent {
+        id: id::new_id(id::EVENT),
+        kind: format!("fleet.claim.{outcome}"),
+        source: "farmer".into(),
+        occurred_at: at,
+        recorded_at: at,
+        title: match outcome {
+            "ok" | "reclaimed" => "Collar claimed".into(),
+            _ => "Claim refused".into(),
+        },
+        body: None,
+        payload,
+        targets,
+    };
+    if let Err(err) = ctx.store().record_event(&e).await {
+        tracing::warn!("claim audit: {err:#}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -384,6 +418,11 @@ pub struct Claimed {
     /// same collar, a new key (the old one stops working).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reclaimed: bool,
+    /// `POST /api/collars/{id}/undo` within 24 hours reverses this claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn claim_serial(
@@ -392,42 +431,76 @@ async fn claim_serial(
     Path(serial): Path<String>,
     ApiJson(b): ApiJson<ClaimBody>,
 ) -> ApiResult<(StatusCode, Json<Claimed>)> {
+    require_claim_role(&identity)?;
     if b.card.is_some() || b.factory_record.is_some() {
         return Err(ApiError::bad_request("A card goes to POST /api/fleet/claim."));
     }
-    let key = caller_key(&ctx, &identity);
-    if !may_try(&key) {
-        return Err(too_many());
+    let caller = caller_key(&identity);
+    let target = claim_limit::target_for_serial(&serial);
+    claim_limit::may_try(&ctx, &caller, Some(&serial), &target).await?;
+    let code = match b.claim_code.as_deref().and_then(normalize_claim_code) {
+        Some(c) => c,
+        None => {
+            audit_attempt(&ctx, &identity, Some(&serial), None, "wrong_code", json!({})).await;
+            return Err(claim_limit::wrong(&ctx, &caller, Some(&serial), &target).await);
+        }
+    };
+    let unit = match units::get_unit(&ctx, &serial).await? {
+        Some(u) => u,
+        None => {
+            audit_attempt(&ctx, &identity, None, Some(&serial), "wrong_code", json!({})).await;
+            return Err(claim_limit::wrong(&ctx, &caller, Some(&serial), &target).await);
+        }
+    };
+    // Already on a farm: same 409 as a second claim (do not reveal whether the code matched).
+    if unit.state.on_farm() {
+        return claim(&ctx, &identity, unit, &b).await;
     }
-    let code = b.claim_code.as_deref().and_then(normalize_claim_code).ok_or_else(|| wrong_code(&key))?;
-    let unit = units::get_unit(&ctx, &serial).await?.ok_or_else(|| wrong_code(&key))?;
-    if unit.claim_code.as_deref() != Some(code.as_str()) {
-        return Err(wrong_code(&key));
+    if !codes_equal(unit.claim_code.as_deref(), &code) {
+        audit_attempt(&ctx, &identity, Some(&serial), None, "wrong_code", json!({})).await;
+        return Err(claim_limit::wrong(&ctx, &caller, Some(&serial), &target).await);
     }
     claim(&ctx, &identity, unit, &b).await
 }
 
 /// `POST /api/fleet/claim`: by claim code, or by card.
 async fn claim_any(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJson<ClaimBody>) -> ApiResult<(StatusCode, Json<Claimed>)> {
-    let key = caller_key(&ctx, &identity);
-    if !may_try(&key) {
-        return Err(too_many());
-    }
+    require_claim_role(&identity)?;
+    let caller = caller_key(&identity);
     let unit = match (&b.card, &b.claim_code) {
         (Some(text), _) => {
             let card = Card::parse(text).ok_or_else(|| ApiError::bad_request("That isn't an OpenCollar card (OC2:serial:key:code)."))?;
+            let target = claim_limit::target_for_serial(&card.serial);
+            claim_limit::may_try(&ctx, &caller, Some(&card.serial), &target).await?;
             if b.claim_code.as_deref().is_some_and(|c| normalize_claim_code(c).as_deref() != Some(card.claim_code.as_str())) {
-                return Err(wrong_code(&key));
+                audit_attempt(&ctx, &identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
+                return Err(claim_limit::wrong(&ctx, &caller, Some(&card.serial), &target).await);
             }
-            match from_card(&ctx, &identity, &card, b.factory_record.as_deref(), &key).await? {
+            match from_card(&ctx, &identity, &card, b.factory_record.as_deref(), &caller, &target).await? {
                 FromCard::New(u) => u,
                 FromCard::Reset(u) => return reclaim(&ctx, &identity, u, &b).await,
             }
         }
         (None, Some(code)) => {
-            let code = normalize_claim_code(code).ok_or_else(|| wrong_code(&key))?;
+            let code = match normalize_claim_code(code) {
+                Some(c) => c,
+                None => {
+                    let target = claim_limit::target_for_code(code);
+                    claim_limit::may_try(&ctx, &caller, None, &target).await?;
+                    audit_attempt(&ctx, &identity, None, None, "wrong_code", json!({ "via": "code" })).await;
+                    return Err(claim_limit::wrong(&ctx, &caller, None, &target).await);
+                }
+            };
+            let target = claim_limit::target_for_code(&code);
+            claim_limit::may_try(&ctx, &caller, None, &target).await?;
             let serial: Option<String> = sqlx::query_scalar("SELECT serial FROM fleet_units WHERE claim_code = ?").bind(&code).fetch_optional(ctx.db()).await?;
-            units::find(&ctx, &serial.ok_or_else(|| wrong_code(&key))?).await?
+            match serial {
+                Some(s) => units::find(&ctx, &s).await?,
+                None => {
+                    audit_attempt(&ctx, &identity, None, None, "wrong_code", json!({ "via": "code" })).await;
+                    return Err(claim_limit::wrong(&ctx, &caller, None, &target).await);
+                }
+            }
         }
         (None, None) => return Err(ApiError::bad_request("Send the claim code or the card.")),
     };
@@ -454,18 +527,19 @@ fn code_matches(check: &[u8; 16], code: &str, device_key: &[u8; 32]) -> bool {
 /// or registered from the card. The card is the proof of holding the unit;
 /// the key on it is the one the collar proves itself with. A code is checked
 /// against the factory record's claim check whenever there is a record.
-async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&str>, key: &str) -> ApiResult<FromCard> {
+async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&str>, caller: &str, target: &str) -> ApiResult<FromCard> {
     let pk = op_protocol::VerifyingKey::from_bytes(&card.device_key).map_err(|_| ApiError::bad_request("The card's device key isn't an Ed25519 key."))?;
     let pubkey = op_protocol::encode_public_key(&pk);
     if let Some(u) = units::get_unit(ctx, &card.serial).await? {
         if u.device_pubkey != pubkey {
             return Err(ApiError::conflict(format!("{} is known here with another device key than the card's.", card.serial)));
         }
-        if u.claim_code.as_deref() == Some(card.claim_code.as_str()) {
+        if codes_equal(u.claim_code.as_deref(), &card.claim_code) {
             return Ok(FromCard::New(u));
         }
-        // In service, its code forgotten: the factory record still tells the right code from a wrong one.
-        if u.claim_code.is_none() && u.state.on_farm() {
+        // In service, code erased at claim: the factory record still tells a
+        // right code from a wrong one (reclaim after a factory reset). Card alone.
+        if u.claim_code.is_none() && u.state == UnitState::InService {
             let stored: Option<String> =
                 sqlx::query_scalar("SELECT factory_record FROM fleet_units WHERE serial = ?").bind(&u.serial).fetch_one(ctx.db()).await?;
             let check = match &stored {
@@ -475,8 +549,19 @@ async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&
             if check.is_some_and(|c| code_matches(&c, &card.claim_code, &card.device_key)) {
                 return Ok(FromCard::Reset(u));
             }
+            audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
+            return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
         }
-        return Err(wrong_code(key));
+        if u.state.on_farm() {
+            // Claimed (code already erased) or in service without a usable record check.
+            let herd = match &u.herd_id {
+                Some(h) => ctx.store().get_herd(h).await?.map(|h| h.name).unwrap_or_else(|| h.clone()),
+                None => "a herd".into(),
+            };
+            return Err(ApiError::conflict(format!("{} is already claimed, in {herd}.", u.serial)));
+        }
+        audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
+        return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
     }
     let kid = keys::kid(&pk);
     // What the maker's record says about it, when it came with one.
@@ -492,7 +577,8 @@ async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&
     };
     let check = rec.as_ref().and_then(|r| r.record.claim_check);
     if check.is_some_and(|c| !code_matches(&c, &card.claim_code, &card.device_key)) {
-        return Err(wrong_code(key));
+        audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
+        return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
     }
     let checked = check.is_some();
     let (class, hw_rev, fw) = match &rec {
@@ -577,7 +663,8 @@ async fn reclaim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> A
     let bearer = op_core::keys::new_collar_key();
     let at = to_db(&now());
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
-    let n = sqlx::query("UPDATE fleet_units SET state = 'claimed', claimed_at = ?, updated_at = ? WHERE serial = ? AND state IN ('claimed', 'in_service') AND claim_code IS NULL AND generation = ? AND collar_id = ?")
+    // Card alone is enough after a factory reset (no proof-from-collar).
+    let n = sqlx::query("UPDATE fleet_units SET state = 'claimed', claimed_at = ?, updated_at = ? WHERE serial = ? AND state = 'in_service' AND claim_code IS NULL AND generation = ? AND collar_id = ?")
         .bind(&at)
         .bind(&at)
         .bind(&unit.serial)
@@ -597,7 +684,7 @@ async fn reclaim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> A
     units::log(&mut tx, &unit.serial, "reclaimed", json!({ "collar_id": collar_id, "from_card": true }), who(identity).as_deref()).await?;
     tx.commit().await?;
     tracing::info!(serial = %unit.serial, collar = %collar_id, "unit reclaimed from its card after a reset");
-    finish_claim(ctx, &unit.serial, &collar_id, &collar.herd_id, bearer, true, StatusCode::OK).await
+    finish_claim(ctx, identity, &unit.serial, &collar_id, &collar.herd_id, collar.animal_id.clone(), bearer, true, StatusCode::OK).await
 }
 
 /// The unit becomes a collar in the herd, on the animal when one is named.
@@ -662,14 +749,19 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
             return Err(ApiError::conflict("The animal took another collar meanwhile. Nothing was claimed."));
         }
     }
-    let n = sqlx::query("UPDATE fleet_units SET collar_id = ?, state = 'claimed', claimed_at = ?, updated_at = ? WHERE serial = ? AND state = 'provisioned'")
-        .bind(&collar_id)
-        .bind(&at)
-        .bind(&at)
-        .bind(&unit.serial)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // Claim code erased at claim time (identity.md §4 / server.md): single-use
+    // until first report is no longer needed for secrecy; reclaim uses the
+    // factory record's claim check while in_service.
+    let n = sqlx::query(
+        "UPDATE fleet_units SET collar_id = ?, state = 'claimed', claim_code = NULL, claimed_at = ?, updated_at = ? WHERE serial = ? AND state = 'provisioned'",
+    )
+    .bind(&collar_id)
+    .bind(&at)
+    .bind(&at)
+    .bind(&unit.serial)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if n != 1 {
         return Err(ApiError::conflict(format!("{} was claimed meanwhile.", unit.serial)));
     }
@@ -678,21 +770,44 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     tx.commit().await?;
     tracing::info!(serial = %unit.serial, collar = %collar_id, herd = %b.herd_id, "unit claimed");
 
-    finish_claim(ctx, &unit.serial, &collar_id, &b.herd_id, bearer, false, StatusCode::CREATED).await
+    finish_claim(ctx, identity, &unit.serial, &collar_id, &b.herd_id, b.animal_id.clone(), bearer, false, StatusCode::CREATED).await
 }
 
 /// The claim's answer: the collar, the unit, and the v1 key for today's firmware.
 async fn finish_claim(
     ctx: &Ctx,
+    identity: &Identity,
     serial: &str,
     collar_id: &str,
     herd_id: &str,
+    animal_id: Option<String>,
     bearer: String,
     reclaimed: bool,
     status: StatusCode,
 ) -> ApiResult<(StatusCode, Json<Claimed>)> {
+    claim_limit::clear_serial(ctx, serial).await;
     let collar = collar_record(ctx, collar_id).await?;
+    let undo_id = record_claim_undo(ctx, identity, &collar, serial, reclaimed).await;
+    let outcome = if reclaimed { "reclaimed" } else { "ok" };
+    audit_attempt(
+        ctx,
+        identity,
+        Some(serial),
+        None,
+        outcome,
+        json!({ "collar_id": collar_id, "herd_id": herd_id, "animal_id": animal_id, "undo_id": undo_id }),
+    )
+    .await;
     ctx.publish(Event::Collar { collar: collar.clone() });
+    ctx.publish(Event::Claimed {
+        serial: serial.to_owned(),
+        collar_id: collar_id.to_owned(),
+        herd_id: herd_id.to_owned(),
+        animal_id: animal_id.clone(),
+        reclaimed,
+        undo_id: undo_id.clone(),
+        undo_until: undo_id.as_ref().map(|_| now() + chrono::Duration::hours(24)),
+    });
     units::publish(ctx, serial).await;
     let endpoint = collar_endpoint(ctx).await?;
     let public_key = ctx.public_key_b64();
@@ -703,7 +818,43 @@ async fn finish_claim(
     let why = endpoint.is_none().then(|| NO_COLLAR_ADDRESS.to_owned());
     let unit = units::find(ctx, serial).await?;
     let code_checked = unit.claim_checked || reclaimed;
-    Ok((status, Json(Claimed { unit, collar, v1: V1Provisioning { key: bearer, public_key, endpoint, line, why }, code_checked, reclaimed })))
+    let undo_until = undo_id.as_ref().map(|_| now() + chrono::Duration::hours(24));
+    Ok((
+        status,
+        Json(Claimed { unit, collar, v1: V1Provisioning { key: bearer, public_key, endpoint, line, why }, code_checked, reclaimed, undo_id, undo_until }),
+    ))
+}
+
+/// 24-hour undo for a claim: reverse it back to a provisioned unit.
+async fn record_claim_undo(ctx: &Ctx, identity: &Identity, collar: &Collar, serial: &str, reclaimed: bool) -> Option<String> {
+    if reclaimed {
+        // Reclaim keeps the same collar/herd; no herd to restore. Skip undo row.
+        return None;
+    }
+    let id = id::new_id("undo");
+    let at = now();
+    let expires = at + chrono::Duration::hours(24);
+    let ok = sqlx::query(
+        "INSERT INTO collar_undos (id, collar_id, kind, serial, to_herd_id, to_animal_id, by_user, created_at, expires_at)
+         VALUES (?, ?, 'claim', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&collar.id)
+    .bind(serial)
+    .bind(&collar.herd_id)
+    .bind(&collar.animal_id)
+    .bind(who(identity))
+    .bind(to_db(&at))
+    .bind(to_db(&expires))
+    .execute(ctx.db())
+    .await;
+    match ok {
+        Ok(_) => Some(id),
+        Err(e) => {
+            tracing::warn!("claim undo row: {e:#}");
+            None
+        }
+    }
 }
 
 /// The collar as `/api/collars/:id` returns it.

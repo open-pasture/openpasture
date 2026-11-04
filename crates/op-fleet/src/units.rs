@@ -749,9 +749,9 @@ async fn summary(State(ctx): State<Ctx>) -> ApiResult<Json<Summary>> {
 
 // ---- in service --------------------------------------------------------------------------------
 
-/// A claimed unit is in service from its collar's first report. Its claim
-/// code is forgotten then: claim codes are kept only as long as a claim
-/// takes (protocol v2 `server.md` §10); the factory record's claim check stays.
+/// A claimed unit is in service from its collar's first report. The claim
+/// code was already cleared at claim time; the factory record's claim check
+/// stays for reclaim after a reset.
 pub async fn mark_in_service(ctx: &Ctx, collar_id: &str) -> anyhow::Result<bool> {
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     let serial: Option<String> = sqlx::query_scalar(&format!(
