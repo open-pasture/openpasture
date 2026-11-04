@@ -1227,7 +1227,11 @@ async fn export_includes_only_that_collars_data() {
             recorded_at: at,
             title: "About A".into(),
             body: None,
-            payload: serde_json::json!({ "collar": &a }),
+            payload: serde_json::json!({
+                "collar": &a,
+                "by": { "via": "user_token", "user_id": "usr_secret", "name": "Ana" },
+                "caller_id": "usr_secret"
+            }),
             targets: vec![("collar".into(), a.clone())],
         })
         .await
@@ -1248,6 +1252,15 @@ async fn export_includes_only_that_collars_data() {
     assert!(audit.iter().any(|e| e["title"] == "About A"), "{audit:?}");
     assert!(audit.iter().all(|e| e["title"] != "About B only" && e["title"] != "Herd-wide note"), "{audit:?}");
     assert!(audit.iter().all(|e| { e["targets"].as_array().unwrap().iter().filter(|t| t[0] == "collar").all(|t| t[1] == a) }), "{audit:?}");
+    for e in audit {
+        let p = &e["payload"];
+        assert!(p.get("caller_id").is_none(), "{p}");
+        assert!(p.get("user_id").is_none(), "{p}");
+        if e["title"] == "About A" {
+            assert_eq!(p["by"], "Ana", "{p}");
+        }
+        assert!(!p.to_string().contains("usr_secret"), "{p}");
+    }
 }
 
 /// App with fleet + ingest (claim, release, export).
@@ -1318,10 +1331,26 @@ async fn release_revokes_key_and_transfer_token_claims_on_another_farm() {
     let collar_id = c["collar"]["id"].as_str().unwrap().to_owned();
     let old_key = c["v1"]["key"].as_str().unwrap().to_owned();
 
+    // Seed a fix so history can travel with the collar.
+    let fix = json!({"fixes": [{"at": "2026-09-25T12:00:00Z", "point": [-92.405, 38.125], "accuracy_m": 2.0, "sats": 8}], "battery": 0.8});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/collar/v1/report")
+        .header("authorization", format!("Bearer {old_key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(fix.to_string()))
+        .unwrap();
+    let res = a.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (s, exp) = a.call("GET", &format!("/api/collars/{collar_id}/export"), None).await;
+    assert_eq!(s, StatusCode::OK, "{exp}");
+
     let (s, rel) = a.call("POST", &format!("/api/collars/{collar_id}/release"), Some(json!({ "expires_hours": 48 }))).await;
     assert_eq!(s, StatusCode::OK, "{rel}");
     let token = rel["transfer_token"].as_str().unwrap().to_owned();
     assert!(token.starts_with("OPT1:"));
+    assert!(token.split(':').count() >= 8, "signed token has farm pubkey + sig: {token}");
     assert_eq!(rel["export_path"], format!("/api/collars/{collar_id}/export"));
     let hash: String = sqlx::query_scalar("SELECT key_hash FROM collars WHERE id = ?").bind(&collar_id).fetch_one(a.ctx.db()).await.unwrap();
     assert_ne!(hash, op_core::keys::hash_key(&old_key), "old key revoked");
@@ -1332,9 +1361,33 @@ async fn release_revokes_key_and_transfer_token_claims_on_another_farm() {
     b.call("POST", "/api/farm", Some(json!({"name": "B", "timezone": "UTC", "center": [-92.4, 38.1]}))).await;
     let (_, h) = b.call("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 0}))).await;
     let herd_b = h["id"].as_str().unwrap().to_owned();
-    let (s, c2) = b.call("POST", "/api/fleet/claim", Some(json!({ "transfer_token": token, "herd_id": herd_b }))).await;
+
+    // Forged token (tampered collar id): generic 404.
+    let forged = token.replacen(&collar_id, "col_forged", 1);
+    let (s, e) = b.call("POST", "/api/fleet/claim", Some(json!({ "transfer_token": forged, "herd_id": herd_b }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{e}");
+
+    // Expired token: sign one with exp in the past.
+    let expired = op_fleet::transfer_token::format(
+        serial,
+        &pk,
+        &collar_id,
+        "ABCDEFGHJKLMNPQR",
+        chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap(),
+        a.ctx.signing_key(),
+    );
+    let (s, e) = b.call("POST", "/api/fleet/claim", Some(json!({ "transfer_token": expired, "herd_id": herd_b }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "expired: {e}");
+
+    let (s, c2) = b.call("POST", "/api/fleet/claim", Some(json!({ "transfer_token": token, "herd_id": herd_b, "history": exp }))).await;
     assert_eq!(s, StatusCode::CREATED, "{c2}");
     assert_eq!(c2["collar"]["id"], collar_id);
     assert_eq!(c2["unit"]["serial"], serial);
     assert_ne!(c2["v1"]["key"].as_str().unwrap(), old_key);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixes WHERE collar_id = ?").bind(&collar_id).fetch_one(b.ctx.db()).await.unwrap();
+    assert_eq!(n, 1, "history travelled with the collar");
+
+    // Reuse on the same receiving farm: generic 404.
+    let (s, e) = b.call("POST", "/api/fleet/claim", Some(json!({ "transfer_token": token, "herd_id": herd_b }))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "reuse: {e}");
 }

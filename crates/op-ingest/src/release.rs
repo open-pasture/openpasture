@@ -89,7 +89,7 @@ async fn release(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<Stri
     let at = now();
     let expires = at + Duration::hours(hours);
     let release_id = id::new_id("rel");
-    let transfer_token = transfer_token::format(&serial, &device_pubkey, &id, &code, expires);
+    let transfer_token = transfer_token::format(&serial, &device_pubkey, &id, &code, expires, ctx.signing_key());
     let dead = keys::new_collar_key();
 
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;

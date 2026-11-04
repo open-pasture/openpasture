@@ -83,14 +83,16 @@ async fn export(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<Strin
 }
 
 /// Activity lines that target this collar, excluding any that also target
-/// another collar (herd-wide digests must not leak neighbours).
+/// another collar (herd-wide digests must not leak neighbours). Payloads are
+/// scrubbed of user ids / other people's data — only role/display-safe labels.
 async fn collar_audit(ctx: &Ctx, collar_id: &str) -> anyhow::Result<Vec<Value>> {
     let events = ctx.store().list_events(Some(("collar", collar_id)), 1000).await?;
     let mut out = Vec::with_capacity(events.len());
-    for e in events {
+    for mut e in events {
         if targets_other_collar(&e, collar_id) {
             continue;
         }
+        sanitize_audit_event(&mut e, collar_id);
         if let Ok(v) = serde_json::to_value(e) {
             out.push(v);
         }
@@ -100,6 +102,50 @@ async fn collar_audit(ctx: &Ctx, collar_id: &str) -> anyhow::Result<Vec<Value>> 
 
 fn targets_other_collar(e: &ActivityEvent, collar_id: &str) -> bool {
     e.targets.iter().any(|(kind, id)| kind == "collar" && id != collar_id)
+}
+
+/// Drop user ids and foreign targets; keep a display-safe `by` label when present.
+fn sanitize_audit_event(e: &mut ActivityEvent, collar_id: &str) {
+    e.targets.retain(|(kind, id)| match kind.as_str() {
+        "collar" => id == collar_id,
+        "unit" | "animal" => true,
+        // Never ship other herds / farms / people.
+        "herd" | "farm" | "user" | "paddock" => false,
+        _ => false,
+    });
+    if let Some(obj) = e.payload.as_object_mut() {
+        let by_label = obj
+            .get("by")
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    return Some(s.to_owned());
+                }
+                let o = v.as_object()?;
+                if let Some(name) = o.get("name").and_then(|n| n.as_str()).filter(|n| !n.is_empty()) {
+                    return Some(name.to_owned());
+                }
+                match o.get("via").and_then(|v| v.as_str()) {
+                    Some("local") => Some("owner".into()),
+                    Some("user_token") => Some("hand".into()),
+                    Some(other) => Some(other.to_owned()),
+                    None => None,
+                }
+            })
+            .or_else(|| obj.get("caller_id").map(|_| "farmer".into()));
+        for key in ["by", "caller_id", "user_id", "created_by", "who", "actor"] {
+            obj.remove(key);
+        }
+        // Drop nested objects that often carry user ids.
+        obj.retain(|k, v| {
+            if k.ends_with("_user_id") || k == "email" || k == "token" {
+                return false;
+            }
+            !v.as_object().is_some_and(|o| o.contains_key("user_id"))
+        });
+        if let Some(label) = by_label {
+            obj.insert("by".into(), json!(label));
+        }
+    }
 }
 
 async fn table_json(db: &sqlx::SqlitePool, sql: &str, collar_id: &str) -> anyhow::Result<Vec<Value>> {

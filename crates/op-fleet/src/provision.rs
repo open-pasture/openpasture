@@ -391,6 +391,9 @@ struct ClaimBody {
     herd_id: String,
     name: Option<String>,
     animal_id: Option<String>,
+    /// Collar-only history from `GET /api/collars/{id}/export` (travels with the collar).
+    #[serde(default)]
+    history: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,14 +514,29 @@ async fn claim_any(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJs
     claim(&ctx, &identity, unit, &b).await
 }
 
-/// Claim from a releasing farm's `OPT1:…` token: keep the collar id, mint a new key.
+/// Claim from a releasing farm's signed `OPT1:…` token: keep the collar id, mint a new key.
 async fn claim_transfer(ctx: &Ctx, identity: &Identity, caller: &str, token_text: &str, b: &ClaimBody) -> ApiResult<(StatusCode, Json<Claimed>)> {
-    let token = crate::transfer_token::parse(token_text).ok_or_else(|| ApiError::bad_request("That isn't a transfer token (OPT1:…)."))?;
-    let target = claim_limit::target_for_serial(&token.serial);
-    claim_limit::may_try(ctx, caller, Some(&token.serial), &target).await?;
+    let target = claim_limit::target_for_serial("transfer");
+    claim_limit::may_try(ctx, caller, None, &target).await?;
+    // Forged / malformed / bad signature: same generic 404 as a wrong claim code.
+    let token = match crate::transfer_token::parse_and_verify(token_text) {
+        Some(t) => t,
+        None => {
+            audit_attempt(ctx, identity, None, None, "wrong_code", json!({ "via": "transfer", "reason": "forged" })).await;
+            return Err(claim_limit::wrong(ctx, caller, None, &target).await);
+        }
+    };
+    let serial_target = claim_limit::target_for_serial(&token.serial);
+    claim_limit::may_try(ctx, caller, Some(&token.serial), &serial_target).await?;
     if token.expires_at < now() {
         audit_attempt(ctx, identity, Some(&token.serial), None, "wrong_code", json!({ "via": "transfer", "reason": "expired" })).await;
-        return Err(claim_limit::wrong(ctx, caller, Some(&token.serial), &target).await);
+        return Err(claim_limit::wrong(ctx, caller, Some(&token.serial), &serial_target).await);
+    }
+    let code_hash = crate::transfer_token::code_hash(&token.transfer_code);
+    let already: i64 = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM transfer_token_uses WHERE code_hash = ?)").bind(&code_hash).fetch_one(ctx.db()).await?;
+    if already != 0 {
+        audit_attempt(ctx, identity, Some(&token.serial), None, "wrong_code", json!({ "via": "transfer", "reason": "reused" })).await;
+        return Err(claim_limit::wrong(ctx, caller, Some(&token.serial), &serial_target).await);
     }
     if b.card.is_some() || b.claim_code.is_some() {
         return Err(ApiError::bad_request("A transfer token is claimed alone (no card or claim_code beside it)."));
@@ -558,6 +576,22 @@ async fn claim_transfer(ctx: &Ctx, identity: &Identity, caller: &str, token_text
     let bearer = op_core::keys::new_collar_key();
     let at = to_db(&now());
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+    // Single use: insert the code hash; a reuse conflicts and becomes a generic 404.
+    let used = sqlx::query(
+        "INSERT INTO transfer_token_uses (code_hash, serial, collar_id, farm_pubkey, used_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(code_hash) DO NOTHING",
+    )
+    .bind(&code_hash)
+    .bind(&token.serial)
+    .bind(&token.collar_id)
+    .bind(&token.farm_pubkey)
+    .bind(&at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if used != 1 {
+        return Err(claim_limit::wrong(ctx, caller, Some(&token.serial), &serial_target).await);
+    }
     sqlx::query(
         "INSERT INTO fleet_units (serial, device_class, hw_rev, fw_version, device_pubkey, device_kid, state, origin, claim_code, claim_checked,
            collar_id, claimed_at, created_at, updated_at)
@@ -600,6 +634,9 @@ async fn claim_transfer(ctx: &Ctx, identity: &Identity, caller: &str, token_text
             return Err(ApiError::conflict("The animal took another collar meanwhile. Nothing was claimed."));
         }
     }
+    if let Some(hist) = &b.history {
+        import_collar_history(&mut tx, &token.collar_id, &b.herd_id, b.animal_id.as_deref(), hist).await?;
+    }
     units::log(
         &mut tx,
         &token.serial,
@@ -609,8 +646,129 @@ async fn claim_transfer(ctx: &Ctx, identity: &Identity, caller: &str, token_text
     )
     .await?;
     tx.commit().await?;
+    // Audit lines from history (after commit so they are not rolled back with the unit).
+    if let Some(hist) = &b.history {
+        import_collar_audit(ctx, &token.collar_id, hist).await;
+    }
+    // Mark used_at on a same-server release row if present (handover back, or test).
+    let _ = sqlx::query("UPDATE collar_releases SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND revoked_at IS NULL")
+        .bind(&at)
+        .bind(&code_hash)
+        .execute(ctx.db())
+        .await;
     tracing::info!(serial = %token.serial, collar = %token.collar_id, herd = %b.herd_id, "unit claimed from transfer token");
     finish_claim(ctx, identity, &token.serial, &token.collar_id, &b.herd_id, b.animal_id.clone(), bearer, false, StatusCode::CREATED).await
+}
+
+/// Import collar-only fixes/cues/episodes from an export body into the new herd.
+async fn import_collar_history(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    collar_id: &str,
+    herd_id: &str,
+    animal_id: Option<&str>,
+    hist: &Value,
+) -> ApiResult<()> {
+    if hist.get("scope").and_then(|s| s.as_str()) != Some("collar_only") {
+        return Err(ApiError::bad_request("history must be a collar_only export."));
+    }
+    if let Some(id) = hist.pointer("/collar/id").and_then(|v| v.as_str()) {
+        if id != collar_id {
+            return Err(ApiError::bad_request("history collar id does not match the transfer token."));
+        }
+    }
+    for fix in hist.get("fixes").and_then(|v| v.as_array()).into_iter().flatten() {
+        if fix.get("collar_id").and_then(|v| v.as_str()) != Some(collar_id) {
+            continue;
+        }
+        let at = fix.get("at").and_then(|v| v.as_str()).unwrap_or("");
+        let lon = fix.get("lon").and_then(|v| v.as_f64()).or_else(|| fix.get("lon").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()));
+        let lat = fix.get("lat").and_then(|v| v.as_f64()).or_else(|| fix.get("lat").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()));
+        let (Some(lon), Some(lat)) = (lon, lat) else { continue };
+        let _ = sqlx::query(
+            "INSERT INTO fixes (collar_id, herd_id, animal_id, at, t, lon, lat, accuracy_m, sats, cn0, ttf_s, boundary_version, state, margin_m, paddock_id, hdop)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'unknown', NULL, NULL, NULL)",
+        )
+        .bind(collar_id)
+        .bind(herd_id)
+        .bind(animal_id)
+        .bind(at)
+        .bind(fix.get("t").and_then(|v| v.as_i64()).unwrap_or(0))
+        .bind(lon)
+        .bind(lat)
+        .bind(fix.get("accuracy_m").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        .bind(fix.get("sats").and_then(|v| v.as_i64()).unwrap_or(0))
+        .bind(fix.get("cn0").and_then(|v| v.as_f64()))
+        .bind(fix.get("ttf_s").and_then(|v| v.as_f64()))
+        .execute(&mut **tx)
+        .await;
+    }
+    for cue in hist.get("cues").and_then(|v| v.as_array()).into_iter().flatten() {
+        if cue.get("collar_id").and_then(|v| v.as_str()) != Some(collar_id) {
+            continue;
+        }
+        let at = cue.get("at").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO cues (collar_id, herd_id, animal_id, at, t, level, margin_m, lon, lat, boundary_version, kind, ring, dur_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+        )
+        .bind(collar_id)
+        .bind(herd_id)
+        .bind(animal_id)
+        .bind(at)
+        .bind(cue.get("t").and_then(|v| v.as_i64()))
+        .bind(cue.get("level").and_then(|v| v.as_i64()).unwrap_or(0))
+        .bind(cue.get("margin_m").and_then(|v| v.as_f64()))
+        .bind(cue.get("lon").and_then(|v| v.as_f64()))
+        .bind(cue.get("lat").and_then(|v| v.as_f64()))
+        .bind(cue.get("kind").and_then(|v| v.as_str()))
+        .bind(cue.get("ring").and_then(|v| v.as_i64()))
+        .bind(cue.get("dur_ms").and_then(|v| v.as_i64()))
+        .execute(&mut **tx)
+        .await;
+    }
+    for ep in hist.get("episodes").and_then(|v| v.as_array()).into_iter().flatten() {
+        if ep.get("collar_id").and_then(|v| v.as_str()) != Some(collar_id) {
+            continue;
+        }
+        let id = ep.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO episodes (id, collar_id, herd_id, animal_id, start_t, end_t, start_at, end_at, boundary_version, ring, cues, max_level, min_margin_m, outcome)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(collar_id)
+        .bind(herd_id)
+        .bind(animal_id)
+        .bind(ep.get("start_t").and_then(|v| v.as_i64()))
+        .bind(ep.get("end_t").and_then(|v| v.as_i64()))
+        .bind(ep.get("start_at").and_then(|v| v.as_str()))
+        .bind(ep.get("end_at").and_then(|v| v.as_str()))
+        .bind(ep.get("ring").and_then(|v| v.as_i64()))
+        .bind(ep.get("cues").and_then(|v| v.as_i64()))
+        .bind(ep.get("max_level").and_then(|v| v.as_i64()))
+        .bind(ep.get("min_margin_m").and_then(|v| v.as_f64()))
+        .bind(ep.get("outcome").and_then(|v| v.as_str()))
+        .execute(&mut **tx)
+        .await;
+    }
+    Ok(())
+}
+
+async fn import_collar_audit(ctx: &Ctx, collar_id: &str, hist: &Value) {
+    for row in hist.get("audit").and_then(|v| v.as_array()).into_iter().flatten() {
+        let Ok(mut ev) = serde_json::from_value::<ActivityEvent>(row.clone()) else {
+            continue;
+        };
+        // Retarget to this collar only; keep sanitized payload from export.
+        ev.targets.retain(|(k, id)| k != "collar" || id == collar_id);
+        if !ev.targets.iter().any(|(k, id)| k == "collar" && id == collar_id) {
+            ev.targets.push(("collar".into(), collar_id.to_owned()));
+        }
+        let _ = ctx.store().record_event(&ev).await;
+    }
 }
 
 /// What a card names here.
