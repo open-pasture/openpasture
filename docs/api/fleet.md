@@ -239,10 +239,11 @@ Unauthenticated callers get **401**.
   otherwise: move it with `/transfer` afterwards). **The card alone is enough** (no
   proof-from-collar). This needs the stored record, so units this server didn't record a claim
   check for can't be reclaimed this way.
-- **Notice + 24h undo**: managers and owners see a live `claimed` event; an activity log line is
+- **Notice + undo**: managers and owners see a live `claimed` event; an activity log line is
   stored. `undo_id` / `undo_until` on the response (and event) allow
-  `POST /api/collars/{id}/undo` within 24 hours to reverse the claim (unit returns to
-  `provisioned` with a fresh code).
+  `POST /api/collars/{id}/undo` within the undo window (default **24 hours**,
+  `UNDO_WINDOW_HOURS` — pending the owner's OK of the final value) to reverse the claim
+  (unit returns to `provisioned` with a fresh code).
 
 Returns 201:
 
@@ -253,15 +254,16 @@ Claimed {
   v1: { key, public_key, endpoint?, line?, why? },   // firmware that speaks protocol v1: shown once
   code_checked: boolean,                      // see the typo check
   reclaimed?: true,                           // a reset unit claimed again (200)
-  undo_id?, undo_until?,                      // 24h reverse via POST /api/collars/{id}/undo
+  undo_id?, undo_until?,                      // undo window (UNDO_WINDOW_HOURS, default 24h pending owner OK)
 }
 ```
 
 - Wrong or unknown claim code: 404 (identical message; serials are not enumerable). Five wrong
-  codes a minute per caller, per serial and per attempt target; a global ceiling (60/min); after
-  a full window on a serial/target, exponential lockout (1–60 min). All counters persist across
-  restart (`claim_lockouts`). **429** includes `Retry-After`.
-- The unit must be `provisioned` (409 otherwise; a claimed one names the herd it is in).
+  codes a minute per caller, per serial and per attempt target; after a full window on a
+  serial/target, exponential lockout (1–60 min). A farm-wide counter (60/min) raises a soft
+  abuse alarm (`fleet.claim.abuse_alarm`) but does **not** lock out other callers. Counters
+  persist across restart (`claim_lockouts`). **429** includes `Retry-After`.
+- The unit must be `provisioned` (409 otherwise: already claimed — without naming the herd).
 - `v1.line` is `provision {"v":1,…}` for a v1 collar's console; without a collar address it is
   absent and `why` says so.
 - The unit turns `in_service` on the collar's first report.
@@ -273,9 +275,10 @@ between herds on **this farm** only. Preserves collar id, key and history; clear
 hands the new herd's boundary (same logic as `PATCH /api/collars/{id}` with a new `herd_id`).
 Detaches any animal on the old herd; if `animal_id` is given it must already be in the destination
 herd. Stops an open escape first. No approval. Managers/owners get a live `collar_moved` notice
-and an activity line; `POST /api/collars/{id}/undo` within 24 hours restores the previous herd and
-re-copies that herd's **current** fence (not a byte-for-byte restore of the prior applied
-version). Cross-farm handover (release / transfer code / export) is a separate flow.
+and an activity line; `POST /api/collars/{id}/undo` within the undo window (default 24h,
+`UNDO_WINDOW_HOURS` — pending owner OK) restores the previous herd and re-copies that herd's
+**current** fence (not a byte-for-byte restore of the prior applied version). Cross-farm
+handover (release / transfer code / export) is a separate flow.
 
 ### Live events
 

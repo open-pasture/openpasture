@@ -6,7 +6,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use op_core::time::{from_db, now, to_db};
-use op_core::{ActivityEvent, Animal, ApiError, ApiJson, ApiResult, Collar, Ctx, Event, FenceState, Identity, Position, id, keys, patch};
+use op_core::{
+    ActivityEvent, Animal, ApiError, ApiJson, ApiResult, Collar, Ctx, Event, FenceState, Identity, Position, UNDO_WINDOW_HOURS, id, keys, patch, undo_window,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -131,7 +133,8 @@ struct TransferBody {
 }
 
 /// `POST /api/collars/{id}/transfer`: same-farm herd move. Preserves collar
-/// id, key and history. No approval; managers/owners get a notice with 24h undo.
+/// id, key and history. No approval; managers/owners get a notice with undo
+/// for [`UNDO_WINDOW_HOURS`] (default pending owner OK).
 async fn transfer(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>, ApiJson(b): ApiJson<TransferBody>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
     if b.to_herd_id == current.herd_id && b.animal_id == current.animal_id {
@@ -264,7 +267,7 @@ async fn record_move_undo(
 ) -> Option<String> {
     let id = id::new_id("undo");
     let at = now();
-    let expires = at + chrono::Duration::hours(24);
+    let expires = at + undo_window();
     let by = identity.and_then(|i| i.user_id.clone().or_else(|| i.name.clone()));
     let ok = sqlx::query(
         "INSERT INTO collar_undos (id, collar_id, kind, from_herd_id, to_herd_id, from_animal_id, to_animal_id,
@@ -304,7 +307,7 @@ async fn notice_moved(
     undo_id: Option<String>,
 ) {
     let at = now();
-    let undo_until = undo_id.as_ref().map(|_| at + chrono::Duration::hours(24));
+    let undo_until = undo_id.as_ref().map(|_| at + undo_window());
     let e = ActivityEvent {
         id: id::new_id(id::EVENT),
         kind: "collar.moved".into(),
@@ -352,7 +355,8 @@ enum UndoResult {
     },
 }
 
-/// `POST /api/collars/{id}/undo`: reverse the latest claim or move within 24h.
+/// `POST /api/collars/{id}/undo`: reverse the latest claim or move within
+/// [`UNDO_WINDOW_HOURS`] (default pending owner OK).
 /// Move undo restores the previous herd and re-copies that herd's current
 /// fence (not a byte-for-byte restore of the prior applied version).
 async fn undo(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>) -> ApiResult<Json<UndoResult>> {
@@ -382,7 +386,7 @@ async fn undo(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>
     };
     let expires_at = from_db(&expires)?;
     if expires_at < at {
-        return Err(ApiError::conflict("The 24-hour undo window has ended."));
+        return Err(ApiError::conflict(format!("The {UNDO_WINDOW_HOURS}-hour undo window has ended.")));
     }
     let collar = find(&ctx, &id).await?;
     match kind.as_str() {

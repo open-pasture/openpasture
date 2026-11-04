@@ -44,7 +44,7 @@ pub enum Event {
         collar: Collar,
     },
     /// Notice to managers and owners: a unit was claimed into a herd (op-fleet).
-    /// No claim code. Optional `undo_id` is good for 24 hours.
+    /// No claim code. Optional `undo_id` is good for [`crate::UNDO_WINDOW_HOURS`].
     Claimed {
         serial: String,
         collar_id: String,

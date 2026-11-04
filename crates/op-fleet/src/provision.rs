@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use op_core::time::{now, to_db};
-use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Collar, Ctx, Event, Identity, Role, id};
+use op_core::{ActivityEvent, ApiError, ApiJson, ApiResult, Collar, Ctx, Event, Identity, Role, id, undo_window};
 use op_protocol::v2::crypto::ct_eq;
 use op_protocol::v2::identity::{Card, normalize_claim_code};
 use serde::{Deserialize, Serialize};
@@ -418,7 +418,7 @@ pub struct Claimed {
     /// same collar, a new key (the old one stops working).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reclaimed: bool,
-    /// `POST /api/collars/{id}/undo` within 24 hours reverses this claim.
+    /// `POST /api/collars/{id}/undo` within [`op_core::UNDO_WINDOW_HOURS`] reverses this claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub undo_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -452,11 +452,10 @@ async fn claim_serial(
             return Err(claim_limit::wrong(&ctx, &caller, Some(&serial), &target).await);
         }
     };
-    // Already on a farm: same 409 as a second claim (do not reveal whether the code matched).
-    if unit.state.on_farm() {
-        return claim(&ctx, &identity, unit, &b).await;
-    }
-    if !codes_equal(unit.claim_code.as_deref(), &code) {
+    // Validate the code first. Wrong / unknown codes always look the same (404);
+    // never reveal that a serial is claimed until the code checks out.
+    let code_ok = codes_equal(unit.claim_code.as_deref(), &code) || stored_factory_code_matches(&ctx, &unit, &code).await?;
+    if !code_ok {
         audit_attempt(&ctx, &identity, Some(&serial), None, "wrong_code", json!({})).await;
         return Err(claim_limit::wrong(&ctx, &caller, Some(&serial), &target).await);
     }
@@ -523,6 +522,30 @@ fn code_matches(check: &[u8; 16], code: &str, device_key: &[u8; 32]) -> bool {
     op_protocol::v2::identity::claim_check(&op_protocol::v2::identity::claim_key(code, &id)) == *check
 }
 
+/// Conflict when a unit is already on this farm — never name the herd (enumeration).
+fn already_claimed(serial: &str) -> ApiError {
+    ApiError::conflict(format!("{serial} is already claimed."))
+}
+
+/// True when the unit's stored factory record's claim check matches `code`.
+async fn stored_factory_code_matches(ctx: &Ctx, unit: &Unit, code: &str) -> ApiResult<bool> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT factory_record FROM fleet_units WHERE serial = ?").bind(&unit.serial).fetch_optional(ctx.db()).await?;
+    let Some(hex) = stored else {
+        return Ok(false);
+    };
+    let Ok(view) = crate::record::read(ctx, &hex).await else {
+        return Ok(false);
+    };
+    let Some(check) = view.record.claim_check else {
+        return Ok(false);
+    };
+    let Ok(pk) = op_protocol::decode_public_key(&unit.device_pubkey) else {
+        return Ok(false);
+    };
+    Ok(code_matches(&check, code, pk.as_bytes()))
+}
+
 /// The unit a card names: known here (its key and code must match the card),
 /// or registered from the card. The card is the proof of holding the unit;
 /// the key on it is the one the collar proves itself with. A code is checked
@@ -540,25 +563,20 @@ async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&
         // In service, code erased at claim: the factory record still tells a
         // right code from a wrong one (reclaim after a factory reset). Card alone.
         if u.claim_code.is_none() && u.state == UnitState::InService {
-            let stored: Option<String> =
-                sqlx::query_scalar("SELECT factory_record FROM fleet_units WHERE serial = ?").bind(&u.serial).fetch_one(ctx.db()).await?;
-            let check = match &stored {
-                Some(h) => crate::record::read(ctx, h).await.ok().and_then(|r| r.record.claim_check),
-                None => None,
-            };
-            if check.is_some_and(|c| code_matches(&c, &card.claim_code, &card.device_key)) {
+            if stored_factory_code_matches(ctx, &u, &card.claim_code).await? {
                 return Ok(FromCard::Reset(u));
             }
             audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
             return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
         }
         if u.state.on_farm() {
-            // Claimed (code already erased) or in service without a usable record check.
-            let herd = match &u.herd_id {
-                Some(h) => ctx.store().get_herd(h).await?.map(|h| h.name).unwrap_or_else(|| h.clone()),
-                None => "a herd".into(),
-            };
-            return Err(ApiError::conflict(format!("{} is already claimed, in {herd}.", u.serial)));
+            // Code was erased at claim. Only confirm "already claimed" when the
+            // card's code still checks out against the factory record.
+            if stored_factory_code_matches(ctx, &u, &card.claim_code).await? {
+                return Err(already_claimed(&u.serial));
+            }
+            audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
+            return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
         }
         audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
         return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
@@ -692,11 +710,7 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     match unit.state {
         UnitState::Provisioned => {}
         UnitState::Claimed | UnitState::InService => {
-            let herd = match &unit.herd_id {
-                Some(h) => ctx.store().get_herd(h).await?.map(|h| h.name).unwrap_or_else(|| h.clone()),
-                None => "a herd".into(),
-            };
-            return Err(ApiError::conflict(format!("{} is already claimed, in {herd}.", unit.serial)));
+            return Err(already_claimed(&unit.serial));
         }
         _ => return Err(ApiError::conflict(format!("{} isn't provisioned yet, so it can't be claimed.", unit.serial))),
     }
@@ -806,7 +820,7 @@ async fn finish_claim(
         animal_id: animal_id.clone(),
         reclaimed,
         undo_id: undo_id.clone(),
-        undo_until: undo_id.as_ref().map(|_| now() + chrono::Duration::hours(24)),
+        undo_until: undo_id.as_ref().map(|_| now() + undo_window()),
     });
     units::publish(ctx, serial).await;
     let endpoint = collar_endpoint(ctx).await?;
@@ -818,14 +832,14 @@ async fn finish_claim(
     let why = endpoint.is_none().then(|| NO_COLLAR_ADDRESS.to_owned());
     let unit = units::find(ctx, serial).await?;
     let code_checked = unit.claim_checked || reclaimed;
-    let undo_until = undo_id.as_ref().map(|_| now() + chrono::Duration::hours(24));
+    let undo_until = undo_id.as_ref().map(|_| now() + undo_window());
     Ok((
         status,
         Json(Claimed { unit, collar, v1: V1Provisioning { key: bearer, public_key, endpoint, line, why }, code_checked, reclaimed, undo_id, undo_until }),
     ))
 }
 
-/// 24-hour undo for a claim: reverse it back to a provisioned unit.
+/// Undo a claim within [`op_core::UNDO_WINDOW_HOURS`]: reverse it back to a provisioned unit.
 async fn record_claim_undo(ctx: &Ctx, identity: &Identity, collar: &Collar, serial: &str, reclaimed: bool) -> Option<String> {
     if reclaimed {
         // Reclaim keeps the same collar/herd; no herd to restore. Skip undo row.
@@ -833,7 +847,7 @@ async fn record_claim_undo(ctx: &Ctx, identity: &Identity, collar: &Collar, seri
     }
     let id = id::new_id("undo");
     let at = now();
-    let expires = at + chrono::Duration::hours(24);
+    let expires = at + undo_window();
     let ok = sqlx::query(
         "INSERT INTO collar_undos (id, collar_id, kind, serial, to_herd_id, to_animal_id, by_user, created_at, expires_at)
          VALUES (?, ?, 'claim', ?, ?, ?, ?, ?, ?)",

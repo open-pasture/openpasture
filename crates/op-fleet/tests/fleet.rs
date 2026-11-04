@@ -210,12 +210,15 @@ async fn a_unit_from_registration_to_service() {
     assert!(c["v1"]["why"].as_str().unwrap().contains("collar address"));
     assert_eq!(f.ctx.store().get_animal("ani_1").await.unwrap().unwrap().collar_id.as_deref(), Some(collar_id.as_str()));
     assert!(c["unit"].get("claim_code").is_none(), "claim code erased at claim time");
-    // Code is gone: lookup by code alone is a 404. By serial: already claimed.
+    // Code is gone from the unit row: lookup by code alone is a 404.
     let (s, e) = f.call("POST", "/api/fleet/claim", Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "code erased at claim: {e}");
+    // By serial with the real code (factory claim_check still validates): 409, no herd name.
     let (s, e) = f.call("POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
     assert_eq!(s, StatusCode::CONFLICT, "{e}");
-    assert!(e["error"].as_str().unwrap().contains("Cows"));
+    let msg = e["error"].as_str().unwrap();
+    assert!(msg.contains("already claimed"), "{e}");
+    assert!(!msg.contains("Cows") && !msg.contains("herd"), "must not name the herd: {e}");
     assert_eq!(f.call("POST", &format!("/api/fleet/units/{serial}/tests"), Some(run(3.3, 9))).await.0, StatusCode::CONFLICT);
 
     // In service from the collar's first report.
@@ -300,9 +303,11 @@ async fn another_server_claims_from_the_card() {
     assert_eq!(s, StatusCode::CREATED);
     assert_eq!((c["code_checked"].as_bool(), c["unit"]["claim_checked"].as_bool()), (Some(false), Some(false)), "said plainly: {c}");
     assert_eq!(c["unit"]["state"], "claimed", "claimed, not in service, until the collar reports");
+    // Wrong/right card after claim: without a factory record on this server we cannot
+    // validate the erased code, so both look like a wrong code (404) — no herd leak.
     let (s, e) = farm2.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "herd_id": "herd_1" }))).await;
-    assert_eq!(s, StatusCode::CONFLICT, "already claimed (code was erased at claim): {e}");
-    assert!(e["error"].as_str().unwrap().contains("already claimed"), "{e}");
+    assert_eq!(s, StatusCode::NOT_FOUND, "no factory check here to prove the code: {e}");
+    assert!(!e["error"].as_str().unwrap_or("").contains("herd"), "{e}");
 
     let farm3 = farm().await;
     let (s, c) = farm3.call("POST", "/api/fleet/claim", Some(json!({ "card": card, "factory_record": record, "herd_id": "herd_1" }))).await;
@@ -956,6 +961,54 @@ fn hand() -> Identity {
 
 fn viewer() -> Identity {
     Identity { role: Role::Viewer, user_id: Some("usr_v".into()), name: Some("Vic".into()), via: Via::UserToken }
+}
+
+#[tokio::test]
+async fn wrong_code_on_a_claimed_serial_is_the_same_404_and_never_names_the_herd() {
+    let f = farm().await;
+    // Rename the herd so a leak would be obvious.
+    sqlx::query("UPDATE herds SET name = 'SecretHerd' WHERE id = ?").bind(&f.herd).execute(f.ctx.db()).await.unwrap();
+    let p = provisioned(&f, "OCN-2611-00310", 40).await;
+    let code = p["claim_code"].as_str().unwrap().to_owned();
+    let serial = "OCN-2611-00310";
+    let (s, c) = f.call_as(hand(), "POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{c}");
+
+    let wrong = json!({ "claim_code": "0000000000000000", "herd_id": f.herd });
+    let (s_claimed, e_claimed) = f.call_as(hand(), "POST", &format!("/api/fleet/units/{serial}/claim"), Some(wrong.clone())).await;
+    let (s_unknown, e_unknown) = f.call_as(hand(), "POST", "/api/fleet/units/OCN-2611-99999/claim", Some(wrong)).await;
+    assert_eq!(s_claimed, StatusCode::NOT_FOUND, "{e_claimed}");
+    assert_eq!(s_unknown, StatusCode::NOT_FOUND, "{e_unknown}");
+    assert_eq!(e_claimed["error"], e_unknown["error"], "identical message");
+    let msg = e_claimed["error"].as_str().unwrap();
+    assert!(!msg.contains("SecretHerd") && !msg.contains("already claimed") && !msg.contains("Cows"), "{e_claimed}");
+
+    // Right code after claim (factory check): 409 without the herd name.
+    let (s, e) = f.call_as(hand(), "POST", &format!("/api/fleet/units/{serial}/claim"), Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{e}");
+    assert!(e["error"].as_str().unwrap().contains("already claimed"), "{e}");
+    assert!(!e["error"].as_str().unwrap().contains("SecretHerd"), "{e}");
+}
+
+#[tokio::test]
+async fn farm_wide_wrong_code_cap_is_a_soft_alarm_not_a_lockout() {
+    let f = farm().await;
+    let p = provisioned(&f, "OCN-2611-00311", 41).await;
+    let code = p["claim_code"].as_str().unwrap().to_owned();
+    // Burn the global soft-alarm budget with many distinct callers (each under their own 5/min).
+    for i in 0..op_fleet::claim_limit::GLOBAL_ALARM_PER_MINUTE {
+        let who = Identity { role: Role::Hand, user_id: Some(format!("usr_flood_{i}")), name: Some(format!("Flood{i}")), via: Via::UserToken };
+        // Distinct wrong codes / serials so per-serial and per-target don't lock first.
+        let serial = format!("OCN-2611-9{:04}", i);
+        let wrong = json!({ "claim_code": format!("{:016}", i), "herd_id": f.herd });
+        let (s, _) = f.call_as(who, "POST", &format!("/api/fleet/units/{serial}/claim"), Some(wrong)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+    let events = f.ctx.store().list_events(Some(("farm", "farm")), 50).await.unwrap();
+    assert!(events.iter().any(|e| e.kind == "fleet.claim.abuse_alarm"), "soft alarm event: {events:?}");
+    // A different Hand can still claim a real unit.
+    let (s, c) = f.call_as(hand(), "POST", &format!("/api/fleet/units/OCN-2611-00311/claim"), Some(json!({ "claim_code": code, "herd_id": f.herd }))).await;
+    assert_eq!(s, StatusCode::CREATED, "farm-wide alarm must not block other callers: {c}");
 }
 
 #[tokio::test]

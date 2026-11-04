@@ -1,19 +1,23 @@
 //! Persisted claim-attempt limits: per caller, per serial, per attempt
-//! target, and a global ceiling. Wrong codes count; a successful claim
-//! clears the serial's lockout. Survives restart via `claim_lockouts`.
+//! target. Wrong codes count; a successful claim clears the serial's
+//! lockout. Survives restart via `claim_lockouts`.
+//!
+//! A farm-wide counter still runs for abuse detection, but crossing it only
+//! raises an audit/log alarm — it does **not** lock out other callers.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use op_core::time::{from_db, now, to_db};
-use op_core::{ApiError, ApiResult, Ctx};
+use op_core::{ActivityEvent, ApiError, ApiResult, Ctx, id};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 /// Wrong claim codes allowed per caller / serial / target per minute.
 pub const TRIES_PER_MINUTE: usize = 5;
-/// Farm-wide wrong codes allowed per minute (all callers together).
-pub const GLOBAL_TRIES_PER_MINUTE: usize = 60;
+/// Farm-wide wrong-code rate that raises a soft abuse alarm (does not 429 others).
+pub const GLOBAL_ALARM_PER_MINUTE: usize = 60;
 /// First lockout after a full window of failures on one serial/target (seconds);
 /// doubles each time, capped.
 const LOCK_BASE_SECS: i64 = 60;
@@ -112,6 +116,9 @@ fn blocked(row: &Row, limit: usize, at: DateTime<Utc>, now_s: i64) -> Option<u64
 }
 
 /// Whether this caller may try a claim against `target` (and optional `serial`) now.
+///
+/// Only per-caller / per-serial / per-target ceilings block. The farm-wide
+/// counter is checked for a soft alarm elsewhere (`wrong`), never here.
 pub async fn may_try(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) -> ApiResult<()> {
     let at = now();
     let now_s = unix_now();
@@ -123,7 +130,6 @@ pub async fn may_try(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str
     };
     take(&load(ctx, SCOPE_CALLER, caller).await?, TRIES_PER_MINUTE);
     take(&load(ctx, SCOPE_TARGET, target).await?, TRIES_PER_MINUTE);
-    take(&load(ctx, SCOPE_GLOBAL, GLOBAL_KEY).await?, GLOBAL_TRIES_PER_MINUTE);
     if let Some(serial) = serial {
         take(&load(ctx, SCOPE_SERIAL, serial).await?, TRIES_PER_MINUTE);
     }
@@ -163,11 +169,49 @@ pub async fn wrong(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) 
     };
     bump_one(SCOPE_CALLER, caller, TRIES_PER_MINUTE, false).await;
     bump_one(SCOPE_TARGET, target, TRIES_PER_MINUTE, true).await;
-    bump_one(SCOPE_GLOBAL, GLOBAL_KEY, GLOBAL_TRIES_PER_MINUTE, false).await;
     if let Some(serial) = serial {
         bump_one(SCOPE_SERIAL, serial, TRIES_PER_MINUTE, true).await;
     }
+    // Farm-wide counter: soft alarm only — never blocks other callers.
+    let before = load(ctx, SCOPE_GLOBAL, GLOBAL_KEY).await.ok();
+    let before_n = before
+        .as_ref()
+        .map(|r| {
+            let mut f = r.fails.clone();
+            prune(&mut f, unix_now());
+            f.len()
+        })
+        .unwrap_or(0);
+    bump_one(SCOPE_GLOBAL, GLOBAL_KEY, GLOBAL_ALARM_PER_MINUTE, false).await;
+    if before_n < GLOBAL_ALARM_PER_MINUTE {
+        if let Ok(after) = load(ctx, SCOPE_GLOBAL, GLOBAL_KEY).await {
+            let mut fails = after.fails.clone();
+            prune(&mut fails, unix_now());
+            if fails.len() >= GLOBAL_ALARM_PER_MINUTE {
+                soft_global_alarm(ctx, fails.len()).await;
+            }
+        }
+    }
     ApiError::not_found("That claim code doesn't match a unit here. Check it against the card.")
+}
+
+async fn soft_global_alarm(ctx: &Ctx, count: usize) {
+    tracing::warn!(count, limit = GLOBAL_ALARM_PER_MINUTE, "claim abuse: farm-wide wrong-code rate exceeded (soft alarm, no lockout)");
+    let at = now();
+    let e = ActivityEvent {
+        id: id::new_id(id::EVENT),
+        kind: "fleet.claim.abuse_alarm".into(),
+        source: "system".into(),
+        occurred_at: at,
+        recorded_at: at,
+        title: "Many wrong claim codes across the farm".into(),
+        body: Some(format!("{count} wrong codes in the last minute (alarm at {GLOBAL_ALARM_PER_MINUTE}/min). Callers are not locked out farm-wide.")),
+        payload: json!({ "count": count, "limit": GLOBAL_ALARM_PER_MINUTE }),
+        targets: vec![("farm".into(), "farm".into())],
+    };
+    if let Err(err) = ctx.store().record_event(&e).await {
+        tracing::warn!("claim abuse alarm event: {err:#}");
+    }
 }
 
 /// A successful claim against `serial` clears its lockout ladder.

@@ -232,8 +232,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id, simulated? }` | `{ collar: Collar, key: string, endpoint?: string, no_endpoint?: string, public_key: string }` (key shown once; `endpoint` is the collar address + `/collar/v1`, absent until one is set, with `no_endpoint` saying why) |
 | GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
-| POST | `/api/collars/:id/transfer` | `{ to_herd_id, animal_id? }` (hand+; same-farm only) | `Collar`; notice + 24h undo |
-| POST | `/api/collars/:id/undo` | (hand+) | undoes latest claim or herd move within 24h |
+| POST | `/api/collars/:id/transfer` | `{ to_herd_id, animal_id? }` (hand+; same-farm only) | `Collar`; notice + undo (`UNDO_WINDOW_HOURS`, default 24h pending owner OK) |
+| POST | `/api/collars/:id/undo` | (hand+) | undoes latest claim or herd move within `UNDO_WINDOW_HOURS` |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
