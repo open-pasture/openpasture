@@ -92,6 +92,15 @@ pub const HAND: &[Rule] = &[
     ("POST", "/api/collars/{id}/escape/stop"),
     ("POST", "/api/collars/{id}/park"),
     ("POST", "/api/collars/{id}/unpark"),
+    // Same-farm herd move: preserves collar id, key and history.
+    ("POST", "/api/collars/{id}/transfer"),
+    // 24-hour undo of a claim or same-farm herd move.
+    ("POST", "/api/collars/{id}/undo"),
+    // Claim into any herd on this farm (roles are farm-wide; no per-herd
+    // membership). The card's claim code is still required. Viewers: 403
+    // `claim_requires_hand`. Provisioning stays a manager's / station's.
+    ("POST", "/api/fleet/claim"),
+    ("POST", "/api/fleet/units/{serial}/claim"),
     ("POST", "/api/fleet/{id}/fit-checks"),
     ("POST", "/api/fleet/fit-checks"),
     ("POST", "/api/paddocks/{id}/heights"),
@@ -303,13 +312,11 @@ pub const MANAGER: &[Rule] = &[
     ("POST", "/api/fleet/anchors"),
     ("DELETE", "/api/fleet/anchors/{id}"),
     ("PATCH", "/api/fleet/anchors/{id}"),
-    ("POST", "/api/fleet/claim"),
     ("PUT", "/api/fleet/firmware/policy"),
     ("POST", "/api/fleet/firmware/rollouts"),
     ("POST", "/api/fleet/firmware/rollouts/{id}/{action}"),
     ("PUT", "/api/fleet/settings"),
     ("POST", "/api/fleet/units"),
-    ("POST", "/api/fleet/units/{serial}/claim"),
     ("POST", "/api/fleet/units/{serial}/provision"),
     ("POST", "/api/fleet/units/{serial}/state"),
     ("POST", "/api/fleet/units/{serial}/tests"),
@@ -414,10 +421,28 @@ pub fn required(method: &Method, path: &str) -> Role {
     classified(method, path).unwrap_or(Role::Owner)
 }
 
-/// 403 `{"error": "Your role can't do this."}` when the identity's role is
-/// below what the request needs (401 when anonymous).
+/// Message and code when a viewer tries to claim a collar.
+pub const CLAIM_VIEWER_MSG: &str = "Viewers can't add collars. Ask a farm hand, manager or owner.";
+pub const CLAIM_VIEWER_CODE: &str = "claim_requires_hand";
+
+fn is_claim(method: &Method, path: &str) -> bool {
+    *method == Method::POST && (path == "/api/fleet/claim" || path_matches("/api/fleet/units/{serial}/claim", path))
+}
+
+/// 403 when the identity's role is below what the request needs (401 when
+/// anonymous). Claim routes name the viewer refusal plainly.
 pub fn check(identity: &Identity, method: &Method, path: &str) -> Result<(), ApiError> {
-    identity.require(required(method, path))
+    let need = required(method, path);
+    if identity.is_anonymous() {
+        return Err(ApiError::unauthorized("Sign in first."));
+    }
+    if identity.can(need) {
+        return Ok(());
+    }
+    if is_claim(method, path) {
+        return Err(ApiError::forbidden(CLAIM_VIEWER_MSG).with_details(serde_json::json!({ "code": CLAIM_VIEWER_CODE })));
+    }
+    Err(ApiError::forbidden(op_core::identity::FORBIDDEN))
 }
 
 // ---- rate limit for open requests -------------------------------------------------------
@@ -499,7 +524,8 @@ pub fn peer_key(peer: Option<SocketAddr>, headers: &HeaderMap) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, StatusCode};
+    use op_core::Via;
 
     fn m(s: &str) -> Method {
         Method::from_bytes(s.as_bytes()).unwrap()
@@ -570,10 +596,29 @@ mod tests {
             ("PUT", "/api/server/retention", Owner),
             ("GET", "/api/server/retention", Viewer),
             ("POST", "/api/collars/col_1/park", Hand),
+            ("POST", "/api/fleet/claim", Hand),
+            ("POST", "/api/fleet/units/OCN-2611-00001/claim", Hand),
+            ("POST", "/api/fleet/units/OCN-2611-00001/provision", Manager),
+            ("POST", "/api/collars/col_1/transfer", Hand),
+            ("POST", "/api/collars/col_1/undo", Hand),
         ];
         for (method, path, need) in cases {
             assert_eq!(required(&m(method), path), need, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn viewers_get_a_plain_claim_refusal() {
+        let viewer = Identity { role: Role::Viewer, user_id: Some("usr_v".into()), name: Some("Vic".into()), via: Via::UserToken };
+        let hand = Identity { role: Role::Hand, user_id: Some("usr_h".into()), name: Some("Hal".into()), via: Via::UserToken };
+        let err = check(&viewer, &m("POST"), "/api/fleet/claim").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.message, CLAIM_VIEWER_MSG);
+        assert_eq!(err.details.as_ref().and_then(|d| d.get("code")).and_then(|c| c.as_str()), Some(CLAIM_VIEWER_CODE));
+        assert!(check(&hand, &m("POST"), "/api/fleet/claim").is_ok());
+        assert!(check(&hand, &m("POST"), "/api/fleet/units/OCN-1/claim").is_ok());
+        let anon = Identity::anonymous();
+        assert_eq!(check(&anon, &m("POST"), "/api/fleet/claim").unwrap_err().status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
