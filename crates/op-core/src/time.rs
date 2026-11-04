@@ -1,11 +1,23 @@
 //! Timestamps. Stored as RFC 3339 UTC text with milliseconds so they sort as
 //! text; telemetry also stores unix milliseconds in `t`.
 
+use std::cell::Cell;
+
 use chrono::{DateTime, SubsecRound, Utc};
+
+thread_local! {
+    /// Test pin for [`now`]. `None` uses the real clock.
+    static PINNED: Cell<Option<DateTime<Utc>>> = const { Cell::new(None) };
+}
 
 /// Now, truncated to milliseconds so it round-trips through the database.
 pub fn now() -> DateTime<Utc> {
-    Utc::now().trunc_subsecs(3)
+    PINNED.with(|p| p.get()).unwrap_or_else(|| Utc::now().trunc_subsecs(3))
+}
+
+/// Pin [`now`] to `t` for this thread (tests). `None` clears the pin.
+pub fn pin(t: Option<DateTime<Utc>>) {
+    PINNED.with(|p| p.set(t.map(|t| t.trunc_subsecs(3))));
 }
 
 /// Database text form: `2026-09-26T12:00:00.000Z`.

@@ -302,7 +302,7 @@ fn check_codes() {
     for c in RejectCode::ALL {
         assert_eq!(RejectCode::parse(c.as_str()), Some(c));
         assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
-        assert_eq!(c.is_permanent(), c != RejectCode::SlotsFull);
+        assert_eq!(c.is_permanent(), !matches!(c, RejectCode::SlotsFull | RejectCode::NotNow));
     }
     assert_eq!(cmd.total_vertices(), 5 + 3);
     assert_eq!(cmd.record_bytes(), 192 + 8 * 8);
@@ -432,7 +432,7 @@ fn episodes_convert_from_the_cue_policy() {
 fn report_response_carries_the_config() {
     let mut config = ConfigCommand { command_id: "cfg_1".into(), collar_id: "col_a".into(), version: 2, report_s: 60, poll_s: 60, ..Default::default() };
     sign_config(&mut config, &seed_key());
-    let r = ReportResponse { latest_version: Some(7), config: Some(config.clone()) };
+    let r = ReportResponse { latest_version: Some(7), config: Some(config.clone()), ..Default::default() };
     let json = serde_json::to_string(&r).unwrap();
     let back: ReportResponse = serde_json::from_str(&json).unwrap();
     verify_config(back.config.as_ref().unwrap(), &seed_key().verifying_key()).unwrap();

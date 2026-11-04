@@ -211,6 +211,37 @@ pub struct Collar {
     /// Run by the simulator, not on an animal (the `sim` cap). Never cleared.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub simulated: bool,
+    /// Last reported welfare enforcement (`on` / `off`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welfare_state: Option<String>,
+    /// Last reported auto shut-off time (persists across collar reboots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutoff_at: Option<DateTime<Utc>>,
+    /// True only when the collar's reported caps include `rearm`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rearm_available: bool,
+    /// Latest re-arm command state for the farmer UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rearm: Option<CollarRearm>,
+}
+
+/// Farmer-facing re-arm state on a collar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollarRearm {
+    /// `pending` | `acked` | `expired` | `rejected` | `superseded`
+    pub status: String,
+    pub rearm_seq: u32,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_code: Option<String>,
+    pub reason_code: String,
+    /// Who queued it (`kind` is `agent` or `human`).
+    pub by: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

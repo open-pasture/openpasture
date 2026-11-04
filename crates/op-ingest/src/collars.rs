@@ -101,8 +101,24 @@ async fn create(State(ctx): State<Ctx>, ApiJson(body): ApiJson<NewCollar>) -> Ap
 /// report landing at the same time keeps its telemetry.
 async fn update(State(ctx): State<Ctx>, Path(id): Path<String>, ApiJson(body): ApiJson<Value>) -> ApiResult<Json<Collar>> {
     let current = find(&ctx, &id).await?;
-    let immutable =
-        ["id", "last_seen", "battery", "boundary_version", "state", "last_fix", "fw", "caps", "outside_since", "parked_at", "parked_reason", "simulated"];
+    let immutable = [
+        "id",
+        "last_seen",
+        "battery",
+        "boundary_version",
+        "state",
+        "last_fix",
+        "fw",
+        "caps",
+        "outside_since",
+        "parked_at",
+        "parked_reason",
+        "simulated",
+        "welfare_state",
+        "shutoff_at",
+        "rearm_available",
+        "rearm",
+    ];
     let mut next: Collar = patch::apply(&current, &body, &immutable)?;
     next.name = clean_name(&next.name)?;
     if next.herd_id != current.herd_id {

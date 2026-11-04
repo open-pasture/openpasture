@@ -37,7 +37,10 @@ pub mod sql {
 
 pub async fn get_collar(db: &SqlitePool, id: &str) -> anyhow::Result<Option<Collar>> {
     let row = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(id).fetch_optional(db).await?;
-    row.map(|r| collar_from_row(&r)).transpose()
+    match row.map(|r| collar_from_row(&r)).transpose()? {
+        Some(c) => Ok(Some(crate::rearm::enrich_one(db, c).await?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn list_collars(db: &SqlitePool, herd_id: Option<&str>) -> anyhow::Result<Vec<Collar>> {
@@ -45,7 +48,8 @@ pub async fn list_collars(db: &SqlitePool, herd_id: Option<&str>) -> anyhow::Res
         Some(h) => sqlx::query("SELECT * FROM collars WHERE herd_id = ? ORDER BY created_at, id").bind(h).fetch_all(db).await?,
         None => sqlx::query("SELECT * FROM collars ORDER BY created_at, id").fetch_all(db).await?,
     };
-    rows.iter().map(collar_from_row).collect()
+    let collars: Vec<Collar> = rows.iter().map(collar_from_row).collect::<anyhow::Result<_>>()?;
+    crate::rearm::enrich_many(db, collars).await
 }
 
 /// A new collar with its key hash.

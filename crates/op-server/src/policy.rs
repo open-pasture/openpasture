@@ -292,6 +292,7 @@ pub const MANAGER: &[Rule] = &[
     ("PUT", "/api/collars/config"),
     ("DELETE", "/api/collars/{id}"),
     ("PATCH", "/api/collars/{id}"),
+    ("POST", "/api/collars/{id}/rearm"),
     ("POST", "/api/decisions/{id}/respond"),
     ("PATCH", "/api/farm"),
     ("POST", "/api/farm"),
@@ -570,6 +571,7 @@ mod tests {
             ("PUT", "/api/server/retention", Owner),
             ("GET", "/api/server/retention", Viewer),
             ("POST", "/api/collars/col_1/park", Hand),
+            ("POST", "/api/collars/col_1/rearm", Manager),
         ];
         for (method, path, need) in cases {
             assert_eq!(required(&m(method), path), need, "{method} {path}");
