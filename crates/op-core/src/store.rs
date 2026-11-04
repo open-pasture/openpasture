@@ -759,10 +759,13 @@ pub fn animal_from_row(r: &SqliteRow) -> anyhow::Result<Animal> {
 }
 
 /// A `collars` row. `last_fix` is Fix JSON, `caps` a JSON array. The
-/// `limits` column stays off the struct (op-ingest reads it).
+/// `limits` column stays off the struct (op-ingest reads it). `rearm` is
+/// filled by op-ingest when listing or fetching a collar.
 pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
     let last_fix: Option<String> = r.try_get("last_fix")?;
     let caps: Option<String> = r.try_get("caps")?;
+    let caps: Vec<String> = caps.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
+    let rearm_available = caps.iter().any(|c| c == op_protocol::caps::REARM);
     Ok(Collar {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
@@ -774,12 +777,16 @@ pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
         state: FenceState::parse(&r.try_get::<String, _>("state")?),
         last_fix: last_fix.map(|s| serde_json::from_str(&s)).transpose()?,
         fw: r.try_get("fw")?,
-        caps: caps.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default(),
+        caps,
         outside_since: opt_from_db(r.try_get("outside_since")?)?,
         parked_at: opt_from_db(r.try_get("parked_at")?)?,
         parked_reason: r.try_get::<Option<String>, _>("parked_reason")?.map(|s| ParkReason::from_db(&s)).transpose()?,
         // Absent from queries that pick their columns.
         simulated: r.try_get::<Option<bool>, _>("simulated").ok().flatten().unwrap_or(false),
+        welfare_state: r.try_get("welfare_state").ok().flatten(),
+        shutoff_at: opt_from_db(r.try_get("shutoff_at").ok().flatten())?,
+        rearm_available,
+        rearm: None,
     })
 }
 

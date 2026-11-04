@@ -229,7 +229,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | --- | --- | --- | --- |
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id, simulated? }` | `{ collar: Collar, key: string, endpoint?: string, no_endpoint?: string, public_key: string }` (key shown once; `endpoint` is the collar address + `/collar/v1`, absent until one is set, with `no_endpoint` saying why) |
-| GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
+| GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*`, `welfare_*`, `rearm*` come from the collar and other routes) | `Collar` / 204 |
+| POST | `/api/collars/:id/rearm` | `{ reason, reason_code? }` (manager+; `reason` required free text; `reason_code` is `animal_back_in`\|`fence_fixed`\|`false_trigger`\|`other`, default `other`) | 201 `{ collar, command }`; 409 `rearm_not_supported` / `not_shut_off` / `rearm_pending` |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
@@ -238,7 +239,14 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
            boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix,
            fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair",
-           simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */ }
+           simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */,
+           welfare_state?: "on"|"off"|string /* last reported enforcement */,
+           shutoff_at?,                                 /* last reported welfare.shutoff_at; persists across reboots */
+           rearm_available?: true,                      /* caps include `rearm` */
+           rearm?: CollarRearm                          /* latest queued / settled re-arm */ }
+CollarRearm { status: "pending"|"acked"|"expired"|"rejected"|"superseded", rearm_seq,
+              issued_at, expires_at, ack_at?, ack_status?, ack_code?, reason_code,
+              by /* { via, kind: "agent"|"human", user_id?, name?, token_id? } */ }
 Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
@@ -413,9 +421,9 @@ Per `../opencollar/protocol/README.md`. HTTP + JSON for V0. `Authorization: Bear
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| POST | `/collar/v1/report` | position report (`collar_id`, `boundary_version`, `fixes`, `cues`, `battery`, optional `health`) | `{ latest_version }` |
+| POST | `/collar/v1/report` | position report (`collar_id`, `boundary_version`, `fixes`, `cues`, `battery`, optional `health`, `welfare`, `welfare_events`) | `{ latest_version, config?, rearm? }` |
 | GET | `/collar/v1/boundary?have=N` | | 204 if N is current, else the boundary command plus `sig` |
-| POST | `/collar/v1/ack` | `{ command_id, version, status, reason?, at }` | 204 |
+| POST | `/collar/v1/ack` | `{ command_id, version, status, reason?, code?, at }` (boundary or re-arm; for re-arm `version` is `rearm_seq`) | 204 |
 
 Reports are idempotent: a report sent again (the reply was lost and the collar retried) stores
 nothing new and announces nothing. A fix is one per collar per instant (`(collar_id, at)` to the
@@ -472,7 +480,7 @@ answered 204 and not stored, so a newer collar's report is never refused for one
 | GET | `/api/herds/:id/slots` | | `HerdSlots` |
 | GET | `/api/collars/:id/slots` | | `CollarSlots` |
 | GET PUT | `/api/collars/config` | `CollarsConfig` (each 10-3600) | `CollarsConfig` (PUT gives every collar that takes configs a new version) |
-| POST | `/collar/v1/report` | position report, see below | `{ latest_version, config?: ConfigCommand }` |
+| POST | `/collar/v1/report` | position report, see below | `{ latest_version, config?: ConfigCommand, rearm?: RearmCommand }` |
 | GET | `/collar/v1/boundary?have=&free=&free_bytes=` | | 204, or the boundary command for this collar |
 | POST | `/collar/v1/ack` | `{ command_id, version, status, reason?, code?, at }` | 204 |
 
@@ -530,13 +538,38 @@ on the collar: `fw` and `caps` show on `Collar`, limits in `CollarSlots`; `sim` 
 collar `simulated` for good; `device_class` (`node`, `anchor`, `direct`) is its role in the herd
 network view, sent by the simulator until protocol v2), `slots` (the complete
 list; replaces the collar's applied/received rows), `episodes` (stored once per collar and start),
-cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, and health
+cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, health
 `fix_attempts`, `fix_ok`, `cell { rsrp_dbm, rsrq_db, snr_db, mode, band, cell_id, tac }`,
-`still_s`, `tilt_deg`, `temp_c`, `battery_v`, `charging`, `uptime_s`, `reset`. Cues without a kind
+`still_s`, `tilt_deg`, `temp_c`, `battery_v`, `charging`, `uptime_s`, `reset`, and welfare
+`welfare { enforcement, shutoff_at?, escape_cycles /* alias cycles */, rearm_seq }` plus
+`welfare_events [{ kind /* 1 pulse_cutoff, 2 returned, 3 auto_shutoff, 4 enforcement_resumed
+(with by: serial|server and rearm_seq when by=server) */, at?, … }]` (unknown fields and kinds
+kept; kind 3 raises an `auto_shutoff` alert). Firmware does not yet uplink `welfare_events`; the
+report `welfare` block is the reliable source until that lands. Cues without a kind
 (firmware 0.1) are stored with `kind` NULL; the live `cue` event carries `outside` when
 `margin_m` < 0, else `warn`. Acks store `code` on the ack and in `collar_boundary_state`; between
 reports (and for firmware 0.1) acks keep the collar's slot rows: `applied` drops every lower
 version, as the collar does.
+
+**Re-arm**: a collar with the `rearm` cap that has reported a shut-off may be re-armed by a
+manager (or an agent/API token whose role is Manager or above; no human confirm step) via
+`POST /api/collars/:id/rearm` or MCP `rearm_collar`. The free-text `reason` is required and stays
+on the server audit row; the signed wire command carries only `reason_code`. The command is
+`RearmCommand { command_id, collar_id, herd_id, rearm_seq, issued_at, expires_at, shutoff_at,
+reason_code, sig }` — Ed25519 over canonical JSON without `sig`, same as boundaries/config —
+delivered in the next report reply and acknowledged on `/collar/v1/ack` (`version` = `rearm_seq`).
+`rearm_seq` is `max(server, last reported welfare.rearm_seq) + 1` and always ≥ 1 (the collar
+never lowers it). Pending commands expire after `REARM_TTL_HOURS` (24) with no redelivery; they
+are re-signed with the current server key on each delivery (key rotation does not drop them).
+Ack reject codes (opencollar / op-firmware registry): `bad_sig` = 1, `wrong_collar` = 3,
+`stale` = 6, `expired` = 22, `unsupported` = 24, `not_now` = 28 (name or number accepted).
+`stale` covers `rearm_seq` ≤ held and a `shutoff_at` mismatch (including when enforcement is on).
+When the collar already reports `welfare.rearm_seq` ≥ the acked seq (re-signed redelivery of an
+applied command), the server treats that `stale` as **already applied** and marks the command
+done. Otherwise (`welfare.rearm_seq` below the seq, or a shutoff mismatch) it is a real failure:
+re-read the latest reported `shutoff_at` / `rearm_seq`, queue one refreshed command, and do not
+refresh again if that one is also `stale`. Optional guards (setting `collars.rearm`, all
+default off): `agent_rate_limit`, `refuse_outside`, `notify_on_agent`.
 
 **Configs**: each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,
 version per collar). It gets a new version when its herd changes (at once on the PATCH), when

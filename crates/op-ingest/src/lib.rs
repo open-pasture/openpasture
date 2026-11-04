@@ -43,6 +43,7 @@ pub mod schedule;
 // @L
 // @M
 // @Z
+pub mod rearm;
 pub mod wire_log;
 pub mod withdraw;
 
@@ -95,6 +96,7 @@ pub fn router() -> axum::Router<Ctx> {
         // @Z
         wire_log::router(),
         gate::router(),
+        rearm::router(),
     ] {
         app = app.merge(part);
     }
@@ -146,7 +148,7 @@ pub fn register_tools(ctx: &Ctx) {
 }
 
 fn tool_specs() -> Vec<op_core::tools::ToolSpec> {
-    vec![
+    let mut tools = vec![
         // @HUB
         // @HUB-UI
         // @E-lib
@@ -170,5 +172,7 @@ fn tool_specs() -> Vec<op_core::tools::ToolSpec> {
         // @L
         // @M
         // @Z
-    ]
+    ];
+    tools.extend(rearm::tool_specs());
+    tools
 }

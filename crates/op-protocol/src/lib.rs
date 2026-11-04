@@ -26,6 +26,7 @@
 mod canonical;
 pub mod config;
 mod named;
+pub mod rearm;
 mod sign;
 pub mod slots;
 pub mod v2;
@@ -42,6 +43,7 @@ pub use config::{ConfigCommand, sign_config, verify_config};
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use named::{Named, RegistryName};
 pub use op_geo::{CollarLimits, CueKind, CueMode, EpisodeOutcome};
+pub use rearm::{REARM_TTL_HOURS, RearmCommand, ReasonCode, WelfareEnforcement, WelfareEvent, WelfareReport, sign_rearm, verify_rearm, welfare_kind};
 pub use sign::{
     decode_public_key, decode_signing_key, encode_public_key, encode_signing_key, generate_signing_key, sign_command, signing_payload, verify_command,
     verify_json,
@@ -76,6 +78,8 @@ pub mod caps {
     pub const EPISODES: &str = "episodes";
     /// Accepts config commands.
     pub const CONFIG: &str = "config";
+    /// Accepts signed re-arm commands after an auto shut-off.
+    pub const REARM: &str = "rearm";
     /// Everything firmware 0.2 does.
     pub const ALL: [&str; 6] = [HOLES, SLOTS, COLLAR_ID, CUE_MODE, EPISODES, CONFIG];
     /// A simulated collar, not on an animal. Every simulated collar lists it,
@@ -131,10 +135,16 @@ pub enum RejectCode {
     BadMargins,
     SlotsFull,
     BadConfig,
+    /// Registry 22: `expires_at` has passed.
+    Expired,
+    /// Registry 24: a message type this collar doesn't implement.
+    Unsupported,
+    /// Registry 28: valid but not now; the collar may try again.
+    NotNow,
 }
 
 impl RejectCode {
-    pub const ALL: [RejectCode; 20] = [
+    pub const ALL: [RejectCode; 23] = [
         Self::BadSig,
         Self::WrongHerd,
         Self::WrongCollar,
@@ -155,6 +165,9 @@ impl RejectCode {
         Self::BadMargins,
         Self::SlotsFull,
         Self::BadConfig,
+        Self::Expired,
+        Self::Unsupported,
+        Self::NotNow,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -179,16 +192,56 @@ impl RejectCode {
             Self::BadMargins => "bad_margins",
             Self::SlotsFull => "slots_full",
             Self::BadConfig => "bad_config",
+            Self::Expired => "expired",
+            Self::Unsupported => "unsupported",
+            Self::NotNow => "not_now",
+        }
+    }
+
+    /// Registry number (opencollar draft PR #25 / firmware). Used by v2 CBOR and
+    /// accepted on v1 JSON acks as a number or numeric string.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::BadSig => 1,
+            Self::WrongHerd => 2,
+            Self::WrongCollar => 3,
+            Self::BadJson => 4,
+            Self::TooLarge => 5,
+            Self::Stale => 6,
+            Self::OutOfRange => 7,
+            Self::TooFewVertices => 8,
+            Self::TooManyVertices => 9,
+            Self::TooManyHoles => 10,
+            Self::SelfIntersecting => 11,
+            Self::RingsCross => 12,
+            Self::HoleOutside => 13,
+            Self::HolesOverlap => 14,
+            Self::ZeroArea => 15,
+            Self::HoleTooSmall => 16,
+            Self::HoleTooClose => 17,
+            Self::BadMargins => 18,
+            Self::SlotsFull => 19,
+            Self::BadConfig => 20,
+            Self::Expired => 22,
+            Self::Unsupported => 24,
+            Self::NotNow => 28,
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
+        if let Ok(n) = s.parse::<u8>() {
+            return Self::from_code(n);
+        }
         Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
 
-    /// Everything but `slots_full`, which clears once the collar has room.
+    pub fn from_code(n: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.code() == n)
+    }
+
+    /// Everything but `slots_full` and `not_now`, which clear on their own.
     pub fn is_permanent(self) -> bool {
-        self != Self::SlotsFull
+        !matches!(self, Self::SlotsFull | Self::NotNow)
     }
 
     /// One short sentence for people.
@@ -202,6 +255,9 @@ impl RejectCode {
             Self::Stale => "The collar already holds a newer version.",
             Self::SlotsFull => "The collar has no room for another staged boundary.",
             Self::BadConfig => "The configuration is out of range.",
+            Self::Expired => "The command has expired.",
+            Self::Unsupported => "The collar does not support this command.",
+            Self::NotNow => "The collar cannot apply this command right now.",
             Self::OutOfRange => ShapeCode::OutOfRange.message(),
             Self::TooFewVertices => ShapeCode::TooFewVertices.message(),
             Self::TooManyVertices => ShapeCode::TooManyVertices.message(),
@@ -264,7 +320,13 @@ mod lenient_code {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RejectCode>, D::Error> {
-        Ok(Option::<String>::deserialize(d)?.and_then(|s| RejectCode::parse(&s)))
+        let v = Option::<serde_json::Value>::deserialize(d)?;
+        Ok(match v {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => RejectCode::parse(&s),
+            Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| u8::try_from(n).ok()).and_then(RejectCode::from_code),
+            Some(_) => None,
+        })
     }
 }
 
@@ -720,6 +782,12 @@ pub struct PositionReport {
     pub battery: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<Health>,
+    /// Welfare / enforcement snapshot (optional; unknown fields ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welfare: Option<WelfareReport>,
+    /// Welfare events since the last report (kinds 1-4; unknown kinds kept).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub welfare_events: Vec<WelfareEvent>,
 }
 
 impl PositionReport {
@@ -803,6 +871,11 @@ pub struct ReportResponse {
     /// is lower (or absent) and it has the `config` cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigCommand>,
+    /// A pending signed re-arm, when the collar has the `rearm` cap and the
+    /// command has not expired. Re-signed with the current server key on each
+    /// delivery (key rotation does not drop pending commands).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rearm: Option<RearmCommand>,
 }
 
 #[cfg(test)]

@@ -156,20 +156,20 @@ async fn decided(t: &T, herd: &str, action: DecisionAction, to: Option<&str>) ->
 async fn a_daily_seven_oclock_schedule_opens_at_seven_local_on_both_sides_of_the_dst_change() {
     let t = setup().await;
     let f = farm(&t).await;
-    // Saturday 2026-10-31 07:00 CDT; clocks fall back early on Sunday 2026-11-01.
-    let s = schedule(&t, &f, json!({ "starts_at": "2026-10-31T12:00:00Z" })).await;
+    // Saturday 2027-11-06 07:00 CDT; clocks fall back early on Sunday 2027-11-07.
+    let s = schedule(&t, &f, json!({ "starts_at": "2027-11-06T12:00:00Z" })).await;
     assert_eq!((s["next_index"].as_u64(), s["status"].as_str()), (Some(1), Some("active")));
     let ms = moves(&t, s["id"].as_str().unwrap()).await;
     let o = opens(&ms);
     assert_eq!(o.len(), 5);
-    assert_eq!(o[0].1, utc("2026-10-31T12:00:00Z"));
-    assert_eq!(o[1].1, utc("2026-11-01T13:00:00Z"), "07:00 CST is 13:00 UTC");
-    assert_eq!(o[2].1, utc("2026-11-02T13:00:00Z"));
+    assert_eq!(o[0].1, utc("2027-11-06T12:00:00Z"));
+    assert_eq!(o[1].1, utc("2027-11-07T13:00:00Z"), "07:00 CST is 13:00 UTC");
+    assert_eq!(o[2].1, utc("2027-11-08T13:00:00Z"));
     let days: Vec<String> = o.iter().map(|(_, at)| local(*at)).collect();
-    assert_eq!(days, ["2026-10-31 07:00", "2026-11-01 07:00", "2026-11-02 07:00", "2026-11-03 07:00", "2026-11-04 07:00"]);
+    assert_eq!(days, ["2027-11-06 07:00", "2027-11-07 07:00", "2027-11-08 07:00", "2027-11-09 07:00", "2027-11-10 07:00"]);
     // The back fence closes 4 h after each open, three steps 10 minutes apart (defaults).
     let closes: Vec<String> = ms.iter().filter(|m| m["index"] == 2 && m["step"].as_u64() > Some(0)).map(|m| local(utc(m["at"].as_str().unwrap()))).collect();
-    assert_eq!(closes, ["2026-11-01 11:00", "2026-11-01 11:10", "2026-11-01 11:20"]);
+    assert_eq!(closes, ["2027-11-07 11:00", "2027-11-07 11:10", "2027-11-07 11:20"]);
     // With no start given it is the next time the farm's clock reads 07:00.
     let (st, p) = t.req("POST", "/api/schedules/preview", Some(json!({ "herd_id": f.herd, "strips": f.strips }))).await;
     assert_eq!(st, StatusCode::CONFLICT, "one schedule per herd: {p}");

@@ -33,7 +33,7 @@ use serde::Deserialize;
 use sqlx::Row;
 
 use crate::shape::{self, CollarCaps};
-use crate::{config, db, escapes, slots};
+use crate::{config, db, escapes, rearm, slots};
 
 /// Id prefix of stored episodes.
 pub const EPISODE: &str = "epi";
@@ -220,9 +220,16 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             .bind(&collar.id)
             .execute(&mut *tx)
             .await?;
+        let auto_shutoff = rearm::apply_welfare(&mut tx, &mut collar, &herd_id, rep.welfare.as_ref(), &rep.welfare_events, received).await?;
+        let pending_rearm = rearm::pending_command(&mut tx, &ctx, &collar, received).await?;
         tx.commit().await?;
+        if auto_shutoff {
+            if let Err(e) = rearm::raise_auto_shutoff_alert(&ctx, &collar, received).await {
+                tracing::warn!(collar = %collar.id, "auto_shutoff alert: {e:#}");
+            }
+        }
         ctx.publish(Event::Collar { collar });
-        return Ok(Json(ReportResponse { latest_version, config }));
+        return Ok(Json(ReportResponse { latest_version, config, rearm: pending_rearm }));
     }
     // Fixes newer than the collar's last fix move its state and position;
     // late or backfilled ones are stored with their own fence state only.
@@ -328,13 +335,20 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         .bind(&collar.id)
         .execute(&mut *tx)
         .await?;
+    let auto_shutoff = rearm::apply_welfare(&mut tx, &mut collar, &herd_id, rep.welfare.as_ref(), &rep.welfare_events, received).await?;
+    let pending_rearm = rearm::pending_command(&mut tx, &ctx, &collar, received).await?;
     tx.commit().await?;
 
+    if auto_shutoff {
+        if let Err(e) = rearm::raise_auto_shutoff_alert(&ctx, &collar, received).await {
+            tracing::warn!(collar = %collar.id, "auto_shutoff alert: {e:#}");
+        }
+    }
     for e in events {
         ctx.publish(e);
     }
     ctx.publish(Event::Collar { collar });
-    Ok(Json(ReportResponse { latest_version, config }))
+    Ok(Json(ReportResponse { latest_version, config, rearm: pending_rearm }))
 }
 
 // @L
@@ -603,6 +617,29 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
     if a.reason.as_ref().is_some_and(|r| r.len() > 1000) {
         return Err(ApiError::bad_request("reason is too long."));
     }
+    // A code only goes with a rejection. Unknown codes stay as the wire string
+    // via RejectCode::parse elsewhere; here we keep the known ones.
+    let code = a.code.filter(|_| status == AckStatus::Rejected);
+    let received = now();
+
+    // Re-arm commands share /collar/v1/ack; `version` is rearm_seq.
+    {
+        let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+        let handled = rearm::apply_ack(&mut tx, &collar, &a.command_id, a.version, status, code.map(|c| c.as_str()), a.at).await?;
+        if handled {
+            // Refresh shut-off / welfare fields after an applied re-arm.
+            if let Some(row) = sqlx::query("SELECT * FROM collars WHERE id = ?").bind(&collar.id).fetch_optional(&mut *tx).await? {
+                collar = op_core::store::collar_from_row(&row)?;
+            }
+            tx.commit().await?;
+            tracing::info!(collar = %collar.id, rearm = %a.command_id, status = a.status.as_str(), code = code.map(|c| c.as_str()), "rearm ack");
+            let collar = rearm::enrich_one(ctx.db(), collar).await?;
+            ctx.publish(Event::Collar { collar });
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        tx.commit().await?;
+    }
+
     let b = db::boundary_by_id(ctx.db(), &a.command_id)
         .await?
         .filter(|b| b.herd_id == collar.herd_id && b.collar_id.as_ref().is_none_or(|c| *c == collar.id))
@@ -610,8 +647,6 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
     if b.version != a.version {
         return Err(ApiError::bad_request(format!("Command {} is version {}, not {}.", b.id, b.version, a.version)));
     }
-    // A code only goes with a rejection.
-    let code = a.code.filter(|_| status == AckStatus::Rejected);
     // Collars may repeat an ack; keep one row per change of status (or code).
     let last: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT status, code FROM acks WHERE collar_id = ? AND version = ? AND herd_id = ? ORDER BY id DESC LIMIT 1")
@@ -623,7 +658,6 @@ async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -
     if last.is_some_and(|(s, c)| s == a.status.as_str() && c.as_deref() == code.map(|c| c.as_str())) {
         return Ok(StatusCode::NO_CONTENT);
     }
-    let received = now();
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     sqlx::query("INSERT INTO acks (collar_id, herd_id, command_id, version, status, reason, at, received_at, code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&collar.id)
