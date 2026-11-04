@@ -114,7 +114,7 @@ fn events(msgs: &[Value]) -> Vec<&Value> {
 }
 
 fn fix(i: usize) -> Fix {
-    Fix { at: op_core::time::now(), point: [-93.62 + i as f64 * 1e-5, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None }
+    Fix { at: op_core::time::now(), point: [-93.62 + i as f64 * 1e-5, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None, hdop: None }
 }
 
 fn viewer() -> Identity {

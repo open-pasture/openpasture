@@ -336,7 +336,7 @@ fn fix_event(collar: &str, herd: &str) -> Event {
         collar_id: collar.into(),
         animal_id: None,
         herd_id: herd.into(),
-        fix: op_core::Fix { at: t0(), point: [-93.62, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None },
+        fix: op_core::Fix { at: t0(), point: [-93.62, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None, hdop: None },
         state: op_core::FenceState::Inside,
     }
 }

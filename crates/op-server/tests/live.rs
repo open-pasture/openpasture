@@ -117,7 +117,7 @@ fn of<'a>(msgs: &'a [Value], ty: &str) -> Vec<&'a Value> {
 }
 
 fn fix(i: usize) -> Fix {
-    Fix { at: op_core::time::now(), point: [-93.62 + i as f64 * 1e-5, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None }
+    Fix { at: op_core::time::now(), point: [-93.62 + i as f64 * 1e-5, 42.03], accuracy_m: 3.0, sats: 9, cn0: None, ttf_s: None, hdop: None }
 }
 
 #[tokio::test]
@@ -175,9 +175,20 @@ async fn telemetry_only_collar_changes_ride_in_positions_and_a_renamed_collar_go
     let f = farm(2).await;
     let mut ws = connect(&f.ctx, owner()).await;
     let c = &f.collars[0];
-    // A report: battery, last contact, a new fix and state. Nothing that matters changed.
+    // A report: battery, last contact, a new fix and state, plus optional telemetry.
+    // Nothing that matters (identity) changed.
     let fx = fix(0);
-    let reported = Collar { battery: Some(0.64), last_seen: Some(fx.at), last_fix: Some(fx.clone()), state: FenceState::Warning, ..c.clone() };
+    let cue_at = fx.at;
+    let reported = Collar {
+        battery: Some(0.64),
+        last_seen: Some(fx.at),
+        last_fix: Some(fx.clone()),
+        state: FenceState::Warning,
+        charging: Some(true),
+        signal: Some(-101.0),
+        last_cue_at: Some(cue_at),
+        ..c.clone()
+    };
     f.ctx.publish(Event::Collar { collar: reported.clone() });
     let msgs = gather(&mut ws, Duration::from_millis(900)).await;
     assert!(of(&msgs, "collar").is_empty(), "{msgs:?}");
@@ -185,6 +196,9 @@ async fn telemetry_only_collar_changes_ride_in_positions_and_a_renamed_collar_go
     assert_eq!(positions.len(), 1, "{msgs:?}");
     let item = &positions[0]["items"][0];
     assert_eq!((item["collar_id"].as_str(), item["battery"].as_f64(), item["state"].as_str()), (Some(c.id.as_str()), Some(0.64), Some("warning")));
+    assert_eq!(item["charging"], true);
+    assert_eq!(item["signal"].as_f64(), Some(-101.0));
+    assert_eq!(item["last_cue_at"], json!(cue_at));
 
     // The same collar reporting only a boundary version: an applied ack.
     f.ctx.publish(Event::Collar { collar: Collar { boundary_version: Some(3), ..reported.clone() } });

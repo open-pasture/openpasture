@@ -435,11 +435,75 @@ async fn cues_episodes_and_health_are_stored() {
         }
     }
     assert_eq!(kinds, vec![(Some("warn".into()), Some(1)), (Some("outside".into()), None)]);
+    // App-facing collar JSON carries charging, signal (dBm), hdop and last_cue_at.
+    let (_, c) = app.call("GET", &format!("/api/collars/{id}"), None).await;
+    assert_eq!(c["charging"], true);
+    assert_eq!(c["signal"].as_f64(), Some(-104.0));
+    assert_eq!(c["last_fix"]["hdop"].as_f64(), Some(1.1));
+    assert_eq!(c["last_cue_at"], ts(now));
+    let (_, list) = app.call("GET", &format!("/api/collars?herd_id={herd}"), None).await;
+    let listed = list.as_array().unwrap().iter().find(|c| c["id"] == id).unwrap();
+    assert_eq!((listed["charging"].as_bool(), listed["signal"].as_f64()), (Some(true), Some(-104.0)));
     // A resent episode is stored once.
     let resend = json!({"episodes": body["episodes"].clone()});
     app.report(&key, resend).await;
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episodes").fetch_one(app.ctx.db()).await.unwrap();
     assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn collar_telemetry_fields_are_omitted_until_reported_and_kept_when_absent() {
+    let app = App::new().await;
+    let herd = app.herd("Cows").await;
+    let (id, key) = app.v0(&herd).await;
+    let now = Utc::now();
+    // A plain fix report: none of the optional fields appear (never invent charging: false).
+    app.report(
+        &key,
+        json!({
+            "fixes": [{"at": ts(now - Duration::seconds(30)), "point": m_at(50.0, 50.0), "accuracy_m": 2.0, "sats": 8}],
+            "battery": 0.7
+        }),
+    )
+    .await;
+    let (_, c) = app.call("GET", &format!("/api/collars/{id}"), None).await;
+    assert!(c.get("charging").is_none(), "{c}");
+    assert!(c.get("signal").is_none(), "{c}");
+    assert!(c.get("last_cue_at").is_none(), "{c}");
+    assert!(c["last_fix"].get("hdop").is_none(), "{c}");
+    // Report them once.
+    let cue_at = now - Duration::seconds(5);
+    app.report(
+        &key,
+        json!({
+            "fixes": [{"at": ts(now), "point": m_at(51.0, 50.0), "accuracy_m": 1.5, "sats": 9, "hdop": 0.8}],
+            "cues": [{"at": ts(cue_at), "kind": "warn", "level": 1, "margin_m": 2.0}],
+            "battery": 0.72,
+            "health": {"charging": false, "cell": {"rsrp_dbm": -98.0, "mode": "ltem"}}
+        }),
+    )
+    .await;
+    let (_, c) = app.call("GET", &format!("/api/collars/{id}"), None).await;
+    assert_eq!(c["charging"], false, "reported false is kept, not invented earlier");
+    assert_eq!(c["signal"].as_f64(), Some(-98.0));
+    assert_eq!(c["last_fix"]["hdop"].as_f64(), Some(0.8));
+    assert_eq!(c["last_cue_at"], ts(cue_at));
+    // A later report without them keeps the last known values (and a fix without hdop
+    // still moves last_fix; hdop is absent on that fix).
+    app.report(
+        &key,
+        json!({
+            "fixes": [{"at": ts(now + Duration::seconds(10)), "point": m_at(52.0, 50.0), "accuracy_m": 2.0, "sats": 7}],
+            "battery": 0.71
+        }),
+    )
+    .await;
+    let (_, c) = app.call("GET", &format!("/api/collars/{id}"), None).await;
+    assert_eq!(c["charging"], false);
+    assert_eq!(c["signal"].as_f64(), Some(-98.0));
+    assert_eq!(c["last_cue_at"], ts(cue_at));
+    assert!(c["last_fix"].get("hdop").is_none(), "new last fix had no hdop: {c}");
+    assert_eq!(c["last_fix"]["at"], ts(now + Duration::seconds(10)));
 }
 
 #[tokio::test]

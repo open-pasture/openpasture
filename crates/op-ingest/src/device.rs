@@ -207,16 +207,19 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     }
     // A parked collar (charging, on the shelf, in repair) says nothing about
     // grazing: only who it is, what it holds, its battery, health and last
-    // contact are kept.
+    // contact are kept. Cues are not stored, so last_cue_at does not move.
     if collar.parked_at.is_some() {
         insert_health(&mut tx, &collar.id, &herd_id, received, &rep, &health, (rep.fixes.len(), rep.cues.len(), 0)).await?;
         collar.last_seen = Some(received);
         if rep.battery.is_some() {
             collar.battery = rep.battery;
         }
-        sqlx::query("UPDATE collars SET last_seen = ?, battery = ? WHERE id = ?")
+        apply_reported_health(&mut collar, &health);
+        sqlx::query("UPDATE collars SET last_seen = ?, battery = ?, charging = ?, signal = ? WHERE id = ?")
             .bind(collar.last_seen.as_ref().map(to_db))
             .bind(collar.battery)
+            .bind(collar.charging)
+            .bind(collar.signal)
             .bind(&collar.id)
             .execute(&mut *tx)
             .await?;
@@ -270,6 +273,7 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             sats: wf.sats.or(health.sats).unwrap_or(0),
             cn0: wf.cn0.or(health.cn0),
             ttf_s: wf.ttf_s.or(health.ttf_s),
+            hdop: wf.hdop,
         };
         fix_rows.push(FixRow {
             fix: fix.clone(),
@@ -277,7 +281,6 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
             state: fix_state,
             margin_m: margin,
             paddock_id: db::paddock_for_point(&paddocks, fix.point).map(|p| p.id.clone()),
-            hdop: wf.hdop,
         });
         if newer && latest_fix.as_ref().is_none_or(|l| fix.at >= l.at) {
             latest_fix = Some(fix.clone());
@@ -296,11 +299,15 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
         tracing::warn!(collar = %collar.id, fixes = fix_conflicts, cues = cue_conflicts, "records at the same instant as a different one: both kept (health.conflicts)");
     }
     // Only cues stored now are announced, so a resent report can't count twice.
+    let mut newest_cue = collar.last_cue_at;
     for (cue, _) in rep.cues.iter().zip(&new_cues).filter(|(_, new)| **new) {
         // Firmware 0.1 sends no kind: outside when past the line, else warn.
         // A kind this build doesn't know is stored and announced as sent.
         let kind = cue.kind.as_ref().map_or(if cue.margin_m < 0.0 { "outside" } else { "warn" }, |k| k.as_str());
         events.push(Event::Cue { collar_id: collar.id.clone(), at: cue.at, level: cue.level, margin_m: cue.margin_m, kind: Some(kind.into()), ring: cue.ring });
+        if newest_cue.is_none_or(|t| cue.at > t) {
+            newest_cue = Some(cue.at);
+        }
     }
     for e in &rep.episodes {
         insert_episode(&mut tx, &collar, &herd_id, e, rep.boundary_version).await?;
@@ -315,19 +322,26 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     if rep.boundary_version.is_some() {
         collar.boundary_version = rep.boundary_version;
     }
+    apply_reported_health(&mut collar, &health);
+    collar.last_cue_at = newest_cue;
     collar.state = state;
     collar.outside_since = if state == FenceState::Outside { outside_since } else { None };
     collar.last_fix = latest_fix;
-    sqlx::query("UPDATE collars SET last_seen = ?, battery = ?, boundary_version = ?, state = ?, last_fix = ?, outside_since = ? WHERE id = ?")
-        .bind(collar.last_seen.as_ref().map(to_db))
-        .bind(collar.battery)
-        .bind(collar.boundary_version.map(|v| v as i64))
-        .bind(collar.state.as_str())
-        .bind(collar.last_fix.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?)
-        .bind(collar.outside_since.as_ref().map(to_db))
-        .bind(&collar.id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE collars SET last_seen = ?, battery = ?, boundary_version = ?, state = ?, last_fix = ?, outside_since = ?, charging = ?, signal = ?, last_cue_at = ? WHERE id = ?",
+    )
+    .bind(collar.last_seen.as_ref().map(to_db))
+    .bind(collar.battery)
+    .bind(collar.boundary_version.map(|v| v as i64))
+    .bind(collar.state.as_str())
+    .bind(collar.last_fix.as_ref().map(serde_json::to_string).transpose().map_err(anyhow::Error::from)?)
+    .bind(collar.outside_since.as_ref().map(to_db))
+    .bind(collar.charging)
+    .bind(collar.signal)
+    .bind(collar.last_cue_at.as_ref().map(to_db))
+    .bind(&collar.id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     for e in events {
@@ -335,6 +349,18 @@ async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJso
     }
     ctx.publish(Event::Collar { collar });
     Ok(Json(ReportResponse { latest_version, config }))
+}
+
+/// Apply charging and cell signal from a report's health only when present,
+/// so a report that omits them leaves the last known values alone (and never
+/// invents `charging: false`).
+fn apply_reported_health(collar: &mut Collar, health: &op_protocol::Health) {
+    if health.charging.is_some() {
+        collar.charging = health.charging;
+    }
+    if let Some(rsrp) = health.cell.as_ref().and_then(|c| c.rsrp_dbm) {
+        collar.signal = Some(rsrp);
+    }
 }
 
 // @L
@@ -345,7 +371,6 @@ struct FixRow {
     state: FenceState,
     margin_m: Option<f64>,
     paddock_id: Option<String>,
-    hdop: Option<f64>,
 }
 
 /// Rows per INSERT: well under SQLite's bound-variable limit (16 columns a fix).
@@ -386,7 +411,7 @@ async fn insert_fixes(tx: &mut sqlx::SqliteConnection, collar: &Collar, herd_id:
                 .push_bind(r.state.as_str())
                 .push_bind(r.margin_m)
                 .push_bind(r.paddock_id.as_deref())
-                .push_bind(r.hdop);
+                .push_bind(r.fix.hdop);
         });
         // VALUES columns are column1… in order: collar_id 1, t 5, lon 6, lat 7, accuracy_m 8.
         q.push(

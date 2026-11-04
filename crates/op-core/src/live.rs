@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{AckStatus, FenceState, Fix};
 
 /// The latest position and telemetry of one collar that changed in the batch
-/// window: its newest fix, fence state, battery (0-1) and last contact.
+/// window: its newest fix, fence state, battery (0-1), last contact, and the
+/// optional reported fields (`charging`, `signal`, `last_cue_at`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PositionItem {
     pub collar_id: String,
@@ -23,6 +24,15 @@ pub struct PositionItem {
     pub battery: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<DateTime<Utc>>,
+    /// On charge, only when the collar reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+    /// Cellular RSRP in dBm, when the collar measured a cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<f64>,
+    /// Newest cue stored for this collar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cue_at: Option<DateTime<Utc>>,
 }
 
 /// A collar's latest boundary ack in the batch window. A collar whose
@@ -58,7 +68,8 @@ pub struct CueItem {
 /// Collar keys that change with every report. A `collar` event whose JSON
 /// differs from the last one sent only in these is not sent on its own:
 /// `boundary_version` rides in `ack_batch`, the rest in `positions`.
-pub const COLLAR_VOLATILE_KEYS: [&str; 6] = ["last_seen", "battery", "last_fix", "state", "outside_since", "boundary_version"];
+pub const COLLAR_VOLATILE_KEYS: [&str; 9] =
+    ["last_seen", "battery", "last_fix", "state", "outside_since", "boundary_version", "charging", "signal", "last_cue_at"];
 
 /// Every collar as stored now: where the live layer starts comparing from.
 pub async fn stored_collars(store: &crate::Store) -> anyhow::Result<Vec<crate::Collar>> {
