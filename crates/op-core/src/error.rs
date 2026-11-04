@@ -3,7 +3,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug)]
@@ -12,13 +12,15 @@ pub struct ApiError {
     pub message: String,
     /// Fields that go beside `error` in the body (e.g. the gate's `findings`).
     pub details: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Seconds for a `Retry-After` header (rate limits / lockouts).
+    pub retry_after: Option<u64>,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), details: None }
+        Self { status, message: message.into(), details: None, retry_after: None }
     }
     /// With fields beside `error` in the body. Not an object: no details.
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
@@ -26,6 +28,11 @@ impl ApiError {
             serde_json::Value::Object(m) => Some(m),
             _ => None,
         };
+        self
+    }
+    /// `Retry-After: <secs>` on the response (typically with 429).
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs.max(1));
         self
     }
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -58,7 +65,13 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = self.details.unwrap_or_default();
         body.insert("error".into(), self.message.into());
-        (self.status, axum::Json(serde_json::Value::Object(body))).into_response()
+        let mut res = (self.status, axum::Json(serde_json::Value::Object(body))).into_response();
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                res.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
+        res
     }
 }
 
