@@ -211,6 +211,9 @@ pub struct Collar {
     /// Run by the simulator, not on an animal (the `sim` cap). Never cleared.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub simulated: bool,
+    /// Released for cross-farm handover; the v1 key no longer works here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

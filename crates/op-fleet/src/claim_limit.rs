@@ -159,19 +159,23 @@ async fn bump(ctx: &Ctx, scope: &str, key: &str, limit: usize, lock_on_full: boo
     Ok(())
 }
 
-/// Record a wrong-code attempt. Always the same 404 (wrong code and unknown
-/// serial look identical); the next try may get 429 from [`may_try`].
-pub async fn wrong(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) -> ApiError {
+async fn bump_all(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str, lock_targets: bool) {
     let bump_one = async |scope: &str, key: &str, limit: usize, lock: bool| {
         if let Err(e) = bump(ctx, scope, key, limit, lock).await {
             tracing::warn!("claim lockout: {e:#}");
         }
     };
     bump_one(SCOPE_CALLER, caller, TRIES_PER_MINUTE, false).await;
-    bump_one(SCOPE_TARGET, target, TRIES_PER_MINUTE, true).await;
+    bump_one(SCOPE_TARGET, target, TRIES_PER_MINUTE, lock_targets).await;
     if let Some(serial) = serial {
-        bump_one(SCOPE_SERIAL, serial, TRIES_PER_MINUTE, true).await;
+        bump_one(SCOPE_SERIAL, serial, TRIES_PER_MINUTE, lock_targets).await;
     }
+}
+
+/// Record a wrong-code attempt. Always the same 404 (wrong code and unknown
+/// serial look identical); the next try may get 429 from [`may_try`].
+pub async fn wrong(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) -> ApiError {
+    bump_all(ctx, caller, serial, target, true).await;
     // Farm-wide counter: soft alarm only — never blocks other callers.
     let before = load(ctx, SCOPE_GLOBAL, GLOBAL_KEY).await.ok();
     let before_n = before
@@ -182,7 +186,9 @@ pub async fn wrong(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) 
             f.len()
         })
         .unwrap_or(0);
-    bump_one(SCOPE_GLOBAL, GLOBAL_KEY, GLOBAL_ALARM_PER_MINUTE, false).await;
+    if let Err(e) = bump(ctx, SCOPE_GLOBAL, GLOBAL_KEY, GLOBAL_ALARM_PER_MINUTE, false).await {
+        tracing::warn!("claim lockout: {e:#}");
+    }
     if before_n < GLOBAL_ALARM_PER_MINUTE {
         if let Ok(after) = load(ctx, SCOPE_GLOBAL, GLOBAL_KEY).await {
             let mut fails = after.fails.clone();
@@ -193,6 +199,11 @@ pub async fn wrong(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) 
         }
     }
     ApiError::not_found("That claim code doesn't match a unit here. Check it against the card.")
+}
+
+/// Count one release / sensitive action toward the same ceilings (no 404).
+pub async fn record(ctx: &Ctx, caller: &str, serial: Option<&str>, target: &str) {
+    bump_all(ctx, caller, serial, target, false).await;
 }
 
 async fn soft_global_alarm(ctx: &Ctx, count: usize) {

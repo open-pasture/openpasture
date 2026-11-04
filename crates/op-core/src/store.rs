@@ -780,6 +780,7 @@ pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
         parked_reason: r.try_get::<Option<String>, _>("parked_reason")?.map(|s| ParkReason::from_db(&s)).transpose()?,
         // Absent from queries that pick their columns.
         simulated: r.try_get::<Option<bool>, _>("simulated").ok().flatten().unwrap_or(false),
+        released_at: r.try_get::<Option<String>, _>("released_at").ok().flatten().map(|s| from_db(&s)).transpose()?,
     })
 }
 

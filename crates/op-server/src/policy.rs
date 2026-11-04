@@ -94,11 +94,12 @@ pub const HAND: &[Rule] = &[
     ("POST", "/api/collars/{id}/unpark"),
     // Same-farm herd move: preserves collar id, key and history.
     ("POST", "/api/collars/{id}/transfer"),
-    // 24-hour undo of a claim or same-farm herd move.
+    // Undo of a claim or same-farm herd move within `UNDO_WINDOW_HOURS`.
     ("POST", "/api/collars/{id}/undo"),
     // Claim into any herd on this farm (roles are farm-wide; no per-herd
     // membership). The card's claim code is still required. Viewers: 403
     // `claim_requires_hand`. Provisioning stays a manager's / station's.
+    // Also accepts a cross-farm `transfer_token` (`OPT1:…`).
     ("POST", "/api/fleet/claim"),
     ("POST", "/api/fleet/units/{serial}/claim"),
     ("POST", "/api/fleet/{id}/fit-checks"),
@@ -160,6 +161,8 @@ pub const MANAGER_READS: &[Rule] = &[
     ("GET", "/api/fleet/yield"),
     ("GET", "/api/fleet/throughput"),
     ("GET", "/api/fleet/summary"),
+    // Collar-only history for cross-farm handover (never other collars/herds/farms).
+    ("GET", "/api/collars/{id}/export"),
     // @Z
 ];
 
@@ -178,6 +181,8 @@ pub const OWNER: &[Rule] = &[
     ("*", "/api/texting*"),
     ("PUT", "/api/push/settings"),
     ("POST", "/api/collars/{id}/rekey"),
+    // Cross-farm handover: one-time transfer code (revokes the v1 key here).
+    ("POST", "/api/collars/{id}/release"),
     // The collar address goes into every collar.
     ("*", "/api/server/collar-address*"),
     // Retention deletes raw telemetry.
@@ -601,6 +606,8 @@ mod tests {
             ("POST", "/api/fleet/units/OCN-2611-00001/provision", Manager),
             ("POST", "/api/collars/col_1/transfer", Hand),
             ("POST", "/api/collars/col_1/undo", Hand),
+            ("GET", "/api/collars/col_1/export", Manager),
+            ("POST", "/api/collars/col_1/release", Owner),
         ];
         for (method, path, need) in cases {
             assert_eq!(required(&m(method), path), need, "{method} {path}");

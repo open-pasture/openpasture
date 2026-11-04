@@ -213,10 +213,10 @@ link it to the unit.
 
 `POST /api/fleet/units/:serial/claim` `{ claim_code, herd_id, name?, animal_id? }`
 
-`POST /api/fleet/claim` `{ claim_code? | card?, factory_record?, herd_id, name?, animal_id? }`: by
-claim code alone, or by the scanned card. A server that never saw the unit registers it from the
-card (`origin: "card"`; class, board and firmware from `factory_record` when given, else
-`unknown`).
+`POST /api/fleet/claim` `{ claim_code? | card? | transfer_token?, factory_record?, herd_id, name?, animal_id? }`: by
+claim code alone, by the scanned card, or by a cross-farm `transfer_token` (`OPT1:…`; see
+**Cross-farm handover**). A server that never saw the unit registers it from the card
+(`origin: "card"`; class, board and firmware from `factory_record` when given, else `unknown`).
 
 **Who may claim:** hand, manager or owner (any herd on this farm — roles are farm-wide; there is
 no per-herd membership). Viewers get **403**
@@ -242,8 +242,8 @@ Unauthenticated callers get **401**.
 - **Notice + undo**: managers and owners see a live `claimed` event; an activity log line is
   stored. `undo_id` / `undo_until` on the response (and event) allow
   `POST /api/collars/{id}/undo` within the undo window (default **24 hours**,
-  `UNDO_WINDOW_HOURS` — pending the owner's OK of the final value) to reverse the claim
-  (unit returns to `provisioned` with a fresh code).
+  `UNDO_WINDOW_HOURS` in op-core — pending the owner's OK of the final value) to reverse the
+  claim (unit returns to `provisioned` with a fresh code).
 
 Returns 201:
 
@@ -279,6 +279,25 @@ and an activity line; `POST /api/collars/{id}/undo` within the undo window (defa
 `UNDO_WINDOW_HOURS` — pending owner OK) restores the previous herd and re-copies that herd's
 **current** fence (not a byte-for-byte restore of the prior applied version). Cross-farm
 handover (release / transfer code / export) is a separate flow.
+
+### Cross-farm handover
+
+1. **Release** — `POST /api/collars/{id}/release` `{ expires_hours? }` (**owner**): revokes the
+   collar's v1 key on this farm, retires the fleet unit, and returns a one-time **signed**
+   portable `transfer_token` (`OPT1:…`, HMAC over serial / source farm / collar / expiry /
+   single-use code; default 72h, max 30 days) plus `export_path`. The collar record stays here
+   with `released_at` set until the operator deletes it.
+2. **Export** — `GET /api/collars/{id}/export` `?format=json|ndjson` (manager+): this collar's
+   **own** fixes, cues, episodes and activity lines that target that collar only. Never other
+   collars' or animals' telemetry from the same herd, and never another farm's data (one server
+   is one farm). Audit lines use role/display-safe labels (no user ids). `scope: "collar_only"`.
+   History travels with the collar: the receiving farm accepts an optional `history` body (or
+   imports the export file) when claiming the transfer token.
+3. **Claim on the receiving farm** — `POST /api/fleet/claim` `{ transfer_token, herd_id, name?,
+   animal_id?, history? }` (hand+): verifies the signed token (forged / expired / reused →
+   same generic 404), keeps the same collar id, mints a new key, registers the unit, and
+   stores any provided collar-only history. Send the token alone (no card or claim_code
+   beside it).
 
 ### Live events
 

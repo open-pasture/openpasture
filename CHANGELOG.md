@@ -15,6 +15,10 @@ cut a release (see `docs/RELEASING.md`).
   (`UNDO_WINDOW_HOURS`, default 24 hours pending a final owner decision). Wrong claim codes
   never reveal that a serial is already claimed or which herd it is in; a farm-wide wrong-code
   rate only raises a soft abuse alarm (it does not lock out other people).
+- Cross-farm collar handover: owners can release a collar (revokes its key here), take a
+  signed one-time transfer token to another farm, and export that collar's own history only
+  (audit without user ids). Hands claim the token on the receiving farm, keep the same collar
+  id, and can bring the export history with them.
 
 ## 0.2.2 (2026-10-01)
 
