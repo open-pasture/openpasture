@@ -370,7 +370,9 @@ async fn mcp_tool_and_optional_guards() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn stale_code_6_refreshes_once() {
+async fn stale_when_seq_already_held_counts_as_applied() {
+    // Re-signed redelivery of an already-applied seq: collar returns stale (6)
+    // but welfare.rearm_seq >= that seq → mark done, do not refresh.
     let app = App::new().await;
     let herd = app.herd().await;
     let (id, key) = app.device(&herd).await;
@@ -381,17 +383,64 @@ async fn stale_code_6_refreshes_once() {
     let seq = v["command"]["rearm_seq"].as_u64().unwrap();
     assert!(seq >= 1);
 
-    // Collar reports a newer shut-off before rejecting the old command as stale (6).
+    // Collar has already applied this seq (held >= command seq).
     let body = json!({
         "device": { "fw": "0.3", "caps": [caps::REARM] },
         "fixes": [{"at": "2026-11-04T05:08:00Z", "point": [-92.405, 38.125], "accuracy_m": 2.0, "sats": 9}],
         "battery": 0.8,
-        "welfare": { "enforcement": "off", "shutoff_at": "2026-11-04T05:07:00Z", "rearm_seq": seq }
+        "welfare": { "enforcement": "on", "rearm_seq": seq }
     });
     let (s, _) = app.req("POST", "/collar/v1/report", Some(&key), Some(body)).await;
     assert_eq!(s, StatusCode::OK);
 
-    // Numeric registry code 6 (= stale), not an unknown number.
+    let ack = json!({
+        "command_id": cmd_id,
+        "version": seq,
+        "status": "rejected",
+        "code": 6,
+        "at": "2026-11-04T05:10:00Z"
+    });
+    let (s, _) = app.req("POST", "/collar/v1/ack", Some(&key), Some(ack)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let (status, ack_status, ack_code): (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, ack_status, ack_code FROM collar_rearms WHERE id = ?").bind(&cmd_id).fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(status, "acked");
+    assert_eq!(ack_status, "applied");
+    assert_eq!(ack_code.as_deref(), Some("stale")); // collar said stale; treated as applied
+
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collar_rearms WHERE collar_id = ? AND status = 'pending'").bind(&id).fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(pending, 0, "already-held stale must not queue a refresh");
+
+    let welfare_state: Option<String> = sqlx::query_scalar("SELECT welfare_state FROM collars WHERE id = ?").bind(&id).fetch_one(app.ctx.db()).await.unwrap();
+    assert_eq!(welfare_state.as_deref(), Some("on"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_below_held_or_shutoff_mismatch_refreshes_once() {
+    // Real stale: welfare.rearm_seq still below the command (e.g. shutoff_at
+    // moved). Refresh once; a second stale on the refresh does not retry.
+    let app = App::new().await;
+    let herd = app.herd().await;
+    let (id, key) = app.device(&herd).await;
+    app.report_shutoff(&key, "2026-11-04T04:55:00Z", 0).await;
+    let (s, v) = app.call("POST", &format!("/api/collars/{id}/rearm"), Some(json!({"reason": "try"}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let cmd_id = v["command"]["id"].as_str().unwrap().to_owned();
+    let seq = v["command"]["rearm_seq"].as_u64().unwrap();
+    assert!(seq >= 1);
+
+    // Newer shut-off; held seq still below the command → real stale.
+    let body = json!({
+        "device": { "fw": "0.3", "caps": [caps::REARM] },
+        "fixes": [{"at": "2026-11-04T05:08:00Z", "point": [-92.405, 38.125], "accuracy_m": 2.0, "sats": 9}],
+        "battery": 0.8,
+        "welfare": { "enforcement": "off", "shutoff_at": "2026-11-04T05:07:00Z", "rearm_seq": 0 }
+    });
+    let (s, _) = app.req("POST", "/collar/v1/report", Some(&key), Some(body)).await;
+    assert_eq!(s, StatusCode::OK);
+
     let ack = json!({
         "command_id": cmd_id,
         "version": seq,
@@ -407,7 +456,6 @@ async fn stale_code_6_refreshes_once() {
     let ack_code: String = sqlx::query_scalar("SELECT ack_code FROM collar_rearms WHERE id = ?").bind(&cmd_id).fetch_one(app.ctx.db()).await.unwrap();
     assert_eq!(ack_code, "stale");
 
-    // One refreshed pending command with the new shutoff_at and a higher seq.
     let (new_id, new_seq, shut, refresh_of): (String, i64, String, String) =
         sqlx::query_as("SELECT id, rearm_seq, shutoff_at, refresh_of FROM collar_rearms WHERE collar_id = ? AND status = 'pending'")
             .bind(&id)
@@ -419,7 +467,7 @@ async fn stale_code_6_refreshes_once() {
     assert_eq!(shut, "2026-11-04T05:07:00.000Z");
     assert_ne!(new_id, cmd_id);
 
-    // A second stale on the refresh does not create another.
+    // Second stale on the refresh (held still below) does not create another.
     let ack2 = json!({
         "command_id": new_id,
         "version": new_seq,

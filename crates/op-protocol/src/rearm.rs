@@ -168,20 +168,22 @@ impl<'de> Deserialize<'de> for WelfareEnforcement {
     }
 }
 
-/// Provisional welfare event kinds (registry.md not in this repo). Kind 3 is
-/// treated as auto shut-off for alerting until op-architect confirms.
+/// Welfare event kinds (opencollar PR #25 / op-firmware head `f2287f4`).
+/// Kind 4 carries `by`: `serial` | `server` and `rearm_seq` when `by` is `server`.
+/// Firmware does not yet uplink these events; the report `welfare` block is the
+/// reliable source until that lands.
 pub mod welfare_kind {
-    pub const ENFORCEMENT_ON: i32 = 1;
-    pub const ENFORCEMENT_OFF: i32 = 2;
+    pub const PULSE_CUTOFF: i32 = 1;
+    pub const RETURNED: i32 = 2;
     pub const AUTO_SHUTOFF: i32 = 3;
-    pub const REARMED: i32 = 4;
+    pub const ENFORCEMENT_RESUMED: i32 = 4;
 
     pub fn name(kind: i32) -> &'static str {
         match kind {
-            ENFORCEMENT_ON => "enforcement_on",
-            ENFORCEMENT_OFF => "enforcement_off",
+            PULSE_CUTOFF => "pulse_cutoff",
+            RETURNED => "returned",
             AUTO_SHUTOFF => "auto_shutoff",
-            REARMED => "rearmed",
+            ENFORCEMENT_RESUMED => "enforcement_resumed",
             _ => "unknown",
         }
     }
@@ -284,5 +286,9 @@ mod tests {
         assert_eq!(e.extra.get("note").and_then(|v| v.as_str()), Some("x"));
         assert!(welfare_kind::is_auto_shutoff(3));
         assert!(!welfare_kind::is_auto_shutoff(99));
+        assert_eq!(welfare_kind::name(1), "pulse_cutoff");
+        assert_eq!(welfare_kind::name(2), "returned");
+        assert_eq!(welfare_kind::name(3), "auto_shutoff");
+        assert_eq!(welfare_kind::name(4), "enforcement_resumed");
     }
 }

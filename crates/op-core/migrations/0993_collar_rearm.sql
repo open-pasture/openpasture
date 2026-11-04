@@ -48,7 +48,7 @@ CREATE TABLE collar_welfare_events (
     id TEXT PRIMARY KEY,
     collar_id TEXT NOT NULL,
     herd_id TEXT NOT NULL,
-    kind INTEGER NOT NULL,                  -- 1..4 (provisional; see registry)
+    kind INTEGER NOT NULL,                  -- 1 pulse_cutoff, 2 returned, 3 auto_shutoff, 4 enforcement_resumed
     at TEXT NOT NULL,
     t INTEGER NOT NULL,
     payload TEXT,                           -- JSON remainder of the event

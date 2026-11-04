@@ -542,8 +542,10 @@ cue `kind`/`ring`/`dur_ms`/`boundary_version`, fix `hdop`/`boundary_version`, he
 `fix_attempts`, `fix_ok`, `cell { rsrp_dbm, rsrq_db, snr_db, mode, band, cell_id, tac }`,
 `still_s`, `tilt_deg`, `temp_c`, `battery_v`, `charging`, `uptime_s`, `reset`, and welfare
 `welfare { enforcement, shutoff_at?, escape_cycles /* alias cycles */, rearm_seq }` plus
-`welfare_events [{ kind /* 1-4 */, at?, … }]` (unknown fields and kinds kept; kind 3 raises an
-`auto_shutoff` alert). Cues without a kind
+`welfare_events [{ kind /* 1 pulse_cutoff, 2 returned, 3 auto_shutoff, 4 enforcement_resumed
+(with by: serial|server and rearm_seq when by=server) */, at?, … }]` (unknown fields and kinds
+kept; kind 3 raises an `auto_shutoff` alert). Firmware does not yet uplink `welfare_events`; the
+report `welfare` block is the reliable source until that lands. Cues without a kind
 (firmware 0.1) are stored with `kind` NULL; the live `cue` event carries `outside` when
 `margin_m` < 0, else `warn`. Acks store `code` on the ack and in `collar_boundary_state`; between
 reports (and for firmware 0.1) acks keep the collar's slot rows: `applied` drops every lower
@@ -559,11 +561,14 @@ delivered in the next report reply and acknowledged on `/collar/v1/ack` (`versio
 `rearm_seq` is `max(server, last reported welfare.rearm_seq) + 1` and always ≥ 1 (the collar
 never lowers it). Pending commands expire after `REARM_TTL_HOURS` (24) with no redelivery; they
 are re-signed with the current server key on each delivery (key rotation does not drop them).
-Ack reject codes (opencollar registry): `bad_sig` = 1, `wrong_collar` = 3, `stale` = 6,
-`expired` = 22, `unsupported` = 24, `not_now` = 28 (name or number accepted). `stale` covers
-`rearm_seq` ≤ held, a `shutoff_at` mismatch, and enforcement already on; the server then
-re-reads the latest reported `shutoff_at` / `rearm_seq`, queues one refreshed command, and does
-not refresh again if that one is also `stale`. Optional guards (setting `collars.rearm`, all
+Ack reject codes (opencollar / op-firmware registry): `bad_sig` = 1, `wrong_collar` = 3,
+`stale` = 6, `expired` = 22, `unsupported` = 24, `not_now` = 28 (name or number accepted).
+`stale` covers `rearm_seq` ≤ held and a `shutoff_at` mismatch (including when enforcement is on).
+When the collar already reports `welfare.rearm_seq` ≥ the acked seq (re-signed redelivery of an
+applied command), the server treats that `stale` as **already applied** and marks the command
+done. Otherwise (`welfare.rearm_seq` below the seq, or a shutoff mismatch) it is a real failure:
+re-read the latest reported `shutoff_at` / `rearm_seq`, queue one refreshed command, and do not
+refresh again if that one is also `stale`. Optional guards (setting `collars.rearm`, all
 default off): `agent_rate_limit`, `refuse_outside`, `notify_on_agent`.
 
 **Configs**: each collar with the `config` cap has one signed `ConfigCommand` (`cfg_…`,

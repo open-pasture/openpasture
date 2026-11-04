@@ -394,10 +394,14 @@ pub async fn pending_command(tx: &mut SqliteConnection, ctx: &Ctx, collar: &Coll
 /// Apply a collar ack for a re-arm command. `version` on the wire is `rearm_seq`.
 /// Returns `Ok(false)` when `command_id` is not a re-arm for this collar.
 ///
-/// A rejection with registry code `stale` (6) — rearm_seq ≤ held, shutoff_at
-/// mismatch, or enforcement already on — triggers one refresh: re-read the
-/// collar's latest `shutoff_at` / `welfare_rearm_seq`, queue a new pending
-/// command, and stop. A second `stale` on that refresh is not retried.
+/// A rejection with registry code `stale` (6):
+/// - If the collar already reports `welfare.rearm_seq` ≥ this command's seq
+///   (re-signed redelivery of an applied seq), treat as **already applied**:
+///   mark the command acked/applied, not a failure.
+/// - Otherwise (`welfare.rearm_seq` below the seq, or a shutoff_at mismatch /
+///   enforcement already on without holding the seq) it is a real failure:
+///   re-read latest `shutoff_at` / `welfare_rearm_seq`, queue one refreshed
+///   command. A second `stale` on that refresh is not retried.
 pub async fn apply_ack(
     tx: &mut SqliteConnection,
     collar: &Collar,
@@ -416,29 +420,38 @@ pub async fn apply_ack(
     if r.try_get::<String, _>("status")? != "pending" {
         return Ok(true); // already settled; idempotent
     }
-    let (new_status, event) = match status {
-        AckStatus::Applied | AckStatus::Received => ("acked", "acked"),
-        AckStatus::Rejected => ("rejected", "rejected"),
-    };
-    let ack_code = code.filter(|_| status == AckStatus::Rejected);
-    sqlx::query("UPDATE collar_rearms SET status = ?, ack_status = ?, ack_code = ?, ack_at = ? WHERE id = ?")
-        .bind(new_status)
-        .bind(status.as_str())
-        .bind(ack_code)
-        .bind(to_db(&at))
-        .bind(command_id)
-        .execute(&mut *tx)
-        .await?;
     let who: Value = serde_json::from_str(&r.try_get::<String, _>("actor")?).unwrap_or(json!({}));
     let reason: String = r.try_get("reason")?;
     let reason_code: String = r.try_get("reason_code")?;
     let shutoff = opt_from_db(r.try_get("shutoff_at")?)?;
     let refresh_of: Option<String> = r.try_get("refresh_of")?;
-    audit(tx, &collar.id, Some(command_id), at, &who, &reason, &reason_code, shutoff, event, Some(status.as_str()), ack_code).await?;
-    if status == AckStatus::Applied {
+
+    // stale (6) for a seq the collar already holds → already applied (not a failure).
+    let held: i64 = sqlx::query_scalar("SELECT COALESCE(welfare_rearm_seq, 0) FROM collars WHERE id = ?").bind(&collar.id).fetch_one(&mut *tx).await?;
+    let stale_already_applied = status == AckStatus::Rejected && is_stale_code(code) && held >= seq as i64;
+
+    let (new_status, event, ack_status, ack_code) = if stale_already_applied {
+        tracing::info!(collar = %collar.id, command = %command_id, rearm_seq = seq, held, "stale rearm: seq already held, treating as applied");
+        ("acked", "acked", AckStatus::Applied.as_str(), code) // wire code kept for audit
+    } else {
+        match status {
+            AckStatus::Applied | AckStatus::Received => ("acked", "acked", status.as_str(), None),
+            AckStatus::Rejected => ("rejected", "rejected", status.as_str(), code),
+        }
+    };
+    sqlx::query("UPDATE collar_rearms SET status = ?, ack_status = ?, ack_code = ?, ack_at = ? WHERE id = ?")
+        .bind(new_status)
+        .bind(ack_status)
+        .bind(ack_code)
+        .bind(to_db(&at))
+        .bind(command_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(tx, &collar.id, Some(command_id), at, &who, &reason, &reason_code, shutoff, event, Some(ack_status), ack_code).await?;
+    if new_status == "acked" && (status == AckStatus::Applied || stale_already_applied) {
         // Enforcement is back on; clear shut-off until the collar reports again.
         sqlx::query("UPDATE collars SET welfare_state = 'on', shutoff_at = NULL WHERE id = ?").bind(&collar.id).execute(&mut *tx).await?;
-    } else if status == AckStatus::Rejected && is_stale_code(ack_code) && refresh_of.is_none() {
+    } else if status == AckStatus::Rejected && is_stale_code(code) && !stale_already_applied && refresh_of.is_none() {
         refresh_after_stale(tx, collar, command_id, &reason, &reason_code, &who, at).await?;
     }
     Ok(true)
