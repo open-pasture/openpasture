@@ -234,6 +234,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
 | POST | `/api/collars/:id/transfer` | `{ to_herd_id, animal_id? }` (hand+; same-farm only) | `Collar`; notice + undo (`UNDO_WINDOW_HOURS`, default 24h pending owner OK) |
 | POST | `/api/collars/:id/undo` | (hand+) | undoes latest claim or herd move within `UNDO_WINDOW_HOURS` |
+| GET | `/api/collars/:id/export` | `?format=json\|ndjson` (manager+) | **collar-only**: this collar's fixes/cues/episodes/audit; never other collars, animals, or farms |
+| POST | `/api/collars/:id/release` | `{ expires_hours? }` (owner) | one-time signed `OPT1` transfer token for another farm; revokes v1 key here |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
@@ -242,7 +244,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
            boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix,
            fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair",
-           simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */ }
+           simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */,
+           released_at? /* cross-farm handover: v1 key revoked here */ }
 Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
