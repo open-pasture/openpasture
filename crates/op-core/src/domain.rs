@@ -176,6 +176,9 @@ pub struct Fix {
     pub cn0: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttf_s: Option<f64>,
+    /// Horizontal dilution of precision from the fix, when the collar sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdop: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -208,6 +211,18 @@ pub struct Collar {
     pub parked_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked_reason: Option<ParkReason>,
+    /// Whether the collar reported it is on charge. Absent until it says so;
+    /// never defaulted to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+    /// Cellular signal strength from the last health that measured a cell:
+    /// LTE RSRP in dBm (higher is better). Absent on GNSS-only boards and
+    /// until a modem reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<f64>,
+    /// Time of the newest cue stored for this collar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cue_at: Option<DateTime<Utc>>,
     /// Run by the simulator, not on an animal (the `sim` cap). Never cleared.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub simulated: bool,

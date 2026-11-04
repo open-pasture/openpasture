@@ -778,6 +778,10 @@ pub fn collar_from_row(r: &SqliteRow) -> anyhow::Result<Collar> {
         outside_since: opt_from_db(r.try_get("outside_since")?)?,
         parked_at: opt_from_db(r.try_get("parked_at")?)?,
         parked_reason: r.try_get::<Option<String>, _>("parked_reason")?.map(|s| ParkReason::from_db(&s)).transpose()?,
+        // Absent from queries that pick their columns (pre-0987 selects).
+        charging: r.try_get::<Option<i64>, _>("charging").ok().flatten().map(|c| c != 0),
+        signal: r.try_get::<Option<f64>, _>("signal").ok().flatten(),
+        last_cue_at: r.try_get::<Option<String>, _>("last_cue_at").ok().flatten().map(|s| from_db(&s)).transpose()?,
         // Absent from queries that pick their columns.
         simulated: r.try_get::<Option<bool>, _>("simulated").ok().flatten().unwrap_or(false),
     })

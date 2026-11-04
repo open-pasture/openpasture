@@ -5,7 +5,7 @@
 //! (about 100 events a second), and a sweep step adds two acks and two collar
 //! events per collar. Every 500 ms the coalescer sends instead, per herd:
 //! - `positions`: the newest fix of each collar that fixed, plus telemetry-only
-//!   collar changes (battery, last contact, fence state);
+//!   collar changes (battery, last contact, fence state, charging, signal, last cue);
 //! - `ack_batch`: each collar's latest ack, plus collar changes that only move
 //!   `boundary_version`;
 //! - `cue_batch`: every cue.
@@ -150,6 +150,16 @@ fn ident(c: &Collar) -> Value {
     v
 }
 
+/// Battery, last contact and the optional reported fields that ride in `positions`.
+fn apply_telemetry(p: &mut PositionItem, collar: &Collar) {
+    p.battery = collar.battery;
+    p.last_seen = collar.last_seen;
+    p.charging = collar.charging;
+    p.signal = collar.signal;
+    p.last_cue_at = collar.last_cue_at;
+    p.animal_id = collar.animal_id.clone();
+}
+
 /// What one herd gathered in the current window.
 #[derive(Default)]
 struct Batch {
@@ -219,7 +229,11 @@ impl Coalescer {
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Fix { collar_id, animal_id, herd_id, fix, state } => {
-                let known = self.collars.get(&collar_id).map(|k| (k.collar.battery, k.collar.last_seen));
+                let (battery, last_seen, charging, signal, last_cue_at) = self
+                    .collars
+                    .get(&collar_id)
+                    .map(|k| (k.collar.battery, k.collar.last_seen, k.collar.charging, k.collar.signal, k.collar.last_cue_at))
+                    .unwrap_or_default();
                 let b = self.batch(&herd_id);
                 match b.positions.get_mut(&collar_id) {
                     Some(p) if p.fix.at > fix.at => {}
@@ -231,8 +245,8 @@ impl Coalescer {
                         }
                     }
                     None => {
-                        let (battery, last_seen) = known.unwrap_or_default();
-                        b.positions.insert(collar_id.clone(), PositionItem { collar_id, animal_id, fix, state, battery, last_seen });
+                        b.positions
+                            .insert(collar_id.clone(), PositionItem { collar_id, animal_id, fix, state, battery, last_seen, charging, signal, last_cue_at });
                     }
                 }
             }
@@ -278,7 +292,10 @@ impl Coalescer {
             || collar.battery != prev.battery
             || collar.last_fix != prev.last_fix
             || collar.state != prev.state
-            || collar.outside_since != prev.outside_since;
+            || collar.outside_since != prev.outside_since
+            || collar.charging != prev.charging
+            || collar.signal != prev.signal
+            || collar.last_cue_at != prev.last_cue_at;
         if telemetry {
             if let Some(fix) = collar.last_fix.clone() {
                 let b = self.batch(&collar.herd_id);
@@ -289,14 +306,15 @@ impl Coalescer {
                     state: collar.state,
                     battery: None,
                     last_seen: None,
+                    charging: None,
+                    signal: None,
+                    last_cue_at: None,
                 });
                 if fix.at >= p.fix.at {
                     p.fix = fix;
                     p.state = collar.state;
                 }
-                p.battery = collar.battery;
-                p.last_seen = collar.last_seen;
-                p.animal_id = collar.animal_id.clone();
+                apply_telemetry(p, &collar);
             }
         }
         self.collars.insert(collar.id.clone(), Known { ident: id, collar });
@@ -315,9 +333,7 @@ impl Coalescer {
                 p.fix = fix.clone();
                 p.state = collar.state;
             }
-            p.battery = collar.battery;
-            p.last_seen = collar.last_seen;
-            p.animal_id = collar.animal_id.clone();
+            apply_telemetry(p, collar);
         }
     }
 

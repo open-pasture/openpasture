@@ -30,3 +30,17 @@ The device protocol is versioned on its own (`/collar/v1/…`); a change that br
 gets a new protocol version. The HTTP API under `/api/*` is used by openpasture's own UI and
 can still change between releases; changes are listed in `CHANGELOG.md`. A stable,
 versioned subset for integrators is planned.
+
+## App-facing collar telemetry
+
+`GET /api/collars`, `GET /api/collars/:id` and live `positions` / `collar` events carry four
+optional fields the collar report already provides (see [`../API.md`](../API.md) § Collars):
+
+| Field | Source | Unit / notes |
+| --- | --- | --- |
+| `charging` | `health.charging` | bool; omitted until reported — never defaulted to `false` |
+| `signal` | `health.cell.rsrp_dbm` | dBm (LTE RSRP); omitted on GNSS-only boards |
+| `last_fix.hdop` | fix `hdop` | dimensionless HDOP from the last fix |
+| `last_cue_at` | newest stored cue | RFC 3339 UTC |
+
+All are additive and optional. Protocol fields not present at all are not invented on the wire.

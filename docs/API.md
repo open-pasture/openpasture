@@ -229,7 +229,7 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | --- | --- | --- | --- |
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id, simulated? }` | `{ collar: Collar, key: string, endpoint?: string, no_endpoint?: string, public_key: string }` (key shown once; `endpoint` is the collar address + `/collar/v1`, absent until one is set, with `no_endpoint` saying why) |
-| GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
+| GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*`, `charging`, `signal`, `last_cue_at` come from the collar and other routes) | `Collar` / 204 |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |
@@ -238,8 +238,11 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 Collar   { id, name, herd_id, animal_id?, last_seen?, battery? /* 0-1 */,
            boundary_version?, state: "inside"|"warning"|"outside"|"unknown", last_fix?: Fix,
            fw?, caps?: string[], outside_since?, parked_at?, parked_reason?: "charging"|"shelf"|"repair",
+           charging?,          /* bool; only when the collar reported it — never defaulted to false */
+           signal?,            /* cellular RSRP in dBm from health.cell.rsrp_dbm; GNSS-only boards omit it */
+           last_cue_at?,       /* RFC 3339 of the newest cue stored for this collar */
            simulated?: true /* run by the simulator: linked so, or reported the `sim` cap; never cleared */ }
-Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s? }
+Fix      { at, point: [lon, lat], accuracy_m, sats, cn0?, ttf_s?, hdop? /* from the fix when the collar sent it */ }
 Position { collar_id, animal_id?, fix: Fix, state }
 Boundary { id, herd_id, version, geometry: Polygon, warn_m, hysteresis_m, effective_at?,
            decision_id, created_at, collar_id? /* one collar's own, see Escapes */ }
@@ -248,6 +251,11 @@ BoundaryStatus { active?: Boundary, pending?: Boundary, proposed?: { decision_id
            move?: Move, escapes?: Escape[], staged?: Boundary[], slots?: SlotCount[] }
 SlotCount { version, effective_at?, applied, stored, rejected, collars }
 ```
+
+`charging`, `signal`, `last_cue_at` and `last_fix.hdop` are additive and optional: omitted (or
+null) until the collar reports them. A later report that leaves them out keeps the last known
+value; the server never invents `charging: false` or a signal of 0. `signal` is LTE RSRP in dBm
+(higher is better), the same figure stored on `health.rsrp_dbm`.
 
 Boundary versions come from one sequence shared by every herd (herd A may hold v1, v3, v4 and
 herd B v2); `active`/`pending` are still per herd. A collar moved to another herd starts over
@@ -1995,7 +2003,8 @@ Event =
   | { type: "batch", events: Event[] }   // one farm window's positions, ack_batch and cue_batch, in herd id order
   | { type: "ping" }                     // every 15 s, so a quiet socket can be told from a dead one
 
-PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen? }  // newest fix and telemetry per collar
+PositionItem { collar_id, animal_id?, fix: Fix, state, battery? /* 0-1 */, last_seen?,
+               charging?, signal? /* dBm RSRP */, last_cue_at? }  // newest fix and telemetry per collar
 AckItem      { collar_id, version, status: "received"|"applied"|"rejected", code?, reason? }  // latest per collar
 CueItem      { collar_id, at, level, margin_m, kind?: "warn"|"outside", ring? }              // every cue, in order
 ```
@@ -2015,13 +2024,13 @@ schedules) still get every single event. A collar's `rejected` ack with a protoc
 (`hole_too_close`, `slots_full`, …) carries it on the bus (`ack.code`) and in `AckItem.code`.
 
 A `collar` event goes out on its own only when the collar's JSON minus `last_seen`, `battery`,
-`last_fix`, `state`, `outside_since` and `boundary_version` changed (renamed, relinked, parked,
-moved herd, fields added later). A report's telemetry rides in `positions`; a reported boundary
-version with no ack rides in `ack_batch` as `applied`. A collar with no fix yet has no position
-to send, so its telemetry-only changes wait for a refetch. Every other event goes out at once,
-in bus order; batches can arrive after events published later in the same 500 ms. Each message
-is serialized once for all sockets; a socket drops what its identity may not see; a socket (or
-the coalescer) that falls behind gets `resync`. A socket opened with a person's token closes
+`last_fix`, `state`, `outside_since`, `boundary_version`, `charging`, `signal` and `last_cue_at`
+changed (renamed, relinked, parked, moved herd, fields added later). A report's telemetry rides in
+`positions`; a reported boundary version with no ack rides in `ack_batch` as `applied`. A collar
+with no fix yet has no position to send, so its telemetry-only changes wait for a refetch. Every
+other event goes out at once, in bus order; batches can arrive after events published later in the
+same 500 ms. Each message is serialized once for all sockets; a socket drops what its identity may
+not see; a socket (or the coalescer) that falls behind gets `resync`. A socket opened with a person's token closes
 within 5 s once that token is revoked, the person disabled or their role changed; the browser
 reconnects as whoever it is now. A client's close gets a close back.
 
