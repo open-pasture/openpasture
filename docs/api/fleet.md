@@ -254,11 +254,7 @@ Claimed {
   v1: { key, public_key, endpoint?, line?, why? },   // firmware that speaks protocol v1: shown once
   code_checked: boolean,                      // see the typo check
   reclaimed?: true,                           // a reset unit claimed again (200)
-<<<<<<< HEAD
   undo_id?, undo_until?,                      // undo window (UNDO_WINDOW_HOURS, default 24h pending owner OK)
-=======
-  undo_id?, undo_until?,                      // undo window (default 24h, pending owner OK)
->>>>>>> 98b7943 (Test export isolation and cross-farm claim; document handover)
 }
 ```
 
@@ -280,31 +276,28 @@ hands the new herd's boundary (same logic as `PATCH /api/collars/{id}` with a ne
 Detaches any animal on the old herd; if `animal_id` is given it must already be in the destination
 herd. Stops an open escape first. No approval. Managers/owners get a live `collar_moved` notice
 and an activity line; `POST /api/collars/{id}/undo` within the undo window (default 24h,
-<<<<<<< HEAD
 `UNDO_WINDOW_HOURS` — pending owner OK) restores the previous herd and re-copies that herd's
 **current** fence (not a byte-for-byte restore of the prior applied version). Cross-farm
 handover (release / transfer code / export) is a separate flow.
-=======
-pending owner OK) restores the previous herd and re-copies that herd's **current** fence (not a
-byte-for-byte restore of the prior applied version). Cross-farm handover (release / transfer
-code / export) is a separate flow.
 
 ### Cross-farm handover
 
 1. **Release** — `POST /api/collars/{id}/release` `{ expires_hours? }` (**owner**): revokes the
-   collar's v1 key on this farm, retires the fleet unit, and returns a one-time portable
-   `transfer_token` (`OPT1:serial:device_key:collar_id:code:exp`, default 72h, max 30 days)
-   plus `export_path`. The collar record stays here with `released_at` set until the operator
-   deletes it.
+   collar's v1 key on this farm, retires the fleet unit, and returns a one-time **signed**
+   portable `transfer_token` (`OPT1:…`, HMAC over serial / source farm / collar / expiry /
+   single-use code; default 72h, max 30 days) plus `export_path`. The collar record stays here
+   with `released_at` set until the operator deletes it.
 2. **Export** — `GET /api/collars/{id}/export` `?format=json|ndjson` (manager+): this collar's
    **own** fixes, cues, episodes and activity lines that target that collar only. Never other
    collars' or animals' telemetry from the same herd, and never another farm's data (one server
-   is one farm). `scope: "collar_only"`. Import on the receiving farm is not automatic.
+   is one farm). Audit lines use role/display-safe labels (no user ids). `scope: "collar_only"`.
+   History travels with the collar: the receiving farm accepts an optional `history` body (or
+   imports the export file) when claiming the transfer token.
 3. **Claim on the receiving farm** — `POST /api/fleet/claim` `{ transfer_token, herd_id, name?,
-   animal_id? }` (hand+): keeps the same collar id, mints a new key, registers the unit. Send
-   the token alone (no card or claim_code beside it). The releasing farm's token is portable;
-   the receiving farm does not read the releaser's database.
->>>>>>> 98b7943 (Test export isolation and cross-farm claim; document handover)
+   animal_id?, history? }` (hand+): verifies the signed token (forged / expired / reused →
+   same generic 404), keeps the same collar id, mints a new key, registers the unit, and
+   stores any provided collar-only history. Send the token alone (no card or claim_code
+   beside it).
 
 ### Live events
 
