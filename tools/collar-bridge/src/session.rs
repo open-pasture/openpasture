@@ -274,6 +274,7 @@ impl Session {
             episodes: std::mem::take(&mut self.episodes),
             battery: None,
             health: Some(Health { sats: self.sats, uptime_s: self.uptime_ms.map(|ms| ms / 1000), ..Health::default() }),
+            ..Default::default()
         }
     }
 

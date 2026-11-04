@@ -672,6 +672,7 @@ async fn run_collar(l: Linked, start: Option<LonLat>, area: Area, world: World, 
                         ..Default::default()
                     }
                 }),
+                ..Default::default()
             };
             last_report = Some(now);
             match dev.report(&collar.firmware, &rep).await {
