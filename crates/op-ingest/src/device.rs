@@ -54,7 +54,17 @@ impl Device {
     }
 }
 
-impl FromRequestParts<Ctx> for Device {
+/// Auth for `/collar/v1/*`: a claimed collar, or a USB-prebound unit still
+/// waiting for the farmer to scan its QR card (`fleet_units.v1_key_hash`).
+enum CollarAuth {
+    Claimed(Device),
+    /// Provisioned unit with a prebound v1 bearer; keepalive only.
+    Prebind {
+        collar_id: String,
+    },
+}
+
+impl FromRequestParts<Ctx> for CollarAuth {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, ctx: &Ctx) -> Result<Self, Self::Rejection> {
@@ -66,9 +76,31 @@ impl FromRequestParts<Ctx> for Device {
             .map(str::trim)
             .filter(|k| !k.is_empty())
             .ok_or_else(|| ApiError::unauthorized("Missing collar key."))?;
-        let row = sqlx::query("SELECT * FROM collars WHERE key_hash = ?").bind(keys::hash_key(key)).fetch_optional(ctx.db()).await?;
-        let row = row.ok_or_else(|| ApiError::unauthorized("Unknown collar key."))?;
-        Ok(Device { collar: op_core::store::collar_from_row(&row)?, limits: row.try_get("limits")? })
+        let hash = keys::hash_key(key);
+        if let Some(row) = sqlx::query("SELECT * FROM collars WHERE key_hash = ?").bind(&hash).fetch_optional(ctx.db()).await? {
+            return Ok(CollarAuth::Claimed(Device { collar: op_core::store::collar_from_row(&row)?, limits: row.try_get("limits")? }));
+        }
+        // Pre-claim keepalive: provisioned unit waiting for QR/code claim.
+        let pre: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT serial, v1_collar_id FROM fleet_units WHERE v1_key_hash = ? AND state = 'provisioned'")
+                .bind(&hash)
+                .fetch_optional(ctx.db())
+                .await?;
+        match pre {
+            Some((_, Some(collar_id))) => Ok(CollarAuth::Prebind { collar_id }),
+            _ => Err(ApiError::unauthorized("Unknown collar key.")),
+        }
+    }
+}
+
+impl FromRequestParts<Ctx> for Device {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, ctx: &Ctx) -> Result<Self, Self::Rejection> {
+        match CollarAuth::from_request_parts(parts, ctx).await? {
+            CollarAuth::Claimed(d) => Ok(d),
+            CollarAuth::Prebind { .. } => Err(ApiError::unauthorized("Unknown collar key.")),
+        }
     }
 }
 
@@ -96,7 +128,20 @@ fn fence_for(b: Option<&Boundary>, caps: &CollarCaps, state: FenceState) -> Opti
     Some(f)
 }
 
-async fn report(State(ctx): State<Ctx>, device: Device, ApiJson(mut rep): ApiJson<PositionReport>) -> ApiResult<Json<ReportResponse>> {
+async fn report(State(ctx): State<Ctx>, auth: CollarAuth, ApiJson(mut rep): ApiJson<PositionReport>) -> ApiResult<Json<ReportResponse>> {
+    let device = match auth {
+        CollarAuth::Prebind { collar_id } => {
+            // Keepalive only: no fixes stored; Rook stays on its normal cadence
+            // instead of a 1-hour 401 backoff while waiting for claim.
+            if let Some(c) = rep.collar_id.as_deref().filter(|c| !c.is_empty())
+                && c != collar_id
+            {
+                return Err(ApiError::new(StatusCode::FORBIDDEN, format!("This key belongs to collar {collar_id}, not {c}.")));
+            }
+            return Ok(Json(ReportResponse { latest_version: None, config: None }));
+        }
+        CollarAuth::Claimed(d) => d,
+    };
     let mut collar = device.collar.clone();
     check_collar_id(&collar, rep.collar_id.as_deref())?;
     rep.validate()?;
@@ -566,7 +611,11 @@ struct Want {
 /// has a free slot and the command fits its free bytes. Versions the collar
 /// refused for good are left out. A collar out on an escape gets its own
 /// boundary instead of the herd's.
-async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Want>) -> ApiResult<Response> {
+async fn get_boundary(State(ctx): State<Ctx>, auth: CollarAuth, Query(q): Query<Want>) -> ApiResult<Response> {
+    let device = match auth {
+        CollarAuth::Prebind { .. } => return Ok(StatusCode::NO_CONTENT.into_response()),
+        CollarAuth::Claimed(d) => d,
+    };
     let have = q.have.unwrap_or(0);
     let caps = device.caps();
     let split = escapes::collar_boundaries(ctx.db(), &device.collar, now()).await?;
@@ -591,7 +640,11 @@ async fn get_boundary(State(ctx): State<Ctx>, device: Device, Query(q): Query<Wa
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn ack(State(ctx): State<Ctx>, device: Device, ApiJson(a): ApiJson<Ack>) -> ApiResult<StatusCode> {
+async fn ack(State(ctx): State<Ctx>, auth: CollarAuth, ApiJson(a): ApiJson<Ack>) -> ApiResult<StatusCode> {
+    let device = match auth {
+        CollarAuth::Prebind { .. } => return Ok(StatusCode::NO_CONTENT),
+        CollarAuth::Claimed(d) => d,
+    };
     let mut collar = device.collar;
     check_collar_id(&collar, a.collar_id.as_deref())?;
     // A status this build doesn't know (a newer collar's) is taken and set

@@ -142,6 +142,10 @@ mod tests {
             claimed_at: None,
             created_at: op_core::time::now(),
             updated_at: op_core::time::now(),
+            v1_collar_id: None,
+            v1_key_hash: None,
+            v1_card_code: None,
+            v1_herd_id: None,
         }
     }
 

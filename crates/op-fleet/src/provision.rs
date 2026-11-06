@@ -155,6 +155,9 @@ pub struct Provisioning {
     pub card: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub factory_record: Option<RecordView>,
+    /// Protocol-v1 USB credentials when `prebind_v1` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v1: Option<V1Credentials>,
 }
 
 /// How a unit reaches the server: nodes over LoRa through an anchor, anchors
@@ -202,6 +205,14 @@ struct ProvisionBody {
     /// Draw a new code (the old label stops working).
     #[serde(default)]
     rotate_claim: bool,
+    /// Mint protocol-v1 `(collar_id, key)` now so a cordless Rook can keep
+    /// alive before the farmer scans its QR card. Default false: unchanged.
+    #[serde(default)]
+    prebind_v1: bool,
+    /// Herd for the USB `provision` line `"h"` when `prebind_v1` is true.
+    /// Omitted: first non-simulated herd on the farm (409 if none).
+    #[serde(default)]
+    herd_id: Option<String>,
 }
 
 /// `POST /api/fleet/units/:serial/provision`. A unit that already belongs
@@ -316,12 +327,36 @@ async fn provision(State(ctx): State<Ctx>, identity: Identity, Path(serial): Pat
         .execute(&mut *tx)
         .await?;
     }
+    let mut v1_out = None;
+    if b.prebind_v1 {
+        let herd_id = resolve_prebind_herd(&ctx, b.herd_id.as_deref()).await?;
+        let v1_collar_id = match (&unit.v1_collar_id, b.rotate_claim) {
+            (Some(id), false) => id.clone(),
+            _ => id::new_id(id::COLLAR),
+        };
+        let bearer = op_core::keys::new_collar_key();
+        sqlx::query("UPDATE fleet_units SET v1_collar_id = ?, v1_key_hash = ?, v1_card_code = ?, v1_herd_id = ? WHERE serial = ?")
+            .bind(&v1_collar_id)
+            .bind(op_core::keys::hash_key(&bearer))
+            .bind(&code)
+            .bind(&herd_id)
+            .bind(&serial)
+            .execute(&mut *tx)
+            .await?;
+        v1_out = Some(v1_credentials(&ctx, &v1_collar_id, &herd_id, bearer).await?);
+    }
     let by = who(&identity);
     let rotated = unit.claim_code.as_deref().is_some_and(|old| old != code);
-    units::log(&mut tx, &serial, "provisioned", json!({ "server_kid": keys::kid(&ctx.public_key()), "transport": t, "rotated_claim": rotated }), by.as_deref())
-        .await?;
+    units::log(
+        &mut tx,
+        &serial,
+        "provisioned",
+        json!({ "server_kid": keys::kid(&ctx.public_key()), "transport": t, "rotated_claim": rotated, "prebind_v1": b.prebind_v1 }),
+        by.as_deref(),
+    )
+    .await?;
     tx.commit().await?;
-    tracing::info!(serial = %serial, "unit provisioned");
+    tracing::info!(serial = %serial, prebind_v1 = b.prebind_v1, "unit provisioned");
     units::publish(&ctx, &serial).await;
     Ok(Json(Provisioning {
         serial: serial.clone(),
@@ -333,7 +368,33 @@ async fn provision(State(ctx): State<Ctx>, identity: Identity, Path(serial): Pat
         card: crate::record::card(&with_code, &code).unwrap_or_default(),
         claim_code: code,
         factory_record: record,
+        v1: v1_out,
     }))
+}
+
+/// Herd for a `prebind_v1` provision line: the body, else the first real herd.
+async fn resolve_prebind_herd(ctx: &Ctx, given: Option<&str>) -> ApiResult<String> {
+    if let Some(h) = given.map(str::trim).filter(|h| !h.is_empty()) {
+        let herd = ctx.store().get_herd(h).await?.ok_or_else(|| ApiError::bad_request("No such herd."))?;
+        if op_core::sim::herd_is_simulated(ctx.db(), &herd.id).await? {
+            return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+        }
+        return Ok(herd.id);
+    }
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM herds WHERE COALESCE(simulated, 0) = 0 ORDER BY created_at ASC LIMIT 1").fetch_optional(ctx.db()).await?;
+    id.ok_or_else(|| ApiError::conflict("No herd on this farm yet. Make a herd first, or pass herd_id."))
+}
+
+/// Build the v1 credentials block (USB `provision {…}` line).
+async fn v1_credentials(ctx: &Ctx, collar_id: &str, herd_id: &str, bearer: String) -> ApiResult<V1Credentials> {
+    let endpoint = collar_endpoint(ctx).await?;
+    let public_key = ctx.public_key_b64();
+    let line = endpoint.as_ref().map(|e| {
+        format!(r#"provision {{"v":1,"c":{},"h":{},"k":{},"e":{},"s":{}}}"#, json!(collar_id), json!(herd_id), json!(bearer), json!(e), json!(&public_key))
+    });
+    let why = endpoint.is_none().then(|| NO_COLLAR_ADDRESS.to_owned());
+    Ok(V1Credentials { key: bearer, public_key, endpoint, line, why })
 }
 
 // ---- claim ---------------------------------------------------------------------------------
@@ -389,10 +450,16 @@ struct ClaimBody {
     herd_id: String,
     name: Option<String>,
     animal_id: Option<String>,
+    /// Explicit factory-reset reclaim for a unit that has a USB-prebound v1
+    /// key. Without this, re-scanning an in-service prebind unit returns 409
+    /// instead of rotating the key (which would brick a cordless Rook).
+    #[serde(default)]
+    reset: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct V1Provisioning {
+/// Protocol-v1 credentials returned at USB provision (`prebind_v1`) or claim.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V1Credentials {
     /// The collar's bearer key for protocol v1. Shown once; only its hash is kept.
     pub key: String,
     pub public_key: String,
@@ -404,6 +471,9 @@ pub struct V1Provisioning {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
+
+/// Alias kept for claim responses (same shape as [`V1Credentials`]).
+pub type V1Provisioning = V1Credentials;
 
 #[derive(Debug, Serialize)]
 pub struct Claimed {
@@ -477,7 +547,14 @@ async fn claim_any(State(ctx): State<Ctx>, identity: Identity, ApiJson(b): ApiJs
             }
             match from_card(&ctx, &identity, &card, b.factory_record.as_deref(), &caller, &target).await? {
                 FromCard::New(u) => u,
-                FromCard::Reset(u) => return reclaim(&ctx, &identity, u, &b).await,
+                FromCard::Reset(u) => {
+                    // Prebound v1 key must not rotate on an accidental card
+                    // re-scan; explicit reset:true opts into reclaim().
+                    if u.v1_key_hash.is_some() && !b.reset {
+                        return Err(already_claimed_unit(&u));
+                    }
+                    return reclaim(&ctx, &identity, u, &b).await;
+                }
             }
         }
         (None, Some(code)) => {
@@ -527,6 +604,23 @@ fn already_claimed(serial: &str) -> ApiError {
     ApiError::conflict(format!("{serial} is already claimed."))
 }
 
+/// Already-claimed for a USB-prebound unit: include collar/herd so the app
+/// can focus the live collar without rotating the v1 key.
+fn already_claimed_unit(unit: &Unit) -> ApiError {
+    let err = already_claimed(&unit.serial);
+    if unit.v1_key_hash.is_none() {
+        return err;
+    }
+    let mut details = json!({ "code": "already_claimed" });
+    if let Some(c) = &unit.collar_id {
+        details["collar_id"] = json!(c);
+    }
+    if let Some(h) = &unit.herd_id {
+        details["herd_id"] = json!(h);
+    }
+    err.with_details(details)
+}
+
 /// True when the unit's stored factory record's claim check matches `code`.
 async fn stored_factory_code_matches(ctx: &Ctx, unit: &Unit, code: &str) -> ApiResult<bool> {
     let stored: Option<String> =
@@ -573,7 +667,7 @@ async fn from_card(ctx: &Ctx, identity: &Identity, card: &Card, record: Option<&
             // Code was erased at claim. Only confirm "already claimed" when the
             // card's code still checks out against the factory record.
             if stored_factory_code_matches(ctx, &u, &card.claim_code).await? {
-                return Err(already_claimed(&u.serial));
+                return Err(already_claimed_unit(&u));
             }
             audit_attempt(ctx, identity, Some(&card.serial), None, "wrong_code", json!({ "via": "card" })).await;
             return Err(claim_limit::wrong(ctx, caller, Some(&card.serial), target).await);
@@ -679,6 +773,7 @@ async fn reclaim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> A
         return Err(ApiError::conflict(format!("{} comes back on the animal it was on. Change the animal from the collar's page.", unit.serial)));
     }
     let bearer = op_core::keys::new_collar_key();
+    let key_hash = op_core::keys::hash_key(&bearer);
     let at = to_db(&now());
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     // Card alone is enough after a factory reset (no proof-from-collar).
@@ -695,14 +790,23 @@ async fn reclaim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> A
         return Err(ApiError::conflict(format!("{} changed meanwhile. Look at it again.", unit.serial)));
     }
     sqlx::query("UPDATE collars SET key_hash = ?, boundary_version = NULL, state = 'unknown', outside_since = NULL WHERE id = ?")
-        .bind(op_core::keys::hash_key(&bearer))
+        .bind(&key_hash)
         .bind(&collar_id)
         .execute(&mut *tx)
         .await?;
+    // Keep prebind columns in sync when an explicit reset rotates the key.
+    if unit.v1_key_hash.is_some() {
+        sqlx::query("UPDATE fleet_units SET v1_key_hash = ?, v1_collar_id = COALESCE(v1_collar_id, ?) WHERE serial = ?")
+            .bind(&key_hash)
+            .bind(&collar_id)
+            .bind(&unit.serial)
+            .execute(&mut *tx)
+            .await?;
+    }
     units::log(&mut tx, &unit.serial, "reclaimed", json!({ "collar_id": collar_id, "from_card": true }), who(identity).as_deref()).await?;
     tx.commit().await?;
     tracing::info!(serial = %unit.serial, collar = %collar_id, "unit reclaimed from its card after a reset");
-    finish_claim(ctx, identity, &unit.serial, &collar_id, &collar.herd_id, collar.animal_id.clone(), bearer, true, StatusCode::OK).await
+    finish_claim(ctx, identity, &unit.serial, &collar_id, &collar.herd_id, collar.animal_id.clone(), bearer, true, false, StatusCode::OK).await
 }
 
 /// The unit becomes a collar in the herd, on the animal when one is named.
@@ -710,7 +814,7 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     match unit.state {
         UnitState::Provisioned => {}
         UnitState::Claimed | UnitState::InService => {
-            return Err(already_claimed(&unit.serial));
+            return Err(already_claimed_unit(&unit));
         }
         _ => return Err(ApiError::conflict(format!("{} isn't provisioned yet, so it can't be claimed.", unit.serial))),
     }
@@ -720,6 +824,19 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     // A real unit never joins a simulated herd (op_core::sim).
     if op_core::sim::herd_is_simulated(ctx.db(), &b.herd_id).await? {
         return Err(ApiError::conflict(op_core::sim::WRONG_SIDE));
+    }
+    // Rook firmware checks BoundaryCommand.herd_id against the USB-provisioned
+    // "h" until a signed config updates it. First claim must match v1_herd_id;
+    // same-farm transfer (with config refresh) moves it afterwards.
+    if let Some(bound) = unit.v1_herd_id.as_deref()
+        && bound != b.herd_id
+    {
+        let name = ctx.store().get_herd(bound).await?.map(|h| h.name).unwrap_or_else(|| bound.to_owned());
+        return Err(ApiError::conflict(format!(
+            "{} was USB-provisioned for herd {name} ({bound}). Claim it there, then move it with POST /api/collars/{{id}}/transfer.",
+            unit.serial
+        ))
+        .with_details(json!({ "code": "v1_herd_mismatch", "v1_herd_id": bound, "herd_id": b.herd_id })));
     }
     let name = match b.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) if n.len() > 200 => return Err(ApiError::bad_request("The collar name is too long.")),
@@ -738,15 +855,21 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
             return Err(ApiError::conflict(format!("{} already wears a collar.", a.tag)));
         }
     }
-    let collar_id = id::new_id(id::COLLAR);
-    let bearer = op_core::keys::new_collar_key();
+    let prebound = unit.v1_collar_id.as_ref().zip(unit.v1_key_hash.as_ref());
+    let (collar_id, key_hash, bearer, prebound_key) = match prebound {
+        Some((cid, hash)) => (cid.clone(), hash.clone(), String::new(), true),
+        None => {
+            let bearer = op_core::keys::new_collar_key();
+            (id::new_id(id::COLLAR), op_core::keys::hash_key(&bearer), bearer, false)
+        }
+    };
     let at = to_db(&now());
     let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
     sqlx::query("INSERT INTO collars (id, name, herd_id, key_hash, state, created_at, animal_id) VALUES (?, ?, ?, ?, 'unknown', ?, ?)")
         .bind(&collar_id)
         .bind(&name)
         .bind(&b.herd_id)
-        .bind(op_core::keys::hash_key(&bearer))
+        .bind(&key_hash)
         .bind(&at)
         .bind(&b.animal_id)
         .execute(&mut *tx)
@@ -765,7 +888,7 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     }
     // Claim code erased at claim time (identity.md §4 / server.md): single-use
     // until first report is no longer needed for secrecy; reclaim uses the
-    // factory record's claim check while in_service.
+    // factory record's claim check while in_service. Prebind columns stay.
     let n = sqlx::query(
         "UPDATE fleet_units SET collar_id = ?, state = 'claimed', claim_code = NULL, claimed_at = ?, updated_at = ? WHERE serial = ? AND state = 'provisioned'",
     )
@@ -779,12 +902,18 @@ async fn claim(ctx: &Ctx, identity: &Identity, unit: Unit, b: &ClaimBody) -> Api
     if n != 1 {
         return Err(ApiError::conflict(format!("{} was claimed meanwhile.", unit.serial)));
     }
-    units::log(&mut tx, &unit.serial, "claimed", json!({ "collar_id": collar_id, "herd_id": b.herd_id, "animal_id": b.animal_id }), who(identity).as_deref())
-        .await?;
+    units::log(
+        &mut tx,
+        &unit.serial,
+        "claimed",
+        json!({ "collar_id": collar_id, "herd_id": b.herd_id, "animal_id": b.animal_id, "prebind_v1": prebound_key }),
+        who(identity).as_deref(),
+    )
+    .await?;
     tx.commit().await?;
-    tracing::info!(serial = %unit.serial, collar = %collar_id, herd = %b.herd_id, "unit claimed");
+    tracing::info!(serial = %unit.serial, collar = %collar_id, herd = %b.herd_id, prebind_v1 = prebound_key, "unit claimed");
 
-    finish_claim(ctx, identity, &unit.serial, &collar_id, &b.herd_id, b.animal_id.clone(), bearer, false, StatusCode::CREATED).await
+    finish_claim(ctx, identity, &unit.serial, &collar_id, &b.herd_id, b.animal_id.clone(), bearer, false, prebound_key, StatusCode::CREATED).await
 }
 
 /// The claim's answer: the collar, the unit, and the v1 key for today's firmware.
@@ -797,6 +926,7 @@ async fn finish_claim(
     animal_id: Option<String>,
     bearer: String,
     reclaimed: bool,
+    prebound: bool,
     status: StatusCode,
 ) -> ApiResult<(StatusCode, Json<Claimed>)> {
     claim_limit::clear_serial(ctx, serial).await;
@@ -825,18 +955,19 @@ async fn finish_claim(
     units::publish(ctx, serial).await;
     let endpoint = collar_endpoint(ctx).await?;
     let public_key = ctx.public_key_b64();
-    // The v1 card payload, keys in the order v c h k e s (op-import cards).
-    let line = endpoint.as_ref().map(|e| {
-        format!(r#"provision {{"v":1,"c":{},"h":{},"k":{},"e":{},"s":{}}}"#, json!(collar_id), json!(herd_id), json!(bearer), json!(e), json!(public_key))
-    });
-    let why = endpoint.is_none().then(|| NO_COLLAR_ADDRESS.to_owned());
+    let (key, line, why) = if prebound {
+        (String::new(), None, Some("Credentials were pre-bound at USB provisioning.".to_owned()))
+    } else {
+        let line = endpoint.as_ref().map(|e| {
+            format!(r#"provision {{"v":1,"c":{},"h":{},"k":{},"e":{},"s":{}}}"#, json!(collar_id), json!(herd_id), json!(bearer), json!(e), json!(public_key))
+        });
+        let why = endpoint.is_none().then(|| NO_COLLAR_ADDRESS.to_owned());
+        (bearer, line, why)
+    };
     let unit = units::find(ctx, serial).await?;
     let code_checked = unit.claim_checked || reclaimed;
     let undo_until = undo_id.as_ref().map(|_| now() + undo_window());
-    Ok((
-        status,
-        Json(Claimed { unit, collar, v1: V1Provisioning { key: bearer, public_key, endpoint, line, why }, code_checked, reclaimed, undo_id, undo_until }),
-    ))
+    Ok((status, Json(Claimed { unit, collar, v1: V1Provisioning { key, public_key, endpoint, line, why }, code_checked, reclaimed, undo_id, undo_until })))
 }
 
 /// Undo a claim within [`op_core::UNDO_WINDOW_HOURS`]: reverse it back to a provisioned unit.

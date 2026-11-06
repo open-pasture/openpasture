@@ -406,8 +406,16 @@ async fn undo(State(ctx): State<Ctx>, identity: Identity, Path(id): Path<String>
             if collar.animal_id.is_some() {
                 link_animal(&ctx, &collar, None).await?;
             }
-            let code = op_protocol::v2::identity::new_claim_code();
+            let fresh = op_protocol::v2::identity::new_claim_code();
             let mut tx = op_core::store::begin_immediate(ctx.db()).await?;
+            // USB-prebound units keep v1_collar_id / v1_key_hash / v1_herd_id and
+            // restore the printed card code from v1_card_code across undo.
+            let v1_card: Option<String> = sqlx::query_scalar("SELECT v1_card_code FROM fleet_units WHERE serial = ? AND v1_key_hash IS NOT NULL")
+                .bind(&serial)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+            let code = v1_card.unwrap_or(fresh);
             sqlx::query("UPDATE animals SET collar_id = NULL WHERE collar_id = ?").bind(&id).execute(&mut *tx).await?;
             let n = sqlx::query(
                 "UPDATE fleet_units SET collar_id = NULL, state = 'provisioned', claim_code = ?, claimed_at = NULL, updated_at = ?

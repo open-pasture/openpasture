@@ -178,7 +178,7 @@ TestRun {
 ### Provision
 
 `POST /api/fleet/units/:serial/provision`, body optional:
-`{ "claim_code": "<the fixture's>", "rotate_claim": false }`.
+`{ "claim_code": "<the fixture's>", "rotate_claim": false, "prebind_v1"?: false, "herd_id"?: "herd_…" }`.
 
 Refused (409) unless the run that decides (above) passed (or the unit came from another builder's
 card and is claimed here), never for `built`, `rma` or `retired` units, and, for units that talk
@@ -193,8 +193,17 @@ Provisioning {
   claim_code,                                 // 16 characters; kept across re-provisioning unless rotated
   card,                                       // the card's QR text: OC2:<serial>:<device key, base64url>:<claim code>
   factory_record?: { cose, record, maker_kid, verified },   // hex COSE_Sign1 and its JSON view
+  v1?: { key, public_key, endpoint?, line?, why? },         // only when prebind_v1: true
 }
 ```
+
+- **`prebind_v1: true`** (opt-in, default false): mint a permanent protocol-v1 `(collar_id, bearer key)`
+  at provision time and return `v1.line` (`provision {"v":1,"c","h","k","e","s"}`) for USB flash
+  before the farmer claims. Stores `v1_collar_id`, `v1_key_hash`, `v1_card_code` (the printed
+  claim code) and `v1_herd_id` (the `"h"` in the line). `herd_id` is that herd; if omitted, the
+  first non-simulated herd on the farm (409 if none). A provisioned unit's prebound key answers
+  `/collar/v1/{report,boundary,ack}` with keepalive 200/204 (no grazing fixes stored) so a Rook
+  powered on before QR claim does not hit a 1-hour 401 backoff. Default provision stays unchanged.
 
 - The claim code is the fixture's when it sends one (here or at registration), else drawn here.
 - The factory record is the fixture's own when it sent one and the claim code hasn't changed;
@@ -213,7 +222,7 @@ link it to the unit.
 
 `POST /api/fleet/units/:serial/claim` `{ claim_code, herd_id, name?, animal_id? }`
 
-`POST /api/fleet/claim` `{ claim_code? | card?, factory_record?, herd_id, name?, animal_id? }`: by
+`POST /api/fleet/claim` `{ claim_code? | card?, factory_record?, herd_id, name?, animal_id?, reset?: false }`: by
 claim code alone, or by the scanned card. A server that never saw the unit registers it from the
 card (`origin: "card"`; class, board and firmware from `factory_record` when given, else
 `unknown`).
@@ -238,12 +247,24 @@ Unauthenticated callers get **401**.
   body's `herd_id` must be the collar's herd and `animal_id`, if given, its animal (409
   otherwise: move it with `/transfer` afterwards). **The card alone is enough** (no
   proof-from-collar). This needs the stored record, so units this server didn't record a claim
-  check for can't be reclaimed this way.
+  check for can't be reclaimed this way. **Exception for `prebind_v1` units** (`v1_key_hash`
+  set): re-scanning the card while `claimed` / `in_service` returns **409**
+  `already_claimed` with `collar_id` / `herd_id` and does **not** rotate the key (a cordless
+  Rook would brick on 401). Pass `"reset": true` to opt into key rotation after a real factory
+  reset. Non-prebind units keep the default reclaim behaviour.
+- **Prebind claim**: when the unit has `v1_collar_id` + `v1_key_hash`, claim creates the
+  `collars` row with that exact id and key hash (no new bearer). `v1.key` is empty and `v1.why`
+  says the credentials were pre-bound at USB provisioning. The body's `herd_id` must equal
+  `v1_herd_id` (the USB line's `"h"`) — Rook rejects `wrong_herd` boundaries until a signed
+  config updates `herd_id`; claim into another herd is **409** `v1_herd_mismatch`. Move later
+  with `POST /api/collars/{id}/transfer`.
 - **Notice + undo**: managers and owners see a live `claimed` event; an activity log line is
   stored. `undo_id` / `undo_until` on the response (and event) allow
   `POST /api/collars/{id}/undo` within the undo window (default **24 hours**,
   `UNDO_WINDOW_HOURS` — pending the owner's OK of the final value) to reverse the claim
-  (unit returns to `provisioned` with a fresh code).
+  (unit returns to `provisioned` with a fresh code). For `prebind_v1` units, undo keeps
+  `v1_collar_id` / `v1_key_hash` / `v1_herd_id` and restores `claim_code` from `v1_card_code`
+  so the printed QR card and USB bearer both keep working across bench → undo → field claim.
 
 Returns 201:
 

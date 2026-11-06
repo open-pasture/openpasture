@@ -133,6 +133,18 @@ pub struct Unit {
     pub claimed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Protocol-v1 collar id minted at USB provision (`prebind_v1`); not in API JSON.
+    #[serde(skip)]
+    pub v1_collar_id: Option<String>,
+    /// Hash of the USB-provisioned v1 bearer key; not in API JSON.
+    #[serde(skip)]
+    pub v1_key_hash: Option<String>,
+    /// Claim code printed on the OC2 card when v1 was pre-bound; not in API JSON.
+    #[serde(skip)]
+    pub v1_card_code: Option<String>,
+    /// Herd id written into the USB `provision` line `"h"`; not in API JSON.
+    #[serde(skip)]
+    pub v1_herd_id: Option<String>,
 }
 
 /// Units with their herd (through the collar) and the run that decides
@@ -178,6 +190,10 @@ fn from_row(r: &SqliteRow) -> anyhow::Result<Unit> {
         claimed_at: opt_from_db(r.try_get("claimed_at")?)?,
         created_at: ts("created_at")?,
         updated_at: ts("updated_at")?,
+        v1_collar_id: r.try_get("v1_collar_id")?,
+        v1_key_hash: r.try_get("v1_key_hash")?,
+        v1_card_code: r.try_get("v1_card_code")?,
+        v1_herd_id: r.try_get("v1_herd_id")?,
     })
 }
 
