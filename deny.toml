@@ -28,13 +28,15 @@ ignore = [
     # again ("review by YYYY-MM-DD" in its reason). CI fails once that date
     # passes (scripts/deny-ignores.py), so an ignore can't outlive its reason.
     #
-    # zip < 9: extract() to disk mishandles symlinks and SUID bits. op-import
-    # reads entries into memory (by_index, files/read.rs) and never extracts;
+    # zip < 9: extract() to disk mishandles symlinks and SUID bits; also a
+    # ZIP64 symlink target Vec::with_capacity abort (0429). op-import reads
+    # entries into memory (by_index, files/read.rs) and never extracts;
     # tauri-plugin-updater's zip path is Windows-only, our updates are tar.gz.
-    # Drop these when zip 9 lands in both.
+    # Drop these when zip 9 lands in both (tauri still pins zip 4.x).
     { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
     { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
     { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0429", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
     # zstd 0.13 / zstd-safe 7: fixed only in zstd 0.14.3 / zstd-safe 8.2,
     # which arrow-ipc and parquet 59 (datafusion 55) and tantivy-sstable 0.7
     # can't take (they ask for zstd ^0.13). All three call only zstd::bulk

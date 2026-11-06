@@ -10,6 +10,15 @@ cut a release (see `docs/RELEASING.md`).
 
 ## Unreleased
 
+- Hands and up can claim collars into any herd on the farm; viewers get a plain refusal.
+  Same-farm herd moves preserve the collar id and key, with a notice and undo window
+  (`UNDO_WINDOW_HOURS`, default 24 hours pending a final owner decision). Wrong claim codes
+  never reveal that a serial is already claimed or which herd it is in; a farm-wide wrong-code
+  rate only raises a soft abuse alarm (it does not lock out other people).
+- Opt-in `prebind_v1` on fleet provision mints protocol-v1 collar credentials for USB flash
+  before claim (cordless Rook field claim). Pre-claim reports keep alive without 401 backoff;
+  claim reuses the prebound key and must match the USB herd; undo keeps the card code and key.
+
 ## 0.2.2 (2026-10-01)
 
 - Desktop: a workbench layout with a rail, sidebars and tabs. Things that need a person (a move

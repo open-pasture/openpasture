@@ -43,6 +43,36 @@ pub enum Event {
     Collar {
         collar: Collar,
     },
+    /// Notice to managers and owners: a unit was claimed into a herd (op-fleet).
+    /// No claim code. Optional `undo_id` is good for [`crate::UNDO_WINDOW_HOURS`].
+    Claimed {
+        serial: String,
+        collar_id: String,
+        herd_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        animal_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        reclaimed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo_until: Option<DateTime<Utc>>,
+    },
+    /// Notice to managers and owners: a collar moved between herds on this farm.
+    CollarMoved {
+        collar_id: String,
+        from_herd_id: String,
+        to_herd_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        animal_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo_until: Option<DateTime<Utc>>,
+        /// Fence after undo is the destination herd's current boundary, not a
+        /// byte-for-byte restore of the prior applied version.
+        fence_restored_exactly: bool,
+    },
     Boundary {
         herd_id: String,
         boundary: Boundary,
@@ -153,7 +183,12 @@ impl Event {
     /// codes, so they go to managers and up; everything else to any role.
     pub fn min_role(&self) -> Role {
         match self {
-            Event::Message { .. } | Event::CollarWire { .. } | Event::FleetUnit { .. } | Event::FleetTest { .. } => Role::Manager,
+            Event::Message { .. }
+            | Event::CollarWire { .. }
+            | Event::FleetUnit { .. }
+            | Event::FleetTest { .. }
+            | Event::Claimed { .. }
+            | Event::CollarMoved { .. } => Role::Manager,
             _ => Role::Viewer,
         }
     }

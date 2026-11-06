@@ -9,6 +9,7 @@
 //! cycle.
 
 pub mod batch;
+pub mod claim_limit;
 pub mod console;
 pub mod firmware;
 pub mod keys;

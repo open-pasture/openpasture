@@ -62,7 +62,9 @@ pub mod schedule;
 // @Z
 // @X1
 pub mod area_repair;
+mod collar_undo;
 
+pub use collar_undo::{UNDO_WINDOW_HOURS, undo_window};
 pub use ctx::{BrainToken, Ctx, default_data_dir};
 pub use domain::*;
 pub use error::{ApiError, ApiJson, ApiResult};

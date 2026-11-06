@@ -183,9 +183,11 @@ no list is the owner's alone, and a test that reads every crate's routes fails u
   Every role may also use `/api/me` and `/api/me/*` and `POST`/`DELETE /api/push/subscriptions*`.
 - hand: a viewer plus `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`,
   `PUT /api/alerts/prefs/me`, `POST /api/herds/:id/move/stop`, `POST /api/collars/:id/escape/stop`,
-  `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/fleet/:id/fit-checks`,
-  `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`, `POST /api/feed-log`,
-  `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
+  `POST /api/collars/:id/park`, `POST /api/collars/:id/unpark`, `POST /api/collars/:id/transfer`,
+  `POST /api/collars/:id/undo`, `POST /api/fleet/claim`, `POST /api/fleet/units/:serial/claim`,
+  `POST /api/fleet/:id/fit-checks`, `POST /api/fleet/fit-checks`, `POST /api/paddocks/:id/heights`,
+  `POST /api/feed-log`, `POST /api/herds/:id/check`; MCP read tools plus `ack_alert`, `resolve_alert`.
+  Viewers who try to claim get 403 `claim_requires_hand`.
 - manager: the writes listed for managers (everything that isn't a hand's or the owner's);
   `GET /api/messages` and `GET /api/alerts/prefs` are managers' reads; all MCP tools.
 - owner: also `PUT /api/settings`, `POST /api/settings/app-token/*`, `/api/secrets*`,
@@ -230,6 +232,8 @@ through MCP `propose_boundary` keeps its caller as `inputs.by`.
 | GET | `/api/collars` | `?herd_id` | `Collar[]` |
 | POST | `/api/collars` | `{ name?, herd_id, simulated? }` | `{ collar: Collar, key: string, endpoint?: string, no_endpoint?: string, public_key: string }` (key shown once; `endpoint` is the collar address + `/collar/v1`, absent until one is set, with `no_endpoint` saying why) |
 | GET PATCH DELETE | `/api/collars/:id` | `{ name?, herd_id?, animal_id? }` (only these columns are written; `fw`, `caps`, `outside_since`, `parked_*` come from the collar and other routes) | `Collar` / 204 |
+| POST | `/api/collars/:id/transfer` | `{ to_herd_id, animal_id? }` (hand+; same-farm only) | `Collar`; notice + undo (`UNDO_WINDOW_HOURS`, default 24h pending owner OK) |
+| POST | `/api/collars/:id/undo` | (hand+) | undoes latest claim or herd move within `UNDO_WINDOW_HOURS` |
 | GET | `/api/herds/:id/boundary` | | `BoundaryStatus` |
 | POST | `/api/herds/:id/boundary` | `{ geometry: Polygon, warn_m?, hysteresis_m?, effective_at? }` | 201 `Move` (records a farmer decision and starts a move; see Moves) |
 | GET | `/api/positions` | `?herd_id` | `Position[]` latest per collar |

@@ -1147,3 +1147,27 @@ async fn a_farmer_can_let_an_escaped_animal_go() {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM escapes WHERE status = 'returning'").fetch_one(app.ctx.db()).await.unwrap();
     assert_eq!(n, 1);
 }
+
+#[tokio::test]
+async fn transfer_moves_a_collar_between_herds_with_undo() {
+    let app = App::new().await;
+    let herd_a = app.herd().await;
+    let (_, h) = app.call("POST", "/api/herds", Some(json!({"name": "Heifers", "species": "cattle", "count": 0}))).await;
+    let herd_b = h["id"].as_str().unwrap().to_owned();
+    let (id, _key) = app.device(&herd_a).await;
+
+    let (s, c) = app.call("POST", &format!("/api/collars/{id}/transfer"), Some(json!({ "to_herd_id": herd_b }))).await;
+    assert_eq!(s, StatusCode::OK, "{c}");
+    assert_eq!(c["herd_id"], herd_b);
+    assert!(c.get("boundary_version").is_none());
+    assert_eq!(c["state"], "unknown");
+
+    let events = app.ctx.store().list_events(Some(("collar", &id)), 10).await.unwrap();
+    assert!(events.iter().any(|e| e.kind == "collar.moved"), "{events:?}");
+
+    let (s, u) = app.call("POST", &format!("/api/collars/{id}/undo"), None).await;
+    assert_eq!(s, StatusCode::OK, "{u}");
+    assert_eq!(u["herd_id"], herd_a);
+    let events = app.ctx.store().list_events(Some(("collar", &id)), 10).await.unwrap();
+    assert!(events.iter().any(|e| e.kind == "collar.move_undone"), "{events:?}");
+}
