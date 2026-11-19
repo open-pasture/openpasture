@@ -27,7 +27,7 @@ pub mod shape;
 pub mod strip;
 
 pub use clip::{RingError, subtract_ring, union_rings};
-pub use cue::{Cue, CueCommand, CueConfig, CueKind, CueMode, Episode, EpisodeOutcome, EpisodeTracker};
+pub use cue::{Cue, CueCommand, CueConfig, CueKind, CueMode, Episode, EpisodeOutcome, EpisodeTracker, WelfareEvent, WelfareEventKind};
 pub use exclude::{Placement, Shaped, shape_target};
 pub use geofence::{Geofence, GeofenceConfig, GeofenceResult, GeofenceState};
 pub use limits::CollarLimits;

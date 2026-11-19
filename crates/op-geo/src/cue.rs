@@ -18,6 +18,14 @@
 //! evaluates the fence without sound, and episodes: a run of armed warning
 //! cues, ending `turned_back` (the animal reached inside), `crossed`, `rest`
 //! (the 20 s cap forced a rest) or `boundary_changed` (a new boundary).
+//!
+//! Welfare (see opencollar `docs/WELFARE-POLICY.md`): outside cues are
+//! count-capped per crossing (pulse cutoff), then suspended until the animal
+//! is clear inside; repeated escape→return cycles auto-shut off enforcement.
+//! A new boundary ([`Cue::rearm`]) never clears shut-off or resets escape-cycle
+//! counters; only an explicit caretaker [`Cue::clear_shutoff`] does. Zero
+//! welfare fields on [`CueConfig`] become the firmware's safe defaults
+//! (3 / 3 / 24 h).
 
 use serde::{Deserialize, Serialize};
 
@@ -35,12 +43,47 @@ pub struct CueConfig {
     pub rest_ms: u32,
     /// How long to cue after leaving the polygon.
     pub outside_max_ms: u32,
+    /// Outside/pulse cues per crossing; default 3. Zero becomes the default at [`Cue::new`].
+    pub max_outside_cues: u8,
+    /// Escape→return cycles before shut-off; default 3. Zero becomes the default at [`Cue::new`].
+    pub escape_cycle_limit: u8,
+    /// Fixed window (from the first escape) for those cycles, in ms; default 24 h.
+    pub escape_cycle_window_ms: u32,
 }
 
+/// Conservative defaults when a caller leaves welfare fields at 0 (firmware `cue_init`).
+const WELFARE_DEFAULT_MAX_OUTSIDE_CUES: u8 = 3;
+const WELFARE_DEFAULT_ESCAPE_CYCLE_LIMIT: u8 = 3;
+const WELFARE_DEFAULT_ESCAPE_WINDOW_MS: u32 = 24 * 60 * 60 * 1000;
+
 impl Default for CueConfig {
-    /// The V0 firmware's values.
+    /// The V0 firmware's values, including welfare caps 3 / 3 / 24 h.
     fn default() -> Self {
-        Self { warn_freq_hz: 2730, outside_freq_hz: 1000, beep_ms: 300, max_active_ms: 20_000, rest_ms: 30_000, outside_max_ms: 10_000 }
+        Self {
+            warn_freq_hz: 2730,
+            outside_freq_hz: 1000,
+            beep_ms: 300,
+            max_active_ms: 20_000,
+            rest_ms: 30_000,
+            outside_max_ms: 10_000,
+            max_outside_cues: WELFARE_DEFAULT_MAX_OUTSIDE_CUES,
+            escape_cycle_limit: WELFARE_DEFAULT_ESCAPE_CYCLE_LIMIT,
+            escape_cycle_window_ms: WELFARE_DEFAULT_ESCAPE_WINDOW_MS,
+        }
+    }
+}
+
+impl CueConfig {
+    fn apply_welfare_defaults(&mut self) {
+        if self.max_outside_cues == 0 {
+            self.max_outside_cues = WELFARE_DEFAULT_MAX_OUTSIDE_CUES;
+        }
+        if self.escape_cycle_limit == 0 {
+            self.escape_cycle_limit = WELFARE_DEFAULT_ESCAPE_CYCLE_LIMIT;
+        }
+        if self.escape_cycle_window_ms == 0 {
+            self.escape_cycle_window_ms = WELFARE_DEFAULT_ESCAPE_WINDOW_MS;
+        }
     }
 }
 
@@ -200,6 +243,26 @@ impl EpisodeTracker {
     }
 }
 
+/// One welfare event, same shape as firmware `cue_take_welfare`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelfareEvent {
+    pub kind: WelfareEventKind,
+    pub at_ms: i64,
+    pub outside_cues: u8,
+    pub escape_cycles: u8,
+}
+
+/// Firmware `welfare_event_kind`. Names match the firmware strings; wire
+/// encoding of `kind` (name vs registry code) is a separate Q1 decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WelfareEventKind {
+    PulseCutoff,
+    Returned,
+    AutoShutoff,
+    EnforcementResumed,
+}
+
 #[derive(Debug, Clone)]
 pub struct Cue {
     cfg: CueConfig,
@@ -213,8 +276,21 @@ pub struct Cue {
     seen_outside: bool,
     /// Crossed out; the outside tone window is running.
     escaping: bool,
+    /// Outside cues delivered this escape.
+    outside_cues: u8,
+    /// Budget spent; silent until clear inside.
+    pulse_cutoff: bool,
+    /// A real crossing is open until returned.
+    crossed_out: bool,
+    /// Completed escape→return cycles in the window.
+    escape_cycles: u8,
+    /// Start of the current cycle window; 0 = none.
+    escape_window_start_ms: i64,
+    /// Auto shut-off: no cues until [`Cue::clear_shutoff`].
+    enforcement_off: bool,
     episodes: EpisodeTracker,
     done: Vec<Episode>,
+    welfare: Vec<WelfareEvent>,
     last_ms: i64,
 }
 
@@ -226,7 +302,8 @@ fn warning_volume(margin_m: f64, warn_m: f64) -> u8 {
 }
 
 impl Cue {
-    pub fn new(cfg: CueConfig) -> Self {
+    pub fn new(mut cfg: CueConfig) -> Self {
+        cfg.apply_welfare_defaults();
         Self {
             cfg,
             mode: CueMode::Audio,
@@ -237,8 +314,15 @@ impl Cue {
             armed: false,
             seen_outside: false,
             escaping: false,
+            outside_cues: 0,
+            pulse_cutoff: false,
+            crossed_out: false,
+            escape_cycles: 0,
+            escape_window_start_ms: 0,
+            enforcement_off: false,
             episodes: EpisodeTracker::new(),
             done: Vec::new(),
+            welfare: Vec::new(),
             last_ms: 0,
         }
     }
@@ -260,6 +344,8 @@ impl Cue {
     /// Call whenever a new boundary is applied: silent until the next inside
     /// fix. Keeps any forced rest that is running. A running episode ends as
     /// `boundary_changed` at the last fix's time; see [`Cue::rearm_at`].
+    /// Does **not** clear auto shut-off or reset escape-cycle counters — only
+    /// [`Cue::clear_shutoff`] does that.
     pub fn rearm(&mut self) {
         self.rearm_at(self.last_ms);
     }
@@ -269,8 +355,26 @@ impl Cue {
         self.done.extend(self.episodes.boundary_changed(now_ms));
         self.armed = false;
         self.seen_outside = false;
-        self.escaping = false;
         self.cueing = false;
+        self.clear_escape_state();
+    }
+
+    /// Explicit caretaker re-arm for this collar. Clears auto shut-off, resets
+    /// escape-cycle counters, and emits `enforcement_resumed` when shut-off was
+    /// active. A fence move must call [`Cue::rearm`], never this.
+    pub fn clear_shutoff(&mut self) {
+        self.clear_shutoff_at(self.last_ms);
+    }
+
+    /// [`Cue::clear_shutoff`] at `now_ms`.
+    pub fn clear_shutoff_at(&mut self, now_ms: i64) {
+        self.clear_escape_state();
+        self.escape_cycles = 0;
+        self.escape_window_start_ms = 0;
+        if self.enforcement_off {
+            self.enforcement_off = false;
+            self.push_welfare(WelfareEventKind::EnforcementResumed, now_ms);
+        }
     }
 
     /// Whether a crossing would be cued now.
@@ -278,9 +382,19 @@ impl Cue {
         self.armed
     }
 
+    /// True when audio/pulse enforcement is allowed (not auto-shut-off, not track).
+    pub fn enforcement_active(&self) -> bool {
+        self.mode == CueMode::Audio && !self.enforcement_off
+    }
+
     /// Episodes that ended since the last call.
     pub fn take_episodes(&mut self) -> Vec<Episode> {
         std::mem::take(&mut self.done)
+    }
+
+    /// Welfare events that were raised since the last call.
+    pub fn take_welfare(&mut self) -> Vec<WelfareEvent> {
+        std::mem::take(&mut self.welfare)
     }
 
     pub fn update(&mut self, r: &GeofenceResult, warn_m: f64, now_ms: i64) -> CueCommand {
@@ -295,6 +409,48 @@ impl Cue {
         cmd
     }
 
+    fn push_welfare(&mut self, kind: WelfareEventKind, now_ms: i64) {
+        self.welfare.push(WelfareEvent { kind, at_ms: now_ms, outside_cues: self.outside_cues, escape_cycles: self.escape_cycles });
+    }
+
+    fn clear_escape_state(&mut self) {
+        self.escaping = false;
+        self.pulse_cutoff = false;
+        self.outside_cues = 0;
+        self.crossed_out = false;
+        self.outside_since_ms = 0;
+    }
+
+    fn note_return(&mut self, now_ms: i64) {
+        if !self.crossed_out {
+            self.clear_escape_state();
+            return;
+        }
+        if self.escape_window_start_ms == 0 || now_ms - self.escape_window_start_ms >= self.cfg.escape_cycle_window_ms as i64 {
+            self.escape_window_start_ms = now_ms;
+            self.escape_cycles = 1;
+        } else {
+            self.escape_cycles += 1;
+        }
+        self.push_welfare(WelfareEventKind::Returned, now_ms);
+        self.clear_escape_state();
+        if !self.enforcement_off && self.escape_cycles >= self.cfg.escape_cycle_limit {
+            self.enforcement_off = true;
+            self.armed = false;
+            self.push_welfare(WelfareEventKind::AutoShutoff, now_ms);
+        }
+    }
+
+    fn engage_pulse_cutoff(&mut self, now_ms: i64) {
+        if self.pulse_cutoff {
+            return;
+        }
+        self.pulse_cutoff = true;
+        self.escaping = false;
+        self.cueing = false;
+        self.push_welfare(WelfareEventKind::PulseCutoff, now_ms);
+    }
+
     /// The cue for this fix, and whether a forced rest began at it.
     fn decide(&mut self, r: &GeofenceResult, warn_m: f64, now_ms: i64) -> (CueCommand, bool) {
         let mut cmd = CueCommand::default();
@@ -302,28 +458,40 @@ impl Cue {
 
         match r.state {
             GeofenceState::Inside => {
-                self.armed = true;
-                self.escaping = false;
+                if self.crossed_out || self.escaping || self.pulse_cutoff {
+                    self.note_return(now_ms);
+                } else {
+                    self.clear_escape_state();
+                }
+                if !self.enforcement_off {
+                    self.armed = true;
+                }
             }
             GeofenceState::Warning => {
-                if !self.seen_outside {
+                if !self.seen_outside && !self.enforcement_off {
                     self.armed = true;
                 }
                 self.escaping = false;
             }
             GeofenceState::Outside => {
-                if self.armed {
+                if self.armed && !self.enforcement_off {
                     // A real crossing: cue it, then stay quiet until back inside.
                     self.armed = false;
                     self.escaping = true;
                     self.outside_since_ms = now_ms;
+                    self.outside_cues = 0;
+                    self.pulse_cutoff = false;
+                    // Count toward auto shut-off only under audio enforcement.
+                    if self.mode == CueMode::Audio {
+                        self.crossed_out = true;
+                    }
                 }
                 self.seen_outside = true;
             }
             GeofenceState::Unknown => {}
         }
 
-        if self.mode == CueMode::Track {
+        if self.mode == CueMode::Track || self.enforcement_off {
             return (cmd, false);
         }
         if r.state == GeofenceState::Warning && self.armed {
@@ -331,11 +499,16 @@ impl Cue {
             cmd.freq_hz = self.cfg.warn_freq_hz;
             cmd.volume = warning_volume(r.margin_m, warn_m);
             cmd.kind = Some(CueKind::Warn);
-        } else if r.state == GeofenceState::Outside && self.escaping && now_ms - self.outside_since_ms < self.cfg.outside_max_ms as i64 {
-            want = true;
-            cmd.freq_hz = self.cfg.outside_freq_hz;
-            cmd.volume = 4;
-            cmd.kind = Some(CueKind::Outside);
+        } else if r.state == GeofenceState::Outside && self.escaping && !self.pulse_cutoff {
+            let outside_budget_ok = self.outside_cues < self.cfg.max_outside_cues && now_ms - self.outside_since_ms < self.cfg.outside_max_ms as i64;
+            if outside_budget_ok {
+                want = true;
+                cmd.freq_hz = self.cfg.outside_freq_hz;
+                cmd.volume = 4;
+                cmd.kind = Some(CueKind::Outside);
+            } else {
+                self.engage_pulse_cutoff(now_ms);
+            }
         }
 
         if !want {
@@ -352,6 +525,16 @@ impl Cue {
             self.cueing = false;
             self.rest_until_ms = now_ms + self.cfg.rest_ms as i64;
             return (CueCommand::default(), true);
+        }
+
+        if cmd.kind == Some(CueKind::Outside) {
+            self.outside_cues += 1;
+            if self.outside_cues >= self.cfg.max_outside_cues && !self.pulse_cutoff {
+                // Last allowed cue for this crossing; cutoff after it.
+                self.escaping = false;
+                self.pulse_cutoff = true;
+                self.push_welfare(WelfareEventKind::PulseCutoff, now_ms);
+            }
         }
 
         cmd.active = true;

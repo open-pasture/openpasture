@@ -1017,6 +1017,10 @@ fn rearm(t_ms: i64) -> CueStep {
     CueStep { op: "rearm".into(), t_ms: Some(t_ms), ..Default::default() }
 }
 
+fn clear_shutoff(t_ms: i64) -> CueStep {
+    CueStep { op: "clear_shutoff".into(), t_ms: Some(t_ms), ..Default::default() }
+}
+
 fn mode(m: &str) -> CueStep {
     CueStep { op: "mode".into(), mode: Some(m.into()), ..Default::default() }
 }
@@ -1049,6 +1053,7 @@ fn run_cue(warn_m: f64, steps: &[CueStep]) -> Vec<CueExpect> {
                     out = c.active.then(|| CueOut { kind: c.kind.unwrap().as_str().into(), level: c.volume });
                 }
                 "rearm" => cue.rearm_at(s.t_ms.unwrap()),
+                "clear_shutoff" => cue.clear_shutoff_at(s.t_ms.unwrap()),
                 "mode" => cue.set_mode(if s.mode.as_deref() == Some("track") { CueMode::Track } else { CueMode::Audio }),
                 op => panic!("unknown op {op}"),
             }
@@ -1124,6 +1129,65 @@ fn cue_cases() -> Vec<CueCase> {
         case("mode_change_ends_the_episode", vec![fix(0, "inside", 20.0), fix(1000, "warning", 2.0), mode("track"), fix(2000, "warning", 1.0)]),
         case("crossing_into_a_hole", vec![fix_ring(0, "inside", 30.0, 0), fix_ring(1000, "warning", 2.0, 1), fix_ring(2000, "outside", -0.5, 1)]),
         case("unknown_state_changes_nothing", vec![fix(0, "unknown", 0.0), fix(1000, "warning", 2.0), fix(2000, "unknown", 0.0), fix(3000, "warning", 1.0)]),
+        case(
+            "pulse_cutoff_after_three_outside_cues",
+            vec![
+                fix(0, "inside", 20.0),
+                fix(1000, "outside", -2.0),
+                fix(2000, "outside", -3.0),
+                fix(2500, "outside", -3.5),
+                fix(3000, "outside", -4.0),
+                fix(4000, "warning", 2.0),
+                fix(5000, "inside", 10.0),
+                fix(6000, "warning", 2.0),
+            ],
+        ),
+        case(
+            "auto_shutoff_after_three_escape_cycles",
+            vec![
+                fix(1000, "inside", 20.0),
+                fix(2000, "outside", -2.0),
+                fix(3000, "outside", -3.0),
+                fix(4000, "inside", 20.0),
+                fix(5000, "inside", 20.0),
+                fix(6000, "outside", -2.0),
+                fix(7000, "outside", -3.0),
+                fix(8000, "inside", 20.0),
+                fix(9000, "inside", 20.0),
+                fix(10_000, "outside", -2.0),
+                fix(11_000, "outside", -3.0),
+                fix(12_000, "inside", 20.0),
+                fix(13_000, "warning", 2.0),
+                fix(14_000, "outside", -1.0),
+                rearm(15_000),
+                fix(16_000, "inside", 20.0),
+                fix(17_000, "warning", 2.0),
+                clear_shutoff(18_000),
+                fix(19_000, "inside", 20.0),
+                fix(20_000, "warning", 2.0),
+            ],
+        ),
+        case(
+            "boundary_change_does_not_clear_shutoff",
+            vec![
+                fix(1000, "inside", 20.0),
+                fix(2000, "outside", -2.0),
+                fix(3000, "outside", -3.0),
+                fix(4000, "inside", 20.0),
+                fix(5000, "inside", 20.0),
+                fix(6000, "outside", -2.0),
+                fix(7000, "outside", -3.0),
+                fix(8000, "inside", 20.0),
+                fix(9000, "inside", 20.0),
+                fix(10_000, "outside", -2.0),
+                fix(11_000, "outside", -3.0),
+                fix(12_000, "inside", 20.0),
+                rearm(13_000),
+                fix(14_000, "inside", 20.0),
+                fix(15_000, "warning", 2.0),
+                fix(16_000, "outside", -1.0),
+            ],
+        ),
     ];
     // What the rules say, checked by hand on the reference's output.
     let by = |n: &str| cases.iter().find(|c| c.name == n).unwrap();
