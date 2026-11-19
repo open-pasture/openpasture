@@ -22,7 +22,7 @@ env:
   # that changes the vectors on either side. It must be a commit on GitHub.
   #
   # Empty: the comparison is skipped with a warning.
-  OPENCOLLAR_REF: "798f5e719f6d5d0f45004d0b375fb90361c4d636"
+  OPENCOLLAR_REF: "12375fca1336c0c5098cfe9d0e9b8eab820e330d"
 
 # Actions are pinned to commit SHAs (Dependabot keeps them current). The Rust
 # toolchain comes from rust-toolchain.toml and bun from .bun-version.

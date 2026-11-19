@@ -59,14 +59,15 @@ Expect: `{ acks: [{ version, status, code?, at? }], active, have, free, free_byt
 
 ### cue.json
 
-`{ config, cases: [{ name, warn_m, steps, expect }] }`: the cue policy ("only cue a crossing", warning levels, the 20 s cap and 30 s rest, the 10 s outside tone, episodes, track mode). `config` is the cue configuration (`warn_freq_hz`, `outside_freq_hz`, `beep_ms`, `max_active_ms`, `rest_ms`, `outside_max_ms`). Each case starts from boot: unarmed, audio mode.
+`{ config, cases: [{ name, warn_m, steps, expect }] }`: the cue policy ("only cue a crossing", warning levels, the 20 s cap and 30 s rest, outside tone with pulse cutoff, auto shut-off, episodes, track mode). `config` is the cue configuration (`warn_freq_hz`, `outside_freq_hz`, `beep_ms`, `max_active_ms`, `rest_ms`, `outside_max_ms`, plus welfare: `max_outside_cues`, `escape_cycle_limit`, `escape_cycle_window_ms`). Zero welfare fields mean the firmware's safe defaults (3 / 3 / 24 h). Each case starts from boot: unarmed, audio mode, enforcement on.
 
 Steps:
 - `{ op: "fix", t_ms, state, margin_m, ring }`: a geofence result (`inside`, `warning`, `outside` or `unknown`, the signed margin, the nearest ring) at `t_ms` on the collar's clock.
-- `{ op: "rearm", t_ms }`: a new boundary applied at `t_ms`.
+- `{ op: "rearm", t_ms }`: a new boundary applied at `t_ms`. Does **not** clear auto shut-off or reset escape-cycle counters.
+- `{ op: "clear_shutoff", t_ms }`: explicit caretaker re-arm at `t_ms` (clears shut-off, resets escape-cycle counters, emits `enforcement_resumed` when shut-off was active).
 - `{ op: "mode", mode }`: `audio` or `track`.
 
-Expect after each step: `{ cue, armed, episodes }`. `cue` is `null` (silent) or `{ kind, level }` (`warn` 1–4, `outside` 4); `armed` whether a crossing would be cued; `episodes` the episodes that ended at this step, each `{ start_ms, end_ms, ring, cues, max_level, min_margin_m, outcome }`.
+Expect after each step: `{ cue, armed, episodes }`. `cue` is `null` (silent) or `{ kind, level }` (`warn` 1–4, `outside` 4); `armed` whether a crossing would be cued; `episodes` the episodes that ended at this step, each `{ start_ms, end_ms, ring, cues, max_level, min_margin_m, outcome }`. An optional `welfare` array (same shape as firmware `cue_take_welfare`: `{ kind, at_ms, outside_cues, escape_cycles }`) may appear once report runners learn it; until then, welfare behaviour is asserted through `cue` / `armed` (see `pulse_cutoff_after_three_outside_cues`, `auto_shutoff_after_three_escape_cycles`, `boundary_change_does_not_clear_shutoff`) and by the firmware host tests.
 
 ## v1 commands (HTTP + JSON)
 
