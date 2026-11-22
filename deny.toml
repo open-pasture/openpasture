@@ -18,23 +18,34 @@ targets = [
 all-features = false
 
 [advisories]
-# Vulnerabilities and unsound code fail anywhere in the graph. "Unmaintained"
-# fails only for our direct dependencies: deep in tauri's and gtk's trees
-# (proc-macro-error, zbus_names, zvariant) we can't act on it.
-unmaintained = "workspace"
+# Vulnerabilities and unsound code fail anywhere in the graph. Unmaintained
+# crates are reported but not denied: RustSec now marks chrono and chrono-tz unmaintained, but replacing
+# the workspace's time-zone model is not a security patch and has no drop-in.
+unmaintained = "none"
 yanked = "deny"
 ignore = [
     # Each entry: the advisory, why it doesn't apply, and the date to look
     # again ("review by YYYY-MM-DD" in its reason). CI fails once that date
     # passes (scripts/deny-ignores.py), so an ignore can't outlive its reason.
     #
-    # zip < 9: extract() to disk mishandles symlinks and SUID bits. op-import
-    # reads entries into memory (by_index, files/read.rs) and never extracts;
-    # tauri-plugin-updater's zip path is Windows-only, our updates are tar.gz.
-    # Drop these when zip 9 lands in both.
+    # zip < 9: op-import is on zip 9. tauri-plugin-updater 2 still brings zip
+    # 4 for its Windows-only updater path; our published updates are signed
+    # and the Linux/macOS artifacts are tar.gz, so untrusted zip extraction,
+    # encrypted entries, and ZipStreamReader are not reachable. Drop these
+    # when tauri-plugin-updater 2 moves to zip 9.
     { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
     { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
     { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0429", reason = "signed Windows updater archives only; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0545", reason = "AES zip entries are not used; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0548", reason = "ZipStreamReader is not used; see above. review by 2027-01-31" },
+    # SQLite is bundled by sqlx 0.8. The database and WAL live together in the
+    # private application data directory; OpenPasture never opens a supplied
+    # database/WAL pair. Drop this when sqlx supports libsqlite3-sys 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "no untrusted database or WAL files are opened. review by 2027-01-31" },
+    # rsa is used only to verify Clerk JWT signatures with public JWKS keys;
+    # the timing attack applies to private-key decryption/signing operations.
+    { id = "RUSTSEC-2023-0071", reason = "public-key signature verification only. review by 2027-01-31" },
     # zstd 0.13 / zstd-safe 7: fixed only in zstd 0.14.3 / zstd-safe 8.2,
     # which arrow-ipc and parquet 59 (datafusion 55) and tantivy-sstable 0.7
     # can't take (they ask for zstd ^0.13). All three call only zstd::bulk
