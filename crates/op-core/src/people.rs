@@ -168,6 +168,26 @@ fn random_hex(n: usize) -> String {
     hex(&bytes)
 }
 
+/// Issue a fresh person token. Used by trusted external identity exchanges;
+/// the external credential has already been verified by the caller.
+pub async fn issue_token(ctx: &Ctx, user: User, label: Option<&str>) -> ApiResult<Accepted> {
+    if user.disabled_at.is_some() {
+        return Err(ApiError::new(StatusCode::GONE, "This person can't sign in any more."));
+    }
+    let label: String = label.unwrap_or_default().trim().chars().take(80).collect();
+    let token = format!("{TOKEN_PREFIX}{}", random_hex(32));
+    sqlx::query("INSERT INTO user_tokens (id, user_id, label, token_hash, created_at, last_used, revoked_at) VALUES (?, ?, ?, ?, ?, NULL, NULL)")
+        .bind(id::new_id(TOKEN))
+        .bind(&user.id)
+        .bind(label)
+        .bind(keys::hash_key(&token))
+        .bind(to_db(&now()))
+        .execute(ctx.db())
+        .await?;
+    evict(ctx, Some(&user.id));
+    Ok(Accepted { token, user })
+}
+
 /// `opu_` and 64 lowercase hex characters.
 pub fn is_token_shape(token: &str) -> bool {
     token.strip_prefix(TOKEN_PREFIX).is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))

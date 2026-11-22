@@ -3,6 +3,7 @@
 //! desktop app both call [`serve`].
 
 mod auth;
+mod clerk;
 mod collar_address;
 mod limits;
 pub mod live;
@@ -321,6 +322,7 @@ pub fn build_app(ctx: Ctx, info: ServerInfo, dev: bool) -> Router {
     let mut app = routes
         .merge(collar_address::router())
         .merge(session::router())
+        .merge(clerk::router())
         .route("/api/server", get(move |state| server_info(state, info.clone())))
         .route("/api/server/retention", get(ops::get_retention).put(ops::put_retention))
         .route("/healthz", get(ops::healthz))

@@ -1,5 +1,11 @@
 # API
 
+## Clerk mobile sign-in
+
+`POST /api/auth/clerk` needs no bearer token and accepts `{ token, name?, email?, label? }`. It verifies an RS256 Clerk session JWT against `OP_CLERK_ISSUER` and the cached JWKS at `OP_CLERK_JWKS_URL` (or the issuer's standard JWKS URL), then returns `{ token, user, farm_ready }`. The returned `opu_…` person token is used for subsequent API calls. The JWT `sub` is the identity; name and email are display profile data only. The first Clerk subject on a server without an enabled owner becomes owner; later new subjects use `OP_CLERK_NEW_USER_ROLE` (default `manager`).
+
+`POST /api/auth/bootstrap` is an optional deployment-test exchange configured by `OP_BOOTSTRAP_SECRET`; see `MOBILE-BACKEND.md`. It must not be embedded in clients.
+
 The contract between the UI, the crates, and collars. JSON everywhere. Geometry is
 GeoJSON, `[longitude, latitude]`, WGS 84. Times are RFC 3339 UTC. IDs are prefixed
 ULIDs (`farm_…`, `pad_…`, `herd_…`, `ani_…`, `col_…`, `bnd_…`, `dec_…`; newer types name
