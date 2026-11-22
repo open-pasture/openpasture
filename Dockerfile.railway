@@ -25,7 +25,6 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/openpasture /usr/local/bin/openpasture
 COPY LICENSE NOTICE THIRD-PARTY-NOTICES* /usr/share/doc/openpasture/
 ENV OPENPASTURE_DATA_DIR=/data
-VOLUME /data
 EXPOSE 7878
 USER openpasture
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 CMD ["openpasture", "health"]
