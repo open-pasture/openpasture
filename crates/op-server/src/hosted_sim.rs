@@ -15,6 +15,7 @@ const TASK: &str = "mobile.hosted_sim";
 pub fn spawn(ctx: &Ctx) {
     ctx.supervise(TASK, Some(Duration::from_secs(30)), |ctx| async move {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("HTTP client");
+        let mut last_cues = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -22,7 +23,7 @@ pub fn spawn(ctx: &Ctx) {
                 _ = ctx.on_shutdown() => break,
                 _ = tick.tick() => {
                     ctx.beat(TASK);
-                    if let Err(error) = report_all(&ctx, &client).await {
+                    if let Err(error) = report_all(&ctx, &client, &mut last_cues).await {
                         tracing::warn!("hosted collar simulation tick: {error:#}");
                     }
                     if let Err(error) = refresh_decisions(&ctx).await {
@@ -62,7 +63,7 @@ async fn refresh_decisions(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn report_all(ctx: &Ctx, client: &reqwest::Client) -> anyhow::Result<()> {
+async fn report_all(ctx: &Ctx, client: &reqwest::Client, last_cues: &mut HashMap<String, chrono::DateTime<chrono::Utc>>) -> anyhow::Result<()> {
     let bearers = op_fleet::hosted::bearers(ctx)?;
     if bearers.is_empty() {
         return Ok(());
@@ -94,6 +95,10 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client) -> anyhow::Result<()> {
         let days = (now.timestamp().rem_euclid(90 * 86_400)) as f64 / 86_400.0;
         let battery = (0.98 - days * 0.004 - (seed % 7) as f64 * 0.003).clamp(0.55, 0.99);
         let class = if serial.contains("ROOK") { "direct" } else { "node" };
+        // One low-level warning at most every eight hours (3/24 h), matching
+        // the on-collar welfare cap while still exercising cue analytics.
+        let cue_due = last_cues.get(&serial).is_none_or(|at| now - *at >= chrono::Duration::hours(8));
+        let cues = if cue_due { vec![json!({"at": now, "kind": "warn", "level": 1, "dur_ms": 350, "margin_m": 2.0, "point": [lon, lat]})] } else { vec![] };
         let body = json!({
             "collar_id": collar_id,
             "device": {
@@ -102,11 +107,14 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client) -> anyhow::Result<()> {
                 "device_class": class
             },
             "fixes": [{"at": now, "point": [lon, lat], "accuracy_m": 3.5, "sats": 11, "hdop": 0.9}],
+            "cues": cues,
             "battery": battery,
             "health": {"temp_c": 24.0 + phase.sin() * 3.0, "battery_v": 3.65 + battery * 0.5}
         });
         let response = client.post(format!("{}/collar/v1/report", ctx.local_url())).bearer_auth(&bearer).json(&body).send().await?;
-        if !response.status().is_success() {
+        if response.status().is_success() && cue_due {
+            last_cues.insert(serial.clone(), now);
+        } else if !response.status().is_success() {
             tracing::warn!(%serial, status = %response.status(), "hosted simulated report rejected");
         }
     }
