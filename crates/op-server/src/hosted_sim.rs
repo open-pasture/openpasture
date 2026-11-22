@@ -80,11 +80,9 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client) -> anyhow::Result<()> {
         .fetch_optional(ctx.db())
         .await?;
         let Some((collar_id, herd_id)) = row else { continue };
-        let center = herds
-            .get(&herd_id)
-            .and_then(|h| h.paddock_id.as_ref())
-            .and_then(|id| paddocks.get(id))
-            .and_then(|p| p.geometry.centroid())
+        let boundary_center = op_ingest::herd_boundaries(ctx.db(), &herd_id, now).await?.active.and_then(|b| b.geometry.centroid());
+        let center = boundary_center
+            .or_else(|| herds.get(&herd_id).and_then(|h| h.paddock_id.as_ref()).and_then(|id| paddocks.get(id)).and_then(|p| p.geometry.centroid()))
             .or_else(|| farm.as_ref().map(|f| f.center))
             .unwrap_or([-96.58, 39.19]);
         let seed = serial.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(u64::from(b)));

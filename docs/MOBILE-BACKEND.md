@@ -47,7 +47,7 @@ Full request/response schemas are in [API.md](API.md) and fleet claim details in
 
 ## Demo factory collars
 
-These are stable demo-factory credentials. `OP_SIM=1` provisions them as unclaimed inventory on first boot. Claiming one starts realistic drifting reports through the real authenticated `/collar/v1/report` ingest path. Device seeds and claimed v1 bearer keys persist in `/data/mobile-sim-device-keys.json` (0600) across deploys.
+These are stable demo-factory credentials. `OP_SIM=1` provisions them as unclaimed inventory on first boot. Claiming one starts realistic drifting reports through the real authenticated `/collar/v1/report` ingest path. The drift follows the herd's applied boundary (then its paddock, then farm center), with simulated battery and health data; the reported `sim` capability labels its provenance. Device seeds and claimed v1 bearer keys persist in `/data/mobile-sim-device-keys.json` (0600) across deploys.
 
 | Model | Serial | Claim code | OC2 card |
 |---|---|---|---|
