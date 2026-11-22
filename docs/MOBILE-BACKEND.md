@@ -39,7 +39,7 @@ Use these calls in order (all with the person bearer token):
 - Fence now: `POST /api/herds/:id/boundary` with `{"geometry":<Polygon>}`; status at `GET /api/herds/:id/boundary`.
 - Rotation/strip schedules: `POST /api/strips/preview`, `POST /api/schedules`, then `GET /api/schedules`; actions are `/api/schedules/:id/{pause,resume,hold,skip,move-now,time,end}`.
 - Decisions: `POST /api/herds/:id/decide`, list with `GET /api/decisions?herd_id=…`; answer `POST /api/decisions/:id/respond` using `{"action":"approve"}`, `{"action":"reject","note":"…"}`, or `{"action":"modify","geometry":<Polygon>,"note":"…"}`.
-- Pasture: `GET /api/signals`, `GET /api/analytics/pasture`, `GET /api/land/:paddock_id`, `GET /api/paddocks/:id/heights`.
+- Pasture: `GET /api/signals`, `GET /api/analytics/pasture`, `GET /api/land/:paddock_id`, `GET /api/paddocks/:id/heights`. With `OP_SIM=1` and no imagery/height, forage and feed budget use a low-confidence 6-inch baseline explicitly returned as `source: "model", reason: "hosted_simulation_baseline"`; real deployments continue to return null without evidence.
 - Alerts: `GET /api/alerts`, `GET /api/alerts/:id`, `POST /api/alerts/:id/ack`, `POST /api/alerts/:id/resolve`.
 - Live feed: WebSocket `wss://op-server-mobile-staging.up.railway.app/api/live?token=<URL-encoded opu token>`. Re-fetch state after reconnect; event payloads are invalidation/progress hints, not the sole record.
 
