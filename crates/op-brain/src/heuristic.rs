@@ -112,6 +112,12 @@ pub fn decide(ctx: &Value) -> DecisionOutput {
                 confidence = 0.5;
                 reasoning.push(format!("{} is planned for grazing until {}.", cur.name, until.format("%-d %b")));
             }
+            (Some(cur), None) if position_source == "collar" => {
+                action = Action::Stay;
+                confidence = 0.45;
+                reasoning.push(format!("Collar positions confirm the herd is grazing in {}.", cur.name));
+                reasoning.push("There is not yet a field observation or planned graze end that supports moving it.".into());
+            }
             _ => reasoning.push("There is no recent field observation from the current paddock.".into()),
         }
     } else if inferred && current_id.is_some() {
@@ -366,15 +372,15 @@ mod tests {
     }
 
     #[test]
-    fn no_notes_asks_for_one() {
+    fn collar_location_without_notes_stays_cautiously() {
         let mut ctx = fixture::context();
         ctx["observations"] = json!([]);
         ctx["paddocks"][0]["grazed_until"] = Value::Null;
         let out = decide(&ctx);
-        assert_eq!(out.action, Action::NeedsInfo);
-        assert_eq!(out.confidence, LOW);
-        assert!(out.need.as_deref().unwrap().contains("Home"));
-        assert!(out.reasoning.starts_with("There is no recent field observation"));
+        assert_eq!(out.action, Action::Stay);
+        assert_eq!(out.confidence, 0.45);
+        assert!(out.need.is_none());
+        assert!(out.reasoning.starts_with("Collar positions confirm"));
     }
 
     #[test]
@@ -385,7 +391,7 @@ mod tests {
             { "content": "Hot and dry.", "source": "weather" }
         ]);
         ctx["paddocks"][0]["grazed_until"] = Value::Null;
-        assert_eq!(decide(&ctx).action, Action::NeedsInfo);
+        assert_eq!(decide(&ctx).action, Action::Stay);
     }
 
     #[test]
