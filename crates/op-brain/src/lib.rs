@@ -91,6 +91,21 @@ pub trait Brain: Send + Sync {
 /// The brain chosen in settings.
 pub async fn resolve(ctx: &Ctx) -> anyhow::Result<Box<dyn Brain>> {
     let s = ctx.settings().await?;
+    // A fresh self-hosted farm works without secrets. If the owner later
+    // adds an API brain key while the fallback is still selected, use it
+    // automatically; an explicit non-heuristic selection always wins.
+    if s.brain.id == BrainId::Heuristic {
+        for (secret, id) in [
+            ("anthropic_api_key", BrainId::Anthropic),
+            ("openai_api_key", BrainId::Openai),
+            ("hosted_api_key", BrainId::Hosted),
+            ("compatible_base_url", BrainId::Compatible),
+        ] {
+            if ctx.secrets().get(secret)?.is_some_and(|v| !v.trim().is_empty()) {
+                return brain_for(ctx, id, None);
+            }
+        }
+    }
     brain_for(ctx, s.brain.id, s.brain.model.clone())
 }
 

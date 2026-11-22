@@ -62,6 +62,7 @@ op-fleet.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 tokio-tungstenite.workspace = true
 http-body-util.workspace = true

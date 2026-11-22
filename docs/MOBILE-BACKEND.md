@@ -47,4 +47,25 @@ Full request/response schemas are in [API.md](API.md) and fleet claim details in
 
 ## Demo factory collars
 
-The stable Rook (LTE-M/GPS) and Starling (LoRa mesh) card table and scan-ready PNGs will live here and in `docs/mobile-cards/`. Initial deploy work is in progress; do not invent codes or use seeded app fallbacks meanwhile.
+These are stable demo-factory credentials. `OP_SIM=1` provisions them as unclaimed inventory on first boot. Claiming one starts realistic drifting reports through the real authenticated `/collar/v1/report` ingest path. Device seeds and claimed v1 bearer keys persist in `/data/mobile-sim-device-keys.json` (0600) across deploys.
+
+| Model | Serial | Claim code | OC2 card |
+|---|---|---|---|
+| Rook | OPR-ROOK-0001 | `R00K-1001-GRAZ-E001` | `OC2:OPR-ROOK-0001:34ToCB-ZedBSG5VdZ5JwZ23rxMyHEVnk0KizH5Xcn8E:R00K-1001-GRAZ-E001` |
+| Rook | OPR-ROOK-0002 | `R00K-1002-GRAZ-E002` | `OC2:OPR-ROOK-0002:L7DE04GA7jM8_f_qG5n27DhJkQq0kOTdiUJKgyfuL9M:R00K-1002-GRAZ-E002` |
+| Rook | OPR-ROOK-0003 | `R00K-1003-GRAZ-E003` | `OC2:OPR-ROOK-0003:bf0wjmS2rTpQfxR5O_kcNN9jOs89FQgo8oJzJXIwesw:R00K-1003-GRAZ-E003` |
+| Rook | OPR-ROOK-0004 | `R00K-1004-GRAZ-E004` | `OC2:OPR-ROOK-0004:sv2Xj9R9FF4B-anR9ztKkDrmFUIxfMGKBzK233hta1s:R00K-1004-GRAZ-E004` |
+| Rook | OPR-ROOK-0005 | `R00K-1005-GRAZ-E005` | `OC2:OPR-ROOK-0005:qlGoQnzBlPb1F49Kwklu1XiHQwt0E9faZbPBJbeXGCI:R00K-1005-GRAZ-E005` |
+| Rook | OPR-ROOK-0006 | `R00K-1006-GRAZ-E006` | `OC2:OPR-ROOK-0006:kq7So1kBpM08J--uUsP94qodyPtJBJw9UOIVASeLNBs:R00K-1006-GRAZ-E006` |
+| Rook | OPR-ROOK-0007 | `R00K-1007-GRAZ-E007` | `OC2:OPR-ROOK-0007:gFYvvfck4-onrkjy9SKn5EpQVZqudxN7IjPJ7lOelLw:R00K-1007-GRAZ-E007` |
+| Rook | OPR-ROOK-0008 | `R00K-1008-GRAZ-E008` | `OC2:OPR-ROOK-0008:ehAKqwbK-QAwRicgH7mCulnx9Dq0NXPjVPNhoMqi0u0:R00K-1008-GRAZ-E008` |
+| Starling | OPS-STARLING-0001 | `STAR-2001-GRAZ-E001` | `OC2:OPS-STARLING-0001:LzUzvySqKE48hCU8VzX8BfckDgRVQV3qZ8kN3bWia_k:STAR-2001-GRAZ-E001` |
+| Starling | OPS-STARLING-0002 | `STAR-2002-GRAZ-E002` | `OC2:OPS-STARLING-0002:eInT09ps9uueuZtka7eNMt1icN46zc203ADQyVFqV6E:STAR-2002-GRAZ-E002` |
+| Starling | OPS-STARLING-0003 | `STAR-2003-GRAZ-E003` | `OC2:OPS-STARLING-0003:qNJl6HkFPaqC0gdc8GB6quKDOs80nkkubDBpn0LTSTg:STAR-2003-GRAZ-E003` |
+| Starling | OPS-STARLING-0004 | `STAR-2004-GRAZ-E004` | `OC2:OPS-STARLING-0004:SPbDXUx4UzJAjVK_RdZc5QRJQMpxoJImCmrXbWOoPsE:STAR-2004-GRAZ-E004` |
+| Starling | OPS-STARLING-0005 | `STAR-2005-GRAZ-E005` | `OC2:OPS-STARLING-0005:EyDzbUGWikkIA_E_7qPoJ1kvB5ot00C7Wt-UyvoSo80:STAR-2005-GRAZ-E005` |
+| Starling | OPS-STARLING-0006 | `STAR-2006-GRAZ-E006` | `OC2:OPS-STARLING-0006:n8WciD0X2L27Wlw5FK63aeMMPzvfR2bSdDpDSEWGatc:STAR-2006-GRAZ-E006` |
+| Starling | OPS-STARLING-0007 | `STAR-2007-GRAZ-E007` | `OC2:OPS-STARLING-0007:CqUhFrWLcQ5YzLfiHVejwxnII1Qf93UdWVNbHRsl6uY:STAR-2007-GRAZ-E007` |
+| Starling | OPS-STARLING-0008 | `STAR-2008-GRAZ-E008` | `OC2:OPS-STARLING-0008:0eWsLETNJ7Ew7-qpOVTdoF8oQnepI2dLZZ89n-0FqCA:STAR-2008-GRAZ-E008` |
+
+The same cards are scan-ready PNGs under `docs/mobile-cards/`.

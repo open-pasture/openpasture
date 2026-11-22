@@ -59,7 +59,7 @@ struct Header {
     kid: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Claims {
     iss: String,
     sub: String,
@@ -248,4 +248,41 @@ async fn cached_key(url: &str, kid: &str, force: bool) -> ApiResult<Option<RsaPu
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |v, (x, y)| v | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::traits::PublicKeyParts;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn verifies_a_locally_signed_clerk_rs256_token() {
+        let private = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let public = private.to_public_key();
+        let jwks = json!({"keys": [{
+            "kid": "local-test", "kty": "RSA", "alg": "RS256", "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())
+        }]});
+        let app = Router::new().route("/jwks", axum::routing::get(move || async move { Json(jwks) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let now = chrono::Utc::now().timestamp();
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"alg":"RS256","kid":"local-test"})).unwrap());
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"iss":"https://clerk.test","sub":"user_123","iat":now,"nbf":now,"exp":now+60})).unwrap());
+        let signing = format!("{header}.{payload}");
+        let signature = SigningKey::<Sha256>::new(private).sign(signing.as_bytes());
+        let token = format!("{signing}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+        let claims = verify(&token, "https://clerk.test", &format!("http://{addr}/jwks")).await.unwrap();
+        assert_eq!(claims.sub, "user_123");
+
+        let wrong_issuer = verify(&token, "https://another.test", &format!("http://{addr}/jwks")).await.unwrap_err();
+        assert_eq!(wrong_issuer.status, StatusCode::UNAUTHORIZED);
+    }
 }

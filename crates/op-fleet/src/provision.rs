@@ -691,6 +691,7 @@ async fn finish_claim(
     reclaimed: bool,
     status: StatusCode,
 ) -> ApiResult<(StatusCode, Json<Claimed>)> {
+    crate::hosted::remember_bearer(ctx, serial, &bearer)?;
     let collar = collar_record(ctx, collar_id).await?;
     ctx.publish(Event::Collar { collar: collar.clone() });
     units::publish(ctx, serial).await;

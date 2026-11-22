@@ -5,6 +5,7 @@
 mod auth;
 mod clerk;
 mod collar_address;
+mod hosted_sim;
 mod limits;
 pub mod live;
 pub mod logging;
@@ -213,6 +214,9 @@ pub async fn serve(opts: ServeOptions) -> anyhow::Result<ServerHandle> {
     op_import::start(ctx.clone()).await.context("starting op-import")?;
     op_reports::start(ctx.clone()).await.context("starting op-reports")?;
     op_fleet::start(ctx.clone()).await.context("starting op-fleet")?;
+    if std::env::var("OP_SIM").as_deref() == Ok("1") {
+        hosted_sim::spawn(&ctx);
+    }
     // @HUB-UI
     // @E-lib
     // @E-srv
