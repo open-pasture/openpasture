@@ -127,7 +127,7 @@ form_urlencoded = "1.2"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 # Imports: CSV, zip (deflate only), shapefiles, KML, GPX; QR cards (SVG only).
 csv = "1.4"
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 shapefile = "0.9"
 quick-xml = "0.42"
 gpx = "0.10"
