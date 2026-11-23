@@ -20,10 +20,57 @@ pub struct DemoCard {
     pub card: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WelfareState {
+    pub boundary_version: u32,
+    pub armed: bool,
+    pub seen_outside: bool,
+    pub escaping: bool,
+    pub outside_since_ms: i64,
+    pub outside_cues: u8,
+    pub pulse_cutoff: bool,
+    pub crossed_out: bool,
+    pub escape_cycles: u8,
+    pub escape_window_start_ms: i64,
+    pub enforcement_off: bool,
+    pub cueing: bool,
+    pub active_since_ms: i64,
+    pub rest_until_ms: i64,
+}
+
+impl WelfareState {
+    /// Firmware `cue_rearm`: a new fence clears only the current crossing.
+    pub fn rearm(&mut self, boundary_version: u32) {
+        self.boundary_version = boundary_version;
+        self.armed = false;
+        self.seen_outside = false;
+        self.cueing = false;
+        self.clear_crossing();
+    }
+
+    /// Firmware `cue_clear_shutoff`: the explicit caretaker/server clear.
+    pub fn clear_shutoff(&mut self) {
+        self.clear_crossing();
+        self.escape_cycles = 0;
+        self.escape_window_start_ms = 0;
+        self.enforcement_off = false;
+    }
+
+    fn clear_crossing(&mut self) {
+        self.escaping = false;
+        self.outside_since_ms = 0;
+        self.outside_cues = 0;
+        self.pulse_cutoff = false;
+        self.crossed_out = false;
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     seeds: BTreeMap<String, String>,
     bearers: BTreeMap<String, String>,
+    #[serde(default)]
+    welfare: BTreeMap<String, WelfareState>,
 }
 
 const CODES: [&str; 16] = [
@@ -125,6 +172,23 @@ pub fn bearers(ctx: &Ctx) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(read_state(ctx)?.bearers)
 }
 
+pub fn welfare(ctx: &Ctx, serial: &str) -> anyhow::Result<WelfareState> {
+    Ok(read_state(ctx)?.welfare.get(serial).cloned().unwrap_or_default())
+}
+
+pub fn save_welfare(ctx: &Ctx, serial: &str, welfare: WelfareState) -> anyhow::Result<()> {
+    let mut state = read_state(ctx)?;
+    state.welfare.insert(serial.to_owned(), welfare);
+    write_state(ctx, &state)
+}
+
+/// Explicit caretaker/server clear for a hosted simulated collar.
+pub fn clear_welfare(ctx: &Ctx, serial: &str) -> anyhow::Result<()> {
+    let mut state = read_state(ctx)?;
+    state.welfare.entry(serial.to_owned()).or_default().clear_shutoff();
+    write_state(ctx, &state)
+}
+
 pub fn is_demo(serial: &str) -> bool {
     serial.starts_with("OPR-ROOK-") || serial.starts_with("OPS-STARLING-")
 }
@@ -167,5 +231,31 @@ mod tests {
         assert_eq!(cards.len(), 16);
         assert_eq!(cards[0].serial, "OPR-ROOK-0001");
         assert!(cards.iter().all(|c| op_protocol::v2::identity::Card::parse(&c.card).is_some()));
+    }
+
+    #[test]
+    fn boundary_rearm_keeps_welfare_but_caretaker_clear_resets_it() {
+        let mut state = WelfareState {
+            armed: true,
+            outside_cues: 3,
+            pulse_cutoff: true,
+            crossed_out: true,
+            escape_cycles: 3,
+            escape_window_start_ms: 42,
+            enforcement_off: true,
+            ..Default::default()
+        };
+        state.rearm(7);
+        assert_eq!(state.boundary_version, 7);
+        assert_eq!(state.escape_cycles, 3);
+        assert_eq!(state.escape_window_start_ms, 42);
+        assert!(state.enforcement_off);
+        assert_eq!(state.outside_cues, 0);
+        assert!(!state.pulse_cutoff);
+
+        state.clear_shutoff();
+        assert_eq!(state.escape_cycles, 0);
+        assert_eq!(state.escape_window_start_ms, 0);
+        assert!(!state.enforcement_off);
     }
 }

@@ -30,7 +30,6 @@ const MAX_POLLS: usize = 4;
 pub fn spawn(ctx: &Ctx) {
     ctx.supervise(TASK, Some(Duration::from_secs(30)), |ctx| async move {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("HTTP client");
-        let mut last_cues = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut events = ctx.subscribe();
@@ -52,7 +51,7 @@ pub fn spawn(ctx: &Ctx) {
                 },
                 _ = tick.tick() => {
                     ctx.beat(TASK);
-                    if let Err(error) = report_all(&ctx, &client, &mut last_cues).await {
+                    if let Err(error) = report_all(&ctx, &client).await {
                         tracing::warn!("hosted collar simulation tick: {error:#}");
                     }
                     if let Err(error) = sync_all(&ctx, &client, ack_delay).await {
@@ -95,7 +94,7 @@ async fn refresh_decisions(ctx: &Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn report_all(ctx: &Ctx, client: &reqwest::Client, last_cues: &mut HashMap<String, chrono::DateTime<chrono::Utc>>) -> anyhow::Result<()> {
+async fn report_all(ctx: &Ctx, client: &reqwest::Client) -> anyhow::Result<()> {
     let collars = claimed(ctx).await?;
     if collars.is_empty() {
         return Ok(());
@@ -105,7 +104,8 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client, last_cues: &mut HashMap
     let farm = ctx.store().get_farm().await?;
     let now = chrono::Utc::now();
     for (serial, bearer, collar_id, herd_id) in collars {
-        let boundary_center = op_ingest::herd_boundaries(ctx.db(), &herd_id, now).await?.active.and_then(|b| b.geometry.centroid());
+        let active = op_ingest::herd_boundaries(ctx.db(), &herd_id, now).await?.active;
+        let boundary_center = active.as_ref().and_then(|b| b.geometry.centroid());
         let center = boundary_center
             .or_else(|| herds.get(&herd_id).and_then(|h| h.paddock_id.as_ref()).and_then(|id| paddocks.get(id)).and_then(|p| p.geometry.centroid()))
             .or_else(|| farm.as_ref().map(|f| f.center))
@@ -119,17 +119,28 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client, last_cues: &mut HashMap
         let days = (now.timestamp().rem_euclid(90 * 86_400)) as f64 / 86_400.0;
         let battery = (0.98 - days * 0.004 - (seed % 7) as f64 * 0.003).clamp(0.55, 0.99);
         let class = if serial.contains("ROOK") { "direct" } else { "node" };
-        // One low-level warning at most every eight hours (3/24 h), matching
-        // the on-collar welfare cap while still exercising cue analytics.
-        let cue_due = last_cues.get(&serial).is_none_or(|at| now - *at >= chrono::Duration::hours(8));
-        let cues = if cue_due { vec![json!({"at": now, "kind": "warn", "level": 1, "dur_ms": 350, "margin_m": 2.0, "point": [lon, lat]})] } else { vec![] };
         let applied = applied_version(ctx, &collar_id, &herd_id).await?;
+        let mut welfare = op_fleet::hosted::welfare(ctx, &serial)?;
+        if welfare.boundary_version != applied {
+            welfare.rearm(applied);
+        }
+        let cues = active
+            .as_ref()
+            .filter(|b| b.version == applied)
+            .and_then(|b| {
+                let cfg = op_geo::GeofenceConfig { warn_m: b.warn_m, hysteresis_m: b.hysteresis_m, ..Default::default() };
+                let mut fence = op_geo::Geofence::from_polygon(cfg, &b.geometry, b.version, &op_geo::CollarLimits::V0).ok()?;
+                let fix = fence.update([lon, lat], 3.5);
+                cue_for_fix(&mut welfare, now.timestamp_millis(), &fix, b.warn_m).map(|cue| cue_record(now, cue, &fix, applied))
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         let body = json!({
             "collar_id": collar_id,
             "boundary_version": (applied > 0).then_some(applied),
             "device": {
                 "fw": "0.2-hosted-sim",
-                "caps": ["holes", "slots", "collar_id", "cue_mode", "episodes", "config", "sim"],
+                "caps": ["holes", "slots", "collar_id", "cue_mode", "config", "sim"],
                 "device_class": class
             },
             "fixes": [{"at": now, "point": [lon, lat], "accuracy_m": 3.5, "sats": 11, "hdop": 0.9}],
@@ -137,14 +148,101 @@ async fn report_all(ctx: &Ctx, client: &reqwest::Client, last_cues: &mut HashMap
             "battery": battery,
             "health": {"temp_c": 24.0 + phase.sin() * 3.0, "battery_v": 3.65 + battery * 0.5}
         });
+        // The physical collar advances welfare state when it evaluates the
+        // fix, regardless of whether its subsequent report reaches us.
+        op_fleet::hosted::save_welfare(ctx, &serial, welfare)?;
         let response = client.post(format!("{}/collar/v1/report", ctx.local_url())).bearer_auth(&bearer).json(&body).send().await?;
-        if response.status().is_success() && cue_due {
-            last_cues.insert(serial.clone(), now);
-        } else if !response.status().is_success() {
+        if !response.status().is_success() {
             tracing::warn!(%serial, status = %response.status(), "hosted simulated report rejected");
         }
     }
     Ok(())
+}
+
+struct SimCue {
+    kind: &'static str,
+    level: u8,
+}
+
+fn cue_record(at: chrono::DateTime<chrono::Utc>, cue: SimCue, fix: &op_geo::GeofenceResult, boundary_version: u32) -> serde_json::Value {
+    json!({"at": at, "kind": cue.kind, "level": cue.level, "dur_ms": 300,
+        "margin_m": fix.margin_m, "ring": fix.nearest_ring, "boundary_version": boundary_version})
+}
+
+/// Firmware cue.c's pacing and welfare transitions for one GPS fix.
+fn cue_for_fix(state: &mut op_fleet::hosted::WelfareState, now_ms: i64, fix: &op_geo::GeofenceResult, warn_m: f64) -> Option<SimCue> {
+    use op_geo::GeofenceState::{Inside, Outside, Warning};
+    match fix.state {
+        Inside => {
+            if state.crossed_out {
+                if state.escape_window_start_ms == 0 || now_ms - state.escape_window_start_ms >= 24 * 60 * 60 * 1000 {
+                    state.escape_window_start_ms = now_ms;
+                    state.escape_cycles = 1;
+                } else {
+                    state.escape_cycles = state.escape_cycles.saturating_add(1);
+                }
+                if state.escape_cycles >= 3 {
+                    state.enforcement_off = true;
+                    state.armed = false;
+                }
+            }
+            state.escaping = false;
+            state.outside_cues = 0;
+            state.pulse_cutoff = false;
+            state.crossed_out = false;
+            if !state.enforcement_off {
+                state.armed = true;
+            }
+        }
+        Warning => {
+            if !state.seen_outside && !state.enforcement_off {
+                state.armed = true;
+            }
+            state.escaping = false;
+        }
+        Outside => {
+            if state.armed && !state.enforcement_off {
+                state.armed = false;
+                state.escaping = true;
+                state.outside_since_ms = now_ms;
+                state.outside_cues = 0;
+                state.pulse_cutoff = false;
+                state.crossed_out = true;
+            }
+            state.seen_outside = true;
+        }
+        _ => {}
+    }
+    if state.enforcement_off || now_ms < state.rest_until_ms {
+        return None;
+    }
+    let cue = if fix.state == Warning && state.armed {
+        let level = (1 + (3.0 * (warn_m - fix.margin_m) / warn_m.max(f64::EPSILON)) as i32).clamp(1, 4) as u8;
+        Some(SimCue { kind: "warn", level })
+    } else if fix.state == Outside && state.escaping && !state.pulse_cutoff && state.outside_cues < 3 && now_ms - state.outside_since_ms < 10_000 {
+        state.outside_cues += 1;
+        if state.outside_cues == 3 {
+            state.escaping = false;
+            state.pulse_cutoff = true;
+        }
+        Some(SimCue { kind: "outside", level: 4 })
+    } else {
+        if fix.state == Outside && state.escaping {
+            state.escaping = false;
+            state.pulse_cutoff = true;
+        }
+        state.cueing = false;
+        None
+    }?;
+    if !state.cueing {
+        state.cueing = true;
+        state.active_since_ms = now_ms;
+    } else if now_ms - state.active_since_ms >= 20_000 {
+        state.cueing = false;
+        state.rest_until_ms = now_ms + 30_000;
+        return None;
+    }
+    Some(cue)
 }
 
 /// A simulated collar's apply time: 2–6 s, stable per collar (verify the
@@ -193,8 +291,8 @@ pub(crate) async fn sync_all(ctx: &Ctx, client: &reqwest::Client, delay: fn(&str
 async fn sync_collar(ctx: &Ctx, client: &reqwest::Client, bearer: &str, collar_id: &str, herd_id: &str, delay: Duration) -> anyhow::Result<()> {
     let base = ctx.local_url();
     let now = chrono::Utc::now();
-    // Staged boundaries it holds whose time has come: the highest one is
-    // applied, as of its effective time (the collar switches on its own clock).
+    // Staged boundaries are applied only on the first simulated GPS fix at or
+    // after their effective time, exactly as the firmware slot tick does.
     let staged: Vec<(String, i64, Option<String>)> = sqlx::query_as(
         "SELECT b.id, b.version, b.effective_at FROM acks a JOIN boundaries b ON b.id = a.command_id
          WHERE a.collar_id = ?1 AND a.herd_id = ?2 AND a.status = 'received'
@@ -207,9 +305,17 @@ async fn sync_collar(ctx: &Ctx, client: &reqwest::Client, bearer: &str, collar_i
     .await?;
     let applied = applied_version(ctx, collar_id, herd_id).await?;
     let due = staged.iter().find(|(_, v, at)| *v as u32 > applied && at.as_deref().and_then(|t| op_core::time::from_db(t).ok()).is_none_or(|t| t <= now));
-    if let Some((command_id, version, at)) = due {
-        let at = at.as_deref().and_then(|t| op_core::time::from_db(t).ok()).unwrap_or(now);
-        post_ack(client, &base, bearer, collar_id, command_id, *version as u32, "applied", at).await?;
+    if let Some((command_id, version, effective_at)) = due {
+        let effective_at = effective_at.as_deref().and_then(|t| op_core::time::from_db(t).ok()).unwrap_or(now);
+        let fix_at: Option<String> = sqlx::query_scalar("SELECT at FROM fixes WHERE collar_id = ? AND at >= ? ORDER BY at LIMIT 1")
+            .bind(collar_id)
+            .bind(op_core::time::to_db(&effective_at))
+            .fetch_optional(ctx.db())
+            .await?;
+        if let Some(fix_at) = fix_at {
+            let at = op_core::time::from_db(&fix_at)?;
+            post_ack(client, &base, bearer, collar_id, command_id, *version as u32, "applied", None, at).await?;
+        }
     }
 
     for _ in 0..MAX_POLLS {
@@ -228,10 +334,16 @@ async fn sync_collar(ctx: &Ctx, client: &reqwest::Client, bearer: &str, collar_i
                 break;
             }
         }
-        let command: serde_json::Value = response.json().await?;
-        let (Some(command_id), Some(version)) = (command["command_id"].as_str(), command["version"].as_u64()) else {
+        let wire = response.bytes().await?;
+        let untrusted: serde_json::Value = serde_json::from_slice(&wire).unwrap_or_default();
+        let (Some(command_id), Some(version)) = (untrusted["command_id"].as_str().map(str::to_owned), untrusted["version"].as_u64()) else {
             anyhow::bail!("boundary command without command_id or version");
         };
+        if op_protocol::verify_wire(&wire, &ctx.public_key()).is_err() {
+            post_ack(client, &base, bearer, collar_id, &command_id, version as u32, "rejected", Some("bad_sig"), chrono::Utc::now()).await?;
+            break;
+        }
+        let command = untrusted;
         let version = version as u32;
         if version <= have {
             break;
@@ -239,10 +351,10 @@ async fn sync_collar(ctx: &Ctx, client: &reqwest::Client, bearer: &str, collar_i
         let effective_at = command["effective_at"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.to_utc());
         let now = chrono::Utc::now();
         if effective_at.is_some_and(|t| t > now) {
-            post_ack(client, &base, bearer, collar_id, command_id, version, "received", now).await?;
+            post_ack(client, &base, bearer, collar_id, &command_id, version, "received", None, now).await?;
         } else {
             tokio::time::sleep(delay).await;
-            post_ack(client, &base, bearer, collar_id, command_id, version, "applied", chrono::Utc::now()).await?;
+            post_ack(client, &base, bearer, collar_id, &command_id, version, "applied", None, chrono::Utc::now()).await?;
         }
     }
     Ok(())
@@ -277,9 +389,13 @@ async fn post_ack(
     command_id: &str,
     version: u32,
     status: &str,
+    code: Option<&str>,
     at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
-    let body = json!({ "collar_id": collar_id, "command_id": command_id, "version": version, "status": status, "at": at });
+    let mut body = json!({ "collar_id": collar_id, "command_id": command_id, "version": version, "status": status, "at": at });
+    if let Some(code) = code {
+        body["code"] = json!(code);
+    }
     let response = client.post(format!("{base}/collar/v1/ack")).bearer_auth(bearer).json(&body).send().await?;
     if !response.status().is_success() {
         anyhow::bail!("ack {status} v{version} rejected: {}", response.status());
@@ -391,7 +507,7 @@ mod tests {
 
         // The simulated collars report; then boundaries go out and the old
         // simulator (reports only) leaves them unacked.
-        report_all(&ctx, &client, &mut HashMap::new()).await.unwrap();
+        report_all(&ctx, &client).await.unwrap();
         api.ok(reqwest::Method::POST, &format!("/api/herds/{sim_herd}/boundary"), json!({"geometry": square(100.0)})).await;
         api.ok(reqwest::Method::POST, &format!("/api/herds/{real_herd}/boundary"), json!({"geometry": square(100.0)})).await;
         op_alerts::engine::evaluate_all(&ctx, chrono::Utc::now() + chrono::Duration::seconds(70)).await.unwrap();
@@ -438,11 +554,22 @@ mod tests {
             sqlx::query_scalar("SELECT status FROM collar_boundary_state WHERE collar_id = ?").bind(&sim_collars[0]).fetch_one(ctx.db()).await.unwrap();
         assert_eq!(st, "received");
         tokio::time::sleep(Duration::from_millis(3_200)).await;
+        report_all(&ctx, &client).await.unwrap();
         sync_all(&ctx, &client, no_delay).await.unwrap();
         for id in &sim_collars {
             let (version, st): (i64, String) =
                 sqlx::query_as("SELECT version, status FROM collar_boundary_state WHERE collar_id = ?").bind(id).fetch_one(ctx.db()).await.unwrap();
             assert_eq!((version as u64, st.as_str()), (v2, "applied"), "{id}");
+            let (ack_at, fix_at): (String, String) = sqlx::query_as(
+                "SELECT a.at, f.at FROM acks a JOIN fixes f ON f.collar_id = a.collar_id AND f.at = a.at
+                 WHERE a.collar_id = ? AND a.version = ? AND a.status = 'applied'",
+            )
+            .bind(id)
+            .bind(v2 as i64)
+            .fetch_one(ctx.db())
+            .await
+            .unwrap();
+            assert_eq!(ack_at, fix_at);
         }
         op_alerts::engine::evaluate_all(&ctx, chrono::Utc::now() + chrono::Duration::seconds(70)).await.unwrap();
         assert!(open_for(&api.boundary_not_applied().await, &sim_herd).is_empty());
@@ -451,5 +578,125 @@ mod tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acks WHERE collar_id = ?").bind(&real_id).fetch_one(ctx.db()).await.unwrap();
         assert_eq!(n, 0);
         handle.shutdown().await.unwrap();
+    }
+
+    fn fix(state: op_geo::GeofenceState, margin_m: f64) -> op_geo::GeofenceResult {
+        op_geo::GeofenceResult { state, margin_m, nearest_ring: 2, ..Default::default() }
+    }
+
+    #[test]
+    fn three_outside_cues_then_silent_until_clear_inside() {
+        let mut state = op_fleet::hosted::WelfareState::default();
+        assert!(cue_for_fix(&mut state, 1, &fix(op_geo::GeofenceState::Inside, 10.0), 5.0).is_none());
+        for at in 2..=4 {
+            assert_eq!(cue_for_fix(&mut state, at, &fix(op_geo::GeofenceState::Outside, -1.0), 5.0).unwrap().kind, "outside");
+        }
+        assert!(state.pulse_cutoff);
+        assert!(cue_for_fix(&mut state, 5, &fix(op_geo::GeofenceState::Outside, -2.0), 5.0).is_none());
+        assert!(cue_for_fix(&mut state, 6, &fix(op_geo::GeofenceState::Warning, 2.0), 5.0).is_none());
+        assert!(cue_for_fix(&mut state, 7, &fix(op_geo::GeofenceState::Inside, 10.0), 5.0).is_none());
+        assert!(cue_for_fix(&mut state, 8, &fix(op_geo::GeofenceState::Warning, 2.0), 5.0).is_some());
+    }
+
+    #[test]
+    fn third_escape_return_cycle_shuts_enforcement_off() {
+        let mut state = op_fleet::hosted::WelfareState::default();
+        for cycle in 0..3 {
+            let at = 100 + cycle * 10;
+            cue_for_fix(&mut state, at, &fix(op_geo::GeofenceState::Inside, 10.0), 5.0);
+            cue_for_fix(&mut state, at + 1, &fix(op_geo::GeofenceState::Outside, -1.0), 5.0);
+            cue_for_fix(&mut state, at + 2, &fix(op_geo::GeofenceState::Inside, 10.0), 5.0);
+        }
+        assert_eq!(state.escape_cycles, 3);
+        assert!(state.enforcement_off);
+        assert!(cue_for_fix(&mut state, 200, &fix(op_geo::GeofenceState::Warning, 2.0), 5.0).is_none());
+    }
+
+    #[test]
+    fn cue_wire_shape_has_version_and_ring_but_no_point() {
+        let record = cue_record(chrono::Utc::now(), SimCue { kind: "warn", level: 2 }, &fix(op_geo::GeofenceState::Warning, 1.5), 57);
+        assert_eq!(record["boundary_version"], 57);
+        assert_eq!(record["ring"], 2);
+        assert!(record.get("point").is_none());
+    }
+
+    #[test]
+    fn simulator_accepts_server_signature_and_rejects_tampering() {
+        let key = op_protocol::SigningKey::from_bytes(&[9; 32]);
+        let mut command = op_protocol::BoundaryCommand {
+            command_id: "bnd_test".into(),
+            version: 1,
+            boundary: vec![[0.0, 0.0], [0.001, 0.0], [0.0, 0.001]],
+            ..Default::default()
+        };
+        op_protocol::sign_command(&mut command, &key);
+        let good = serde_json::to_vec(&command).unwrap();
+        assert!(op_protocol::verify_wire(&good, &key.verifying_key()).is_ok());
+        let bad = String::from_utf8(good).unwrap().replace("\"version\":1", "\"version\":2");
+        assert_eq!(op_protocol::verify_wire(bad.as_bytes(), &key.verifying_key()), Err(op_protocol::RejectCode::BadSig));
+    }
+
+    async fn boundary_peer(wire: Vec<u8>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::Router;
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Clone)]
+        struct Peer {
+            wire: Arc<Vec<u8>>,
+            served: Arc<AtomicBool>,
+            acks: Arc<std::sync::Mutex<Vec<Value>>>,
+        }
+        async fn boundary(State(peer): State<Peer>) -> (StatusCode, Bytes) {
+            if peer.served.swap(true, Ordering::SeqCst) { (StatusCode::NO_CONTENT, Bytes::new()) } else { (StatusCode::OK, Bytes::copy_from_slice(&peer.wire)) }
+        }
+        async fn ack(State(peer): State<Peer>, axum::Json(body): axum::Json<Value>) -> StatusCode {
+            peer.acks.lock().unwrap().push(body);
+            StatusCode::NO_CONTENT
+        }
+
+        let acks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer = Peer { wire: Arc::new(wire), served: Arc::new(AtomicBool::new(false)), acks: acks.clone() };
+        let app = Router::new().route("/collar/v1/boundary", get(boundary)).route("/collar/v1/ack", post(ack)).with_state(peer);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), acks)
+    }
+
+    #[tokio::test]
+    async fn bad_signature_is_rejected_and_good_signature_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = op_core::Ctx::open(dir.path()).await.unwrap();
+        let mut command = op_protocol::BoundaryCommand {
+            command_id: "bnd_test".into(),
+            version: 1,
+            boundary: vec![[0.0, 0.0], [0.001, 0.0], [0.0, 0.001]],
+            ..Default::default()
+        };
+        op_protocol::sign_command(&mut command, ctx.signing_key());
+        let good = serde_json::to_vec(&command).unwrap();
+        let bad = String::from_utf8(good.clone()).unwrap().replace("\"version\":1", "\"version\":2").into_bytes();
+
+        let (url, acks) = boundary_peer(bad).await;
+        ctx.set_local_url(url);
+        sync_collar(&ctx, &reqwest::Client::new(), "bearer", "col_test", "herd_test", Duration::ZERO).await.unwrap();
+        let got = acks.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["status"], "rejected");
+        assert_eq!(got[0]["code"], "bad_sig");
+        assert!(!got.iter().any(|a| a["status"] == "applied"));
+
+        let (url, acks) = boundary_peer(good).await;
+        ctx.set_local_url(url);
+        sync_collar(&ctx, &reqwest::Client::new(), "bearer", "col_test", "herd_test", Duration::ZERO).await.unwrap();
+        let got = acks.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["status"], "applied");
+        assert!(got[0].get("code").is_none());
     }
 }
