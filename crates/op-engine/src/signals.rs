@@ -358,7 +358,14 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
     for p in i.paddocks {
         let report = i.reports.get(&p.id);
         let (ndvi, hist) = ndvi_inputs(report);
-        forage.insert(p.id.clone(), paddock_forage(ndvi, measured.get(&p.id), report.and_then(land::forage_withheld)));
+        let mut estimate = paddock_forage(ndvi, measured.get(&p.id), report.and_then(land::forage_withheld));
+        if std::env::var("OP_SIM").as_deref() == Ok("1") && estimate["source"].is_null() && estimate.get("reason").is_none() {
+            estimate = calc::forage_estimate(None, Some(6.0), calc::DEFAULT_RESIDUAL_INCHES);
+            estimate["source"] = json!("model");
+            estimate["confidence"] = json!("low");
+            estimate["reason"] = json!("hosted_simulation_baseline");
+        }
+        forage.insert(p.id.clone(), estimate);
         recovery.insert(p.id.clone(), calc::recovery_trend(&hist));
         if let Some(r) = report {
             risks.insert(p.id.clone(), json!(calc::risk_flags(&land::section_data(r))));
@@ -405,6 +412,7 @@ pub async fn compute(ctx: &Ctx, i: SignalInputs<'_>) -> anyhow::Result<Value> {
             "Forage from imagery maps NDVI 0.2-0.8 to 0-10 inches; farmer heights win when recorded.",
             "Grazing pressure assumes collared animals move like the rest of the herd.",
             "Feed budget counts 60% of standing forage above a 3 inch residual at 11.8 kg DM per animal unit per day.",
+            "Hosted simulation only: without imagery or a farmer height, forage uses a clearly labelled low-confidence 6 inch model baseline.",
         ],
     }))
 }

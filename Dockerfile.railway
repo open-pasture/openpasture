@@ -1,0 +1,32 @@
+# Railway staging image. Cache ids are service-scoped as required by Railway.
+FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS ui
+WORKDIR /src/ui
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui/ ./
+RUN bun run build
+
+FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
+WORKDIR /src
+COPY . .
+COPY --from=ui /src/ui/dist ui/dist
+RUN --mount=type=cache,id=s/9f9ed952-fe40-4231-b491-72b0ae40bf57-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=s/9f9ed952-fe40-4231-b491-72b0ae40bf57-target,target=/src/target \
+    cargo build --release --locked -p op-cli \
+    && cp target/release/openpasture /usr/local/bin/openpasture
+
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --user-group --home-dir /data --shell /usr/sbin/nologin openpasture \
+    && mkdir -p /data \
+    && chown openpasture:openpasture /data
+COPY --from=build /usr/local/bin/openpasture /usr/local/bin/openpasture
+COPY LICENSE NOTICE THIRD-PARTY-NOTICES* /usr/share/doc/openpasture/
+ENV OPENPASTURE_DATA_DIR=/data
+EXPOSE 7878
+USER openpasture
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 CMD ["openpasture", "health"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["openpasture", "serve", "--bind", "0.0.0.0", "--port", "7878"]

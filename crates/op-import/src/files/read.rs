@@ -101,7 +101,7 @@ fn read_zip(zip_stem: &str, bytes: &[u8]) -> Result<Vec<RawFeature>, String> {
         if f.is_dir() {
             continue;
         }
-        let name = f.name().replace('\\', "/");
+        let name = f.name().map_err(|e| format!("The zip entry name can't be read: {e}."))?.replace('\\', "/");
         let base = name.rsplit('/').next().unwrap_or(&name);
         if name.starts_with("__MACOSX/") || name.contains("/__MACOSX/") || base.starts_with("._") || base.is_empty() {
             continue;

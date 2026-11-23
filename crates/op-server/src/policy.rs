@@ -30,6 +30,8 @@ type Rule = (&'static str, &'static str);
 
 /// No sign-in: the code in the body is the credential.
 pub const OPEN: &[Rule] = &[
+    ("POST", "/api/auth/clerk"),
+    ("POST", "/api/auth/bootstrap"),
     // @J
     ("POST", "/api/invites/accept"),
     // The owner's one-time sign-in code (op-server session).

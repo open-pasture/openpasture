@@ -11,6 +11,7 @@
 pub mod batch;
 pub mod console;
 pub mod firmware;
+pub mod hosted;
 pub mod keys;
 pub mod label;
 pub mod network;
@@ -50,6 +51,9 @@ pub async fn start(ctx: Ctx) -> anyhow::Result<()> {
     // The maker key exists before the first request can ask for it.
     keys::maker_key(ctx.data_dir())?;
     plans::ensure_shipped(&ctx).await?;
+    if std::env::var("OP_SIM").as_deref() == Ok("1") {
+        hosted::seed_inventory(&ctx).await?;
+    }
     units::spawn_in_service_watch(&ctx);
     firmware::rollout::spawn(&ctx);
     Ok(())
