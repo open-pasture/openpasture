@@ -17,8 +17,12 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from local_only import local_hostport  # noqa: E402
 
 KINDS = ("report", "boundary_200", "boundary_204", "ack", "other")
 
@@ -160,7 +164,7 @@ async def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--every", type=float, default=60.0)
     a = ap.parse_args()
-    host, port = a.upstream.rsplit(":", 1)
+    host, port = local_hostport(a.upstream)
     stats = Stats()
     server = await asyncio.start_server(lambda r, w: handle(r, w, (host, int(port)), stats), "127.0.0.1", a.listen, limit=1 << 20)
 
