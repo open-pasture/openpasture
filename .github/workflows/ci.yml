@@ -191,3 +191,21 @@ jobs:
           persist-credentials: false
       - name: Compare vectors
         run: scripts/compare-vectors.sh opencollar
+
+  # Checks that make a repeated mistake impossible (AGENTS.md lists each rule
+  # and what enforces it). The same commands run locally.
+  rules:
+    name: repo rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: No future dates added to tests
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=HEAD^; fi
+          python3 scripts/check-test-dates.py --base "$BASE" --head HEAD

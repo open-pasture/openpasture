@@ -8,7 +8,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use chrono_tz::Tz;
 use http_body_util::BodyExt;
 use op_core::tools::ToolScope;
@@ -152,24 +152,38 @@ async fn decided(t: &T, herd: &str, action: DecisionAction, to: Option<&str>) ->
     cycle::record(&t.ctx, d, &herd).await.unwrap()
 }
 
+/// The Saturday before America/Chicago's next fall-back (clocks go back early
+/// on the first Sunday in November), at least two days ahead of the real
+/// clock. The server refuses a schedule that starts in the past, so a date
+/// written out here would go stale on that day (it did: 2026-10-31).
+fn saturday_before_next_fall_back() -> NaiveDate {
+    let soon = Utc::now().date_naive() + Duration::days(2);
+    (soon.year()..)
+        .map(|y| NaiveDate::from_weekday_of_month_opt(y, 11, Weekday::Sun, 1).unwrap() - Duration::days(1))
+        .find(|saturday| *saturday >= soon)
+        .unwrap()
+}
+
 #[tokio::test]
 async fn a_daily_seven_oclock_schedule_opens_at_seven_local_on_both_sides_of_the_dst_change() {
     let t = setup().await;
     let f = farm(&t).await;
-    // Saturday 2026-10-31 07:00 CDT; clocks fall back early on Sunday 2026-11-01.
-    let s = schedule(&t, &f, json!({ "starts_at": "2026-10-31T12:00:00Z" })).await;
+    // Saturday 07:00 CDT; clocks fall back early on the Sunday after.
+    let sat = saturday_before_next_fall_back();
+    let day = |n: i64| (sat + Duration::days(n)).format("%Y-%m-%d").to_string();
+    let s = schedule(&t, &f, json!({ "starts_at": format!("{}T12:00:00Z", day(0)) })).await;
     assert_eq!((s["next_index"].as_u64(), s["status"].as_str()), (Some(1), Some("active")));
     let ms = moves(&t, s["id"].as_str().unwrap()).await;
     let o = opens(&ms);
     assert_eq!(o.len(), 5);
-    assert_eq!(o[0].1, utc("2026-10-31T12:00:00Z"));
-    assert_eq!(o[1].1, utc("2026-11-01T13:00:00Z"), "07:00 CST is 13:00 UTC");
-    assert_eq!(o[2].1, utc("2026-11-02T13:00:00Z"));
+    assert_eq!(o[0].1, utc(&format!("{}T12:00:00Z", day(0))));
+    assert_eq!(o[1].1, utc(&format!("{}T13:00:00Z", day(1))), "07:00 CST is 13:00 UTC");
+    assert_eq!(o[2].1, utc(&format!("{}T13:00:00Z", day(2))));
     let days: Vec<String> = o.iter().map(|(_, at)| local(*at)).collect();
-    assert_eq!(days, ["2026-10-31 07:00", "2026-11-01 07:00", "2026-11-02 07:00", "2026-11-03 07:00", "2026-11-04 07:00"]);
+    assert_eq!(days, (0..5).map(|n| format!("{} 07:00", day(n))).collect::<Vec<_>>());
     // The back fence closes 4 h after each open, three steps 10 minutes apart (defaults).
     let closes: Vec<String> = ms.iter().filter(|m| m["index"] == 2 && m["step"].as_u64() > Some(0)).map(|m| local(utc(m["at"].as_str().unwrap()))).collect();
-    assert_eq!(closes, ["2026-11-01 11:00", "2026-11-01 11:10", "2026-11-01 11:20"]);
+    assert_eq!(closes, ["11:00", "11:10", "11:20"].map(|hm| format!("{} {hm}", day(1))));
     // With no start given it is the next time the farm's clock reads 07:00.
     let (st, p) = t.req("POST", "/api/schedules/preview", Some(json!({ "herd_id": f.herd, "strips": f.strips }))).await;
     assert_eq!(st, StatusCode::CONFLICT, "one schedule per herd: {p}");
