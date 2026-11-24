@@ -28,13 +28,31 @@ ignore = [
     # again ("review by YYYY-MM-DD" in its reason). CI fails once that date
     # passes (scripts/deny-ignores.py), so an ignore can't outlive its reason.
     #
-    # zip < 9: extract() to disk mishandles symlinks and SUID bits. op-import
-    # reads entries into memory (by_index, files/read.rs) and never extracts;
-    # tauri-plugin-updater's zip path is Windows-only, our updates are tar.gz.
-    # Drop these when zip 9 lands in both.
-    { id = "RUSTSEC-2026-0367", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
-    { id = "RUSTSEC-2026-0368", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
-    { id = "RUSTSEC-2026-0369", reason = "no zip extract() to disk; see above. review by 2027-01-31" },
+    # zip < 9, now only zip 4 under tauri-plugin-updater (op-import is on
+    # zip 9). Its newest stable release, 2.13.1, still asks for zip 4. The
+    # updater opens a zip only on Windows (extract_zip, for .msi.zip and
+    # .exe.zip bundles), after checking the update's signature; our updates
+    # are tar.gz. It builds zip with no features, so no AES (0545), and it
+    # never uses ZipStreamReader (0548). 0367-0369 and 0429 are bugs in
+    # extract() to disk on untrusted archives. Drop these when
+    # tauri-plugin-updater moves to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "updater's zip 4, signed Windows bundles only; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0368", reason = "updater's zip 4, signed Windows bundles only; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0369", reason = "updater's zip 4, signed Windows bundles only; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0429", reason = "updater's zip 4, signed Windows bundles only; see above. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0545", reason = "updater's zip 4 is built without aes-crypto. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0548", reason = "ZipStreamReader unused; updater reads with ZipArchive. review by 2027-01-31" },
+    # SQLite < 3.54 (libsqlite3-sys < 0.39): a database opened with a -wal
+    # file of a different page size can return stale memory. The fix needs
+    # sqlx 0.9, whose SqlSafeStr check means auditing ~120 dynamic queries;
+    # that's its own change. The server and desktop open only the database,
+    # backups and session store in their own data folder, which they wrote;
+    # nothing opens a SQLite file a user uploads. Drop this with sqlx 0.9.
+    { id = "RUSTSEC-2026-0459", reason = "only our own data folder's databases are opened; see above. review by 2027-01-31" },
+    # chrono and chrono-tz are unmaintained; no release fixes that. Moving
+    # to jiff touches every crate. Not a vulnerability.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no replacement release; move to jiff is its own change. review by 2027-01-31" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, no replacement release; move to jiff is its own change. review by 2027-01-31" },
     # zstd 0.13 / zstd-safe 7: fixed only in zstd 0.14.3 / zstd-safe 8.2,
     # which arrow-ipc and parquet 59 (datafusion 55) and tantivy-sstable 0.7
     # can't take (they ask for zstd ^0.13). All three call only zstd::bulk

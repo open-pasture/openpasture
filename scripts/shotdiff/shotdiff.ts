@@ -16,7 +16,7 @@
 //   --wait 2500                      ms to let the map and fades settle after the network is idle
 //   --tiles                          load real imagery (by default every tile is one blank image, so
 //                                    shots don't change with what the imagery server sends)
-//   --token <t>                      app token, for a server that isn't on this machine
+//   --token <t>                      app token (the page otherwise asks for one)
 //   --seconds 10 --route "#/"        frames: how long to pan, and where
 //   --headed                         a visible window (frames on the real GPU)
 //   --chrome <path>                  Chrome binary (default: $CHROME or /Applications/Google Chrome.app)
@@ -30,6 +30,7 @@ import { join } from "node:path";
 import pixelmatch from "pixelmatch";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { PNG } from "pngjs";
+import { localOnly } from "../local-only.mjs";
 
 type Opts = Record<string, string | boolean>;
 
@@ -197,6 +198,9 @@ async function frames(base: string, o: Opts) {
 
 async function main() {
   const { cmd, args, opts } = parse(process.argv.slice(2));
+  // Server addresses are checked before the browser starts: staging and production are never driven.
+  if (cmd === "shoot" || cmd === "frames") args[0] = localOnly(args[0]);
+  if (cmd === "diff") [args[0], args[1]] = [localOnly(args[0]), localOnly(args[1])];
   if (cmd === "shoot" && args.length === 2) return void (await shoot(args[0], args[1], opts));
   if (cmd === "compare" && args.length === 2) return void process.exit(compare(args[0], args[1], opts) ? 0 : 1);
   if (cmd === "diff" && args.length === 2) {

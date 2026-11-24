@@ -50,8 +50,10 @@ names the missing ones. There is no unsigned fallback.
 
 ## Cut a release
 
-1. `main` is green in CI, and the `protocol vectors` job compared them (not skipped: `OPENCOLLAR_REF`
-   in `.github/workflows/ci.yml` names an opencollar commit on GitHub). The release workflow
+1. `main` is green in CI, including the `protocol vectors` job, which compares op-protocol's
+   vectors with opencollar at the commit in `crates/op-protocol/OPENCOLLAR_REF` and fails when the
+   pin is missing. The `vectors drift` workflow is green too: opencollar's main has no vectors
+   that differ from the pinned ones. The release workflow
    runs all of CI again on the tagged commit and builds nothing unless it passes (`windows
    (server)` excepted while it is marked `continue-on-error`).
 2. On a branch, set the version and name the release in the changelog:

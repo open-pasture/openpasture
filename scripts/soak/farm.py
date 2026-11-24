@@ -7,8 +7,13 @@ y north. P1 is x -413..0, y 0..400; P2 east of it; P3 north of P1.
 import json
 import math
 import time
+import os
+import sys
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from local_only import local_only  # noqa: E402
 
 CENTER = (-93.62, 42.03)
 R = 6371008.8
@@ -42,7 +47,8 @@ P3_S, P3_N = P1_N, to_xy([-93.62, 42.0372])[1]
 
 class Api:
     def __init__(self, base, token=None):
-        self.base = base.rstrip("/")
+        # Refused here, before any request: staging and production are never driven.
+        self.base = local_only(base)
         self.token = token
 
     def call(self, method, path, body=None, ok=(200, 201, 204)):

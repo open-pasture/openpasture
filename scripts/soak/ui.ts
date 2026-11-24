@@ -15,8 +15,10 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { chromium } from "../shotdiff/node_modules/playwright-core/index.mjs";
+import { localOnly } from "../local-only.mjs";
 
-const [base, out, secs] = process.argv.slice(2);
+const [url, out, secs] = process.argv.slice(2);
+const base = localOnly(url);
 mkdirSync(out, { recursive: true });
 const CHROME = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const BLANK = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
