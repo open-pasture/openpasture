@@ -17,13 +17,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The opencollar commit whose protocol vectors op-protocol must match byte for
-  # byte (scripts/compare-vectors.sh). Move it forward in the same pull request
-  # that changes the vectors on either side. It must be a commit on GitHub.
-  #
-  # Empty: the comparison is skipped with a warning.
-  OPENCOLLAR_REF: "798f5e719f6d5d0f45004d0b375fb90361c4d636"
-
 # Actions are pinned to commit SHAs (Dependabot keeps them current). The Rust
 # toolchain comes from rust-toolchain.toml and bun from .bun-version.
 
@@ -181,20 +174,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # The pin lives beside the vectors (crates/op-protocol/OPENCOLLAR_REF) and
+      # moves only with scripts/sync-vectors.sh. Missing or empty fails here:
+      # the comparison is never skipped.
       - name: Pinned opencollar commit
         id: pin
         run: |
-          if [ -z "$OPENCOLLAR_REF" ]; then
-            echo "::warning title=Protocol vectors not compared::OPENCOLLAR_REF is empty in ci.yml, so op-protocol's vectors were not compared with opencollar's. Set it to the opencollar commit that carries them (see the comment there)."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
+          pin=$(grep -Ev '^[[:space:]]*(#|$)' crates/op-protocol/OPENCOLLAR_REF | head -1 | tr -d '[:space:]' || true)
+          echo "ref=$pin" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.pin.outputs.skip != 'true'
+        if: steps.pin.outputs.ref != ''
         with:
           repository: open-pasture/opencollar
-          ref: ${{ env.OPENCOLLAR_REF }}
+          ref: ${{ steps.pin.outputs.ref }}
           path: opencollar
           persist-credentials: false
       - name: Compare vectors
-        if: steps.pin.outputs.skip != 'true'
         run: scripts/compare-vectors.sh opencollar

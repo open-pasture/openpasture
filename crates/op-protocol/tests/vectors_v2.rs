@@ -6,9 +6,9 @@
 //! `vectors_are_current` rebuilds the files and fails if they differ from
 //! what is committed (`OP_WRITE_VECTORS=1 cargo test -p op-protocol --test
 //! vectors_v2` rewrites them). The other tests read the committed files and
-//! check this implementation against every case. `copy_matches_opencollar`
-//! fails when `vectors/` here differs from `opencollar/protocol/vectors/`,
-//! the published source of truth, whenever that checkout sits next to this one.
+//! check this implementation against every case. That `vectors/` here matches
+//! `opencollar/protocol/vectors/` at the commit in `OPENCOLLAR_REF` is
+//! `scripts/compare-vectors.sh`'s job, in CI and locally.
 
 use std::path::{Path, PathBuf};
 
@@ -1778,40 +1778,6 @@ fn identity_agrees() {
         assert_eq!(then, a["then"], "{}", a["name"]);
     }
     assert_eq!(hex(&herd_from_v1(f["v1_herd"]["v1"].as_str().unwrap())), f["v1_herd"]["v2"]);
-}
-
-/// Every file under `vectors/`, relative paths, sorted.
-fn tree(root: &Path) -> Vec<PathBuf> {
-    fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(root, &p, out);
-            } else {
-                out.push(p.strip_prefix(root).unwrap().to_path_buf());
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, root, &mut out);
-    out.sort();
-    out
-}
-
-#[test]
-fn copy_matches_opencollar() {
-    let ours = Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors");
-    let theirs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../opencollar/protocol/vectors");
-    if !theirs.is_dir() {
-        eprintln!("no opencollar checkout next to this one; skipping the copy check");
-        return;
-    }
-    let (a, b) = (tree(&ours), tree(&theirs));
-    assert_eq!(a, b, "crates/op-protocol/vectors and opencollar/protocol/vectors hold different files");
-    for rel in a {
-        let same = std::fs::read(ours.join(&rel)).unwrap() == std::fs::read(theirs.join(&rel)).unwrap();
-        assert!(same, "{} differs from opencollar/protocol/vectors: copy it over (vectors/README.md)", rel.display());
-    }
 }
 
 // ---------------------------------------------------------------- budget

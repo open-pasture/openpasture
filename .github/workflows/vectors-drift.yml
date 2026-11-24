@@ -1,0 +1,33 @@
+name: vectors drift
+
+# The protocol vectors job in ci.yml compares op-protocol's vectors with
+# opencollar at the pinned commit (crates/op-protocol/OPENCOLLAR_REF). This
+# one compares them with opencollar's main every day, so a vectors change
+# landing on either side alone turns red here within a day instead of hiding
+# behind the pin. Fix: bring the two together and move the pin with
+# scripts/sync-vectors.sh.
+
+on:
+  schedule:
+    - cron: "17 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: vectors drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: open-pasture/opencollar
+          path: opencollar
+          persist-credentials: false
+      - name: Compare with opencollar main
+        run: scripts/compare-vectors.sh opencollar HEAD
