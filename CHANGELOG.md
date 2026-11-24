@@ -10,6 +10,9 @@ cut a release (see `docs/RELEASING.md`).
 
 ## Unreleased
 
+- Security: dependency updates for RustSec advisories in lettre (SMTP alert email), cookie,
+  rmcp, url, parquet and zip (file imports).
+
 ## 0.2.2 (2026-10-01)
 
 - Desktop: a workbench layout with a rail, sidebars and tabs. Things that need a person (a move

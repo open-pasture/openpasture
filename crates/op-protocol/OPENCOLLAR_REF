@@ -1,0 +1,3 @@
+# The opencollar commit whose protocol/vectors/ crates/op-protocol/vectors/ copies.
+# Written by scripts/sync-vectors.sh; checked by scripts/compare-vectors.sh in CI.
+798f5e719f6d5d0f45004d0b375fb90361c4d636
