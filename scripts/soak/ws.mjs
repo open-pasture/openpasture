@@ -4,8 +4,10 @@
 // bytes, and resyncs; reconnects when the socket drops.
 // Usage: node ws.mjs ws://127.0.0.1:17150/api/live out.jsonl [seconds]
 import { appendFileSync } from "node:fs";
+import { localOnly } from "../local-only.mjs";
 
-const [url, out, secs] = process.argv.slice(2);
+const [given, out, secs] = process.argv.slice(2);
+const url = localOnly(given);
 const until = secs ? Date.now() + Number(secs) * 1000 : Infinity;
 let perSec = new Map();
 let types = {};
