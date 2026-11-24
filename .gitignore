@@ -21,3 +21,4 @@ out/
 
 # Generated at release by scripts/third-party-notices.py
 /THIRD-PARTY-NOTICES
+__pycache__/
