@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# verify-openpasture: launch, check, drive and stop a local openpasture stack
+# (op-server + collar-sim's simulated farm, the UI the server embeds).
+#
+#   bin/verify build                 ui/dist, then op-cli and collar-sim (debug)
+#   bin/verify launch                a new stack on 127.0.0.1:$OP_VERIFY_PORT (17990)
+#   bin/verify doctor                is the current stack worth driving?
+#   bin/verify drive <journey>       health | collar-reports | report-rate-limit | app-shell
+#   bin/verify all                   doctor, then every journey
+#   bin/verify stop                  stop what launch started; evidence stays
+#
+# OP_BASE_URL, when set, must be http on this machine (bin/local_only.py):
+# anything else exits 3 before any lookup or connection.
+# OP_BIN: the dir holding openpasture and collar-sim (default <target>/debug).
+# OP_VERIFY_DIR: where runs go (default <repo>/target/verify-openpasture).
+set -euo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# The guard runs first, before anything else in this script can reach a network.
+if [ -n "${OP_BASE_URL:-}" ]; then
+  OP_BASE_URL=$(python3 "$HERE/local_only.py" "$OP_BASE_URL") || exit 3
+fi
+ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
+
+TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
+BIN=${OP_BIN:-$TARGET/debug}
+VDIR=${OP_VERIFY_DIR:-$ROOT/target/verify-openpasture}
+PORT=${OP_VERIFY_PORT:-17990}
+CUR=$VDIR/current
+
+load() { # the current run's stack.env; OP_BASE_URL from the env wins (already checked)
+  [ -f "$CUR/stack.env" ] || { echo "no current stack in $VDIR; run bin/verify launch" >&2; exit 2; }
+  local url=${OP_BASE_URL:-}
+  # shellcheck disable=SC1091
+  source "$CUR/stack.env"
+  [ -n "$url" ] && OP_BASE_URL=$url
+  OP_BASE_URL=$(python3 "$HERE/local_only.py" "$OP_BASE_URL") || exit 3
+  export OP_BASE_URL OP_TOKEN OP_DATA_DIR OP_VERIFY_RUN
+}
+
+case "${1:-}" in
+  build)
+    (cd "$ROOT/ui" && bun install --frozen-lockfile && bun run build)
+    cargo build --locked -p op-cli -p collar-sim --manifest-path "$ROOT/Cargo.toml"
+    ;;
+
+  launch)
+    [ -x "$BIN/openpasture" ] && [ -x "$BIN/collar-sim" ] || { echo "no openpasture/collar-sim in $BIN; run bin/verify build (or set OP_BIN)" >&2; exit 2; }
+    if [ -f "$CUR/stack.env" ] && [ -f "$CUR/pgid" ] && kill -0 -- "-$(cat "$CUR/pgid")" 2>/dev/null; then
+      echo "a stack is already running ($(readlink -f "$CUR")); bin/verify stop first" >&2; exit 2
+    fi
+    if python3 -c "import socket,sys; s=socket.socket(); sys.exit(s.connect_ex(('127.0.0.1',$PORT))!=0)"; then
+      echo "port $PORT is taken by something this script didn't start; set OP_VERIFY_PORT" >&2; exit 2
+    fi
+    RUN=$VDIR/$(date -u +%Y%m%dT%H%M%SZ)-$PORT
+    mkdir -p "$RUN/evidence"
+    ln -sfn "$RUN" "$CUR"
+    DATA=$RUN/farm
+    # collar-sim farm starts the real server on its own data dir, makes the farm
+    # (two paddocks, a simulated herd) through the app API, links 6 collars and runs them.
+    setsid "$BIN/collar-sim" farm --port "$PORT" --data-dir "$DATA" --count 6 --openpasture "$BIN/openpasture" \
+      > "$RUN/evidence/collar-sim.log" 2>&1 < /dev/null &
+    echo $! > "$RUN/pgid"
+    URL=http://127.0.0.1:$PORT
+    for _ in $(seq 1 240); do
+      grep -q "simulated farm at" "$RUN/evidence/collar-sim.log" 2>/dev/null && [ -s "$DATA/collar-sim.json" ] && break
+      kill -0 "$(cat "$RUN/pgid")" 2>/dev/null || { echo "collar-sim farm exited:" >&2; tail -20 "$RUN/evidence/collar-sim.log" >&2; exit 2; }
+      sleep 0.5
+    done
+    [ -s "$DATA/collar-sim.json" ] || { echo "the farm wasn't ready in 120 s; see $RUN/evidence/collar-sim.log" >&2; exit 2; }
+    TOKEN=$("$BIN/openpasture" token --data-dir "$DATA" | tail -1)
+    printf 'OP_BASE_URL=%s\nOP_TOKEN=%s\nOP_DATA_DIR=%s\nOP_VERIFY_RUN=%s\n' "$URL" "$TOKEN" "$DATA" "$RUN" > "$RUN/stack.env"
+    chmod 600 "$RUN/stack.env"
+    echo "launched $URL (server $("$BIN/openpasture" --version 2>/dev/null || echo '?') from $BIN); run $RUN"
+    { echo "skill tree: $(git -C "$ROOT" rev-parse HEAD)"; echo "binaries: $BIN"; "$BIN/openpasture" --version 2>/dev/null || true; } > "$RUN/evidence/build"
+    ;;
+
+  doctor)
+    load
+    exec python3 "$HERE/drive.py" doctor
+    ;;
+
+  drive)
+    load
+    j=${2:?journey: health | collar-reports | report-rate-limit | app-shell}
+    if [ "$j" = app-shell ]; then
+      [ -d "$HERE/node_modules/playwright-core" ] || (cd "$HERE" && bun install --frozen-lockfile > /dev/null)
+      exec bun "$HERE/ui.ts"
+    fi
+    exec python3 "$HERE/drive.py" "$j"
+    ;;
+
+  all)
+    load
+    python3 "$HERE/drive.py" doctor || exit $?
+    rc=0
+    for j in health collar-reports report-rate-limit app-shell; do "$0" drive "$j" || rc=1; done
+    echo "all: $([ $rc = 0 ] && echo PASS || echo FAIL) (evidence $OP_VERIFY_RUN/evidence)"
+    exit $rc
+    ;;
+
+  stop)
+    [ -L "$CUR" ] || { echo "nothing launched"; exit 0; }
+    RUN=$(readlink -f "$CUR")
+    if [ -f "$RUN/pgid" ]; then
+      pg=$(cat "$RUN/pgid")
+      # The process group launch started (collar-sim and the server it spawned), nothing else.
+      kill -INT -- "-$pg" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 -- "-$pg" 2>/dev/null || break; sleep 0.5; done
+      kill -KILL -- "-$pg" 2>/dev/null || true
+      rm -f "$RUN/pgid"
+    fi
+    rm -rf "$RUN/farm" "$RUN/stack.env"
+    rm -f "$CUR"
+    echo "stopped; evidence kept in $RUN/evidence"
+    ;;
+
+  *)
+    sed -n 2,15p "$0"; exit 2
+    ;;
+esac

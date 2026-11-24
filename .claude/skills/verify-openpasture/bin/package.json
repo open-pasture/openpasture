@@ -1,0 +1,9 @@
+{
+  "name": "verify-openpasture",
+  "private": true,
+  "type": "module",
+  "description": "Verification scaffolding: drives the openpasture UI in Chromium for the verify-openpasture skill.",
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
