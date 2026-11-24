@@ -1,5 +1,7 @@
 # Agents
 
+Project skills live in `.claude/skills/`. Read the one that fits the task before you start: `cody-mode` for how to work here.
+
 ## Rules and what enforces them
 
 Each rule here is a mistake agents made more than once. A check now fails on it, so this table is a map, not the guard. When an operator corrects a mistake, fix it, then add its rule here with what enforces it. If a rule is here and nothing enforces it, enforce it in the same change.
